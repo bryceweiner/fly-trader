@@ -46,7 +46,11 @@ def settings_panel() -> None:
                 ("LIVE_ENABLED", "1" if config.LIVE_ENABLED else "0", "Allows signing real transactions (legacy modes)."),
                 ("Cluster", config.SOLANA_CLUSTER, "Solana network for live orders."),
                 ("Starting capital", f"{config.CAPITAL_SOL:g} SOL", "Paper books start here."),
-                ("Position size", f"{config.MAX_POSITION_SOL:g} SOL", "Each buy."),
+                ("Position sizing", f"{config.KELLY_FRACTION:g} × Kelly", "Each buy is sized from how certain the model is: this share of the growth-optimal bet for its score band."),
+                ("Largest position", f"{config.MAX_POSITION_FRACTION:.0%} of the bankroll", "Bankroll = wealth at cost minus the gas reserve."),
+                ("Pool share cap", f"{config.MAX_POOL_SHARE:.0%} of the pool", "Bounds the price impact of larger buys."),
+                ("Smallest position", f"{config.MIN_POSITION_SOL:g} SOL", "Smaller sized buys are skipped."),
+                ("Fixed size (older models)", f"{config.MAX_POSITION_SOL:g} SOL", "Models trained before sizing trade this size."),
                 ("Gas reserve", f"{config.GAS_RESERVE_SOL:g} SOL", "Never spent on positions."),
                 ("Reset on start", "yes" if config.RESET_ON_START else "no", "Starting the trading engine archives and clears the paper books.")]
         st.dataframe(pd.DataFrame(rows, columns=["setting", "value", "meaning"]), hide_index=True)

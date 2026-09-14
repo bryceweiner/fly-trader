@@ -7,7 +7,8 @@ synthetic trades, exactly as in training. Graduation time and creation/creator f
 same source training uses. Rows that pass the eligibility gate (pool ≥ 20 SOL, 15-minute volume ≥ 5 SOL, no scale break —
 a close 50× from the previous one or a reserve above 100,000 SOL — since the mint's state began) are scored
 by the deployed selector (``brain_snapshots`` kind 'selector') with the feature vector assembled by name in the
-model's column order; scores at or above its threshold open a ``MAX_POSITION_SOL`` position in book
+model's column order; scores at or above its threshold open a position sized from the model's measured certainty
+(``agent/sizing.py``: a fraction of the growth-optimal bet for the score's band, of the bankroll minus the gas reserve) in book
 ``paper_selector``, held ``horizon_min`` minutes, then sold at the last traded price (the training label's exit).
 Every score, entry and exit is a ``decisions`` row; marks and wealth go to ``wealth_marks`` per minute with the same
 conventions as the other books. Kill switch, pause and reserve rails apply to entries; no entries or exits happen
@@ -29,6 +30,7 @@ import numpy as np
 from .. import config
 from ..db.apilog import record_event
 from ..db.connection import transaction
+from . import sizing
 from ..execution import ledger
 from ..execution.broker_paper import PaperBroker
 from ..market.exit_cost import exit_cost_fraction
@@ -276,26 +278,30 @@ class SelectorSession:
                                  age_hours=self._age_h(p["mint"], m1_epoch), program_label=p.get("program_label"), forced_kind=None, ts=m1)
                 n_exit += 1
             # entries: scores at/above threshold, one position per mint, rails
-            open_mints = {p["mint"] for p in ledger.open_positions(conn, BOOK)}
+            opens_now = ledger.open_positions(conn, BOOK); open_mints = {p["mint"] for p in opens_now}
             cash = ledger.paper_cash(conn, BOOK); n_enter = 0; picks = []
+            bankroll = cash + sum(float(p["cost_sol"]) for p in opens_now)         # wealth at cost: the sizing base (agent/sizing.py)
+            table = getattr(self.model, "sizing", None) or []
             circuit = conn.execute("SELECT kill_switch, entries_paused FROM circuit_state WHERE id = 1").fetchone()
             blocked = "kill switch" if circuit and circuit["kill_switch"] else ("paused" if circuit and circuit["entries_paused"] else None)
             for m, i, sc in zip(mints, infos, scores):
                 if sc < self.model.threshold:
                     continue
                 picks.append((m, float(sc)))
-                if m in open_mints or blocked or cash < config.MAX_POSITION_SOL + config.GAS_RESERVE_SOL:
+                size, why = sizing.size_position(float(sc), self.model.threshold, table, bankroll, cash, i["resq"])
+                if m in open_mints or blocked or size <= 0:
+                    rail = blocked or ("held" if m in open_mints else "sizing")
                     conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, m_hat, size_sol, forced, rail, reason, detail) VALUES (%s,%s,%s,%s,%s,'blocked',%s,%s,false,%s,%s,%s)",
-                                 (beat, self.run_id, m1, m, i["pool"], float(sc), config.MAX_POSITION_SOL, blocked or ("held" if m in open_mints else "cash"), "selector pick not taken",
-                                  json.dumps({"score": float(sc), "threshold": self.model.threshold})))
+                                 (beat, self.run_id, m1, m, i["pool"], float(sc), size, rail, why if rail == "sizing" else "selector pick not taken",
+                                  json.dumps({"score": float(sc), "threshold": self.model.threshold, "sizing": why})))
                     continue
                 did = conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, m_hat, size_sol, forced, reason, book_targets, detail) VALUES (%s,%s,%s,%s,%s,'selector_enter',%s,%s,false,%s,%s,%s) RETURNING id",
-                                   (beat, self.run_id, m1, m, i["pool"], float(sc), config.MAX_POSITION_SOL, f"score {sc:.3f} ≥ {self.model.threshold:.3f}", [BOOK],
-                                    json.dumps({"score": float(sc), "threshold": self.model.threshold, "resq": i["resq"], "age_h": i["age_h"], "price": i["price"]}))).fetchone()["id"]
-                fill = self.broker.buy(conn, decision_id=did, mint=m, pool=i["pool"], size_sol=config.MAX_POSITION_SOL, price=i["price"], res_quote_sol=i["resq"],
+                                   (beat, self.run_id, m1, m, i["pool"], float(sc), size, f"score {sc:.3f} ≥ {self.model.threshold:.3f}; {why}", [BOOK],
+                                    json.dumps({"score": float(sc), "threshold": self.model.threshold, "size_sol": size, "sizing": why, "resq": i["resq"], "age_h": i["age_h"], "price": i["price"]}))).fetchone()["id"]
+                fill = self.broker.buy(conn, decision_id=did, mint=m, pool=i["pool"], size_sol=size, price=i["price"], res_quote_sol=i["resq"],
                                        age_hours=i["age_h"], decimals=i["decimals"], program_label=i["program_label"], ts=m1)
                 if fill.ok:
-                    n_enter += 1; open_mints.add(m); cash -= config.MAX_POSITION_SOL
+                    n_enter += 1; open_mints.add(m); cash -= size
                 else:
                     conn.execute("UPDATE decisions SET rail = %s, reason = %s WHERE id = %s", ("paper_fill", fill.reason, did))
             # marks and wealth (conventions of agent/reward.py: positions net of exit cost, exposure at cost, drawdown ≥ 0)

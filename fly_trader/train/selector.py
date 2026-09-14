@@ -28,7 +28,8 @@ from ..db.apilog import record_event
 from ..db.connection import transaction
 from . import progress as prog
 from ..market.features import FEATURE_VERSION
-from .decisions import DecisionSet, build, evaluate, random_trades, summarize, trades_from_picks
+from ..agent import sizing
+from .decisions import DecisionSet, build, evaluate, random_trades, summarize, taken_rows
 from .mature import AGG_VERSION
 
 log = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ class SelectorModel:
     horizon_min: int
     trained_through: str
     metrics: dict = field(default_factory=dict)
+    sizing: list = field(default_factory=list)   # agent/sizing.py table from the backtest's out-of-sample trades
 
     def score(self, X: np.ndarray) -> np.ndarray:
         return self.gbm.predict_proba((X - self.mean) / self.std)[:, 1]
@@ -115,7 +117,7 @@ def walk_forward(ds: DecisionSet, warmup_days: int = WARMUP_DAYS, block_days: in
                  stop: threading.Event | None = None) -> dict:
     """Every day after the first ``warmup_days`` is a test day, traded by a model fit only on days at least two days
     earlier; the model is refit for each block of ``block_days`` test days."""
-    days = ds.days; out = {"per_day": {}, "auc": {}}; trades = []; rand = []
+    days = ds.days; out = {"per_day": {}, "auc": {}}; trades = []; rand = []; oos = []   # oos: (row, margin over the fold's threshold)
     blocks = [days[k:k + block_days] for k in range(warmup_days, len(days), block_days)]
     for k, blk in enumerate(blocks):
         if stop is not None and stop.is_set():
@@ -138,11 +140,16 @@ def walk_forward(ds: DecisionSet, warmup_days: int = WARMUP_DAYS, block_days: in
             record_event("info", "selector", f"walk-forward {D}", {"day": str(D), "auc": auc, **{k_: v for k_, v in r.items()}, "random_mean": rs["mean"]})
             if r["n"]:
                 rand.append(rr)
-        trades.append(trades_from_picks(ds, fo.pick))
+        rows = taken_rows(ds, fo.pick); trades.append(ds.fwd_pess[rows]); oos.append(np.c_[rows, fo.scores[rows] - m.threshold])
     allr = np.concatenate(trades) if trades else np.array([])
     pooled = summarize(allr); pooled["days_positive"] = sum(1 for v in out["per_day"].values() if v["mean"] and v["mean"] > 0); pooled["days"] = len(out["per_day"])
     out["pooled"] = pooled
     out["random"] = summarize(np.concatenate(rand) if rand else np.array([]))     # same pick counts, costs and fills, no skill
+    # position sizing from the out-of-sample trades: bands of score margin -> growth-optimal fraction; bankroll replay, sized vs fixed
+    o = np.concatenate(oos) if oos else np.zeros((0, 2)); rows = o[:, 0].astype(int); margins = o[:, 1]; rets = ds.fwd_pess[rows]
+    out["sizing"] = sizing.build_table(margins, rets)
+    out["bankroll"] = {"sized": sizing.simulate_bankroll(ds.ts[rows], ds.horizon_s, margins, rets, out["sizing"]),
+                       "fixed": sizing.simulate_bankroll(ds.ts[rows], ds.horizon_s, margins, rets, None)}
     return out
 
 
@@ -194,8 +201,11 @@ def main(days: int | None = None, top_frac: float = 0.01, horizon_min: int = 30,
         return wf
     prog.update("selector: fitting deployable model", 0, 1, force=True)
     deployable, why = deploy_decision(p, rb)
-    final = fit(ds, np.ones(len(ds.y), bool), top_frac, seed=99)
+    final = fit(ds, np.ones(len(ds.y), bool), top_frac, seed=99); final.sizing = wf["sizing"]
+    bk = wf["bankroll"]; log.info("bankroll replay of the backtest trades: sized %.2fx (worst drawdown %.0f%%) vs fixed %g SOL %.2fx (worst drawdown %.0f%%)",
+                                  bk["sized"]["multiple"] or 0, bk["sized"]["max_drawdown"] * 100, config.MAX_POSITION_SOL, bk["fixed"]["multiple"] or 0, bk["fixed"]["max_drawdown"] * 100)
     final.metrics = {"walk_forward": p, "random_baseline": rb, "costs": "paper broker model", "data": DATA_VERSION, "deployable": deployable, "deploy_reason": why,
+                     "sizing": wf["sizing"], "bankroll": bk,
                      "auc_by_day": wf["auc"], "rows": int(len(ds.y)), "days": len(ds.days), "first_day": str(ds.days[0]), "last_day": str(ds.days[-1])}
     path, sid = save(final)
     record_event("info", "selector", f"selector saved (snapshot {sid})", {"path": str(path), "threshold": final.threshold, "deployable": deployable, "reason": why, **p})

@@ -16,7 +16,8 @@ def narrative(s: dict) -> str:
         money = "No real money is at risk." if not s["live_money"] else "Trades spend real SOL from the bot wallet."
         lines.append(f"**{s['trading_why']}** The selector is paper trading with model **#{m['id']}** (trained through {meta.get('trained_through', '—')}). "
                      f"Every minute it scores each PumpSwap token that traded, keeps those with a pool of at least 20 SOL and 5 SOL traded in the last "
-                     f"15 minutes, buys **{config.MAX_POSITION_SOL:g} SOL** of any token scoring at least **{float(run.get('threshold') or meta.get('threshold') or 0):.3f}**, "
+                     f"15 minutes, and buys any token scoring at least **{float(run.get('threshold') or meta.get('threshold') or 0):.3f}** — sized by how certain the "
+                     f"model is (up to {config.MAX_POSITION_FRACTION:.0%} of the bankroll, never the {config.GAS_RESERVE_SOL:g} SOL gas reserve) — "
                      f"and sells it **{run.get('horizon_min') or meta.get('horizon_min') or 30} minutes** later. {money}")
         lines.append(backtest_line(meta))
     else:

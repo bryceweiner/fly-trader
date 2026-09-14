@@ -74,6 +74,11 @@ LIVE_ENABLED = env_bool("LIVE_ENABLED", False)
 CAPITAL_SOL = env_float("CAPITAL_SOL", 0.0)
 MAX_POSITION_SOL = env_float("MAX_POSITION_SOL", 0.0)
 GAS_RESERVE_SOL = env_float("GAS_RESERVE_SOL", 0.30)
+# position sizing (agent/sizing.py): a fraction of the growth-optimal (Kelly) bet measured per score band in the backtest
+KELLY_FRACTION = env_float("KELLY_FRACTION", 0.25)                 # quarter Kelly: the band estimates are noisy
+MAX_POSITION_FRACTION = env_float("MAX_POSITION_FRACTION", 0.10)   # of the deployable bankroll (wealth minus the gas reserve)
+MAX_POOL_SHARE = env_float("MAX_POOL_SHARE", 0.02)                 # of the pool's quote reserve (bounds price impact)
+MIN_POSITION_SOL = env_float("MIN_POSITION_SOL", 0.02)             # smaller sizes are skipped
 NOTIONAL_CAP_SOL_24H = env_float("NOTIONAL_CAP_SOL_24H", 10.0)
 KILL_SWITCH_DRAWDOWN = env_float("KILL_SWITCH_DRAWDOWN", 0.30)
 HARD_STOP_FRAC = env_float("HARD_STOP_FRAC", 0.50)

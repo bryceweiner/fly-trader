@@ -40,7 +40,8 @@ from ..brain.policy import ConnectomePolicy, SubConnectome
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from . import progress as prog
-from .decisions import DecisionSet, build, evaluate, random_trades, summarize, trades_from_picks
+from ..agent import sizing
+from .decisions import DecisionSet, build, evaluate, random_trades, summarize, taken_rows, trades_from_picks
 
 log = logging.getLogger(__name__)
 
@@ -184,6 +185,7 @@ def main(days: int | None = None, test_days: int = 21, top_frac: float = 0.01, h
     rnd = summarize(random_trades(ds, test, int((test & (fs >= thr)).sum())))          # no-skill baseline at the fly's pick count
     agree = agreement(fs, thr, gs, g.threshold, test)
     f_mean = f_ev["pooled"]["mean"]
+    rows = taken_rows(ds, test & (fs >= thr)); size_table = sizing.build_table(fs[rows] - thr, ds.fwd_pess[rows])   # the fly's own certainty bands (agent/sizing.py)
     verdict = {"fly": {"auc": f_auc, **f_ev["pooled"]}, "gbm": {"auc": g_auc, **g_ev["pooled"]}, "random": rnd,
                "fly_beats_gbm": bool((f_mean or -1) > (g_ev["pooled"]["mean"] or -1)), "fly_positive": bool(f_mean is not None and f_mean > 0),
                "agreement": agree, "per_day_fly": f_ev["per_day"], "per_day_gbm": g_ev["per_day"], "fit": fit_info,
@@ -191,7 +193,8 @@ def main(days: int | None = None, test_days: int = 21, top_frac: float = 0.01, h
     log.info("fly selector: AUC %.3f | %s | agreement %s | positive %s | beats GBM: %s", f_auc, f_ev["pooled"], agree, verdict["fly_positive"], verdict["fly_beats_gbm"])
     record_event("info", "fly_selector", "fly (distilled) vs gbm (single split)",
                  {k: verdict[k] for k in ("fly", "gbm", "random", "agreement", "fly_positive", "fly_beats_gbm")})
-    path, sid = fly.save({**{k: verdict[k] for k in ("fly", "gbm", "random", "fly_beats_gbm", "fly_positive", "agreement", "test_days")},
+    verdict["sizing"] = size_table
+    path, sid = fly.save({**{k: verdict[k] for k in ("fly", "gbm", "random", "fly_beats_gbm", "fly_positive", "agreement", "test_days", "sizing")},
                           "teacher": TEACHER_NOTE, "data": DATA_VERSION})
     verdict["snapshot_id"] = sid
     prog.update("fly selector: done", 1, 1, force=True, snapshot_id=sid,

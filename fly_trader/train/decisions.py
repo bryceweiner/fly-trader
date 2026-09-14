@@ -108,6 +108,20 @@ def build(days: int | None = 45, horizon_min: int = 30, fee: float | None = None
                        day=df["ts"].dt.date.to_numpy(), ts=ts, mint=df["mint"].to_numpy(), cols=list(X_COLS), horizon_s=H)
 
 
+def taken_rows(ds: DecisionSet, pick: np.ndarray) -> np.ndarray:
+    """Row indices of the trades a picker takes (the same rule as ``trades_from_picks``)."""
+    idx = np.flatnonzero(pick)
+    if len(idx) == 0:
+        return idx
+    idx = idx[np.lexsort((ds.ts[idx], ds.mint[idx]))]; out = []; last_mint = None; last_t = -1e18
+    for i in idx:
+        if ds.mint[i] != last_mint:
+            last_mint = ds.mint[i]; last_t = -1e18
+        if ds.ts[i] >= last_t + ds.horizon_s:
+            out.append(i); last_t = ds.ts[i]
+    return np.asarray(out, dtype=int)
+
+
 def trades_from_picks(ds: DecisionSet, pick: np.ndarray, returns: np.ndarray | None = None, with_days: bool = False):
     """Net returns of the trades a picker would take: one position per token, re-entry only after the hold.
     With ``with_days`` also returns the entry day of each trade (so per-day tables respect holds across midnight)."""

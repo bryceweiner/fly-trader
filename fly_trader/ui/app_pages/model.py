@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import streamlit as st
 
+from fly_trader import config
 from fly_trader.db.queries import q, q1
 from fly_trader.ops.supervisor import get_supervisor
 from fly_trader.train import pipeline
@@ -21,6 +22,27 @@ def _until(iso: str | None) -> str:
         return "—"
     s = (datetime.fromisoformat(iso) - datetime.now(timezone.utc)).total_seconds()
     return "due now" if s <= 0 else f"in {s / 3600:.0f} h" if s < 172800 else f"in {s / 86400:.1f} days"
+
+
+def sizing_panel(meta: dict) -> None:
+    """How big each buy is: the model's certainty bands from its backtest, and the backtest replayed with that sizing."""
+    tbl = meta.get("sizing") or []; bk = meta.get("bankroll") or {}
+    st.markdown("**Position sizing**")
+    if not tbl:
+        st.caption(f"Fixed {config.MAX_POSITION_SOL:g} SOL per buy: this model was trained before sizing and has no certainty bands.")
+        return
+    st.caption(f"Each buy's size comes from how certain the model is. Its backtest trades are split into bands by how far the score cleared the buy line; "
+               f"each band gets {config.KELLY_FRACTION:g} × its growth-optimal share of the bankroll (wealth minus the {config.GAS_RESERVE_SOL:g} SOL gas reserve), "
+               f"at most {config.MAX_POSITION_FRACTION:.0%} of the bankroll and {config.MAX_POOL_SHARE:.0%} of the pool. Buys under {config.MIN_POSITION_SOL:g} SOL are skipped.")
+    st.dataframe(pd.DataFrame([{"score above the line": f"+{b['lo']:.3f} and up", "test trades": b["n"], "average per trade": (b["mean"] or 0) * 100,
+                                "winning trades": (b["win"] or 0) * 100, "bet (share of bankroll)": min(config.KELLY_FRACTION * b["kelly"], config.MAX_POSITION_FRACTION) * 100}
+                               for b in tbl]), hide_index=True,
+                 column_config={"average per trade": st.column_config.NumberColumn(format="%+.2f%%"), "winning trades": st.column_config.NumberColumn(format="%.0f%%"),
+                                "bet (share of bankroll)": st.column_config.NumberColumn(format="%.1f%%", help="0 % means that band has no edge: no buy.")})
+    s, f = bk.get("sized") or {}, bk.get("fixed") or {}
+    if s and f:
+        st.caption(f"The backtest's trades replayed from {s.get('start_sol', 0):g} SOL: with this sizing → {s.get('final_sol', 0):.2f} SOL (worst drawdown {s.get('max_drawdown', 0):.0%}); "
+                   f"at a fixed {config.MAX_POSITION_SOL:g} SOL → {f.get('final_sol', 0):.2f} SOL (worst drawdown {f.get('max_drawdown', 0):.0%}).")
 
 
 @st.fragment(run_every="10s")
@@ -46,6 +68,7 @@ def loaded() -> None:
                 st.metric("Profit factor", _pf(wf.get("pf")), help="Total gains divided by total losses on the test trades. Above 1 makes money.")
                 st.metric("Profitable test days", f"{wf.get('days_positive', '—')} of {wf.get('days', '—')}", help="Test days whose average trade made money after costs.")
             st.caption(backtest_line(meta))
+            sizing_panel(meta)
         elif not latest:
             st.info("No model has been trained on the current data yet, so nothing is trading. The automatic retraining below runs as soon as the data is ready.",
                     icon=":material/info:")
@@ -119,7 +142,7 @@ def results() -> None:
             st.caption("Each day is traded by a model trained only on days at least two days earlier, with the paper broker's fees and price impact.")
         else:
             st.caption("No selector backtest on the current data yet.")
-    fv = q1("SELECT ts, detail FROM events WHERE source = 'fly_selector' AND message LIKE 'fly vs gbm%%' ORDER BY id DESC LIMIT 1")
+    fv = q1("SELECT ts, detail FROM events WHERE source = 'fly_selector' AND message LIKE 'fly%%vs gbm%%' ORDER BY id DESC LIMIT 1")
     if fv and latest_snapshot("fly_selector"):
         d = jv(fv["detail"]); ag = d.get("agreement") or {}
         with st.container(border=True):
