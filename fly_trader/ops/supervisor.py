@@ -42,10 +42,10 @@ def _entry(name: str):
             regimen = params.get("regimen", "selector")
             if regimen == "selector":          # the strategy: gradient-boosted selector, walk-forward, then the deployable fit
                 from ..train import selector as _sel
-                _sel.main(days=params.get("days", 45), test_days=params.get("test_days", 9), top_frac=params.get("top_frac", 0.01), stop_event=stop_event)
+                _sel.main(days=params.get("days"), top_frac=params.get("top_frac", 0.01), stop_event=stop_event)     # days None: the whole corpus
             elif regimen == "fly":             # the fly trained on the same decision points, scored against the selector
                 from ..train import fly_selector as _fly
-                _fly.main(days=params.get("days", 45), test_days=params.get("test_days", 9), top_frac=params.get("top_frac", 0.01),
+                _fly.main(days=params.get("days"), test_days=params.get("test_days", 21), top_frac=params.get("top_frac", 0.01),
                           epochs=params.get("epochs", 2), rows_per_epoch=params.get("rows_per_epoch", 600_000), stop_event=stop_event)
             else:                              # legacy: PPO / imitation on the tape dataset
                 from ..train import ppo

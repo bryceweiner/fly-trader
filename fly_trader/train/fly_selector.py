@@ -99,7 +99,7 @@ class FlyScorer:
         return path, int(row["id"])
 
 
-def main(days: int = 45, test_days: int = 9, top_frac: float = 0.01, horizon_min: int = 30, epochs: int = 2, rows_per_epoch: int = 600_000,
+def main(days: int | None = None, test_days: int = 21, top_frac: float = 0.01, horizon_min: int = 30, epochs: int = 2, rows_per_epoch: int = 600_000,
          stop_event: threading.Event | None = None) -> dict:
     """Single-split comparison: train on days ≤ D_cut−2, score the last ``test_days`` days, same protocol for the GBM."""
     from ..ops.reset import reset_training_stats

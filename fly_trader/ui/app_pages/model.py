@@ -84,16 +84,18 @@ def start_form() -> None:
         st.markdown("**Start a training run**")
         regimen = st.segmented_control("Model to train", list(names), format_func=names.get, default=pv.get("regimen") if pv.get("regimen") in names else "selector",
                                        help="Selector: backtested day by day, then saved as the newest model. Fly: the connectome trained on the same data and scored against the selector.")
+        st.caption("Training always uses every day of history. The selector's backtest tests every day after the first 21, each with a model that never saw it; "
+                   "the fly is tested on the last 21 days.")
         with st.container(horizontal=True):
-            days = st.number_input("Days of history", 5, 200, int(pv.get("days", 45)))
-            test_days = st.number_input("Backtest days", 2, 30, int(pv.get("test_days", 9)), help="The last days, each tested with a model trained only on earlier days.")
-            top_frac = st.number_input("Buy the top fraction", 0.001, 0.2, float(pv.get("top_frac", 0.01)), step=0.005, format="%.3f")
-            epochs = st.number_input("Fly epochs", 1, 20, int(pv.get("epochs", 2)), help="Fly only.")
+            top_frac = st.number_input("Buy the top fraction", 0.001, 0.2, float(pv.get("top_frac", 0.01)), step=0.005, format="%.3f",
+                                       help="The share of highest scores, on the training days, that counts as a buy signal.")
+            epochs = st.number_input("Fly epochs", 1, 20, int(pv.get("epochs", 2)), help="Fly only: passes over the training data.")
         go = st.form_submit_button("Start training", icon=":material/play_arrow:", type="primary", disabled=sup.alive("train"))
     if go:
         with transaction() as conn:
             conn.execute("INSERT INTO ui_settings (key, value) VALUES ('training_params', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-                         (json.dumps({**pv, "regimen": regimen or "selector", "days": int(days), "test_days": int(test_days), "top_frac": float(top_frac), "epochs": int(epochs)}),))
+                         (json.dumps({**{k: v for k, v in pv.items() if k not in ("days", "test_days")}, "regimen": regimen or "selector",
+                                      "top_frac": float(top_frac), "epochs": int(epochs)}),))
         try:
             sup.start("train", started_by="console")
         except RuntimeError as e:

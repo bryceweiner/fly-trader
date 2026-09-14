@@ -16,7 +16,7 @@ def _pct(v) -> str:
     return f"{v*100:+.2f}%" if v is not None else "-"
 
 
-def main(days: int = 45, test_days: int = 9, top_frac: float = 0.01) -> None:
+def main(days: int | None = None, test_days: int = 21, top_frac: float = 0.01) -> None:
     t0 = time.time()
     ds = build(days=days)
     print(f"decision points {len(ds.y):,} over {len(ds.days)} days, base rate {ds.y.mean()*100:.1f}%, universe mean {ds.fwd.mean()*100:+.2f}% ({time.time()-t0:.0f}s)", flush=True)

@@ -35,6 +35,7 @@ log = logging.getLogger(__name__)
 SELECTOR_DIR = config.BRAIN_DIR / "selectors"
 # the data definitions a model was trained on; a model from other definitions is never loaded and its backtest is not shown
 DATA_VERSION = {"agg": AGG_VERSION, "features": FEATURE_VERSION, "costs": "paper"}
+WARMUP_DAYS, BLOCK_DAYS = 21, 7      # walk-forward: the first 21 days only train; every later day is tested, refit every 7 days
 
 
 def is_current(meta: dict | None) -> bool:
@@ -80,38 +81,49 @@ class Fold:
 
 
 def fold(ds: DecisionSet, D, top_frac: float = 0.01, seed: int = 0, min_train: int = 50_000, min_test: int = 500) -> Fold | None:
-    """One walk-forward step: fit on days ≤ D−2 (one-day purge), score day D. None when either side is too small or the
-    training labels have a single class."""
-    train = ds.day < (D - timedelta(days=1)); test = ds.day == D
+    """One walk-forward step: fit on every day before the first test day minus one (one-day purge), score the test
+    day(s) ``D`` (a date or a list of dates). None when either side is too small or the training labels have one class."""
+    test_days = list(D) if isinstance(D, (list, tuple)) else [D]
+    train = ds.day < (min(test_days) - timedelta(days=1)); test = np.isin(ds.day, test_days)
     if train.sum() < min_train or test.sum() < min_test or len(np.unique(ds.y[train])) < 2:
         return None
     m = fit(ds, train, top_frac, seed=seed); full = np.zeros(len(ds.y)); full[test] = m.score(ds.X[test])
     auc = float(roc_auc_score(ds.y[test], full[test])) if len(np.unique(ds.y[test])) == 2 else None
-    return Fold(day=D, model=m, test=test, scores=full, pick=test & (full >= m.threshold), auc=auc)
+    return Fold(day=test_days[0], model=m, test=test, scores=full, pick=test & (full >= m.threshold), auc=auc)
 
 
 def _pct(v, fmt: str = "+.2f") -> str:
     return f"{v*100:{fmt}}%" if v is not None else "-"
 
 
-def walk_forward(ds: DecisionSet, test_days: int = 9, top_frac: float = 0.01, stop: threading.Event | None = None) -> dict:
+def walk_forward(ds: DecisionSet, warmup_days: int = WARMUP_DAYS, block_days: int = BLOCK_DAYS, top_frac: float = 0.01,
+                 stop: threading.Event | None = None) -> dict:
+    """Every day after the first ``warmup_days`` is a test day, traded by a model fit only on days at least two days
+    earlier; the model is refit for each block of ``block_days`` test days."""
     days = ds.days; out = {"per_day": {}, "auc": {}}; trades = []; rand = []
-    for k, D in enumerate(days[-test_days:]):
+    blocks = [days[k:k + block_days] for k in range(warmup_days, len(days), block_days)]
+    for k, blk in enumerate(blocks):
         if stop is not None and stop.is_set():
             break
-        prog.update("selector walk-forward", k, test_days, day=str(D), force=True)
-        fo = fold(ds, D, top_frac, seed=k)
+        prog.update("selector walk-forward", k, len(blocks), day=f"{blk[0]}..{blk[-1]}", force=True)
+        fo = fold(ds, blk, top_frac, seed=k)
         if fo is None:
             continue
-        auc, m = fo.auc, fo.model; out["auc"][str(D)] = auc
-        ev = evaluate(ds, fo.scores, fo.test, m.threshold)
-        rr = random_trades(ds, fo.test, int(fo.pick.sum())); rs = summarize(rr)
-        out["per_day"][str(D)] = {**ev["pooled"], "auc": auc, "threshold": m.threshold, "random_mean": rs["mean"]}
-        r = ev["pooled"]; log.info("selector %s: AUC %s | top %.0f%%: n=%s mean %s median %s win %s PF %s | random mean %s", D, f"{auc:.3f}" if auc is not None else "-",
-                                   top_frac * 100, r["n"], _pct(r["mean"]), _pct(r["median"]), _pct(r["win"], ".0f"), f"{r['pf']:.2f}" if r["pf"] is not None else "-", _pct(rs["mean"]))
-        record_event("info", "selector", f"walk-forward {D}", {"day": str(D), "auc": auc, **{k_: v for k_, v in r.items()}, "random_mean": rs["mean"]})
-        if r["n"]:
-            trades.append(trades_from_picks(ds, fo.pick)); rand.append(rr)
+        m = fo.model
+        for D in blk:
+            test_d = fo.test & (ds.day == D)
+            if not test_d.any():
+                continue
+            auc = float(roc_auc_score(ds.y[test_d], fo.scores[test_d])) if len(np.unique(ds.y[test_d])) == 2 else None; out["auc"][str(D)] = auc
+            ev = evaluate(ds, fo.scores, test_d, m.threshold)
+            rr = random_trades(ds, test_d, int((fo.pick & test_d).sum())); rs = summarize(rr)
+            out["per_day"][str(D)] = {**ev["pooled"], "auc": auc, "threshold": m.threshold, "random_mean": rs["mean"]}
+            r = ev["pooled"]; log.info("selector %s: AUC %s | top %.1f%%: n=%s mean %s median %s win %s PF %s | random mean %s", D, f"{auc:.3f}" if auc is not None else "-",
+                                       top_frac * 100, r["n"], _pct(r["mean"]), _pct(r["median"]), _pct(r["win"], ".0f"), f"{r['pf']:.2f}" if r["pf"] is not None else "-", _pct(rs["mean"]))
+            record_event("info", "selector", f"walk-forward {D}", {"day": str(D), "auc": auc, **{k_: v for k_, v in r.items()}, "random_mean": rs["mean"]})
+            if r["n"]:
+                rand.append(rr)
+        trades.append(trades_from_picks(ds, fo.pick))
     allr = np.concatenate(trades) if trades else np.array([])
     pooled = summarize(allr); pooled["days_positive"] = sum(1 for v in out["per_day"].values() if v["mean"] and v["mean"] > 0); pooled["days"] = len(out["per_day"])
     out["pooled"] = pooled
@@ -148,7 +160,8 @@ def load_latest() -> SelectorModel | None:
     return joblib.load(r["path"]) if r else None
 
 
-def main(days: int = 45, test_days: int = 9, top_frac: float = 0.01, horizon_min: int = 30, stop_event: threading.Event | None = None) -> dict:
+def main(days: int | None = None, top_frac: float = 0.01, horizon_min: int = 30, stop_event: threading.Event | None = None) -> dict:
+    """``days``: None = every day of the corpus (the default; a number keeps only the most recent days)."""
     from ..ops.reset import reset_training_stats
     reset_training_stats("selector", reason="selector training")
     prog.set_stop_event(stop_event); prog.clear()
@@ -157,11 +170,11 @@ def main(days: int = 45, test_days: int = 9, top_frac: float = 0.01, horizon_min
     prog.update("selector: decision points ready", 1, 1, force=True, rows=int(len(ds.y)), tokens=int(len(set(ds.mint.tolist()))), days=len(ds.days),
                 base_rate=float(ds.y.mean()), universe_mean=float(ds.fwd.mean()))
     log.info("decision points: %d rows, %d days, base rate %.1f%%, universe mean %+.2f%% (%.0fs)", len(ds.y), len(ds.days), ds.y.mean() * 100, ds.fwd.mean() * 100, time.time() - t0)
-    wf = walk_forward(ds, test_days=test_days, top_frac=top_frac, stop=stop_event)
+    wf = walk_forward(ds, top_frac=top_frac, stop=stop_event)
     p = wf["pooled"]; log.info("selector walk-forward pooled: n=%s mean %s median %s win %s PF %s days positive %s/%s", p["n"],
                               f"{(p['mean'] or 0)*100:+.2f}%", f"{(p['median'] or 0)*100:+.2f}%", f"{(p['win'] or 0)*100:.0f}%", f"{p['pf']:.2f}" if p["pf"] else "-", p["days_positive"], p["days"])
     rb = wf["random"]; log.info("random baseline (same pick counts, costs, fills): n=%s mean %s median %s win %s", rb["n"], _pct(rb["mean"]), _pct(rb["median"]), _pct(rb["win"], ".0f"))
-    prog.update("selector: walk-forward done", test_days, test_days, force=True, walk_forward=p, random_baseline=rb)
+    prog.update("selector: walk-forward done", 1, 1, force=True, walk_forward=p, random_baseline=rb)
     if stop_event is not None and stop_event.is_set():
         return wf
     prog.update("selector: fitting deployable model", 0, 1, force=True)
