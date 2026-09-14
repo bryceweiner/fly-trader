@@ -2,7 +2,10 @@
 as feature rows — the population the live bot actually meets on Jupiter's lists, as opposed to the first 12 hours
 after graduation covered by ``replay_assemble``.
 
-Stage 1 (``aggregate_day``): all ``pump-amm`` trade legs of pump.fun-origin mints (suffix ``pump``, SOL-quoted) of a UTC day → per (mint, minute): open/high/low/close,
+Stage 1 (``aggregate_day``): all ``pump-amm`` trade legs of pump.fun-origin mints (suffix ``pump``, SOL-quoted) of a UTC day,
+with causal filters only (the live stream applies the same ones): quote reserve 0.001–100,000 SOL, a leg more than 50× away
+from the median of the mint's previous 200 legs that day is dropped, and each (mint, minute) keeps the pool with the most
+legs → per (mint, minute): open/high/low/close,
 SOL volume split by side, buy/sell counts, distinct traders in the minute, and the pool's quote reserve at the
 minute's last trade → ``data/corpus/mature/<day>.parquet`` (registry ``mature_days``).
 
@@ -11,7 +14,10 @@ synthetic trades (the minute's buy volume and sell volume at the close), so imba
 exact and price features match the live engine; trade counts come from the candle counts (``logn_*``),
 signer counts are replaced by per-minute-distinct trader sums (``logsigners_*``, an upper bound, flagged in the
 mask as absent), Jupiter stats stay masked. Age and price-vs-graduation come from ``corpus_meta`` when the
-graduation is inside the archive; older tokens carry NaN age. Output: ``data/corpus/features_mature/<day>/part.parquet``.
+graduation is inside the archive (``corpus_meta.graduated_at``, the source live uses too); older tokens carry NaN age.
+Output: ``data/corpus/features_mature/<day>/part.parquet``. Both outputs carry a version in their Parquet metadata
+(``AGG_VERSION``, ``market.features.FEATURE_VERSION``); ``loop_once`` rebuilds any file from another version and moves
+the old one to ``data/corpus/_mature_stale/``.
 """
 from __future__ import annotations
 
@@ -28,15 +34,42 @@ import pyarrow.parquet as pq
 
 from .. import config
 from ..db.connection import transaction
-from ..market.features import D, FEATURES, FIDX, TokenMeta, TokenState
+from ..market.features import FEATURE_VERSION, FIDX, TokenMeta, TokenState
 from .corpus_features import SCHEMA as FEAT_SCHEMA, PRE_COLS, _row
 
 log = logging.getLogger(__name__)
 MATURE_DIR = config.CORPUS_DIR / "mature"
 MATURE_FEAT_DIR = config.CORPUS_DIR / "features_mature"
+STALE_DIR = config.CORPUS_DIR / "_mature_stale"
+AGG_VERSION = 2          # 2: causal price band and per-minute dominant pool
 MASKED = ["logsigners_15m", "logsigners_1h", "hawkes", "log_since_last", "vpin_15m"]
 EXTRA = ["traders_15m", "traders_1h", "n_trades_1m"]
 SCHEMA = FEAT_SCHEMA.append(pa.field("traders_15m", pa.float32())).append(pa.field("traders_1h", pa.float32())).append(pa.field("n_trades_1m", pa.float32()))
+
+
+def part_version(path) -> int:
+    md = pq.read_schema(path).metadata or {}
+    try:
+        return int(md.get(b"fly_version", b"0"))
+    except ValueError:
+        return 0
+
+
+def write_part(table: pa.Table, path, version: int) -> None:
+    """Atomic write with the version in the Parquet metadata."""
+    path = __import__("pathlib").Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    table = table.replace_schema_metadata({**(table.schema.metadata or {}), b"fly_version": str(version).encode()})
+    tmp = path.with_name(f"{path.name}.{__import__('os').getpid()}.{__import__('threading').get_ident()}.tmp")
+    pq.write_table(table, tmp, compression="zstd"); tmp.replace(path)
+
+
+def _retire(path, tag: str) -> None:
+    """Move a stale output aside (data is never deleted)."""
+    import pathlib
+    path = pathlib.Path(path)
+    if path.exists():
+        STALE_DIR.mkdir(parents=True, exist_ok=True)
+        path.replace(STALE_DIR / f"{tag}_v{part_version(path)}_{int(time.time())}.parquet")
 
 
 def _hour_files(d: date) -> list[str]:
@@ -67,16 +100,18 @@ def aggregate_day(d: date) -> int:
     cols = [c[0] for c in con.execute("SELECT * FROM read_parquet(?, union_by_name = true) LIMIT 0", [files]).description]
     quote_filter = "AND (quote_mint IS NULL OR quote_mint = 'So11111111111111111111111111111111111111112')" if "quote_mint" in cols else ""
     pool_sel = "pool_id" if "pool_id" in cols else "NULL AS pool_id"
-    # sane SOL pools only (reserve band), one price scale per mint per day (within 50x of the day's median), dominant pool when known
+    # causal filters only (nothing later in the day decides which earlier trades exist); the live stream applies the same:
+    # reserve band, a leg within 50x of the median of the mint's previous 200 legs, and per (mint, minute) the pool with the most legs
     con.execute(f"""CREATE TEMP TABLE raw AS SELECT mint, ts, slot, trader, side, sol, price, quote_in_pool, {pool_sel}
                     FROM read_parquet(?, union_by_name = true)
                     WHERE pool = 'pump-amm' AND price > 0 AND mint LIKE '%pump' AND quote_in_pool BETWEEN 0.001 AND 100000 {quote_filter}""", [files])
-    con.execute("""CREATE TEMP TABLE med AS SELECT mint, median(price) AS pmed FROM raw GROUP BY mint""")
-    if "pool_id" in cols:
-        con.execute("""CREATE TEMP TABLE dom AS SELECT mint, arg_max(pool_id, n) AS pool_id FROM (SELECT mint, pool_id, count(*) AS n FROM raw GROUP BY mint, pool_id) GROUP BY mint""")
-        con.execute("""CREATE TEMP TABLE clean AS SELECT r.* FROM raw r JOIN med USING (mint) JOIN dom USING (mint) WHERE r.price BETWEEN med.pmed / 50 AND med.pmed * 50 AND (r.pool_id IS NULL OR r.pool_id = dom.pool_id)""")
-    else:
-        con.execute("""CREATE TEMP TABLE clean AS SELECT r.* FROM raw r JOIN med USING (mint) WHERE r.price BETWEEN med.pmed / 50 AND med.pmed * 50""")
+    con.execute("""CREATE TEMP TABLE banded AS SELECT * EXCLUDE (pref) FROM (
+                      SELECT *, median(price) OVER (PARTITION BY mint ORDER BY ts, slot ROWS BETWEEN 200 PRECEDING AND 1 PRECEDING) AS pref FROM raw)
+                    WHERE pref IS NULL OR price BETWEEN pref / 50 AND pref * 50""")
+    con.execute("""CREATE TEMP TABLE dom AS SELECT mint, mb, arg_max(pool_id, n) AS pid FROM (
+                      SELECT mint, time_bucket(INTERVAL 1 MINUTE, ts) AS mb, pool_id, count(*) AS n FROM banded GROUP BY ALL) GROUP BY mint, mb""")
+    con.execute("""CREATE TEMP TABLE clean AS SELECT b.* FROM banded b JOIN dom d ON d.mint = b.mint AND d.mb = time_bucket(INTERVAL 1 MINUTE, b.ts)
+                    WHERE b.pool_id IS NULL OR d.pid IS NULL OR b.pool_id = d.pid""")
     tab = con.execute("""
         SELECT mint, time_bucket(INTERVAL 1 MINUTE, ts) AS ts,
                first(price ORDER BY ts, slot) AS open, max(price) AS high, min(price) AS low, last(price ORDER BY ts, slot) AS close,
@@ -85,7 +120,7 @@ def aggregate_day(d: date) -> int:
                count(DISTINCT trader) AS n_traders, last(quote_in_pool ORDER BY ts, slot) AS resq_sol
         FROM clean GROUP BY mint, time_bucket(INTERVAL 1 MINUTE, ts) ORDER BY mint, ts""").fetch_arrow_table()
     con.close()
-    pq.write_table(tab, MATURE_DIR / f"{d.isoformat()}.parquet", compression="zstd")
+    write_part(tab, MATURE_DIR / f"{d.isoformat()}.parquet", AGG_VERSION)
     n_mints = len(pa.compute.unique(tab["mint"]))
     with transaction() as conn:
         conn.execute("INSERT INTO mature_days (day, mints, rows, took_s) VALUES (%s,%s,%s,%s) ON CONFLICT (day) DO UPDATE SET mints = EXCLUDED.mints, rows = EXCLUDED.rows, took_s = EXCLUDED.took_s, built_at = now()",
@@ -111,7 +146,7 @@ def build_day(d: date, lookback_days: int = 1) -> int:
     cd = pd.concat(frames, ignore_index=True).sort_values(["mint", "ts"])
     day_start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp(); day_end = day_start + 86400
     with transaction() as conn:
-        meta = {r["mint"]: r for r in conn.execute("SELECT m.mint, t.graduated_at, m.create_ts FROM corpus_meta m JOIN corpus_tokens t USING (mint)").fetchall()}
+        meta = {r["mint"]: r for r in conn.execute("SELECT mint, graduated_at FROM corpus_meta WHERE graduated_at IS NOT NULL").fetchall()}
     out: list[dict] = []; n_mints = 0
     for mint, x in cd.groupby("mint", sort=False):
         ts_s = _epoch_s(x["ts"]); 
@@ -149,25 +184,43 @@ def build_day(d: date, lookback_days: int = 1) -> int:
             out.append(row)
     if not out:
         return 0
-    dd = MATURE_FEAT_DIR / d.isoformat(); dd.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.Table.from_pylist(out, schema=SCHEMA), dd / "part.parquet", compression="zstd")
+    write_part(pa.Table.from_pylist(out, schema=SCHEMA), MATURE_FEAT_DIR / d.isoformat() / "part.parquet", FEATURE_VERSION)
     log.info("mature features %s: %d mints, %d rows in %.0fs", d, n_mints, len(out), time.time() - t0)
     return len(out)
 
 
 def loop_once() -> int:
+    """One build round. A file lock serialises rounds across processes (the console's replay worker and the CLI)."""
+    import fcntl
+    MATURE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(MATURE_DIR / ".build.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _loop_once()
+
+
+def _loop_once() -> int:
     n = 0
+    # aggregates from another version are rebuilt; their day's and the next day's features depend on them
+    for f in sorted(MATURE_DIR.glob("*.parquet"), reverse=True):
+        if part_version(f) != AGG_VERSION and _hour_files(date.fromisoformat(f.stem)):
+            d = date.fromisoformat(f.stem)
+            _retire(f, f"agg_{d}")
+            for dd in (d, d + timedelta(days=1)):
+                _retire(MATURE_FEAT_DIR / dd.isoformat() / "part.parquet", f"feat_{dd}")
+            with transaction() as conn:
+                conn.execute("DELETE FROM mature_days WHERE day = %s", (d,))
     for d in days_ready():
         aggregate_day(d); n += 1
-    # features for days whose aggregate and previous day's aggregate exist and no feature part yet
     with transaction() as conn:
         assembled = {r["day"] for r in conn.execute("SELECT day FROM replay_days").fetchall()}
     for f in sorted(MATURE_DIR.glob("*.parquet"), reverse=True):
         d = date.fromisoformat(f.stem)
-        if (MATURE_FEAT_DIR / d.isoformat() / "part.parquet").exists() or not (MATURE_DIR / f"{(d - timedelta(days=1)).isoformat()}.parquet").exists():
+        part = MATURE_FEAT_DIR / d.isoformat() / "part.parquet"
+        if part.exists() and part_version(part) == FEATURE_VERSION:
             continue
-        if d not in assembled:          # graduation times for the day's new tokens come from the assembled day
-            continue
+        if not (MATURE_DIR / f"{(d - timedelta(days=1)).isoformat()}.parquet").exists() or d not in assembled:
+            continue                    # graduation times for the day's new tokens come from the assembled day
+        _retire(part, f"feat_{d}")
         build_day(d); n += 1
     return n
 

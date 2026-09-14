@@ -152,12 +152,13 @@ def assemble_loop(stop_event: threading.Event | None = None, idle_s: float = 60.
                 from . import corpus_meta
                 corpus_meta.rebuild(); _last_meta[0] = time.time()
             except Exception:
-                log.exception("corpus_meta rebuild failed")
-            try:
-                from . import mature
-                mature.loop_once()
-            except Exception:
-                log.exception("mature universe build failed")
+                log.exception("corpus_meta rebuild failed; mature build waits for the next round")
+            else:
+                try:
+                    from . import mature
+                    mature.loop_once()
+                except Exception:
+                    log.exception("mature universe build failed")
         end = time.time() + idle_s
         while time.time() < end and not (stop_event is not None and stop_event.is_set()):
             time.sleep(1.0)

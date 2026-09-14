@@ -118,21 +118,27 @@ class Supervisor:
             if name in self.external():
                 raise RuntimeError(f"{name} is already running as an external process; stop it first")
             try:
+                fn = _entry(name)                        # imports first: a broken import must not leave a registered row
+            except Exception as e:
+                raise RuntimeError(f"cannot load {name}: {type(e).__name__}: {scrub(str(e))[:200]}") from e
+            try:
                 with transaction() as conn:
                     row = conn.execute("INSERT INTO processes (name, pid, cmd, log_path, started_by) VALUES (%s,%s,%s,%s,%s) RETURNING id",
                                        (name, self.pid, ["thread", name], f"logs/{name}.log", started_by)).fetchone()
             except Exception as e:                       # e.g. processes_live_uniq: another console (or a stale row) owns this worker
                 raise RuntimeError(f"cannot register {name}: {type(e).__name__}: {scrub(str(e))[:200]}") from e
             ev = threading.Event()
-            self.stops[name] = ev
-            self.errors.pop(name, None)
-            fn = _entry(name)
             t = threading.Thread(target=self._run, args=(name, fn, ev), name=name, daemon=True)
-            self.threads[name] = t
+            self.row_ids[name] = int(row["id"]); self.stops[name] = ev; self.threads[name] = t
+            try:
+                t.start()
+            except Exception as e:
+                with transaction() as conn:
+                    conn.execute("UPDATE processes SET stopped_at = now(), exit_code = -1 WHERE id = %s", (int(row["id"]),))
+                raise RuntimeError(f"cannot start {name}: {type(e).__name__}: {e}") from e
+            self.errors.pop(name, None)
             self.started_at[name] = datetime.now(timezone.utc)
             self.stopped_at.pop(name, None)
-            self.row_ids[name] = int(row["id"])
-            t.start()
         record_event("info", "console", f"started {name} thread", {"pid": self.pid, "by": started_by})
         return True
 
@@ -196,8 +202,8 @@ class Supervisor:
                 try:
                     if self.start(n, started_by="autostart"):
                         started.append(n)
-                except RuntimeError as e:
-                    log.warning("autostart %s: %s", n, e)
+                except Exception as e:
+                    log.warning("autostart %s: %s", n, scrub(str(e)))
         return started
 
     def log_tail(self, name: str, n: int = 60) -> str:

@@ -196,6 +196,8 @@ BASE_DDL: list[str] = [
         prior_launches int, prior_grads int, prior_known int, prior_rug_share real, prior_moon_share real,
         own_dd60 real, own_max60 real, own_alive6h boolean, updated_at timestamptz NOT NULL DEFAULT now())""",
     "CREATE INDEX IF NOT EXISTS corpus_meta_creator_idx ON corpus_meta (creator)",
+    "ALTER TABLE corpus_meta ADD COLUMN IF NOT EXISTS graduated_at timestamptz",
+    "CREATE INDEX IF NOT EXISTS corpus_meta_creator_g_idx ON corpus_meta (creator, graduated_at)",
     """CREATE TABLE IF NOT EXISTS mature_days (
         day date PRIMARY KEY, mints int, rows int, took_s real, built_at timestamptz NOT NULL DEFAULT now())""",
     """CREATE TABLE IF NOT EXISTS pump_minutes (
@@ -207,6 +209,7 @@ BASE_DDL: list[str] = [
         sig text PRIMARY KEY, ts timestamptz NOT NULL, action text NOT NULL, pool text, mint text, pool_id text, signer text, dev_sol double precision,
         dev_tokens double precision, supply double precision, mayhem boolean, quote_in_pool double precision, name text, symbol text, uri text)""",
     "CREATE INDEX IF NOT EXISTS pump_events_mint_idx ON pump_events (mint)",
+    "CREATE INDEX IF NOT EXISTS pump_events_creates_idx ON pump_events (signer, ts) WHERE action = 'create'",
     """CREATE TABLE IF NOT EXISTS ui_settings (
         key text PRIMARY KEY, value jsonb, updated_at timestamptz NOT NULL DEFAULT now())""",
 ]

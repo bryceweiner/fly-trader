@@ -58,6 +58,11 @@ def build(days: int | None = 45, horizon_min: int = 30, fee: float = 0.006, labe
         files = files[-days - 1:]
     if not files:
         raise RuntimeError("no mature feature parts; run build-mature")
+    from ..market.features import FEATURE_VERSION
+    from .mature import part_version
+    stale = [f for f in files if part_version(f) != FEATURE_VERSION]
+    if stale:
+        raise RuntimeError(f"{len(stale)} feature part(s) were built with another feature version (e.g. {stale[0]}); run build-mature")
     need = ["mint", "ts", "open", "close", "resq", "age_h", "traders_15m", "traders_1h", "n_trades_1m"] + FEATURES
     df = pd.concat([pq.read_table(f, columns=need).to_pandas() for f in files], ignore_index=True).sort_values(["mint", "ts"]).reset_index(drop=True)
     # a mint whose series breaks scale (secondary pool in another quote, impossible reserve) is ineligible FROM THAT MINUTE ON —
@@ -75,6 +80,11 @@ def build(days: int | None = 45, horizon_min: int = 30, fee: float = 0.006, labe
         t = ts[s:e]; j = np.searchsorted(t, t + H, side="right") - 1 + s
         exit_px = cl[j]
         fwd[s:e] = exit_px / cl[s:e] * (1 - fee) - 1
+        c = cl[s:e]                                  # an exit on a one-minute print 50x off that reverts the next minute is a data artifact
+        if e - s > 2:
+            r_prev = np.r_[1.0, c[1:] / c[:-1]]; r_next = np.r_[c[1:] / c[:-1], 1.0]
+            spike = ((r_prev > 50) & (r_next < 1 / 50)) | ((r_prev < 1 / 50) & (r_next > 50))
+            fwd[s:e][spike[j - s]] = np.nan
         entry = cl[s:e].copy()                      # pessimistic entry: the next traded minute's open when it is within 2 minutes
         if e - s > 1:
             nxt_ok = np.r_[np.diff(t) <= 120.0, False]

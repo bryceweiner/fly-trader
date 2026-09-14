@@ -483,10 +483,14 @@ class Capture:
         if not self.pending_tape:
             return 0
         batch, self.pending_tape = self.pending_tape, []
+        task = asyncio.ensure_future(self._db(self._insert, batch))
         try:
-            n = await asyncio.shield(self._db(self._insert, batch))     # a cancel at shutdown must not lose the batch in flight
+            n = await asyncio.shield(task)                  # a cancel at shutdown lets the insert in flight finish
         except asyncio.CancelledError:
-            self.pending_tape = batch + self.pending_tape
+            try:
+                await task                                  # committed: nothing to restore (restoring would insert it twice)
+            except Exception:
+                self.pending_tape = batch + self.pending_tape   # failed: the final flush retries it
             raise
         except Exception as e:
             self.db_failures += 1

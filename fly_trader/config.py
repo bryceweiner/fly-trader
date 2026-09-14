@@ -245,8 +245,13 @@ def summary() -> dict:
                 out[k] = str(v)
             elif isinstance(v, dict):
                 out[k] = v
-    if "DATABASE_URL" in out:                      # may carry a password; the database name is enough
-        out["DATABASE_URL"] = "postgresql:///" + str(out["DATABASE_URL"]).rsplit("/", 1)[-1].split("?")[0]
+    if "DATABASE_URL" in out:                      # may carry a password (URL or key=value form); the database name is enough
+        try:
+            from psycopg.conninfo import conninfo_to_dict
+            db = conninfo_to_dict(str(out["DATABASE_URL"])).get("dbname") or "?"
+        except Exception:
+            db = "?"
+        out["DATABASE_URL"] = f"postgresql:///{db}"
     return out
 
 

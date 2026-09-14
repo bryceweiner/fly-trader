@@ -134,14 +134,16 @@ class Writer:
         for r in rows:
             groups[_row_date(r.get(self.ts_field))].append(r)
         written: list[Path] = []
-        for day, rs in sorted(groups.items()):
+        items = sorted(groups.items())
+        for k, (day, rs) in enumerate(items):
             path = self._next_path(day)
             tmp = path.with_name(path.name + ".tmp")
             try:
                 pq.write_table(self._table(rs), tmp, compression="snappy")
                 os.replace(tmp, path)
             except Exception:
-                self.buf = rs + self.buf                     # nothing is dropped: the rows wait for the next flush
+                # nothing is dropped: this group and every later one wait for the next flush
+                self.buf = [r for _, g in items[k:] for r in g] + self.buf
                 if tmp.exists():
                     tmp.unlink()
                 raise

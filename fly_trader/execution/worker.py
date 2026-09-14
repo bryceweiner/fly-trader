@@ -58,7 +58,7 @@ class ExecutionWorker:
         self.results: queue.Queue[ExecResult] = queue.Queue()
         self.inflight: set[str] = set()
         self.lock = threading.Lock()
-        self.thread = threading.Thread(target=self._loop, name="exec", daemon=True)
+        self.thread = threading.Thread(target=self._loop, name="runner-exec", daemon=True)   # routed to the runner's log
         self.stop_flag = False
         self.thread.start()
 

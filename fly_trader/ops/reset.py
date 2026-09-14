@@ -20,6 +20,9 @@ from ..db.connection import connect, transaction
 
 log = logging.getLogger(__name__)
 
+_LIVE_DECISIONS = ("SELECT decision_id FROM orders WHERE book = 'live' AND decision_id IS NOT NULL "
+                   "UNION SELECT entry_decision_id FROM positions WHERE book = 'live' AND entry_decision_id IS NOT NULL "
+                   "UNION SELECT exit_decision_id FROM positions WHERE book = 'live' AND exit_decision_id IS NOT NULL")
 WIPE_TABLES = ["beats", "beat_slots", "brain_activity", "rewards", "wealth_marks", "synapse_updates",
                "slot_visits"]
 BOOK_TABLES = ["positions", "orders", "fills"]
@@ -50,12 +53,11 @@ def reset_training_state(reason: str = "runner start", archive: bool = True) -> 
             for t in BOOK_TABLES:
                 counts[t] = _archive(conn, t, "WHERE book <> 'live'", out_dir)
             counts["runs"] = _archive(conn, "runs", "WHERE kind NOT IN ('connectome_build','calibration')", out_dir)
+            counts["decisions"] = _archive(conn, "decisions", "WHERE id NOT IN (" + _LIVE_DECISIONS + ")", out_dir)
         for t in WIPE_TABLES:
             conn.execute(f"TRUNCATE TABLE {t}")
         conn.execute("DELETE FROM brain_snapshots WHERE kind NOT IN ('policy','selector','fly_selector')")   # trained models survive a reset
-        conn.execute("DELETE FROM decisions WHERE id NOT IN (SELECT decision_id FROM orders WHERE book = 'live' AND decision_id IS NOT NULL "
-                     "UNION SELECT entry_decision_id FROM positions WHERE book = 'live' AND entry_decision_id IS NOT NULL "
-                     "UNION SELECT exit_decision_id FROM positions WHERE book = 'live' AND exit_decision_id IS NOT NULL)")   # live-book references stay intact
+        conn.execute("DELETE FROM decisions WHERE id NOT IN (" + _LIVE_DECISIONS + ")")   # live-book references stay intact
         for t in BOOK_TABLES:
             conn.execute(f"DELETE FROM {t} WHERE book <> 'live'")
         conn.execute("DELETE FROM runs WHERE kind NOT IN ('connectome_build','calibration')")

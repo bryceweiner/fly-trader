@@ -273,8 +273,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    args.fn(args)
-    return 0
+    rc = args.fn(args)
+    return rc if isinstance(rc, int) else 0
 
 
 if __name__ == "__main__":

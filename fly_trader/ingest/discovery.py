@@ -57,10 +57,13 @@ def evaluate(tok: dict) -> tuple[str, str]:
         return "excluded", f"launchpad={lp}"
     if not graduated:
         return "pre", "not graduated"
-    if audit.get("mintAuthorityDisabled") is not True:
+    ma, fa = audit.get("mintAuthorityDisabled"), audit.get("freezeAuthorityDisabled")
+    if ma is False:
         return "excluded", "mint authority not disabled"
-    if audit.get("freezeAuthorityDisabled") is not True:
+    if fa is False:
         return "excluded", "freeze authority not disabled"
+    if ma is not True or fa is not True:
+        return "unknown", "audit missing from payload"      # transient payload variance: no status change
     if not tok.get("graduatedPool"):
         return "excluded", "graduated without graduatedPool"
     return "watch", "graduated, authorities disabled"
@@ -80,7 +83,8 @@ def upsert_token(conn, tok: dict, status: str) -> None:
               graduated_at=EXCLUDED.graduated_at, first_pool_id=EXCLUDED.first_pool_id,
               first_pool_created_at=EXCLUDED.first_pool_created_at, mint_auth_disabled=EXCLUDED.mint_auth_disabled,
               freeze_auth_disabled=EXCLUDED.freeze_auth_disabled, last_seen=now(),
-              watch_status=CASE WHEN tokens.watch_status='watch' AND EXCLUDED.watch_status='pre' THEN tokens.watch_status
+              watch_status=CASE WHEN EXCLUDED.watch_status='unknown' THEN tokens.watch_status
+                                WHEN tokens.watch_status='watch' AND EXCLUDED.watch_status='pre' THEN tokens.watch_status
                                 ELSE EXCLUDED.watch_status END,
               raw=EXCLUDED.raw""",
         (tok["id"], tok.get("symbol"), tok.get("name"), tok.get("decimals"), tok.get("tokenProgram"),
@@ -132,9 +136,12 @@ def ensure_watch_pool(conn, tok: dict) -> bool:
         if not ds:
             return False
         pool, label, source = ds["pool"], ds["dex"], "dexscreener"
-    row = conn.execute("SELECT pool, active, source FROM watch_pools WHERE pool = %s", (pool,)).fetchone()
+    row = conn.execute("SELECT pool, active, source, reason FROM watch_pools WHERE pool = %s", (pool,)).fetchone()
     if row:
-        if not row["active"] and row["source"] != "smoke":      # deactivated earlier (authority regained, transient payload): back on watch
+        # re-arm only deactivations the token has now disproved (authorities disabled again, pool present); pools retired by
+        # maintain_pools (watch window elapsed) stay retired so the two do not flap
+        r = (row["reason"] or "").lower()
+        if not row["active"] and row["source"] != "smoke" and ("authority" in r or "graduatedpool" in r or "audit" in r):
             conn.execute("UPDATE watch_pools SET active = true, deactivated_at = NULL, reason = NULL WHERE pool = %s", (pool,))
         return False
     conn.execute(
@@ -146,7 +153,7 @@ def ensure_watch_pool(conn, tok: dict) -> bool:
 
 
 def process_tokens(conn, toks: list[dict], with_stats: bool) -> dict:
-    counts = {"seen": 0, "watch": 0, "pre": 0, "excluded": 0, "new_pools": 0, "deactivated": 0}
+    counts = {"seen": 0, "watch": 0, "pre": 0, "excluded": 0, "unknown": 0, "new_pools": 0, "deactivated": 0}
     for tok in toks:
         if not tok.get("id"):
             continue

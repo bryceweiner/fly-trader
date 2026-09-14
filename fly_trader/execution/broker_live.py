@@ -40,6 +40,7 @@ from .. import config
 from ..chain.balances import Snapshot, compute_delta, snapshot_balances
 from ..chain.cluster_guard import assert_signing_allowed
 from ..chain.jupiter_swap import JupiterError, JupiterSwap
+from ..db.connection import transaction
 from ..chain.keys import load_keypair
 from ..chain.rpc import TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, HttpSolanaRpc
 from ..chain.signing import NotASigner, n_lookup_programs, sign_transaction_b64, static_program_ids, transaction_id
@@ -263,8 +264,14 @@ class LiveBroker:
                 time.sleep(2.0 * (k + 1))
         if post is None:
             fill_id = self._insert_fill(conn, order_id, book, signature, None, mint, side, 0, 0, None, None, order.get("platformFee"), "unknown", pre, pre)
-            record_event("error", "broker_live", "fill unknown: could not confirm or verify after retries; reconcile with verify-fills",
+            record_event("error", "broker_live", "fill unknown: could not confirm or verify after retries; entries paused until reconciled (verify-fills)",
                          {"order_id": order_id, "signature": signature, "side": side, "mint": mint, "error": scrub(str(last_exc))[:200]})
+            try:                                            # a landed but unrecorded swap must not be bought again or leave a stale position
+                with transaction() as c2:
+                    c2.execute("UPDATE circuit_state SET entries_paused = true, updated_at = now() WHERE id = 1")
+                    c2.execute("INSERT INTO circuit_events (kind, detail) VALUES ('unknown_fill_pause', %s)", (Jsonb({"order_id": order_id, "signature": signature, "mint": mint, "side": side}),))
+            except Exception:
+                log.exception("could not pause entries after an unknown fill")
             raise RuntimeError(f"confirm/verify failed for {signature}: {type(last_exc).__name__}") from last_exc
         delta = compute_delta(pre, post)
         lam = int(delta["lamports_delta"])

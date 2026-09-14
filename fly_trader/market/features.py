@@ -22,6 +22,7 @@ from .exit_cost import exit_cost_fraction
 WINDOWS = {"1m": 60.0, "5m": 300.0, "15m": 900.0, "1h": 3600.0, "3h": 10800.0}
 HAWKES_BETA = 1.0 / 60.0  # per second; intensity decays with a 1-minute time constant
 EWMA_1H_TAU_S = 3600.0  # 1-hour time constant of the price EWMA (continuous time, seconds)
+FEATURE_VERSION = 2      # bump on any change to feature values; stored feature parts from another version are rebuilt
 
 FEATURES: list[str] = [
     "ret_1m", "ret_5m", "ret_15m", "ret_1h", "ret_3h",

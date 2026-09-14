@@ -52,10 +52,14 @@ def load(feature_dir=None, max_tokens: int | None = None, days: int | None = Non
     df = df.sort_values(["mint", "ts"])
     jump = (df["close"] / df.groupby("mint")["close"].shift(1)).fillna(1.0)
     off = ((jump > 50) | (jump < 1 / 50) | (df["resq"] > 100000)).astype(np.int8)
-    broken = off.groupby(df["mint"]).cummax().astype(bool)
-    if broken.any():
-        print(f"(dropping {int(broken.sum()):,} rows from the first scale break of a token onward, past-only)")
-        df = df[~broken]
+    df["broken"] = off.groupby(df["mint"]).cummax().astype(bool)     # entries blocked from a token's first scale break on; exits still see the prices
+    try:
+        from ..market.features import FEATURE_VERSION
+        stale = sum(1 for f in files if (pq.read_schema(f).metadata or {}).get(b"fly_version", b"0") != str(FEATURE_VERSION).encode())
+        if stale:
+            print(f"(warning: {stale} of {len(files)} feature parts come from another feature version; rebuild for exact numbers)")
+    except Exception:
+        pass
     try:
         from .corpus_meta import load_features
         meta = load_features()
@@ -190,7 +194,7 @@ def run(df: pd.DataFrame, fee_side: float, select_frac: float = 0.6, min_trades:
     for sname, make in STRATEGIES.items():
         rows = []; t0 = time.time()
         for vname, cand in make(df):
-            cand = cand & liquid
+            cand = cand & liquid & ~df["broken"].to_numpy()
             if not cand.any():
                 continue
             for trail, hard, mh in (EXITS_S4 if sname[:2] in ("S4", "S5", "S6") else EXITS):

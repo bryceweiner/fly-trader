@@ -39,6 +39,11 @@ def _age(ts):
 
 
 @st.fragment(run_every="3s")
+def _pf(v) -> str:
+    """Profit factor for display: None means no losing trade (infinite)."""
+    return "∞" if v is None else f"{float(v):.2f}"
+
+
 def overview():
     wealth = q("""SELECT DISTINCT ON (book) book, ts, wealth, sol_free, positions_value, exposure, n_open, peak, drawdown
                   FROM wealth_marks ORDER BY book, ts DESC""")
@@ -303,14 +308,14 @@ def training():
     wf = st_.get("walk_forward")
     if wf:
         st.success(f"selector walk-forward (top 1%, pessimistic fills): {wf.get('n')} trades · mean {(wf.get('mean') or 0)*100:+.2f}% · median {(wf.get('median') or 0)*100:+.2f}% · "
-                   f"win {(wf.get('win') or 0)*100:.0f}% · PF {wf.get('pf') or 0:.2f} · days positive {wf.get('days_positive')}/{wf.get('days')}")
+                   f"win {(wf.get('win') or 0)*100:.0f}% · PF {_pf(wf.get('pf'))} · days positive {wf.get('days_positive')}/{wf.get('days')}")
     if st_.get("reference_gbm"):
         rg = st_["reference_gbm"]
-        st.caption(f"reference selector on this split: AUC {rg.get('auc', 0):.3f} · n {rg.get('n')} · mean {(rg.get('mean') or 0)*100:+.2f}% · PF {rg.get('pf') or 0:.2f}")
+        st.caption(f"reference selector on this split: AUC {rg.get('auc', 0):.3f} · n {rg.get('n')} · mean {(rg.get('mean') or 0)*100:+.2f}% · PF {_pf(rg.get('pf'))}")
     if st_.get("verdict"):
         v = st_["verdict"]; f, g = v.get("fly", {}), v.get("gbm", {})
-        (st.success if v.get("fly_beats_gbm") else st.warning)(f"fly {(f.get('mean') or 0)*100:+.2f}%/trade (AUC {f.get('auc', 0):.3f}, n {f.get('n')}, PF {f.get('pf') or 0:.2f}) vs selector "
-                                                                f"{(g.get('mean') or 0)*100:+.2f}%/trade (AUC {g.get('auc', 0):.3f}, n {g.get('n')}, PF {g.get('pf') or 0:.2f}) → "
+        (st.success if v.get("fly_beats_gbm") else st.warning)(f"fly {(f.get('mean') or 0)*100:+.2f}%/trade (AUC {f.get('auc', 0):.3f}, n {f.get('n')}, PF {_pf(f.get('pf'))}) vs selector "
+                                                                f"{(g.get('mean') or 0)*100:+.2f}%/trade (AUC {g.get('auc', 0):.3f}, n {g.get('n')}, PF {_pf(g.get('pf'))}) → "
                                                                 f"{'the fly takes the seat' if v.get('fly_beats_gbm') else 'the selector keeps the seat'}")
     if st_.get("graph"):
         g = st_["graph"]

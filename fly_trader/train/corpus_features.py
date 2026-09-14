@@ -187,7 +187,9 @@ def _write_parts(rows_by_day: dict[str, list[dict]]) -> dict[str, str]:
     for day, rows in rows_by_day.items():
         d = config.CORPUS_FEATURES_DIR / day; d.mkdir(parents=True, exist_ok=True)
         path = d / f"part-{int(time.time() * 1000)}.parquet"
-        pq.write_table(pa.Table.from_pylist(rows, schema=SCHEMA), path, compression="zstd")
+        from ..market.features import FEATURE_VERSION
+        t = pa.Table.from_pylist(rows, schema=SCHEMA)
+        pq.write_table(t.replace_schema_metadata({b"fly_version": str(FEATURE_VERSION).encode()}), path, compression="zstd")
         paths[day] = str(path)
     return paths
 

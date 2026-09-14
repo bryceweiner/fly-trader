@@ -21,7 +21,7 @@ class _Model:
 def _session(monkeypatch, db_conn):
     monkeypatch.setattr(config, "SELECTOR_SOURCE", "stream")
     s = ss.SelectorSession.__new__(ss.SelectorSession)
-    s.model = _Model(); s.horizon_s = 1800; s.states = {}; s.meta_cache = {}; s.meta_refreshed = 0.0; s.live = False
+    s.model = _Model(); s.horizon_s = 1800; s.states = {}; s.meta_cache = {}; s.last_sweep = 0.0; s.live = False
     return s
 
 
@@ -48,9 +48,27 @@ def test_aggregate_and_feature_vector(monkeypatch, db_conn):
                     "('Zpump', %s, 'POOL', 1.0, 1.2, 0.9, 1.1, 6.0, 2.0, 3, 1, 4, 55.0)", (m0,))
     db_conn.commit()
     agg = s._aggregate(db_conn, m0, m0.replace(minute=1))
-    assert list(agg) == ["Zpump"] and agg["Zpump"]["resq"] == 55.0 and len(agg["Zpump"]["traders"]) == 4
+    assert list(agg) == ["Zpump"] and agg["Zpump"]["resq"] == 55.0 and agg["Zpump"]["n_traders"] == 4
     x, info = s._features(db_conn, "Zpump", agg["Zpump"], m0.timestamp() + 60)
     assert x.shape == (len(X_COLS),) and np.isfinite(x).all()
     assert info["resq"] == 55.0 and info["price"] == 1.1
     assert x[X_COLS.index("n_trades_1m")] == 4.0 and x[X_COLS.index("traders_15m")] == 4.0
     assert x[X_COLS.index("meta_known")] == 0.0 and x[X_COLS.index("age_known")] == 0.0
+
+
+def test_graduation_time_comes_from_corpus_meta(monkeypatch, db_conn):
+    s = _session(monkeypatch, db_conn)
+    g = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+    with db_conn.cursor() as cur:
+        cur.execute("DELETE FROM corpus_meta WHERE mint = 'Ypump'")
+        cur.execute("INSERT INTO corpus_meta (mint, graduated_at, ttg_min, dev_sol) VALUES ('Ypump', %s, 45.0, 1.5)", (g,))
+    db_conn.commit()
+    a = {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "buy": 6.0, "sell": 0.0, "nb": 2, "ns": 0, "n_traders": 2, "resq": 60.0, "pool": "P", "program_label": "Pump.fun Amm"}
+    t_end = g.timestamp() + 2 * 3600
+    x, info = s._features(db_conn, "Ypump", a, t_end)
+    assert info["age_h"] == 2.0
+    assert x[X_COLS.index("age_known")] == 1.0 and x[X_COLS.index("meta_known")] == 1.0
+    assert x[X_COLS.index("ttg_min")] == 45.0 and x[X_COLS.index("dev_sol")] == 1.5
+    with db_conn.cursor() as cur:
+        cur.execute("DELETE FROM corpus_meta WHERE mint = 'Ypump'")
+    db_conn.commit()

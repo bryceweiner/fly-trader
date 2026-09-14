@@ -1,13 +1,19 @@
 """PumpAPI live stream → per-minute rich candles (Supervisor thread ``pumpstream``).
 
-``wss://stream.pumpapi.io`` is a free, keyless firehose (~400 events/s, one connection per IP) whose events are
-identical to the replay archive. This worker keeps only what the selector needs: PumpSwap (``pump-amm``,
-SOL-quoted) buys and sells of pump.fun-origin mints, aggregated per (mint, minute) into the same fields
-``train/mature.py`` derives from the archive, written to ``pump_minutes`` as each minute closes; and the
-lifecycle events (``create`` on the curve, ``migrate`` to PumpSwap) into ``pump_events``, from which
-``corpus_meta`` rows are upserted immediately at graduation (creation time, creator, dev buy, reserve at
-migration, and the creator's point-in-time history from the table). Rows older than ``PUMP_MINUTES_KEEP_DAYS``
-are archived to ``data/corpus/stream/<day>.parquet`` before removal.
+``wss://stream.pumpapi.io`` is a free, keyless firehose (~400–800 events/s, one connection per IP) whose events are
+identical to the replay archive. This worker keeps only what the selector needs: PumpSwap (``pump-amm``, SOL-quoted)
+buys and sells of pump.fun-origin mints, aggregated per (mint, minute) into the same fields ``train/mature.py``
+derives from the archive, with the same filters: the pool's quote reserve must lie in 0.001–100,000 SOL, a leg more
+than 50× away from the median of the mint's previous 200 legs that UTC day is dropped, and each minute keeps the
+pool with the most legs. Minutes are written to ``pump_minutes`` once complete: an event stamped ≥ 2 s after the
+minute's end has arrived (event-time watermark) or 15 s have passed by wall clock; ``pumpstream_status.flushed_through``
+publishes the newest complete minute for the selector.
+
+Lifecycle: ``create`` events go to ``pump_events`` as they arrive; at ``migrate`` a ``corpus_meta`` row is written
+with the creation facts and the creator's point-in-time history (``train/corpus_meta.creator_history``, the training
+definition); 61 minutes after a graduation its own 60-minute outcome is filled from the stream's minutes so later
+graduations by the same creator see it, as in training. Minute rows older than ``PUMP_MINUTES_KEEP_DAYS`` are archived
+to ``data/corpus/stream/<day>.parquet`` before removal. Database failures keep the data in memory for the next attempt.
 """
 from __future__ import annotations
 
@@ -16,9 +22,10 @@ import json
 import logging
 import math
 import ssl
+import statistics
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
 import certifi
@@ -31,26 +38,41 @@ from .. import config
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..logging_setup import setup
+from ..train.corpus_meta import creator_history
 
 log = logging.getLogger(__name__)
 WSOL = "So11111111111111111111111111111111111111112"
+RESQ_BAND = (0.001, 100000.0)     # train/mature.py: quote_in_pool BETWEEN 0.001 AND 100000
+PRICE_BAND = 50.0                  # train/mature.py: within 50x of the trailing median of the mint's previous 200 legs
+REF_LEGS = 200
+FLUSH_GRACE_S = 2.0
+FLUSH_FALLBACK_S = 15.0
+MAX_PENDING_CREATES = 200_000
 
 
 class Minute:
     __slots__ = ("open", "high", "low", "close", "buy", "sell", "nb", "ns", "traders", "resq", "pool_id")
 
-    def __init__(self):
+    def __init__(self, pool_id: str | None = None):
         self.open = None; self.high = -math.inf; self.low = math.inf; self.close = None; self.buy = 0.0; self.sell = 0.0
-        self.nb = 0; self.ns = 0; self.traders = set(); self.resq = None; self.pool_id = None
+        self.nb = 0; self.ns = 0; self.traders = set(); self.resq = None; self.pool_id = pool_id
 
 
 class Aggregator:
     def __init__(self):
-        self.minutes: dict[int, dict[str, Minute]] = defaultdict(dict)   # minute start (s) → mint → Minute
+        self.minutes: dict[int, dict[str, dict[str, Minute]]] = defaultdict(lambda: defaultdict(dict))   # minute → mint → pool → Minute
+        self.ref: dict[str, deque] = {}; self.ref_day: int | None = None                                  # trailing legs per mint, reset each UTC day
+        self.max_event_s = 0.0
         self.creates: dict[str, dict] = {}                                 # mint → create facts (24 h)
-        self.pending_creates: list[tuple[str, dict]] = []                          # creates not yet written to pump_events
-        self.flushed_through: datetime | None = None                                # start of the newest minute written
-        self.stats = {"events": 0, "trades": 0, "flushed_minutes": 0, "flushed_rows": 0, "creates": 0, "migrates": 0, "reconnects": 0, "started_at": datetime.now(timezone.utc).isoformat()}
+        self.pending_creates: list[tuple[str, dict]] = []                 # creates not yet written to pump_events
+        self.flushed_through: datetime | None = None                       # start of the newest complete minute written
+        self.stats = {"events": 0, "trades": 0, "dropped_band": 0, "flushed_minutes": 0, "flushed_rows": 0, "creates": 0, "migrates": 0, "reconnects": 0,
+                      "outcomes_filled": 0, "started_at": datetime.now(timezone.utc).isoformat()}
+
+    def row(self, minute: int, mint: str) -> Minute | None:
+        """The minute's candle for a mint: the pool with the most legs (as in training)."""
+        pools = self.minutes.get(minute, {}).get(mint)
+        return max(pools.values(), key=lambda r: (r.nb + r.ns, r.buy + r.sell)) if pools else None
 
     def ingest(self, e: dict) -> None:
         self.stats["events"] += 1
@@ -60,14 +82,31 @@ class Aggregator:
         if a in ("buy", "sell"):
             if pool != "pump-amm" or e.get("quoteMint") != WSOL or not str(mint).endswith("pump"):
                 return
-            price = e.get("price")
-            if not price or price <= 0:
+            price = e.get("price"); q = e.get("quoteInPool")
+            if not price or price <= 0 or q is None or not (RESQ_BAND[0] <= float(q) <= RESQ_BAND[1]):
                 return
-            m = int(ts // 60000) * 60; row = self.minutes[m].get(mint)
-            if row is None:
-                row = self.minutes[m][mint] = Minute()
-            legs = e.get("breakdown") or [{"action": a, "trader": e.get("txSigner"), "quoteAmount": e.get("quoteAmount")}]
+            ts_s = ts / 1000.0; self.max_event_s = max(self.max_event_s, ts_s)
+            day = int(ts_s // 86400)
+            if day != self.ref_day:
+                self.ref = {}; self.ref_day = day
             p = float(price)
+            legs = e.get("breakdown") or [{"action": a, "trader": e.get("txSigner"), "quoteAmount": e.get("quoteAmount")}]
+            dq = self.ref.get(mint)
+            if dq is None:
+                dq = self.ref[mint] = deque(maxlen=REF_LEGS)
+            ok = True
+            if dq:
+                pref = statistics.median(dq)
+                ok = pref / PRICE_BAND <= p <= pref * PRICE_BAND
+            for _ in legs:
+                dq.append(p)
+            if not ok:
+                self.stats["dropped_band"] += 1
+                return
+            m = int(ts_s // 60) * 60; pid = e.get("poolId") or ""
+            row = self.minutes[m][mint].get(pid)
+            if row is None:
+                row = self.minutes[m][mint][pid] = Minute(pid or None)
             row.open = p if row.open is None else row.open; row.high = max(row.high, p); row.low = min(row.low, p); row.close = p
             for b in legs:
                 sol = float(b.get("quoteAmount") or 0.0)
@@ -77,10 +116,7 @@ class Aggregator:
                     row.sell += sol; row.ns += 1
                 if b.get("trader"):
                     row.traders.add(b["trader"])
-            q = e.get("quoteInPool")
-            if q is not None:
-                row.resq = float(q)
-            row.pool_id = e.get("poolId") or row.pool_id
+            row.resq = float(q)
             self.stats["trades"] += 1
         elif a == "create" and pool == "pump":
             c = {"ts": ts, "creator": e.get("txSigner"), "dev_sol": e.get("quoteAmount"), "dev_tokens": e.get("initialBuy"), "supply": e.get("supply"),
@@ -92,16 +128,24 @@ class Aggregator:
                 self.creates = {k: v for k, v in self.creates.items() if v["ts"] >= cutoff}
         elif a == "migrate" and pool == "pump-amm":
             self.stats["migrates"] += 1
+            self.write_creates()                    # the creator's own earlier creates must be visible to the history query
             self._graduation(e)
 
     def write_creates(self) -> int:
-        """Persist creates as they arrive (keyed by signature), so graduations after a restart still find their creation facts."""
+        """Persist creates as they arrive (keyed by signature); on failure they stay queued for the next attempt."""
         rows, self.pending_creates = self.pending_creates, []
         if not rows:
             return 0
-        with transaction() as conn:
-            conn.cursor().executemany("INSERT INTO pump_events (sig, ts, action, pool, mint, signer, dev_sol, dev_tokens, supply, mayhem, name, symbol, uri) VALUES (%s,%s,'create','pump',%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (sig) DO NOTHING",
-                                      [(c["sig"], datetime.fromtimestamp(c["ts"] / 1000, timezone.utc), m, c["creator"], c["dev_sol"], c["dev_tokens"], c["supply"], c["mayhem"], c["name"], c["symbol"], c["uri"]) for m, c in rows if c.get("sig")])
+        try:
+            with transaction() as conn:
+                conn.cursor().executemany("INSERT INTO pump_events (sig, ts, action, pool, mint, signer, dev_sol, dev_tokens, supply, mayhem, name, symbol, uri) "
+                                          "VALUES (%s,%s,'create','pump',%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (sig) DO NOTHING",
+                                          [(c["sig"], datetime.fromtimestamp(c["ts"] / 1000, timezone.utc), m, c["creator"], c["dev_sol"], c["dev_tokens"], c["supply"],
+                                            c["mayhem"], c["name"], c["symbol"], c["uri"]) for m, c in rows if c.get("sig")])
+        except Exception:
+            self.pending_creates = (rows + self.pending_creates)[-MAX_PENDING_CREATES:]
+            log.exception("create rows failed; %d queued for the next attempt", len(self.pending_creates))
+            return 0
         return len(rows)
 
     def _graduation(self, e: dict) -> None:
@@ -111,53 +155,46 @@ class Aggregator:
                 if c is None:                                       # created before this process started: look it up
                     r = conn.execute("SELECT sig, ts, signer, dev_sol, dev_tokens, supply, mayhem, name, symbol, uri FROM pump_events WHERE mint = %s AND action = 'create' ORDER BY ts LIMIT 1", (mint,)).fetchone()
                     if r:
-                        c = {"ts": r["ts"].timestamp() * 1000, "creator": r["signer"], "dev_sol": r["dev_sol"], "dev_tokens": r["dev_tokens"], "supply": r["supply"], "mayhem": r["mayhem"], "name": r["name"], "symbol": r["symbol"], "uri": r["uri"], "sig": r["sig"]}
+                        c = {"ts": r["ts"].timestamp() * 1000, "creator": r["signer"], "dev_sol": r["dev_sol"], "dev_tokens": r["dev_tokens"], "supply": r["supply"],
+                             "mayhem": r["mayhem"], "name": r["name"], "symbol": r["symbol"], "uri": r["uri"], "sig": r["sig"]}
                 conn.execute("INSERT INTO pump_events (sig, ts, action, pool, mint, pool_id, signer, quote_in_pool) VALUES (%s,%s,'migrate','pump-amm',%s,%s,%s,%s) ON CONFLICT (sig) DO NOTHING",
                              (e.get("signature"), g, mint, e.get("poolId"), e.get("txSigner"), e.get("quoteInPool")))
-                if c:
-                    conn.execute("INSERT INTO pump_events (sig, ts, action, pool, mint, signer, dev_sol, dev_tokens, supply, mayhem, name, symbol, uri) VALUES (%s,%s,'create','pump',%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (sig) DO NOTHING",
-                                 (c["sig"], datetime.fromtimestamp(c["ts"] / 1000, timezone.utc), mint, c["creator"], c["dev_sol"], c["dev_tokens"], c["supply"], c["mayhem"], c["name"], c["symbol"], c["uri"]))
-                hist = None; launches = None
-                if c and c.get("creator"):
-                    ct = datetime.fromtimestamp(c["ts"] / 1000, timezone.utc)
-                    launches = conn.execute("SELECT count(*) AS n FROM (SELECT mint FROM pump_events WHERE signer = %s AND action = 'create' AND ts < %s UNION SELECT mint FROM corpus_meta WHERE creator = %s AND create_ts < %s) u",
-                                            (c["creator"], ct, c["creator"], ct)).fetchone()["n"]      # prior creates, graduated or not (the training definition)
-                    hist = conn.execute("""SELECT count(*) AS launches, count(*) FILTER (WHERE own_alive6h IS NOT NULL) AS known,
-                                                  avg(CASE WHEN own_dd60 <= -0.9 THEN 1.0 ELSE 0.0 END) FILTER (WHERE own_alive6h IS NOT NULL) AS rug,
-                                                  avg(CASE WHEN own_max60 >= 1.0 THEN 1.0 ELSE 0.0 END) FILTER (WHERE own_alive6h IS NOT NULL) AS moon
-                                           FROM corpus_meta WHERE creator = %s AND create_ts < %s""", (c["creator"], datetime.fromtimestamp(c["ts"] / 1000, timezone.utc))).fetchone()
-                conn.execute("""INSERT INTO corpus_meta (mint, create_ts, creator, dev_sol, dev_tokens, dev_share, supply, mayhem, uri, name, symbol, ttg_min, rq0, pool_id,
+                ct = datetime.fromtimestamp(c["ts"] / 1000, timezone.utc) if c else None
+                h = creator_history(conn, c.get("creator") if c else None, ct, g)
+                conn.execute("""INSERT INTO corpus_meta (mint, graduated_at, create_ts, creator, dev_sol, dev_tokens, dev_share, supply, mayhem, uri, name, symbol, ttg_min, rq0, pool_id,
                                                          prior_launches, prior_grads, prior_known, prior_rug_share, prior_moon_share)
-                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (mint) DO UPDATE SET
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (mint) DO UPDATE SET
+                                  graduated_at = COALESCE(corpus_meta.graduated_at, EXCLUDED.graduated_at),
                                   create_ts = COALESCE(corpus_meta.create_ts, EXCLUDED.create_ts), creator = COALESCE(corpus_meta.creator, EXCLUDED.creator),
                                   dev_sol = COALESCE(corpus_meta.dev_sol, EXCLUDED.dev_sol), dev_tokens = COALESCE(corpus_meta.dev_tokens, EXCLUDED.dev_tokens),
                                   dev_share = COALESCE(corpus_meta.dev_share, EXCLUDED.dev_share), supply = COALESCE(corpus_meta.supply, EXCLUDED.supply),
-                                  mayhem = COALESCE(corpus_meta.mayhem, EXCLUDED.mayhem), uri = COALESCE(corpus_meta.uri, EXCLUDED.uri), ttg_min = COALESCE(corpus_meta.ttg_min, EXCLUDED.ttg_min),
-                                  rq0 = COALESCE(corpus_meta.rq0, EXCLUDED.rq0), pool_id = COALESCE(corpus_meta.pool_id, EXCLUDED.pool_id),
+                                  mayhem = COALESCE(corpus_meta.mayhem, EXCLUDED.mayhem), uri = COALESCE(corpus_meta.uri, EXCLUDED.uri),
+                                  name = COALESCE(corpus_meta.name, EXCLUDED.name), symbol = COALESCE(corpus_meta.symbol, EXCLUDED.symbol),
+                                  ttg_min = COALESCE(corpus_meta.ttg_min, EXCLUDED.ttg_min), rq0 = COALESCE(corpus_meta.rq0, EXCLUDED.rq0), pool_id = COALESCE(corpus_meta.pool_id, EXCLUDED.pool_id),
                                   prior_launches = COALESCE(corpus_meta.prior_launches, EXCLUDED.prior_launches), prior_grads = COALESCE(corpus_meta.prior_grads, EXCLUDED.prior_grads),
                                   prior_known = COALESCE(corpus_meta.prior_known, EXCLUDED.prior_known), prior_rug_share = COALESCE(corpus_meta.prior_rug_share, EXCLUDED.prior_rug_share),
                                   prior_moon_share = COALESCE(corpus_meta.prior_moon_share, EXCLUDED.prior_moon_share), updated_at = now()""",
-                             (mint, datetime.fromtimestamp(c["ts"] / 1000, timezone.utc) if c else None, c["creator"] if c else None, c["dev_sol"] if c else None,
-                              c["dev_tokens"] if c else None, (float(c["dev_tokens"]) / float(c["supply"])) if c and c.get("dev_tokens") and c.get("supply") else None,
-                              c["supply"] if c else None, c["mayhem"] if c else None, c["uri"] if c else None, c["name"] if c else None, c["symbol"] if c else None,
+                             (mint, g, ct, c.get("creator") if c else None, c.get("dev_sol") if c else None, c.get("dev_tokens") if c else None,
+                              (float(c["dev_tokens"]) / float(c["supply"])) if c and c.get("dev_tokens") and c.get("supply") else None,
+                              c.get("supply") if c else None, c.get("mayhem") if c else None, c.get("uri") if c else None, c.get("name") if c else None, c.get("symbol") if c else None,
                               ((e["timestamp"] - c["ts"]) / 60000.0) if c else None, e.get("quoteInPool"), e.get("poolId"),
-                              int(launches) if launches is not None else None, int(hist["launches"]) if hist else None, int(hist["known"]) if hist else None,
-                              float(hist["rug"]) if hist and hist["rug"] is not None else None, float(hist["moon"]) if hist and hist["moon"] is not None else None))
-                conn.execute("""INSERT INTO corpus_tokens (mint, graduated_at, grad_slot, source, status) VALUES (%s,%s,%s,'stream','pending') ON CONFLICT (mint) DO NOTHING""",
+                              h["prior_launches"], h["prior_grads"], h["prior_known"], h["prior_rug_share"], h["prior_moon_share"]))
+                conn.execute("INSERT INTO corpus_tokens (mint, graduated_at, grad_slot, source, status) VALUES (%s,%s,%s,'stream','pending') ON CONFLICT (mint) DO NOTHING",
                              (mint, g, int(e.get("block") or 0)))
         except Exception:
             log.exception("graduation upsert failed for %s", mint)
 
     def flush(self, before_minute: int) -> int:
-        """Write every closed minute strictly older than ``before_minute`` (seconds)."""
-        done = [m for m in self.minutes if m < before_minute]
+        """Write every minute strictly older than ``before_minute`` (seconds). Rows leave memory only after the commit."""
+        done = sorted(m for m in self.minutes if m < before_minute)
         if not done:
             return 0
         rows = []
-        for m in sorted(done):
+        for m in done:
             ts = datetime.fromtimestamp(m, timezone.utc)
-            for mint, r in self.minutes.pop(m).items():
-                if r.close is None:
+            for mint in self.minutes[m]:
+                r = self.row(m, mint)
+                if r is None or r.close is None:
                     continue
                 rows.append((mint, ts, r.pool_id, r.open, r.high, r.low, r.close, r.buy, r.sell, r.nb, r.ns, len(r.traders), r.resq))
         if rows:
@@ -166,9 +203,39 @@ class Aggregator:
                                           "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (mint, ts) DO UPDATE SET close = EXCLUDED.close, high = greatest(pump_minutes.high, EXCLUDED.high), "
                                           "low = least(pump_minutes.low, EXCLUDED.low), buy_sol = pump_minutes.buy_sol + EXCLUDED.buy_sol, sell_sol = pump_minutes.sell_sol + EXCLUDED.sell_sol, "
                                           "n_buys = pump_minutes.n_buys + EXCLUDED.n_buys, n_sells = pump_minutes.n_sells + EXCLUDED.n_sells, n_traders = greatest(pump_minutes.n_traders, EXCLUDED.n_traders), resq_sol = EXCLUDED.resq_sol", rows)
+        for m in done:
+            self.minutes.pop(m, None)
         self.stats["flushed_minutes"] += len(done); self.stats["flushed_rows"] += len(rows)
-        self.flushed_through = datetime.fromtimestamp(max(done), timezone.utc)
+        newest = datetime.fromtimestamp(done[-1], timezone.utc)
+        if self.flushed_through is None or newest > self.flushed_through:          # a late event for an old minute never rewinds it
+            self.flushed_through = newest
         return len(rows)
+
+    def flush_bound(self, now: float) -> int:
+        """Minutes strictly before this start are complete: event-time watermark, or the wall-clock fallback when quiet."""
+        cur = int(now // 60) * 60
+        wm = max(int((self.max_event_s - FLUSH_GRACE_S) // 60) * 60, int((now - FLUSH_FALLBACK_S) // 60) * 60)
+        return min(cur, wm)
+
+
+def fill_outcomes() -> int:
+    """Own 60-minute outcome for stream graduations 61+ minutes old, from the stream's minutes (candle files replace it later)."""
+    with transaction() as conn:
+        todo = conn.execute("""SELECT mint, graduated_at FROM corpus_meta WHERE own_dd60 IS NULL AND graduated_at IS NOT NULL
+                               AND graduated_at BETWEEN now() - interval '6 hours' AND now() - interval '61 minutes'""").fetchall()
+        n = 0
+        for t in todo:
+            rows = conn.execute("SELECT close FROM pump_minutes WHERE mint = %s AND ts >= %s AND ts < %s ORDER BY ts",
+                                (t["mint"], t["graduated_at"], t["graduated_at"] + timedelta(minutes=60))).fetchall()
+            if not rows:
+                continue
+            closes = [float(r["close"]) for r in rows]; p0 = closes[0]
+            if p0 <= 0:
+                continue
+            conn.execute("UPDATE corpus_meta SET own_dd60 = %s, own_max60 = %s, updated_at = now() WHERE mint = %s AND own_dd60 IS NULL",
+                         (min(closes) / p0 - 1.0, max(closes) / p0 - 1.0, t["mint"]))
+            n += 1
+    return n
 
 
 def archive_old(keep_days: int) -> int:
@@ -182,7 +249,8 @@ def archive_old(keep_days: int) -> int:
             rows = conn.execute("SELECT * FROM pump_minutes WHERE ts >= %s AND ts < %s ORDER BY mint, ts", (d, d + timedelta(days=1))).fetchall()
             if rows:
                 out = config.CORPUS_DIR / "stream"; out.mkdir(parents=True, exist_ok=True)
-                pq.write_table(pa.Table.from_pylist([dict(r) for r in rows]), out / f"{d:%Y-%m-%d}.parquet", compression="zstd")
+                path = out / f"{d:%Y-%m-%d}.parquet"; tmp = path.with_name(path.name + ".tmp")
+                pq.write_table(pa.Table.from_pylist([dict(r) for r in rows]), tmp, compression="zstd"); tmp.replace(path)
                 conn.execute("DELETE FROM pump_minutes WHERE ts >= %s AND ts < %s", (d, d + timedelta(days=1)))
                 n += len(rows)
     return n
@@ -197,8 +265,21 @@ def _status(agg: Aggregator, extra: dict) -> None:
         log.debug("pumpstream status write failed", exc_info=True)
 
 
+def _logged(name: str, fn, *args):
+    try:
+        n = fn(*args)
+        if n:
+            log.info("%s: %d", name, n)
+        return n
+    except Exception:
+        log.exception("%s failed", name)
+        return 0
+
+
 async def _run(stop: threading.Event | None, agg: Aggregator) -> None:
-    ctx = ssl.create_default_context(cafile=certifi.where()); backoff = 1.0; last_status = 0.0; last_flush = 0.0; last_archive = 0.0; last_msg = 0.0; rate_n = 0; rate_t = time.time()
+    ctx = ssl.create_default_context(cafile=certifi.where()); backoff = 1.0
+    last_status = last_flush = last_outcomes = 0.0; last_archive = time.time() - 3000; last_msg = 0.0; rate_n = 0; rate_t = time.time()
+    bg: dict[str, asyncio.Task | None] = {"archive": None, "outcomes": None}
     while not (stop is not None and stop.is_set()):
         try:
             async with websockets.connect(config.PUMPSTREAM_URL, ssl=ctx, max_size=8_000_000, ping_interval=20, ping_timeout=20) as ws:
@@ -217,25 +298,36 @@ async def _run(stop: threading.Event | None, agg: Aggregator) -> None:
                         agg.ingest(e)
                     now = time.time()
                     if now - last_flush >= 1.0:
-                        cur = int(now // 60) * 60
-                        agg.flush(cur if now % 60 >= 2 else cur - 60)   # the minute that just closed is written ~2 s after its end
+                        try:
+                            agg.flush(agg.flush_bound(now))
+                        except Exception:
+                            log.exception("minute flush failed; rows kept for the next attempt")
                         last_flush = now
                     if now - last_status >= 5.0:
-                        try:
-                            agg.write_creates()
-                        except Exception:
-                            log.exception("create rows failed")
+                        agg.write_creates()
                         _status(agg, {"events_per_s": rate_n / max(now - rate_t, 1e-9), "pending_minutes": len(agg.minutes), "lag_s": now - last_msg, "connected": True,
-                                      "flushed_through": agg.flushed_through.isoformat() if agg.flushed_through else None}); rate_n = 0; rate_t = now; last_status = now
-                    if now - last_archive >= 3600:
-                        n = archive_old(config.PUMP_MINUTES_KEEP_DAYS); last_archive = now
-                        if n:
-                            log.info("archived %d old minute rows", n)
+                                      "flushed_through": agg.flushed_through.isoformat() if agg.flushed_through else None,
+                                      "event_watermark": datetime.fromtimestamp(agg.max_event_s, timezone.utc).isoformat() if agg.max_event_s else None})
+                        rate_n = 0; rate_t = now; last_status = now
+                    if now - last_outcomes >= 60 and (bg["outcomes"] is None or bg["outcomes"].done()):
+                        bg["outcomes"] = asyncio.create_task(asyncio.to_thread(_logged, "stream outcomes filled", fill_outcomes)); last_outcomes = now
+                    if now - last_archive >= 3600 and (bg["archive"] is None or bg["archive"].done()):
+                        bg["archive"] = asyncio.create_task(asyncio.to_thread(_logged, "archived old minute rows", archive_old, config.PUMP_MINUTES_KEEP_DAYS)); last_archive = now
         except Exception as e:
             agg.stats["reconnects"] += 1; log.warning("pumpstream: %s; reconnecting in %.0fs", e, backoff)
             _status(agg, {"connected": False, "last_error": str(e)[:200]})
             await asyncio.sleep(backoff); backoff = min(60.0, backoff * 2)
-    agg.flush(int(time.time() // 60) * 60 + 60)
+    for t in bg.values():
+        if t is not None:
+            try:
+                await t
+            except Exception:
+                pass
+    try:
+        agg.flush(int(time.time() // 60) * 60 + 60)
+    except Exception:
+        log.exception("final minute flush failed")
+    agg.write_creates()
 
 
 def main(stop_event: threading.Event | None = None) -> None:
@@ -245,4 +337,4 @@ def main(stop_event: threading.Event | None = None) -> None:
         asyncio.run(_run(stop_event, agg))
     finally:
         _status(agg, {"connected": False, "stage": "stopped"})
-        record_event("info", "pumpstream", "pumpstream stopped", {k: agg.stats.get(k) for k in ("events", "trades", "flushed_rows", "creates", "migrates", "reconnects")})
+        record_event("info", "pumpstream", "pumpstream stopped", {k: agg.stats.get(k) for k in ("events", "trades", "dropped_band", "flushed_rows", "creates", "migrates", "reconnects")})

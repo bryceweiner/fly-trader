@@ -99,7 +99,7 @@ def parse_hour(path: Path) -> tuple[pa.Table, pa.Table, int]:
 
 
 def plan_hours(now: datetime | None = None) -> list[datetime]:
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)   # callers pass the same ``now`` they seed the re-plan bound with
     start = datetime.fromisoformat(config.REPLAY_START).replace(tzinfo=timezone.utc)
     last = (now - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)
     with transaction() as conn:
@@ -157,7 +157,7 @@ def main(stop_event: threading.Event | None = None) -> None:
     tmpdir = config.REPLAY_DIR / "_tmp"; tmpdir.mkdir(parents=True, exist_ok=True)
     for stale in tmpdir.glob("*"):
         stale.unlink()
-    hours = plan_hours(); status = _Status(len(hours))
+    now0 = datetime.now(timezone.utc); hours = plan_hours(now0); status = _Status(len(hours))
     record_event("info", "replay", "replay ingest started", {"hours_pending": len(hours), "parallel": config.REPLAY_PARALLEL})
     log.info("replay ingest: %d hours pending (newest first)", len(hours))
     todo: queue.Queue = queue.Queue(); ready: queue.Queue = queue.Queue(maxsize=config.REPLAY_PARALLEL + 2)
@@ -165,8 +165,9 @@ def main(stop_event: threading.Event | None = None) -> None:
         todo.put(h)
     client = httpx.Client(headers={"User-Agent": "fly-trader replay ingest"}, timeout=httpx.Timeout(60.0, read=600.0), follow_redirects=True)
 
-    newest_planned = [(datetime.now(timezone.utc) - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)]   # the plan's upper bound
+    newest_planned = [(now0 - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)]   # the plan's upper bound (same clock)
     fresh: queue.Queue = queue.Queue()      # hours that closed after the plan was made; served before the backfill
+    retried: dict[datetime, float] = {}
 
     def replan():
         last = (datetime.now(timezone.utc) - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)
@@ -175,6 +176,15 @@ def main(stop_event: threading.Event | None = None) -> None:
             fresh.put(h); h += timedelta(hours=1)
         if last > newest_planned[0]:
             newest_planned[0] = last
+        # an hour fetched before the archive published it (404) or that failed is retried every 30 min for 12 h
+        try:
+            with transaction() as conn:
+                again = [r["hour"] for r in conn.execute("SELECT hour FROM replay_hours WHERE status IN ('missing','error') AND hour > now() - interval '12 hours'").fetchall()]
+        except Exception:
+            again = []
+        for h in again:
+            if time.time() - retried.get(h, 0.0) >= 1800:
+                retried[h] = time.time(); fresh.put(h)
 
     def downloader():
         while not (stop is not None and stop.is_set()):
@@ -200,10 +210,11 @@ def main(stop_event: threading.Event | None = None) -> None:
                 except Exception as e:
                     log.warning("download %s failed (%d): %s", h, attempt, e); time.sleep(10 * (attempt + 1))
             else:
-                try:
-                    ready.put((h, None, 0, 0.0), timeout=5.0)
-                except queue.Full:
-                    pass
+                while not (stop is not None and stop.is_set()):
+                    try:
+                        ready.put((h, None, 0, 0.0), timeout=5.0); break
+                    except queue.Full:
+                        continue
 
     from ..train import replay_assemble
     assembler = threading.Thread(target=replay_assemble.assemble_loop, args=(stop,), name="replay-assemble", daemon=True); assembler.start()

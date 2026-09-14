@@ -226,7 +226,8 @@ def enumerate_graduations(hel: Helius, status: Status, stop: threading.Event | N
     """One enumeration round: (1) newest pages until a page adds nothing new, (2) up to ``max_pages`` of backfill
     from the persisted pagination token until ``CORPUS_DAYS`` is reached. Returns rows added."""
     addr = config.CORPUS_MIGRATION_AUTHORITY
-    horizon = int((datetime.now(timezone.utc) - timedelta(days=config.CORPUS_DAYS)).timestamp())
+    pull_before = datetime.fromisoformat(config.CORPUS_PULL_BEFORE).replace(tzinfo=timezone.utc)
+    horizon = int(min(datetime.now(timezone.utc) - timedelta(days=config.CORPUS_DAYS), pull_before - timedelta(days=30)).timestamp())
     state = _enum_state(); added = 0
     # (1) incremental: newest first, stop when a full page adds nothing
     token = None

@@ -12,9 +12,10 @@ from fly_trader.train import decisions
 from fly_trader.train.mature import SCHEMA
 
 
-def _part(tmp_path, rows):
-    d = tmp_path / "2026-09-01"; d.mkdir(parents=True)
-    pq.write_table(pa.Table.from_pylist(rows, schema=SCHEMA), d / "part.parquet")
+def _part(tmp_path, rows, version=None):
+    from fly_trader.market.features import FEATURE_VERSION
+    from fly_trader.train.mature import write_part
+    write_part(pa.Table.from_pylist(rows, schema=SCHEMA), tmp_path / "2026-09-01" / "part.parquet", FEATURE_VERSION if version is None else version)
     return tmp_path
 
 
@@ -53,8 +54,7 @@ def test_labels_fills_and_past_only_rule(tmp_path):
     # rows from the break onward are gone
     tb = ds.ts[b]
     assert tb.max() < (t0 + timedelta(minutes=30)).timestamp()
-    ib = np.flatnonzero(b & (ds.ts == t0.timestamp()))[0]
-    assert ds.fwd[ib] == pytest.approx(99.0, rel=1e-6)          # entered at 1.0, its 30-minute mark is the 100x print
+    assert not (b & (ds.ts == t0.timestamp())).any()            # its 30-minute exit lands on the reverting 100x print: not a label
     ib5 = np.flatnonzero(b & (ds.ts == (t0 + timedelta(minutes=5)).timestamp()))[0]
     assert ds.fwd[ib5] == pytest.approx(0.0, abs=1e-6)          # its mark (minute 35) is back at 1.0
 
@@ -71,3 +71,10 @@ def test_trades_respect_hold_and_summaries():
     assert s["pf"] is None and s["win"] == 1.0                   # no losing trade → profit factor undefined, never inf
     ev = decisions.evaluate(ds, np.ones(6), np.ones(6, bool), 0.5)
     assert ev["pooled"]["n"] == 3 and ev["per_day"]["2026-09-01"]["n"] == 2 and ev["per_day"]["2026-09-02"]["n"] == 1
+
+
+def test_stale_feature_parts_are_refused(tmp_path):
+    t0 = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    rows = [_row("A", t0 + timedelta(minutes=k), 1.0) for k in range(80)]
+    with pytest.raises(RuntimeError, match="feature version"):
+        decisions.build(days=None, feature_dir=_part(tmp_path, rows, version=1), horizon_min=30, fee=0.0)
