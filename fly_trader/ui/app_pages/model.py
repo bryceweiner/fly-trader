@@ -58,8 +58,10 @@ def loaded() -> None:
             st.caption(f"Model #{m['id']} · gradient-boosted selector · trained on {meta.get('first_day', '—')} → {meta.get('trained_through', '—')} · saved {ago(m['ts'])} · "
                        f"at work since {ago(m['since'])}")
             with st.container(horizontal=True):
-                st.metric("Buys when score ≥", f"{float(run.get('threshold') or meta.get('threshold') or 0):.3f}",
-                          help="The model scores every eligible token each minute (0–1). It buys only above this line: the top 1 % of scores seen in training.")
+                mi = meta.get("model") or {}
+                st.metric("Buys when predicted return ≥", pct(float(run.get('threshold') or meta.get('threshold') or 0), 1),
+                          help=f"Each minute the model predicts every eligible token's net 30-minute return after fees and price impact. It buys tokens at least "
+                               f"{mi.get('min_age_h', 24):g} h past graduation (or older than the archive) whose prediction clears this line.")
                 st.metric("Holds for", f"{run.get('horizon_min') or meta.get('horizon_min') or 30} min", help="Each position is sold this long after the buy.")
                 st.metric("Test trades", wf.get("n", "—"), help=f"Trades the model would have made on {wf.get('days', '—')} test days, each traded by a model that never saw that day.")
                 st.metric("Average per trade", pct(wf.get("mean")), delta=(f"random {pct(rb['mean'])}" if rb.get("mean") is not None else None), delta_color="off",

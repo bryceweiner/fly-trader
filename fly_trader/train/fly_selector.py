@@ -46,6 +46,7 @@ from .decisions import DecisionSet, build, evaluate, random_trades, summarize, t
 log = logging.getLogger(__name__)
 
 TEACHER_NOTE = "selector fit on the fly's training split"
+VALUE_SCALE = 20.0          # value distillation: the fly's output mu = predicted return × 20 (so ±5 % ≈ ±1)
 
 
 def _ranks(a: np.ndarray) -> np.ndarray:
@@ -89,7 +90,7 @@ class FlyScorer:
         self.mean = ds.X[idx].mean(0).astype(np.float32); self.std = (ds.X[idx].std(0) + 1e-6).astype(np.float32)
         self.policy = ConnectomePolicy(self.graph, obs_dim=ds.X.shape[1], k_steps=k_steps, device=self.dev)
         p = float(ds.y[idx].mean()); self.pos_weight = torch.tensor((1 - p) / max(p, 1e-3), device=self.dev)
-        self.threshold = 0.5
+        self.threshold = 0.5; self.mode = "prob"          # "value" once distilled from an expected-return teacher
 
     def logits(self, X: np.ndarray) -> torch.Tensor:
         obs = torch.tensor((X - self.mean) / self.std, device=self.dev)
@@ -100,18 +101,22 @@ class FlyScorer:
     def score(self, X: np.ndarray, batch: int = 512) -> np.ndarray:
         self.policy.eval(); out = []
         for i in range(0, len(X), batch):
-            out.append(torch.sigmoid(self.logits(X[i:i + batch])).float().cpu().numpy())
+            mu = self.logits(X[i:i + batch])
+            out.append((mu / VALUE_SCALE if self.mode == "value" else torch.sigmoid(mu)).float().cpu().numpy())
         self.policy.train()
         return np.concatenate(out) if out else np.array([])
 
     def fit(self, ds: DecisionSet, train: np.ndarray, epochs: int = 2, rows_per_epoch: int = 600_000, batch: int = 256,
             lr_graph: float = 1e-4, lr_heads: float = 1e-3, stop: threading.Event | None = None, seed: int = 0,
-            teacher: Callable[[np.ndarray], np.ndarray] | None = None) -> dict:
-        """With ``teacher`` (X → probabilities, e.g. ``SelectorModel.score``): distillation, BCE on the teacher's
-        probabilities as soft targets (no pos_weight). Without: class-weighted BCE on the labels ``y``."""
+            teacher: Callable[[np.ndarray], np.ndarray] | None = None, value: bool = False) -> dict:
+        """With ``teacher`` (X → its scores, e.g. ``SelectorModel.score``): distillation. ``value`` (an expected-return
+        teacher): Huber loss between mu and the teacher's predicted return × ``VALUE_SCALE``, and the fly then scores in
+        returns; otherwise BCE on the teacher's probabilities as soft targets. Without a teacher: class-weighted BCE on ``y``."""
         idx_all = np.flatnonzero(train); rng = np.random.default_rng(seed)
         opt = torch.optim.Adam(self.policy.param_groups(lr_graph, lr_heads))
-        hist = []; t0 = time.time(); step = 0; target = "teacher" if teacher is not None else "labels"
+        hist = []; t0 = time.time(); step = 0; target = ("teacher value" if value else "teacher") if teacher is not None else "labels"
+        if teacher is not None and value:
+            self.mode = "value"
         for ep in range(epochs):
             idx = rng.choice(idx_all, min(rows_per_epoch, len(idx_all)), replace=False); n_b = len(idx) // batch
             tgt = None
@@ -127,6 +132,9 @@ class FlyScorer:
                 if tgt is None:
                     y = torch.tensor(ds.y[bi].astype(np.float32), device=self.dev)
                     loss = torch.nn.functional.binary_cross_entropy_with_logits(logit, y, pos_weight=self.pos_weight)
+                elif value:
+                    t = torch.tensor(np.clip(tgt[b * batch:(b + 1) * batch], -1.0, 1.0) * VALUE_SCALE, device=self.dev)
+                    loss = torch.nn.functional.huber_loss(logit, t)
                 else:
                     t = torch.tensor(tgt[b * batch:(b + 1) * batch], device=self.dev)
                     loss = torch.nn.functional.binary_cross_entropy_with_logits(logit, t)
@@ -147,7 +155,8 @@ class FlyScorer:
     def save(self, metrics: dict, run_id: str | None = None) -> tuple[Path, int]:
         root = config.BRAIN_DIR / "policies"; root.mkdir(parents=True, exist_ok=True)
         path = root / f"flysel_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.pt"
-        torch.save({"state_dict": self.policy.state_dict(), "mean": self.mean, "std": self.std, "cols": self.cols, "threshold": self.threshold,
+        torch.save({"state_dict": self.policy.state_dict(), "mean": self.mean, "std": self.std, "cols": self.cols, "threshold": self.threshold, "mode": self.mode,
+                    "value_scale": VALUE_SCALE,
                     "k_steps": self.policy.k_steps, "obs_dim": self.policy.obs_dim, "connectome_sha256": getattr(self.graph, "content_sha256", None), "metrics": metrics}, path)
         sha = hashlib.sha256(path.read_bytes()).hexdigest()
         with transaction() as conn:
@@ -171,6 +180,8 @@ def main(days: int | None = None, test_days: int = 21, top_frac: float = 0.01, h
     from .selector import DATA_VERSION, fit as gbm_fit
     prog.update("fly selector: fitting the teacher (gradient-boosted selector)", 0, 1, force=True)
     g = gbm_fit(ds, train, top_frac, seed=7); gs = np.zeros(len(ds.y)); gs[test] = g.score(ds.X[test])
+    tix = np.flatnonzero(test); uni = np.zeros(len(ds.y), bool); uni[tix] = g.universe(ds.X[tix])
+    test = test & uni                                                                   # both models trade the selector's universe only
     g_ev = evaluate(ds, gs, test, g.threshold, "gbm"); g_auc = float(roc_auc_score(ds.y[test], gs[test]))
     log.info("teacher GBM (single split): AUC %.3f | %s", g_auc, g_ev["pooled"])
     record_event("info", "fly_selector", "teacher gbm single-split", {"auc": g_auc, **g_ev["pooled"]})
@@ -178,8 +189,9 @@ def main(days: int | None = None, test_days: int = 21, top_frac: float = 0.01, h
     prog.update("fly selector: distilling the fly from the selector", 0, 1, force=True,
                 graph={"N": fly.graph.N, "edges": int(fly.graph.indices.shape[1]), "params": fly.policy.describe()["params"]},
                 reference_gbm={"auc": g_auc, **g_ev["pooled"]})
-    fit_info = fly.fit(ds, train, epochs=epochs, rows_per_epoch=rows_per_epoch, stop=stop_event, teacher=g.score)
-    thr = fly.set_threshold(ds, train, top_frac)
+    value = getattr(g, "kind", "classifier") == "ev"                                     # an expected-return teacher: the fly learns the return itself
+    fit_info = fly.fit(ds, train, epochs=epochs, rows_per_epoch=rows_per_epoch, stop=stop_event, teacher=g.score, value=value)
+    thr = g.threshold if value else fly.set_threshold(ds, train, top_frac); fly.threshold = thr
     fs = np.zeros(len(ds.y)); fs[test] = fly.score(ds.X[test]); f_auc = float(roc_auc_score(ds.y[test], fs[test]))
     f_ev = evaluate(ds, fs, test, thr, "fly")
     rnd = summarize(random_trades(ds, test, int((test & (fs >= thr)).sum())))          # no-skill baseline at the fly's pick count

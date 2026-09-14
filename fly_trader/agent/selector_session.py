@@ -251,6 +251,8 @@ class SelectorSession:
             xs, infos, mints = [], [], []
             for mint, a in agg.items():
                 x, info = self._features(conn, mint, a, m1_epoch)
+                if not self.model.universe(x[None])[0]:            # the model's tradable universe (train/selector.in_universe)
+                    continue
                 if not info["broken"] and info["resq"] is not None and info["resq"] >= MIN_RESQ_SOL and info["logvol_15m"] >= math.log1p(MIN_VOL_15M_SOL):
                     xs.append(x); infos.append(info); mints.append(mint)
             scores = self.model.score(np.stack(xs)) if xs else np.array([])

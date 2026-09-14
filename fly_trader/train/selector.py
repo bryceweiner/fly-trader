@@ -1,11 +1,16 @@
-"""The selector: gradient-boosted classifier over decision points (``train/decisions.py``).
+"""The selector: a gradient-boosted model of each minute's net 30-minute return (``train/decisions.py``).
 
-Walk-forward protocol (the strategy gate): for each of the last ``test_days`` days D, fit on eligible minutes
-of days ≤ D−2 (one-day purge), score day D, trade the minutes above the threshold that marks the top
-``top_frac`` of training scores, one position per token, ``horizon`` hold, pessimistic fills. The deployed model
-is then fit on every day up to the last one and saved with its threshold, feature list and standardization
-(``data/brain/selectors/selector_<ts>.joblib`` + ``brain_snapshots`` kind 'selector'). Runs as the ``train``
-worker when ``training_params.regimen == 'selector'`` (default) and as ``fly-trader train-selector``.
+Strategy (the clean-universe research of 2026-09-14): the model predicts the net return of buying a token now and
+selling 30 minutes later, after the paper broker's fees and price impact; it trains on every eligible minute. It buys
+only tokens at least ``MIN_AGE_H`` hours past graduation (or graduated before the archive began), whose predicted
+return is at least ``MIN_EV`` — fresh graduations are where the rugs and the 0.5 % Jupiter fee are. ``in_universe`` is
+the one definition of that universe for training, backtest and the live engine.
+
+Walk-forward protocol (the strategy gate): every day after a 21-day warm-up is a test day, traded by a model fit only
+on days at least two days earlier (refit every 7 days), one position per token, pessimistic fills, against random
+picks from the same universe. The deployed model is then fit on every day and saved with its threshold, feature list,
+standardization and sizing table (``data/brain/selectors/selector_<ts>.joblib`` + ``brain_snapshots`` kind 'selector').
+Runs inside the training pipeline (``train/pipeline.py``) and as ``fly-trader train-selector``.
 """
 from __future__ import annotations
 
@@ -20,7 +25,7 @@ from pathlib import Path
 
 import joblib
 import numpy as np
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.metrics import roc_auc_score
 
 from .. import config
@@ -35,8 +40,17 @@ from .mature import AGG_VERSION
 log = logging.getLogger(__name__)
 SELECTOR_DIR = config.BRAIN_DIR / "selectors"
 # the data definitions a model was trained on; a model from other definitions is never loaded and its backtest is not shown
-DATA_VERSION = {"agg": AGG_VERSION, "features": FEATURE_VERSION, "costs": "paper"}
+DATA_VERSION = {"agg": AGG_VERSION, "features": FEATURE_VERSION, "costs": "paper", "selector": "ev-aged-1"}
 WARMUP_DAYS, BLOCK_DAYS = 21, 7      # walk-forward: the first 21 days only train; every later day is tested, refit every 7 days
+MIN_AGE_H = 24.0                     # trade only tokens at least this long past graduation (unknown age = graduated before the archive)
+MIN_EV = 0.01                        # buy when the predicted net 30-minute return is at least +1 %
+MAX_TRAIN_ROWS = 3_000_000
+
+
+def in_universe(X: np.ndarray, cols: list[str]) -> np.ndarray:
+    """Rows the selector may trade: age unknown (graduated before the archive) or at least ``MIN_AGE_H`` hours old."""
+    X = np.atleast_2d(X); c = {n: i for i, n in enumerate(cols)}
+    return (X[:, c["age_known"]] == 0) | (np.expm1(X[:, c["log_age_h"]]) >= MIN_AGE_H)
 
 
 def is_current(meta: dict | None) -> bool:
@@ -60,7 +74,7 @@ def deploy_decision(p: dict, rb: dict) -> tuple[bool, str]:
 
 @dataclass
 class SelectorModel:
-    gbm: HistGradientBoostingClassifier
+    gbm: HistGradientBoostingRegressor | HistGradientBoostingClassifier
     mean: np.ndarray
     std: np.ndarray
     cols: list[str]
@@ -70,21 +84,27 @@ class SelectorModel:
     trained_through: str
     metrics: dict = field(default_factory=dict)
     sizing: list = field(default_factory=list)   # agent/sizing.py table from the backtest's out-of-sample trades
+    kind: str = "ev"                             # "ev": predicted net return; "classifier": models saved before 2026-09-14
 
     def score(self, X: np.ndarray) -> np.ndarray:
-        return self.gbm.predict_proba((X - self.mean) / self.std)[:, 1]
+        """Predicted net 30-minute return (ev models) or the probability of beating +3 % (older classifiers)."""
+        Z = (X - self.mean) / self.std
+        return self.gbm.predict(Z) if getattr(self, "kind", "classifier") == "ev" else self.gbm.predict_proba(Z)[:, 1]
+
+    def universe(self, X: np.ndarray) -> np.ndarray:
+        return in_universe(X, self.cols) if getattr(self, "kind", "classifier") == "ev" else np.ones(len(np.atleast_2d(X)), bool)
 
 
-def fit(ds: DecisionSet, train: np.ndarray, top_frac: float, max_rows: int = 2_500_000, seed: int = 0) -> SelectorModel:
+def fit(ds: DecisionSet, train: np.ndarray, top_frac: float = 0.01, max_rows: int = MAX_TRAIN_ROWS, seed: int = 0) -> SelectorModel:
+    """Regression of the net return (pessimistic fill, paper costs, clipped to ±100 %) on every eligible training minute."""
     idx = np.flatnonzero(train); rng = np.random.default_rng(seed)
     if len(idx) > max_rows:
         idx = rng.choice(idx, max_rows, replace=False)
     mean, std = ds.X[idx].mean(0), ds.X[idx].std(0) + 1e-6
-    gbm = HistGradientBoostingClassifier(max_iter=150, learning_rate=0.08, max_leaf_nodes=63, min_samples_leaf=200, l2_regularization=1.0, random_state=seed)
-    gbm.fit((ds.X[idx] - mean) / std, ds.y[idx])
-    thr = float(np.quantile(gbm.predict_proba((ds.X[idx] - mean) / std)[:, 1], 1 - top_frac))
-    return SelectorModel(gbm=gbm, mean=mean, std=std, cols=ds.cols, threshold=thr, top_frac=top_frac, horizon_min=int(ds.horizon_s // 60),
-                         trained_through=str(max(ds.day[train])))
+    gbm = HistGradientBoostingRegressor(max_iter=200, learning_rate=0.06, max_leaf_nodes=63, min_samples_leaf=300, l2_regularization=1.0, random_state=seed)
+    gbm.fit((ds.X[idx] - mean) / std, np.clip(ds.fwd_pess[idx], -1.0, 1.0))
+    return SelectorModel(gbm=gbm, mean=mean, std=std, cols=ds.cols, threshold=MIN_EV, top_frac=top_frac, horizon_min=int(ds.horizon_s // 60),
+                         trained_through=str(max(ds.day[train])), kind="ev")
 
 
 @dataclass
@@ -105,8 +125,15 @@ def fold(ds: DecisionSet, D, top_frac: float = 0.01, seed: int = 0, min_train: i
     if train.sum() < min_train or test.sum() < min_test or len(np.unique(ds.y[train])) < 2:
         return None
     m = fit(ds, train, top_frac, seed=seed); full = np.zeros(len(ds.y)); full[test] = m.score(ds.X[test])
+    test = test & _universe_rows(ds, m, test)                                                # only the tradable universe is scored as test rows
     auc = float(roc_auc_score(ds.y[test], full[test])) if len(np.unique(ds.y[test])) == 2 else None
     return Fold(day=test_days[0], model=m, test=test, scores=full, pick=test & (full >= m.threshold), auc=auc)
+
+
+def _universe_rows(ds: DecisionSet, m: SelectorModel, rows: np.ndarray) -> np.ndarray:
+    out = np.zeros(len(ds.y), bool); idx = np.flatnonzero(rows)
+    out[idx] = m.universe(ds.X[idx]) if len(idx) else False
+    return out
 
 
 def _pct(v, fmt: str = "+.2f") -> str:
@@ -135,8 +162,8 @@ def walk_forward(ds: DecisionSet, warmup_days: int = WARMUP_DAYS, block_days: in
             ev = evaluate(ds, fo.scores, test_d, m.threshold)
             rr = random_trades(ds, test_d, int((fo.pick & test_d).sum())); rs = summarize(rr)
             out["per_day"][str(D)] = {**ev["pooled"], "auc": auc, "threshold": m.threshold, "random_mean": rs["mean"]}
-            r = ev["pooled"]; log.info("selector %s: AUC %s | top %.1f%%: n=%s mean %s median %s win %s PF %s | random mean %s", D, f"{auc:.3f}" if auc is not None else "-",
-                                       top_frac * 100, r["n"], _pct(r["mean"]), _pct(r["median"]), _pct(r["win"], ".0f"), f"{r['pf']:.2f}" if r["pf"] is not None else "-", _pct(rs["mean"]))
+            r = ev["pooled"]; log.info("selector %s: AUC %s | predicted >= %s: n=%s mean %s median %s win %s PF %s | random mean %s", D, f"{auc:.3f}" if auc is not None else "-",
+                                       _pct(m.threshold), r["n"], _pct(r["mean"]), _pct(r["median"]), _pct(r["win"], ".0f"), f"{r['pf']:.2f}" if r["pf"] is not None else "-", _pct(rs["mean"]))
             record_event("info", "selector", f"walk-forward {D}", {"day": str(D), "auc": auc, **{k_: v for k_, v in r.items()}, "random_mean": rs["mean"]})
             if r["n"]:
                 rand.append(rr)
@@ -205,7 +232,7 @@ def main(days: int | None = None, top_frac: float = 0.01, horizon_min: int = 30,
     bk = wf["bankroll"]; log.info("bankroll replay of the backtest trades: sized %.2fx (worst drawdown %.0f%%) vs fixed %g SOL %.2fx (worst drawdown %.0f%%)",
                                   bk["sized"]["multiple"] or 0, bk["sized"]["max_drawdown"] * 100, config.MAX_POSITION_SOL, bk["fixed"]["multiple"] or 0, bk["fixed"]["max_drawdown"] * 100)
     final.metrics = {"walk_forward": p, "random_baseline": rb, "costs": "paper broker model", "data": DATA_VERSION, "deployable": deployable, "deploy_reason": why,
-                     "sizing": wf["sizing"], "bankroll": bk,
+                     "sizing": wf["sizing"], "bankroll": bk, "model": {"kind": "ev", "min_ev": MIN_EV, "min_age_h": MIN_AGE_H},
                      "auc_by_day": wf["auc"], "rows": int(len(ds.y)), "days": len(ds.days), "first_day": str(ds.days[0]), "last_day": str(ds.days[-1])}
     path, sid = save(final)
     record_event("info", "selector", f"selector saved (snapshot {sid})", {"path": str(path), "threshold": final.threshold, "deployable": deployable, "reason": why, **p})

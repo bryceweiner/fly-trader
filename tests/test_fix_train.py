@@ -199,11 +199,12 @@ def test_corpus_features_failures_and_atomic_commit(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- train/selector.py
 def _ds(n_days=5, per_day=400, seed=0):
     rng = np.random.default_rng(seed); n = n_days * per_day
-    X = rng.normal(size=(n, 3)).astype(np.float32); y = (X[:, 0] + 0.3 * rng.normal(size=n) > 0).astype(np.int8)
+    X = np.c_[rng.normal(size=(n, 3)), np.zeros((n, 2))].astype(np.float32); y = (X[:, 0] + 0.3 * rng.normal(size=n) > 0).astype(np.int8)
     day = np.array([date(2026, 9, 1) + timedelta(days=k) for k in range(n_days) for _ in range(per_day)], dtype=object)
     ts = np.array([datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp() + 60 * (i % per_day) for i, d in enumerate(day)])
     fwd = np.where(y == 1, 0.05, -0.02).astype(np.float32)
-    return DecisionSet(X=X, y=y, fwd=fwd, fwd_pess=fwd, day=day, ts=ts, mint=np.array([f"M{i % 7}" for i in range(n)]), cols=["a", "b", "c"], horizon_s=1800.0)
+    return DecisionSet(X=X, y=y, fwd=fwd, fwd_pess=fwd, day=day, ts=ts, mint=np.array([f"M{i % 7}" for i in range(n)]),
+                       cols=["a", "b", "c", "age_known", "log_age_h"], horizon_s=1800.0)      # age unknown: graduated before the archive, tradable
 
 
 def test_selector_fold_guards():
@@ -216,3 +217,12 @@ def test_selector_fold_guards():
     assert selector.fold(ds, days[-1], 0.05, min_train=100, min_test=10).auc is None              # single-class test day: no crash
     from fly_trader.train import selector_eval                                                      # importable: runs only as a script
     assert selector_eval.fold is selector.fold
+
+
+def test_selector_trades_only_aged_tokens():
+    ds = _ds(); days = ds.days; young = (ds.mint == "M0")
+    ds.X[young, 3] = 1.0; ds.X[young, 4] = np.log1p(2.0)                                           # M0: known graduation, 2 h old
+    fo = selector.fold(ds, days[-1], 0.05, min_train=100, min_test=10)
+    assert fo.pick.any() and not (fo.pick & young).any() and not (fo.test & young).any()           # never a test row or a pick
+    assert list(selector.in_universe(np.array([[0, 0, 0, 1, np.log1p(30.0)], [0, 0, 0, 1, np.log1p(5.0)], [0, 0, 0, 0, 0]]), ds.cols)) == [True, False, True]
+    assert fo.model.kind == "ev" and fo.model.threshold == selector.MIN_EV
