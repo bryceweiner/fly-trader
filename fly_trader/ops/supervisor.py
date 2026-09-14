@@ -208,6 +208,8 @@ def get_supervisor() -> Supervisor:
 def run_console(port: int = 8501) -> None:
     """`fly-trader ui`: start autostart workers in THIS process, then run Streamlit in the main thread."""
     from .. import config
+    from ..db import schema
+    schema.apply_schema()           # idempotent: tables added to the schema exist before any worker uses them
     sup = get_supervisor()
     try:
         started = sup.autostart()
