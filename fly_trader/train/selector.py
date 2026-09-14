@@ -27,7 +27,7 @@ from .. import config
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from . import progress as prog
-from .decisions import DecisionSet, build, evaluate, summarize, trades_from_picks
+from .decisions import DecisionSet, build, evaluate, random_trades, summarize, trades_from_picks
 
 log = logging.getLogger(__name__)
 SELECTOR_DIR = config.BRAIN_DIR / "selectors"
@@ -87,7 +87,7 @@ def _pct(v, fmt: str = "+.2f") -> str:
 
 
 def walk_forward(ds: DecisionSet, test_days: int = 9, top_frac: float = 0.01, stop: threading.Event | None = None) -> dict:
-    days = ds.days; out = {"per_day": {}, "auc": {}}; trades = []
+    days = ds.days; out = {"per_day": {}, "auc": {}}; trades = []; rand = []
     for k, D in enumerate(days[-test_days:]):
         if stop is not None and stop.is_set():
             break
@@ -96,15 +96,18 @@ def walk_forward(ds: DecisionSet, test_days: int = 9, top_frac: float = 0.01, st
         if fo is None:
             continue
         auc, m = fo.auc, fo.model; out["auc"][str(D)] = auc
-        ev = evaluate(ds, fo.scores, fo.test, m.threshold); out["per_day"][str(D)] = {**ev["pooled"], "auc": auc, "threshold": m.threshold}
-        r = ev["pooled"]; log.info("selector %s: AUC %s | top %.0f%%: n=%s mean %s median %s win %s PF %s", D, f"{auc:.3f}" if auc is not None else "-", top_frac * 100, r["n"],
-                                   _pct(r["mean"]), _pct(r["median"]), _pct(r["win"], ".0f"), f"{r['pf']:.2f}" if r["pf"] is not None else "-")
-        record_event("info", "selector", f"walk-forward {D}", {"day": str(D), "auc": auc, **{k_: v for k_, v in r.items()}})
+        ev = evaluate(ds, fo.scores, fo.test, m.threshold)
+        rr = random_trades(ds, fo.test, int(fo.pick.sum())); rs = summarize(rr)
+        out["per_day"][str(D)] = {**ev["pooled"], "auc": auc, "threshold": m.threshold, "random_mean": rs["mean"]}
+        r = ev["pooled"]; log.info("selector %s: AUC %s | top %.0f%%: n=%s mean %s median %s win %s PF %s | random mean %s", D, f"{auc:.3f}" if auc is not None else "-",
+                                   top_frac * 100, r["n"], _pct(r["mean"]), _pct(r["median"]), _pct(r["win"], ".0f"), f"{r['pf']:.2f}" if r["pf"] is not None else "-", _pct(rs["mean"]))
+        record_event("info", "selector", f"walk-forward {D}", {"day": str(D), "auc": auc, **{k_: v for k_, v in r.items()}, "random_mean": rs["mean"]})
         if r["n"]:
-            trades.append(trades_from_picks(ds, fo.pick))
+            trades.append(trades_from_picks(ds, fo.pick)); rand.append(rr)
     allr = np.concatenate(trades) if trades else np.array([])
     pooled = summarize(allr); pooled["days_positive"] = sum(1 for v in out["per_day"].values() if v["mean"] and v["mean"] > 0); pooled["days"] = len(out["per_day"])
     out["pooled"] = pooled
+    out["random"] = summarize(np.concatenate(rand) if rand else np.array([]))     # same pick counts, costs and fills, no skill
     return out
 
 
@@ -127,7 +130,7 @@ def load_latest() -> SelectorModel | None:
 
 def main(days: int = 45, test_days: int = 9, top_frac: float = 0.01, horizon_min: int = 30, stop_event: threading.Event | None = None) -> dict:
     from ..ops.reset import reset_training_stats
-    reset_training_stats(reason="selector training")
+    reset_training_stats("selector", reason="selector training")
     prog.set_stop_event(stop_event); prog.clear()
     prog.update("selector: building decision points", 0, 1, force=True)
     t0 = time.time(); ds = build(days=days, horizon_min=horizon_min)
@@ -137,11 +140,12 @@ def main(days: int = 45, test_days: int = 9, top_frac: float = 0.01, horizon_min
     wf = walk_forward(ds, test_days=test_days, top_frac=top_frac, stop=stop_event)
     p = wf["pooled"]; log.info("selector walk-forward pooled: n=%s mean %s median %s win %s PF %s days positive %s/%s", p["n"],
                               f"{(p['mean'] or 0)*100:+.2f}%", f"{(p['median'] or 0)*100:+.2f}%", f"{(p['win'] or 0)*100:.0f}%", f"{p['pf']:.2f}" if p["pf"] else "-", p["days_positive"], p["days"])
-    prog.update("selector: walk-forward done", test_days, test_days, force=True, walk_forward=p)
+    rb = wf["random"]; log.info("random baseline (same pick counts, costs, fills): n=%s mean %s median %s win %s", rb["n"], _pct(rb["mean"]), _pct(rb["median"]), _pct(rb["win"], ".0f"))
+    prog.update("selector: walk-forward done", test_days, test_days, force=True, walk_forward=p, random_baseline=rb)
     if stop_event is not None and stop_event.is_set():
         return wf
     prog.update("selector: fitting deployable model", 0, 1, force=True)
-    final = fit(ds, np.ones(len(ds.y), bool), top_frac, seed=99); final.metrics = {"walk_forward": p, "auc_by_day": wf["auc"], "rows": int(len(ds.y)), "days": len(ds.days)}
+    final = fit(ds, np.ones(len(ds.y), bool), top_frac, seed=99); final.metrics = {"walk_forward": p, "random_baseline": rb, "costs": "paper broker model", "auc_by_day": wf["auc"], "rows": int(len(ds.y)), "days": len(ds.days)}
     path, sid = save(final)
     record_event("info", "selector", f"selector saved (snapshot {sid})", {"path": str(path), "threshold": final.threshold, **p})
     prog.update("selector: saved", 1, 1, force=True, snapshot_id=sid, path=str(path), threshold=final.threshold)

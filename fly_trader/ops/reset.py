@@ -30,7 +30,8 @@ _LIVE_DECISIONS = ("SELECT decision_id FROM orders WHERE book = 'live' AND decis
 WIPE_TABLES = ["beats", "beat_slots", "brain_activity", "rewards", "wealth_marks", "synapse_updates",
                "slot_visits"]
 BOOK_TABLES = ["positions", "orders", "fills"]
-TRAINING_EVENTS = ("(source IN ('fly_selector', 'ppo') OR (source = 'selector' AND (message LIKE 'walk-forward%' OR message LIKE 'selector saved%')))")
+TRAINING_EVENTS = {"selector": "(source = 'selector' AND (message LIKE 'walk-forward%' OR message LIKE 'selector saved%'))",   # per regimen: a fly
+                   "fly_selector": "source = 'fly_selector'", "ppo": "source = 'ppo'"}                                               # run keeps the selector's
 
 
 def _archive(conn, table: str, where: str, out_dir: Path) -> int:
@@ -82,16 +83,18 @@ def reset_training_state(reason: str = "runner start", archive: bool = True) -> 
     return {"archived_to": str(out_dir) if archive else None, "rows": counts}
 
 
-def reset_training_stats(reason: str = "training start", archive: bool = True) -> dict:
-    """Clear the previous training runs' statistics (walk-forward, iteration and comparison events; the console's training
-    status) so a new run's numbers are never shown next to an old run's. Trained models (brain_snapshots) are kept."""
-    out_dir = config.PG_ARCHIVE_DIR / f"training_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+def reset_training_stats(regimen: str, reason: str = "training start", archive: bool = True) -> dict:
+    """Clear the previous runs' statistics of this training ``regimen`` (selector walk-forward, fly comparisons, PPO
+    iterations; the console's training status) so a new run's numbers are never shown next to an old run's.
+    Other regimens' results and all trained models (brain_snapshots) are kept."""
+    where = TRAINING_EVENTS[regimen]
+    out_dir = config.PG_ARCHIVE_DIR / f"training_{regimen}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     with transaction() as conn:
         n = 0
         if archive:
             out_dir.mkdir(parents=True, exist_ok=True)
-            n = _archive(conn, "events", "WHERE " + TRAINING_EVENTS, out_dir)
-        conn.execute("DELETE FROM events WHERE " + TRAINING_EVENTS)
+            n = _archive(conn, "events", "WHERE " + where, out_dir)
+        conn.execute("DELETE FROM events WHERE " + where)
         conn.execute("DELETE FROM ui_settings WHERE key = 'training_status'")
     log.info("training stats reset (%s): %d events", reason, n)
     return {"archived_to": str(out_dir) if archive else None, "events": n}

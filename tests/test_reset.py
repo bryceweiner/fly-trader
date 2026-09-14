@@ -33,14 +33,17 @@ def test_selector_status_cleared_and_training_stats_reset(db_conn, tmp_path, mon
     reset_training_state(reason="test")
     with transaction() as conn:
         assert conn.execute("SELECT count(*) AS n FROM ui_settings WHERE key = 'selector_status'").fetchone()["n"] == 0
-    out = reset_training_stats(reason="test")
+    out = reset_training_stats("selector", reason="test")
+    msgs = ("('walk-forward 2026-09-01','selector saved (snapshot 1)','iteration 3','selector session started')")
     with transaction() as conn:
-        left = [r["message"] for r in conn.execute("SELECT message FROM events WHERE source IN ('selector','ppo') AND message IN "
-                                                    "('walk-forward 2026-09-01','selector saved (snapshot 1)','iteration 3','selector session started')").fetchall()]
-        assert left == ["selector session started"]                         # session events are not training stats
+        left = sorted(r["message"] for r in conn.execute("SELECT message FROM events WHERE source IN ('selector','ppo') AND message IN " + msgs).fetchall())
+        assert left == ["iteration 3", "selector session started"]         # another regimen's stats and session events stay
         assert conn.execute("SELECT count(*) AS n FROM ui_settings WHERE key = 'training_status'").fetchone()["n"] == 0
+    assert out["events"] >= 2
+    reset_training_stats("ppo", reason="test")
+    with transaction() as conn:
+        assert [r["message"] for r in conn.execute("SELECT message FROM events WHERE source IN ('selector','ppo') AND message IN " + msgs).fetchall()] == ["selector session started"]
         conn.execute("DELETE FROM events WHERE message = 'selector session started'")
-    assert out["events"] >= 3
 
 
 def test_selector_runner_resets_on_start(monkeypatch):

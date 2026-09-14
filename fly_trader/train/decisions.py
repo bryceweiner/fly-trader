@@ -4,7 +4,10 @@ Rows come from ``train/mature.py`` feature parts (pump.fun-origin PumpSwap token
 fed through the live feature engine) joined with ``corpus_meta`` creation-time and creator columns. Eligible =
 pool ≥ 20 SOL, 15-minute volume ≥ 5 SOL, contamination-free series, and a full label horizon ahead.
 Label: net forward return over ``horizon_min`` (fill at the signal minute's close; ``fwd_pess`` fills at the
-next traded minute's open) after a ``fee`` round trip; ``y`` = return above ``label_thr``.
+next traded minute's open) after trading costs; ``y`` = return above ``label_thr``. Costs default to the paper
+broker's model on both sides (``exit_cost_0p1``: Jupiter fee by token age + pool fee + constant-product impact of a
+0.1 SOL position; entry at the signal minute, exit at the exit minute) — the same costs the paper book pays. A flat
+``fee`` round trip can be given instead (tests, sensitivity runs). ``random_trades`` is the no-skill baseline.
 """
 from __future__ import annotations
 
@@ -53,7 +56,7 @@ class DecisionSet:
         return m
 
 
-def build(days: int | None = 45, horizon_min: int = 30, fee: float = 0.006, label_thr: float = 0.03, feature_dir=None) -> DecisionSet:
+def build(days: int | None = 45, horizon_min: int = 30, fee: float | None = None, label_thr: float = 0.03, feature_dir=None) -> DecisionSet:
     root = feature_dir or (config.CORPUS_DIR / "features_mature")
     files = sorted(glob.glob(str(root / "*" / "part.parquet")))
     if days:
@@ -76,10 +79,12 @@ def build(days: int | None = 45, horizon_min: int = 30, fee: float = 0.006, labe
     ts = _epoch_s(df["ts"]); cl = df["close"].to_numpy(); op = df["open"].to_numpy()
     mints = df["mint"].to_numpy(); starts = np.r_[0, np.flatnonzero(mints[1:] != mints[:-1]) + 1, len(mints)]
     fwd = np.full(len(df), np.nan); fwdp = np.full(len(df), np.nan)
+    ec = np.clip(df["exit_cost_0p1"].to_numpy(dtype=float), 0.0, 1.0) if fee is None else None   # one-side cost fraction per minute
     for s, e in zip(starts[:-1], starts[1:]):
         t = ts[s:e]; j = np.searchsorted(t, t + H, side="right") - 1 + s
         exit_px = cl[j]
-        fwd[s:e] = exit_px / cl[s:e] * (1 - fee) - 1
+        keep = (1 - ec[s:e]) * (1 - ec[j]) if fee is None else 1 - fee
+        fwd[s:e] = exit_px / cl[s:e] * keep - 1
         c = cl[s:e]                                  # an exit on a one-minute print 50x off that reverts the next minute is a data artifact
         if e - s > 2:
             r_prev = np.r_[1.0, c[1:] / c[:-1]]; r_next = np.r_[c[1:] / c[:-1], 1.0]
@@ -89,7 +94,7 @@ def build(days: int | None = 45, horizon_min: int = 30, fee: float = 0.006, labe
         if e - s > 1:
             nxt_ok = np.r_[np.diff(t) <= 120.0, False]
             idx = np.flatnonzero(nxt_ok); entry[idx] = op[s + idx + 1]
-        fwdp[s:e] = exit_px / entry * (1 - fee) - 1
+        fwdp[s:e] = exit_px / entry * keep - 1
     hod = df["ts"].dt.hour + df["ts"].dt.minute / 60.0
     df["hod_s"], df["hod_c"] = np.sin(2 * np.pi * hod / 24), np.cos(2 * np.pi * hod / 24)
     df["age_known"] = df["age_h"].notna().astype(np.float32)
@@ -119,6 +124,19 @@ def trades_from_picks(ds: DecisionSet, pick: np.ndarray, returns: np.ndarray | N
             out.append(r_all[i]); days.append(ds.day[i]); last_t = ds.ts[i]
     r = np.asarray(out, dtype=np.float32)
     return (r, np.asarray(days, dtype=object)) if with_days else r
+
+
+def random_trades(ds: DecisionSet, rows: np.ndarray, n_picks: int, seeds: int = 20) -> np.ndarray:
+    """The no-skill baseline: ``n_picks`` random minutes among ``rows`` (the model's pick count on the same eligible
+    minutes), traded with the same hold rule, fills and costs; ``seeds`` draws pooled."""
+    idx = np.flatnonzero(rows)
+    if n_picks <= 0 or len(idx) == 0:
+        return np.array([], dtype=np.float32)
+    out = []
+    for s in range(seeds):
+        pick = np.zeros(len(ds.y), bool); pick[np.random.default_rng(s).choice(idx, min(n_picks, len(idx)), replace=False)] = True
+        out.append(trades_from_picks(ds, pick))
+    return np.concatenate(out)
 
 
 def summarize(r: np.ndarray) -> dict:

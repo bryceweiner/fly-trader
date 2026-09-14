@@ -28,7 +28,7 @@ from ..brain.policy import ConnectomePolicy, SubConnectome
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from . import progress as prog
-from .decisions import DecisionSet, build, evaluate, summarize, trades_from_picks
+from .decisions import DecisionSet, build, evaluate, random_trades, summarize, trades_from_picks
 
 log = logging.getLogger(__name__)
 
@@ -103,7 +103,7 @@ def main(days: int = 45, test_days: int = 9, top_frac: float = 0.01, horizon_min
          stop_event: threading.Event | None = None) -> dict:
     """Single-split comparison: train on days ≤ D_cut−2, score the last ``test_days`` days, same protocol for the GBM."""
     from ..ops.reset import reset_training_stats
-    reset_training_stats(reason="fly selector training")
+    reset_training_stats("fly_selector", reason="fly selector training")
     prog.set_stop_event(stop_event); prog.clear()
     prog.update("fly selector: building decision points", 0, 1, force=True)
     ds = build(days=days, horizon_min=horizon_min); dl = ds.days; D_cut = dl[-test_days]
@@ -123,10 +123,12 @@ def main(days: int = 45, test_days: int = 9, top_frac: float = 0.01, horizon_min
     thr = fly.set_threshold(ds, train, top_frac)
     fs = np.zeros(len(ds.y)); fs[test] = fly.score(ds.X[test]); f_auc = float(roc_auc_score(ds.y[test], fs[test]))
     f_ev = evaluate(ds, fs, test, thr, "fly")
-    verdict = {"fly": {"auc": f_auc, **f_ev["pooled"]}, "gbm": {"auc": g_auc, **g_ev["pooled"]}, "fly_beats_gbm": bool((f_ev["pooled"]["mean"] or -1) > (g_ev["pooled"]["mean"] or -1)),
+    rnd = summarize(random_trades(ds, test, int((test & (fs >= thr)).sum())))          # no-skill baseline at the fly's pick count
+    verdict = {"fly": {"auc": f_auc, **f_ev["pooled"]}, "gbm": {"auc": g_auc, **g_ev["pooled"]}, "random": rnd,
+               "fly_beats_gbm": bool((f_ev["pooled"]["mean"] or -1) > (g_ev["pooled"]["mean"] or -1)),
                "per_day_fly": f_ev["per_day"], "per_day_gbm": g_ev["per_day"], "fit": fit_info, "test_days": [str(D_cut), str(dl[-1])]}
     log.info("fly selector: AUC %.3f | %s | beats GBM: %s", f_auc, f_ev["pooled"], verdict["fly_beats_gbm"])
-    record_event("info", "fly_selector", "fly vs gbm (single split)", {"fly": verdict["fly"], "gbm": verdict["gbm"], "fly_beats_gbm": verdict["fly_beats_gbm"]})
-    path, sid = fly.save({k: verdict[k] for k in ("fly", "gbm", "fly_beats_gbm", "test_days")})
-    prog.update("fly selector: done", 1, 1, force=True, snapshot_id=sid, verdict={k: verdict[k] for k in ("fly", "gbm", "fly_beats_gbm")})
+    record_event("info", "fly_selector", "fly vs gbm (single split)", {"fly": verdict["fly"], "gbm": verdict["gbm"], "random": rnd, "fly_beats_gbm": verdict["fly_beats_gbm"]})
+    path, sid = fly.save({k: verdict[k] for k in ("fly", "gbm", "random", "fly_beats_gbm", "test_days")})
+    prog.update("fly selector: done", 1, 1, force=True, snapshot_id=sid, verdict={k: verdict[k] for k in ("fly", "gbm", "random", "fly_beats_gbm")})
     return verdict

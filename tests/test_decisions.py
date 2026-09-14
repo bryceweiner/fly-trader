@@ -59,6 +59,19 @@ def test_labels_fills_and_past_only_rule(tmp_path):
     assert ds.fwd[ib5] == pytest.approx(0.0, abs=1e-6)          # its mark (minute 35) is back at 1.0
 
 
+def test_model_costs_on_both_sides_and_random_baseline(tmp_path):
+    t0 = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    rows = []
+    for k in range(80):                                   # flat price; entry minutes cost 1 %, the rest 2 % one-way
+        r = _row("C", t0 + timedelta(minutes=k), 1.0); r["exit_cost_0p1"] = 0.01 if k < 10 else 0.02; rows.append(r)
+    ds = decisions.build(days=None, feature_dir=_part(tmp_path, rows), horizon_min=30)   # default: the paper broker's cost model
+    i0 = np.flatnonzero(ds.ts == t0.timestamp())[0]
+    assert ds.fwd[i0] == pytest.approx(0.99 * 0.98 - 1, abs=1e-6)          # entry cost at the signal minute, exit cost at the exit minute
+    rr = decisions.random_trades(ds, np.ones(len(ds.y), bool), 3, seeds=2)
+    assert len(rr) >= 2 and (rr < 0).all()                                  # a flat market loses exactly the costs
+    assert len(decisions.random_trades(ds, np.ones(len(ds.y), bool), 0)) == 0
+
+
 def test_trades_respect_hold_and_summaries():
     ts = np.array([0.0, 60.0, 120.0, 1800.0, 1900.0, 0.0], dtype=float)
     ds = decisions.DecisionSet(X=np.zeros((6, 1), np.float32), y=np.zeros(6, np.int8), fwd=np.array([0.1, 0.2, 0.3, 0.4, 0.5, -0.1], np.float32),
