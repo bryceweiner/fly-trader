@@ -29,11 +29,12 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .. import config
+from .. import config, logging_setup
 from ..db.connection import transaction
-from ..market.features import D, FEATURES, FIDX, TokenMeta, TokenState
+from ..market.features import FEATURE_VERSION, FEATURES, FIDX, TokenMeta, TokenState
 
 log = logging.getLogger(__name__)
+_failed: set[str] = set()      # tokens whose build raised in this process: skipped until restart, never registered
 CANDLE_ONLY_MASKED = ["imb_1m", "imb_5m", "imb_15m", "imb_1h", "logn_1m", "logn_5m", "logn_15m", "logn_1h",
                       "logsigners_15m", "logsigners_1h", "hawkes", "log_since_last", "vpin_15m"]
 PROXY_STATS = ["log_holders", "top_holders_pct", "net_buyers_1h", "holder_change_1h"]
@@ -178,20 +179,32 @@ def build_token(mint: str, graduated_at: datetime, candle_path: str | None, trad
 
 def _pending(limit: int) -> list[dict]:
     with transaction() as conn:
-        return conn.execute("SELECT t.mint, t.graduated_at, t.candle_path, t.trade_path FROM corpus_tokens t LEFT JOIN corpus_features f USING (mint) "
-                            "WHERE t.status = 'done' AND f.mint IS NULL ORDER BY t.graduated_at DESC LIMIT %s", (limit,)).fetchall()
+        rows = conn.execute("SELECT t.mint, t.graduated_at, t.candle_path, t.trade_path FROM corpus_tokens t LEFT JOIN corpus_features f USING (mint) "
+                            "WHERE t.status = 'done' AND f.mint IS NULL ORDER BY t.graduated_at DESC LIMIT %s", (limit + len(_failed),)).fetchall()
+    return [r for r in rows if r["mint"] not in _failed][:limit]
 
 
-def _write_parts(rows_by_day: dict[str, list[dict]]) -> dict[str, str]:
-    paths = {}
-    for day, rows in rows_by_day.items():
-        d = config.CORPUS_FEATURES_DIR / day; d.mkdir(parents=True, exist_ok=True)
-        path = d / f"part-{int(time.time() * 1000)}.parquet"
-        from ..market.features import FEATURE_VERSION
-        t = pa.Table.from_pylist(rows, schema=SCHEMA)
-        pq.write_table(t.replace_schema_metadata({b"fly_version": str(FEATURE_VERSION).encode()}), path, compression="zstd")
-        paths[day] = str(path)
-    return paths
+def _commit_parts(rows_by_day: dict[str, list[dict]], reg: list[tuple]) -> None:
+    """Parts are written to temp files and renamed into place inside the registry transaction: a failed insert leaves
+    neither a part nor a registration, so the tokens are rebuilt once, never duplicated."""
+    ms = int(time.time() * 1000); staged = []
+    try:
+        for day, rows in rows_by_day.items():
+            if not rows:
+                continue
+            path = config.CORPUS_FEATURES_DIR / day / f"part-{ms}.parquet"; path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.tmp")
+            pq.write_table(pa.Table.from_pylist(rows, schema=SCHEMA).replace_schema_metadata({b"fly_version": str(FEATURE_VERSION).encode()}), tmp, compression="zstd")
+            staged.append((day, tmp, path))
+        paths = {day: str(path) for day, _, path in staged}
+        with transaction() as conn:
+            conn.cursor().executemany("INSERT INTO corpus_features (mint, rows, trade_rows, has_trades, path) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (mint) DO NOTHING",
+                                      [(m, r, tr, ht, paths.get(day)) for m, r, tr, ht, day in reg])
+            for _, tmp, path in staged:
+                tmp.replace(path)
+    finally:
+        for _, tmp, _ in staged:
+            tmp.unlink(missing_ok=True)
 
 
 def _status(**kv) -> None:
@@ -204,7 +217,8 @@ def _status(**kv) -> None:
 
 
 def build_batch(limit: int = 200) -> int:
-    """Build features for up to ``limit`` pulled tokens without rows yet. Returns tokens built."""
+    """Build features for up to ``limit`` pulled tokens without rows yet. Returns tokens attempted (a token whose build
+    raises is not registered, so a later process retries it; this one skips it)."""
     todo = _pending(limit)
     if not todo:
         return 0
@@ -213,16 +227,14 @@ def build_batch(limit: int = 200) -> int:
         try:
             rows, n_trade = build_token(t["mint"], t["graduated_at"], t["candle_path"], t["trade_path"])
         except Exception as e:
-            log.warning("features %s failed: %s", t["mint"], e); rows, n_trade = [], 0
+            log.warning("features %s failed: %s", t["mint"], e); _failed.add(t["mint"]); continue
         day = t["graduated_at"].astimezone(timezone.utc).date().isoformat()
         rows_by_day[day].extend(rows)
         reg.append((t["mint"], len(rows), n_trade, n_trade > 0, day))
-    paths = _write_parts(rows_by_day)
-    with transaction() as conn:
-        conn.cursor().executemany("INSERT INTO corpus_features (mint, rows, trade_rows, has_trades, path) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (mint) DO NOTHING",
-                                  [(m, r, tr, ht, paths.get(day)) for m, r, tr, ht, day in reg])
+    if reg:
+        _commit_parts(rows_by_day, reg)
     n_rows = sum(len(v) for v in rows_by_day.values())
-    log.info("features: %d tokens, %d rows in %.1fs", len(todo), n_rows, time.time() - t0)
+    log.info("features: %d tokens (%d failed), %d rows in %.1fs", len(todo), len(todo) - len(reg), n_rows, time.time() - t0)
     return len(todo)
 
 
@@ -247,8 +259,7 @@ def build_loop(stop_event: threading.Event | None = None, idle_s: float = 20.0) 
 
 def main() -> None:
     """CLI: build everything pending, then exit."""
-    from ..logging_setup import setup
-    setup("corpus")
+    logging_setup.setup("corpus")
     total = 0
     while True:
         n = build_batch(500)

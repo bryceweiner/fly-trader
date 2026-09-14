@@ -118,13 +118,16 @@ class ExecutionWorker:
                     return ExecResult(req, True, fr.fill_id, fr.signature, fr.token_delta, fr.lamports_delta, price, position_id=pid)
                 else:
                     proceeds = fr.lamports_delta / config.LAMPORTS_PER_SOL
-                    pos = conn.execute("SELECT * FROM positions WHERE id=%s", (req.position_id,)).fetchone()
-                    price = fr.price_sol or (proceeds / max(abs(fr.token_delta) / (10 ** req.decimals), 1e-12))
-                    remaining = int(pos["qty"]) + fr.token_delta  # token_delta negative
-                    if remaining > max(1, int(pos["qty"]) // 200):  # partial fill: keep the remainder open
-                        conn.execute("UPDATE positions SET qty=%s, cost_sol=cost_sol*%s WHERE id=%s",
-                                     (remaining, remaining / max(int(pos["qty"]), 1), req.position_id))
-                        realized = proceeds - float(pos["cost_sol"]) * (1 - remaining / max(int(pos["qty"]), 1))
+                    pos = conn.execute("SELECT * FROM positions WHERE id=%s FOR UPDATE", (req.position_id,)).fetchone()
+                    price = fr.price_sol if fr.price_sol is not None else (proceeds / max(abs(fr.token_delta) / (10 ** req.decimals), 1e-12))
+                    remaining = int(pos["qty"]) + fr.token_delta if pos else 0  # token_delta negative
+                    if pos is None or pos["status"] != "open":   # closed elsewhere: the fill row stands, nothing is booked twice
+                        log.warning("sell of %s filled but position %s is not open; not booked", req.mint, req.position_id)
+                        realized = None
+                    elif remaining > max(1, int(pos["qty"]) // 200):  # partial fill: keep the remainder open
+                        realized = ledger.realize_partial(conn, position_id=req.position_id, qty_raw=-fr.token_delta,
+                                                          cost_part=float(pos["cost_sol"]) * (1 - remaining / max(int(pos["qty"]), 1)),
+                                                          proceeds_sol=proceeds, fees_sol=0.0, price=price, ts=ts)
                     else:
                         realized = ledger.close_position(conn, position_id=req.position_id, exit_price=price, proceeds_sol=proceeds,
                                                          fees_sol=0.0, decision_id=req.decision_id, forced_kind=req.forced_kind, ts=ts)

@@ -6,8 +6,8 @@ token-intrinsic subset; LP-position slots are dropped. Every feature is standard
 (Welford running moments in the encoder), so scales only need to be consistent.
 
 Data structures: append-only Python lists with prefix sums, so each window statistic is O(log n)
-via bisect; unique-signer counts use sliding counters with eviction pointers. Lists are compacted
-when they hold more than twice the 3 h window.
+via bisect; window highs use per-block maxima; unique-signer counts use sliding counters with eviction
+pointers. Lists are compacted when they hold more than twice the 3 h window.
 """
 from __future__ import annotations
 
@@ -22,6 +22,8 @@ from .exit_cost import exit_cost_fraction
 WINDOWS = {"1m": 60.0, "5m": 300.0, "15m": 900.0, "1h": 3600.0, "3h": 10800.0}
 HAWKES_BETA = 1.0 / 60.0  # per second; intensity decays with a 1-minute time constant
 EWMA_1H_TAU_S = 3600.0  # 1-hour time constant of the price EWMA (continuous time, seconds)
+EXIT_COST_SIZE_SOL = 0.1  # exit_cost_0p1 is priced for a fixed 0.1 SOL position (not the configured size)
+HIGH_BLOCK = 256         # block size of the running window-high index
 FEATURE_VERSION = 2      # bump on any change to feature values; stored feature parts from another version are rebuilt
 
 FEATURES: list[str] = [
@@ -66,7 +68,7 @@ class TokenState:
     last_price: float | None = None
     last_res_quote_sol: float | None = None
     ewma_1h: float | None = None
-    high_1h_cache: tuple[float, float] | None = None
+    blk_max: list[float] = field(default_factory=list)   # max log price of each HIGH_BLOCK-entry block of logp (window highs)
     sig_ptr: dict[str, int] = field(default_factory=lambda: {"15m": 0, "1h": 0})
     sig_cnt: dict[str, Counter] = field(default_factory=lambda: {"15m": Counter(), "1h": Counter()})
     n_since_compact: int = 0
@@ -90,6 +92,10 @@ class TokenState:
             self.ewma_1h = price
         self.ts.append(ts)
         self.logp.append(lp)
+        if (len(self.logp) - 1) % HIGH_BLOCK == 0:
+            self.blk_max.append(lp)
+        elif lp > self.blk_max[-1]:
+            self.blk_max[-1] = lp
         self.cum_vol.append(self.cum_vol[-1] + sol_vol)
         self.cum_buy.append(self.cum_buy[-1] + (sol_vol if is_buy else 0.0))
         h = hash(signer) if signer else 0
@@ -108,7 +114,7 @@ class TokenState:
         return len(self.ts) - bisect_left(self.ts, t0)
 
     def _compact(self, t0: float) -> None:
-        i = bisect_left(self.ts, t0)
+        i = max(0, bisect_left(self.ts, t0) - 1)   # keep the last trade before the window: it is the window's start price
         if i <= 0:
             self.n_since_compact = 0
             return
@@ -125,6 +131,7 @@ class TokenState:
         self.cum_vol = [x - base_vol for x in self.cum_vol[i:]]
         self.cum_buy = [x - base_buy for x in self.cum_buy[i:]]
         self.cum_sq = [x - base_sq for x in self.cum_sq[i:]]
+        self.blk_max = [max(self.logp[j:j + HIGH_BLOCK]) for j in range(0, len(self.logp), HIGH_BLOCK)]
         for k in self.sig_ptr:
             self.sig_ptr[k] = max(0, self.sig_ptr[k] - i)
         self.n_since_compact = 0
@@ -141,6 +148,12 @@ class TokenState:
                 del cnt[h]
             ptr += 1
         self.sig_ptr[key] = ptr
+
+    def high_from(self, i: int) -> float:
+        """Max log price of entries i..n-1 (i < n): the head of i's block, then whole-block maxima."""
+        b = i // HIGH_BLOCK + 1
+        hi = max(self.logp[i:b * HIGH_BLOCK])
+        return max(hi, max(self.blk_max[b:])) if b < len(self.blk_max) else hi
 
     def volume_since(self, t0: float) -> float:
         i = bisect_left(self.ts, t0)
@@ -212,8 +225,7 @@ class TokenState:
         for k in ("1h", "3h"):
             i = idx[k]
             if avail[k]:
-                hi = max(self.logp[i:]) if n - i <= 5000 else max(self.logp[i:i + 5000] + self.logp[-1:])
-                f[FIDX[f"dd_{k}"]] = lp_now - hi
+                f[FIDX[f"dd_{k}"]] = lp_now - self.high_from(i)
                 mask |= 1 << FIDX[f"dd_{k}"]
         if self.ewma_1h:
             f[FIDX["overext_1h"]] = p_now / self.ewma_1h - 1.0
@@ -236,7 +248,7 @@ class TokenState:
         f[FIDX["vol_divergence"]] = math.log1p((self.cum_vol[-1] - self.cum_vol[idx["5m"]]) / 5.0) - \
             math.log1p((self.cum_vol[-1] - self.cum_vol[idx["1h"]]) / 60.0)
         mask |= (1 << FIDX["mom_decel"]) | (1 << FIDX["vol_divergence"])
-        f[FIDX["exit_cost_0p1"]] = exit_cost_fraction(config.MAX_POSITION_SOL, liq, age_h, meta.program_label)
+        f[FIDX["exit_cost_0p1"]] = exit_cost_fraction(EXIT_COST_SIZE_SOL, liq, age_h, meta.program_label)
         mask |= 1 << FIDX["exit_cost_0p1"]
         # Jupiter token stats
         st = meta.stats

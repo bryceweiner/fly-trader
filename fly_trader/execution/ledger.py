@@ -1,6 +1,9 @@
 """Positions and fills bookkeeping per book (live, paper_free, paper_mirror).
 
-Paper cash is derived, never stored: cash = CAPITAL_SOL + Σ realized_sol(closed) − Σ cost_sol(open).
+Paper cash is derived, never stored: cash = CAPITAL_SOL + Σ realized_sol(all) − Σ cost_sol(open).
+realized_sol accumulates per position: each partial sale books proceeds − the cost it retires (cost_sol
+shrinks by that part) and the close adds proceeds − the remaining cost, so an open position may carry
+realized P&L from partial sales.
 Live cash is the on-chain SOL balance. Every open/close writes positions rows; every fill writes a
 fills row (verified_by = 'balance_delta' for live, 'model' for paper).
 """
@@ -28,7 +31,7 @@ def open_positions(conn, book: str) -> list[dict]:
 
 def paper_cash(conn, book: str) -> float:
     r = conn.execute(
-        """SELECT COALESCE(sum(realized_sol) FILTER (WHERE status = 'closed'), 0) AS realized,
+        """SELECT COALESCE(sum(realized_sol), 0) AS realized,
                   COALESCE(sum(cost_sol) FILTER (WHERE status = 'open'), 0) AS open_cost
            FROM positions WHERE book = %s""",
         (book,),
@@ -71,17 +74,34 @@ def open_position(conn, *, book: str, mint: str, pool: str | None, qty_raw: int,
     return int(row["id"])
 
 
-def close_position(conn, *, position_id: int, exit_price: float, proceeds_sol: float, fees_sol: float,
-                   decision_id: int | None, forced_kind: str | None, ts: datetime | None = None) -> float:
+def realize_partial(conn, *, position_id: int, qty_raw: int, cost_part: float, proceeds_sol: float, fees_sol: float,
+                    price: float, ts: datetime | None = None) -> float | None:
+    """Shrink an open position by qty_raw / cost_part and book proceeds − cost_part into realized_sol.
+    Returns this sale's realized P&L, or None when the position is no longer open (nothing booked)."""
     ts = ts or datetime.now(timezone.utc)
-    p = conn.execute("SELECT cost_sol FROM positions WHERE id=%s", (position_id,)).fetchone()
-    realized = proceeds_sol - float(p["cost_sol"])
-    conn.execute(
-        """UPDATE positions SET status='closed', closed_at=%s, exit_decision_id=%s, exit_price=%s, realized_sol=%s,
-             fees_sol=fees_sol+%s, forced_exit_kind=%s, last_mark_price=%s, last_mark_ts=%s WHERE id=%s""",
-        (ts, decision_id, exit_price, realized, fees_sol, forced_kind, exit_price, ts, position_id),
-    )
-    return realized
+    realized = proceeds_sol - cost_part
+    r = conn.execute(
+        """UPDATE positions SET qty = qty - %s, cost_sol = cost_sol - %s, realized_sol = COALESCE(realized_sol, 0) + %s,
+             fees_sol = fees_sol + %s, last_mark_price=%s, last_mark_ts=%s WHERE id=%s AND status='open' RETURNING id""",
+        (qty_raw, cost_part, realized, fees_sol, price, ts, position_id)).fetchone()
+    return realized if r else None
+
+
+def close_position(conn, *, position_id: int, exit_price: float, proceeds_sol: float, fees_sol: float,
+                   decision_id: int | None, forced_kind: str | None, ts: datetime | None = None) -> float | None:
+    """Close an open position; realized_sol accumulates (earlier partial sales + proceeds − remaining cost).
+    Returns this sale's realized P&L, or None when the position was not open (already closed: nothing booked)."""
+    ts = ts or datetime.now(timezone.utc)
+    r = conn.execute(
+        """UPDATE positions SET status='closed', closed_at=%s, exit_decision_id=%s, exit_price=%s,
+             realized_sol=COALESCE(realized_sol, 0) + %s - cost_sol, fees_sol=fees_sol+%s, forced_exit_kind=%s,
+             last_mark_price=%s, last_mark_ts=%s WHERE id=%s AND status='open' RETURNING %s - cost_sol AS realized""",
+        (ts, decision_id, exit_price, proceeds_sol, fees_sol, forced_kind, exit_price, ts, position_id, proceeds_sol),
+    ).fetchone()
+    if r is None:
+        log.warning("close_position: position %s is not open; nothing booked", position_id)
+        return None
+    return float(r["realized"])
 
 
 def mark_positions(conn, book: str, prices: dict[str, float], last_swaps: dict[str, float], ts: datetime,

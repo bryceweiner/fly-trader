@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from urllib.parse import urlparse
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 
 from .. import config
@@ -25,9 +25,7 @@ def database_url() -> str:
 
 
 def database_name(url: str | None = None) -> str:
-    url = url or database_url()
-    path = urlparse(url).path or ""
-    return path.lstrip("/") or "fly_trader"
+    return conninfo_to_dict(url or database_url()).get("dbname") or "fly_trader"   # URL or key=value DSN
 
 
 def _refuse_production_under_pytest(url: str) -> None:

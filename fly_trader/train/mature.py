@@ -17,14 +17,19 @@ mask as absent), Jupiter stats stay masked. Age and price-vs-graduation come fro
 graduation is inside the archive (``corpus_meta.graduated_at``, the source live uses too); older tokens carry NaN age.
 Output: ``data/corpus/features_mature/<day>/part.parquet``. Both outputs carry a version in their Parquet metadata
 (``AGG_VERSION``, ``market.features.FEATURE_VERSION``); ``loop_once`` rebuilds any file from another version and moves
-the old one to ``data/corpus/_mature_stale/``.
+the old one to ``data/corpus/_mature_stale/``. Feature parts also record how many of their mints had a known graduation
+(``fly_known``); a part is rebuilt once ``corpus_meta`` dates more of them (older days are backfilled after newer ones).
 """
 from __future__ import annotations
 
+import fcntl
 import logging
 import math
+import os
+import threading
 import time
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import duckdb
 import numpy as np
@@ -32,10 +37,10 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .. import config
+from .. import config, logging_setup
 from ..db.connection import transaction
 from ..market.features import FEATURE_VERSION, FIDX, TokenMeta, TokenState
-from .corpus_features import SCHEMA as FEAT_SCHEMA, PRE_COLS, _row
+from .corpus_features import SCHEMA as FEAT_SCHEMA, PRE_COLS, _epoch_s, _row
 
 log = logging.getLogger(__name__)
 MATURE_DIR = config.CORPUS_DIR / "mature"
@@ -55,18 +60,27 @@ def part_version(path) -> int:
         return 0
 
 
-def write_part(table: pa.Table, path, version: int) -> None:
-    """Atomic write with the version in the Parquet metadata."""
-    path = __import__("pathlib").Path(path); path.parent.mkdir(parents=True, exist_ok=True)
-    table = table.replace_schema_metadata({**(table.schema.metadata or {}), b"fly_version": str(version).encode()})
-    tmp = path.with_name(f"{path.name}.{__import__('os').getpid()}.{__import__('threading').get_ident()}.tmp")
+def part_known(path) -> int:
+    """Mints of a feature part whose graduation time was known when it was built (parts from before the key: from age_h)."""
+    md = pq.read_schema(path).metadata or {}
+    if b"fly_known" in md:
+        return int(md[b"fly_known"])
+    t = pq.read_table(path, columns=["mint", "age_h"]).to_pandas()
+    return int(t.loc[t["age_h"].notna(), "mint"].nunique())
+
+
+def write_part(table: pa.Table, path, version: int, extra: dict[str, str] | None = None) -> None:
+    """Atomic write with the version (and any ``extra`` keys) in the Parquet metadata."""
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    md = {**(table.schema.metadata or {}), b"fly_version": str(version).encode(), **{k.encode(): str(v).encode() for k, v in (extra or {}).items()}}
+    table = table.replace_schema_metadata(md)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     pq.write_table(table, tmp, compression="zstd"); tmp.replace(path)
 
 
 def _retire(path, tag: str) -> None:
     """Move a stale output aside (data is never deleted)."""
-    import pathlib
-    path = pathlib.Path(path)
+    path = Path(path)
     if path.exists():
         STALE_DIR.mkdir(parents=True, exist_ok=True)
         path.replace(STALE_DIR / f"{tag}_v{part_version(path)}_{int(time.time())}.parquet")
@@ -129,12 +143,14 @@ def aggregate_day(d: date) -> int:
     return tab.num_rows
 
 
-def _epoch_s(col: pd.Series):
-    return ((col - pd.Timestamp(0, tz="UTC")) / pd.Timedelta(seconds=1)).to_numpy(dtype="float64")
+def _graduations() -> dict:
+    with transaction() as conn:
+        return {r["mint"]: r["graduated_at"] for r in conn.execute("SELECT mint, graduated_at FROM corpus_meta WHERE graduated_at IS NOT NULL").fetchall()}
 
 
-def build_day(d: date, lookback_days: int = 1) -> int:
-    """Feature rows for every minute of day D, warmed up on the previous day's candles."""
+def build_day(d: date, lookback_days: int = 1, grads: dict | None = None) -> int:
+    """Feature rows for every minute of day D, warmed up on the previous day's candles. ``grads``: mint → graduated_at
+    (default: read from ``corpus_meta``); the part records how many of its mints had one (metadata ``fly_known``)."""
     t0 = time.time()
     frames = []
     for k in range(lookback_days, -1, -1):
@@ -145,15 +161,15 @@ def build_day(d: date, lookback_days: int = 1) -> int:
         return 0
     cd = pd.concat(frames, ignore_index=True).sort_values(["mint", "ts"])
     day_start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp(); day_end = day_start + 86400
-    with transaction() as conn:
-        meta = {r["mint"]: r for r in conn.execute("SELECT mint, graduated_at FROM corpus_meta WHERE graduated_at IS NOT NULL").fetchall()}
-    out: list[dict] = []; n_mints = 0
+    grads = _graduations() if grads is None else grads
+    out: list[dict] = []; n_mints = 0; n_known = 0
     for mint, x in cd.groupby("mint", sort=False):
-        ts_s = _epoch_s(x["ts"]); 
+        ts_s = _epoch_s(x["ts"])
         if not (ts_s >= day_start).any():
             continue
         n_mints += 1
-        g = meta[mint]["graduated_at"].timestamp() if mint in meta and meta[mint]["graduated_at"] else None
+        g = grads[mint].timestamp() if grads.get(mint) else None
+        n_known += g is not None
         st = TokenState(mint); tm = TokenMeta(mint=mint, program_label="Pump.fun Amm", graduated_at=g)
         pre = {k: float("nan") for k in PRE_COLS}
         o, h, l, c = x["open"].to_numpy(), x["high"].to_numpy(), x["low"].to_numpy(), x["close"].to_numpy()
@@ -184,14 +200,19 @@ def build_day(d: date, lookback_days: int = 1) -> int:
             out.append(row)
     if not out:
         return 0
-    write_part(pa.Table.from_pylist(out, schema=SCHEMA), MATURE_FEAT_DIR / d.isoformat() / "part.parquet", FEATURE_VERSION)
-    log.info("mature features %s: %d mints, %d rows in %.0fs", d, n_mints, len(out), time.time() - t0)
+    write_part(pa.Table.from_pylist(out, schema=SCHEMA), MATURE_FEAT_DIR / d.isoformat() / "part.parquet", FEATURE_VERSION, {"fly_known": n_known})
+    log.info("mature features %s: %d mints (%d with graduation), %d rows in %.0fs", d, n_mints, n_known, len(out), time.time() - t0)
     return len(out)
+
+
+def _knows_more(part: Path, grads: dict) -> bool:
+    """corpus_meta now has the graduation of more of the part's mints than it had when the part was built."""
+    mints = pa.compute.unique(pq.read_table(part, columns=["mint"])["mint"]).to_pylist()
+    return sum(1 for m in mints if m in grads) > part_known(part)
 
 
 def loop_once() -> int:
     """One build round. A file lock serialises rounds across processes (the console's replay worker and the CLI)."""
-    import fcntl
     MATURE_DIR.mkdir(parents=True, exist_ok=True)
     with open(MATURE_DIR / ".build.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -213,19 +234,20 @@ def _loop_once() -> int:
         aggregate_day(d); n += 1
     with transaction() as conn:
         assembled = {r["day"] for r in conn.execute("SELECT day FROM replay_days").fetchall()}
+    grads = _graduations()
     for f in sorted(MATURE_DIR.glob("*.parquet"), reverse=True):
         d = date.fromisoformat(f.stem)
         part = MATURE_FEAT_DIR / d.isoformat() / "part.parquet"
-        if part.exists() and part_version(part) == FEATURE_VERSION:
+        # a current part is rebuilt when graduations assembled since (the backfill runs newest-first) date more of its mints
+        if part.exists() and part_version(part) == FEATURE_VERSION and not _knows_more(part, grads):
             continue
         if not (MATURE_DIR / f"{(d - timedelta(days=1)).isoformat()}.parquet").exists() or d not in assembled:
             continue                    # graduation times for the day's new tokens come from the assembled day
         _retire(part, f"feat_{d}")
-        build_day(d); n += 1
+        build_day(d, grads=grads); n += 1
     return n
 
 
 def main() -> None:
-    from ..logging_setup import setup
-    setup("replay")
+    logging_setup.setup("replay")
     print(f"processed {loop_once()} day steps")

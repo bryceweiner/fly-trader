@@ -27,6 +27,9 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from .. import config
+from ..market.features import FEATURE_VERSION
+from .corpus_features import _epoch_s
+from .corpus_meta import load_features
 
 SIZE = config.MAX_POSITION_SOL
 MIN_RESQ_SOL = 20.0      # entries only into pools with at least this much SOL (the live executability gate)
@@ -54,14 +57,12 @@ def load(feature_dir=None, max_tokens: int | None = None, days: int | None = Non
     off = ((jump > 50) | (jump < 1 / 50) | (df["resq"] > 100000)).astype(np.int8)
     df["broken"] = off.groupby(df["mint"]).cummax().astype(bool)     # entries blocked from a token's first scale break on; exits still see the prices
     try:
-        from ..market.features import FEATURE_VERSION
         stale = sum(1 for f in files if (pq.read_schema(f).metadata or {}).get(b"fly_version", b"0") != str(FEATURE_VERSION).encode())
         if stale:
             print(f"(warning: {stale} of {len(files)} feature parts come from another feature version; rebuild for exact numbers)")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"(warning: feature versions not checked: {e})")
     try:
-        from .corpus_meta import load_features
         meta = load_features()
         if len(meta):
             df = df.merge(meta, on="mint", how="left")
@@ -144,30 +145,34 @@ STRATEGIES = {
 
 # ---------------------------------------------------------------- simulation
 def simulate(d: pd.DataFrame, cand: np.ndarray, fee_side: float, trail: float, hard: float, max_hold_min: int, cooldown_min: int = 5) -> np.ndarray:
-    """Returns array of (grad_day_ordinal, net_return) per closed trade. Fills happen against the pool at the signal
+    """Returns array of (entry fold-day ordinal, net_return) per closed trade. Fills happen against the pool at the signal
     minute's close (an AMM always fills; the close is the pool's current price), entry ``close·(1+impact)/(1−fee)``,
-    exit ``close·(1−impact)·(1−fee)``. Exits are checked on every traded minute's close."""
-    mints = d["mint"].to_numpy(); ts = ((d["ts"] - pd.Timestamp(0, tz="UTC")) / pd.Timedelta(seconds=1)).to_numpy()
+    exit ``close·(1−impact)·(1−fee)``. Trailing and hard stops are checked on every traded minute's close; the time stop
+    exits at the last close at or before ``entry + max_hold`` when the next traded minute is past it."""
+    mints = d["mint"].to_numpy(); ts = _epoch_s(d["ts"])
     cl, resq = d["close"].to_numpy(), d["resq"].to_numpy()
     gday = pd.to_datetime(d["grad_day"]).map(pd.Timestamp.toordinal).to_numpy()
     imp = SIZE / (SIZE + np.where(np.isfinite(resq) & (resq > 0), resq, 5.0))
-    out = []
+    hold_s = max_hold_min * 60; out = []
     starts = np.r_[0, np.flatnonzero(mints[1:] != mints[:-1]) + 1, len(mints)]
     for s, e in zip(starts[:-1], starts[1:]):
         first = np.flatnonzero(cand[s:e])
         if len(first) == 0:
             continue
-        pos = False; basis = peak = 0.0; t_in = 0.0; cd_until = -1.0
+        pos = False; basis = peak = 0.0; t_in = 0.0; d_in = 0; cd_until = -1.0
         for i in range(s + int(first[0]), e):
             t = ts[i]
+            if pos and t - t_in > hold_s:        # time stop fell between traded minutes: the previous row is the last close before it
+                j = i - 1
+                out.append((d_in, cl[j] * (1 - imp[j]) * (1 - fee_side) / basis - 1)); pos = False; cd_until = t_in + hold_s + cooldown_min * 60
             if pos:
                 peak = max(peak, cl[i])
-                if (cl[i] / peak - 1 <= -trail) or (cl[i] / basis - 1 <= -hard) or (t - t_in >= max_hold_min * 60):
-                    out.append((gday[i], cl[i] * (1 - imp[i]) * (1 - fee_side) / basis - 1)); pos = False; cd_until = t + cooldown_min * 60
+                if (cl[i] / peak - 1 <= -trail) or (cl[i] / basis - 1 <= -hard) or (t - t_in >= hold_s):
+                    out.append((d_in, cl[i] * (1 - imp[i]) * (1 - fee_side) / basis - 1)); pos = False; cd_until = t + cooldown_min * 60
             elif cand[i] and t >= cd_until:
-                basis = cl[i] * (1 + imp[i]) / (1 - fee_side); peak = cl[i]; t_in = t; pos = True
+                basis = cl[i] * (1 + imp[i]) / (1 - fee_side); peak = cl[i]; t_in = t; d_in = gday[i]; pos = True
         if pos:   # still open at the end of the rows: mark at the last close
-            out.append((gday[e - 1], cl[e - 1] * (1 - imp[e - 1]) * (1 - fee_side) / basis - 1))
+            out.append((d_in, cl[e - 1] * (1 - imp[e - 1]) * (1 - fee_side) / basis - 1))
     return np.array(out, dtype=float).reshape(-1, 2)
 
 
@@ -190,11 +195,11 @@ def run(df: pd.DataFrame, fee_side: float, select_frac: float = 0.6, min_trades:
     sel_days = set(days[:n_sel]); split_ord = pd.Timestamp(days[n_sel]).toordinal() if n_sel < len(days) else 10**9
     n_tok = df["mint"].nunique(); n_tr = df.loc[df["has_trades"], "mint"].nunique()
     print(f"\nfee/side {fee_side:.4f} | {n_tok:,} tokens ({n_tr:,} with trade rows) | {len(df):,} rows | days {days[0]}..{days[-1]} | selection {len(sel_days)} days, test {len(days)-n_sel} days", flush=True)
-    liquid = np.isfinite(df["resq"].to_numpy()) & (df["resq"].to_numpy() >= MIN_RESQ_SOL)     # executability gate, as live
+    gate = np.isfinite(df["resq"].to_numpy()) & (df["resq"].to_numpy() >= MIN_RESQ_SOL) & ~df["broken"].to_numpy()     # executability gate, as live
     for sname, make in STRATEGIES.items():
         rows = []; t0 = time.time()
         for vname, cand in make(df):
-            cand = cand & liquid & ~df["broken"].to_numpy()
+            cand = cand & gate
             if not cand.any():
                 continue
             for trail, hard, mh in (EXITS_S4 if sname[:2] in ("S4", "S5", "S6") else EXITS):
@@ -208,9 +213,9 @@ def run(df: pd.DataFrame, fee_side: float, select_frac: float = 0.6, min_trades:
         vname, trail, hard, mh, ss, st, cand = best
         tested = [r for r in rows if r[5]["n"] >= 10]
         pos_frac = np.mean([r[5]["mean"] > 0 for r in tested]) if tested else np.nan
-        p_sig = cand.mean(); rb = []
+        p_sig = cand.sum() / max(1, gate.sum()); rb = []          # entry rate among the rows the gate lets through
         for seed in range(5):
-            rc = np.random.default_rng(seed).random(len(df)) < p_sig
+            rc = (np.random.default_rng(seed).random(len(df)) < p_sig) & gate
             trr = simulate(df, rc, fee_side, trail, hard, mh); rb.append(stats(trr[trr[:, 0] >= split_ord, 1])["mean"])
         print(f"\n=== {sname} ===  {len(rows)} configs in {time.time()-t0:.0f}s; share positive on TEST (n>=10): {pos_frac*100:.0f}%")
         print(f"  chosen on selection: {vname} | trail {trail*100:.0f}% hard {hard*100:.0f}% max hold {mh} min")

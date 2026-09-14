@@ -4,7 +4,8 @@ Every UTC minute, once the stream has written it (``pumpstream_status.flushed_th
 mint (``pump_minutes``: open/high/low/close, SOL volume by side, buy/sell counts, distinct traders, quote reserve; the
 same fields and filters ``train/mature.py`` builds from the archive) is fed to the live feature engine as two
 synthetic trades, exactly as in training. Graduation time and creation/creator facts come from ``corpus_meta``, the
-same source training uses. Rows that pass the eligibility gate (pool ≥ 20 SOL, 15-minute volume ≥ 5 SOL) are scored
+same source training uses. Rows that pass the eligibility gate (pool ≥ 20 SOL, 15-minute volume ≥ 5 SOL, no scale break —
+a close 50× from the previous one or a reserve above 100,000 SOL — since the mint's state began) are scored
 by the deployed selector (``brain_snapshots`` kind 'selector') with the feature vector assembled by name in the
 model's column order; scores at or above its threshold open a ``MAX_POSITION_SOL`` position in book
 ``paper_selector``, held ``horizon_min`` minutes, then sold at the last traded price (the training label's exit).
@@ -45,12 +46,13 @@ META_TTL_S = 600
 
 
 class MintState:
-    __slots__ = ("st", "meta", "hist", "decimals", "pool", "program_label", "graduated_at", "meta_row")
+    __slots__ = ("st", "meta", "hist", "decimals", "pool", "program_label", "graduated_at", "meta_row", "prev_close", "broken")
 
     def __init__(self, mint: str, decimals: int, pool: str | None, program_label: str | None, graduated_at: float | None, meta_row: dict | None):
         self.st = TokenState(mint); self.meta = TokenMeta(mint=mint, program_label=program_label or "Pump.fun Amm", graduated_at=graduated_at)
         self.hist: deque = deque(maxlen=200)       # (t_end, n_trades, n_traders) for the trailing hour
         self.decimals, self.pool, self.program_label, self.graduated_at, self.meta_row = decimals, pool, program_label, graduated_at, meta_row
+        self.prev_close: float | None = None; self.broken = False
 
 
 class SelectorSession:
@@ -144,6 +146,9 @@ class SelectorSession:
     def _features(self, conn, mint: str, a: dict, t_end: float) -> tuple[np.ndarray, dict]:
         s = self._state(conn, mint, a["pool"], a["program_label"])
         st, price, resq = s.st, float(a["close"]), a["resq"]
+        if (s.prev_close and not (1 / 50 <= price / s.prev_close <= 50)) or (resq is not None and resq > 1e5):
+            s.broken = True                          # train/decisions.py: a scale break makes the mint ineligible from that minute on
+        s.prev_close = price
         if a["buy"] > 0:
             st.append(t_end - 2e-3, price, a["buy"], True, None, resq)
         if a["sell"] > 0 or a["buy"] <= 0:
@@ -166,7 +171,7 @@ class SelectorSession:
                    **{c: float(meta.get(c)) if meta.get(c) is not None else 0.0 for c in META_COLS}}
         x = np.nan_to_num(np.asarray([by_name.get(c, 0.0) for c in self.model.cols], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         info = {"price": price, "resq": resq, "logvol_15m": f[FIDX["logvol_15m"]], "age_h": (t_end - s.graduated_at) / 3600 if s.graduated_at else None,
-                "decimals": s.decimals, "pool": s.pool, "program_label": s.program_label}
+                "decimals": s.decimals, "pool": s.pool, "program_label": s.program_label, "broken": s.broken}
         return x, info
 
     def _stream_through(self) -> float | None:
@@ -174,14 +179,13 @@ class SelectorSession:
             r = conn.execute("SELECT value->>'flushed_through' AS ft FROM ui_settings WHERE key = 'pumpstream_status'").fetchone()
         return datetime.fromisoformat(r["ft"]).timestamp() if r and r["ft"] else None
 
-    def minute_ready(self, m0_epoch: float, max_wait_s: float = 25.0) -> bool:
-        """True once the stream has written minute ``m0`` (or the source is the tape); gives up after ``max_wait_s`` past the close."""
+    def ready_through(self, m1_epoch: float) -> float:
+        """End of the newest minute (at most ``m1``) the stream has written; the tape source is always current. A minute is
+        never read before it is written, so a lagging stream delays minutes instead of feeding them empty or partial."""
         if config.SELECTOR_SOURCE != "stream":
-            return True
+            return m1_epoch
         ft = self._stream_through()
-        if ft is not None and ft >= m0_epoch:
-            return True
-        return time.time() - (m0_epoch + 60) >= max_wait_s
+        return min(m1_epoch, ft + 60.0) if ft is not None else float("-inf")
 
     def stream_fresh(self, m0_epoch: float) -> bool:
         if config.SELECTOR_SOURCE != "stream":
@@ -218,7 +222,7 @@ class SelectorSession:
             xs, infos, mints = [], [], []
             for mint, a in agg.items():
                 x, info = self._features(conn, mint, a, m1_epoch)
-                if info["resq"] is not None and info["resq"] >= MIN_RESQ_SOL and info["logvol_15m"] >= math.log1p(MIN_VOL_15M_SOL):
+                if not info["broken"] and info["resq"] is not None and info["resq"] >= MIN_RESQ_SOL and info["logvol_15m"] >= math.log1p(MIN_VOL_15M_SOL):
                     xs.append(x); infos.append(info); mints.append(mint)
             scores = self.model.score(np.stack(xs)) if xs else np.array([])
             summary = {"minute": m1.isoformat(), "mints_traded": len(agg), "eligible": len(mints), "picks": int((scores >= self.model.threshold).sum()) if len(scores) else 0,
@@ -299,8 +303,8 @@ def main(stop_event: threading.Event | None = None, live: bool = False) -> None:
     try:
         while not (stop_event is not None and stop_event.is_set()):
             now = time.time(); m1 = math.floor(now / 60) * 60
-            if m1 > s.last_minute and now - m1 >= 4.0 and s.minute_ready(m1 - 60):   # the minute closed and the stream has written it
-                for minute in range(int(s.last_minute) + 60, int(m1) + 1, 60):
+            if m1 > s.last_minute and now - m1 >= 4.0 and (upto := s.ready_through(m1)) > s.last_minute:   # only minutes the stream has written
+                for minute in range(int(s.last_minute) + 60, int(upto) + 1, 60):
                     try:
                         st = s.run_minute(float(minute), trade=(minute == int(m1)))   # missed minutes update features only
                         if minute == int(m1) and s.beat_no % 10 == 0 and "wealth" in st:
@@ -308,7 +312,7 @@ def main(stop_event: threading.Event | None = None, live: bool = False) -> None:
                                      st["picks"], st["entered"], st["exited"], st["open"], st["wealth"])
                     except Exception:
                         log.exception("selector minute %s failed", minute); record_event("error", "selector", f"minute failed: {minute}")
-                s.last_minute = m1
+                s.last_minute = upto
             time.sleep(0.5)
     finally:
         s.finish()

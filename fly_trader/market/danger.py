@@ -21,10 +21,9 @@ BIAS = -2.0
 
 
 def _frac(x: float) -> float:
-    """Jupiter audit percentages arrive as either fractions or percents; normalise to [0,1]."""
-    if x is None:
-        return 0.0
-    return x / 100.0 if x > 1.0 else x
+    """Jupiter audit topHoldersPercentage/devBalancePercentage are percents (0-100; ~1/4 of rows are below 1 %), as is
+    the corpus proxy (100 × top-10 share); normalise to [0,1]."""
+    return 0.0 if x is None else x / 100.0
 
 
 def danger_score(features: list[float], mask: int, age_hours: float | None) -> float:

@@ -19,15 +19,15 @@ import logging
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
 
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .. import config
+from .. import config, logging_setup
 from ..db.connection import transaction
 from ..ingest.corpus_pull import CANDLE_SCHEMA, TRADE_SCHEMA
+from . import corpus_meta, mature
 
 log = logging.getLogger(__name__)
 CANDLE_SCHEMA_R = CANDLE_SCHEMA.append(pa.field("resq_sol", pa.float64()))
@@ -62,6 +62,17 @@ def _files(d: date, kind: str, hours: range) -> list[str]:
     return [str(day / f"{h:02d}_{kind}.parquet") for h in hours if (day / f"{h:02d}_{kind}.parquet").exists()]
 
 
+def band_amm(con, src: str, dst: str) -> None:
+    """One price scale per mint, causally (as ``mature.aggregate_day`` and the live stream): a PumpSwap leg more than 50x away
+    from the median of the mint's previous 200 PumpSwap legs is dropped (secondary pools in other quotes); other legs pass."""
+    con.execute(f"""CREATE TEMP TABLE {dst} AS SELECT * EXCLUDE (pref) FROM (
+                       SELECT *, median(price) OVER (PARTITION BY mint ORDER BY ts, slot ROWS BETWEEN 200 PRECEDING AND 1 PRECEDING) AS pref
+                       FROM {src} WHERE pool = 'pump-amm')
+                    WHERE pref IS NULL OR price BETWEEN pref / 50 AND pref * 50
+                    UNION ALL SELECT * FROM {src} WHERE pool IS DISTINCT FROM 'pump-amm'""")
+    con.execute(f"DROP TABLE {src}")
+
+
 def assemble_day(d: date) -> tuple[int, int]:
     t0 = time.time(); nxt = d + timedelta(days=1)
     con = duckdb.connect()
@@ -75,14 +86,11 @@ def assemble_day(d: date) -> tuple[int, int]:
     con.execute("CREATE TEMP TABLE grads AS SELECT * FROM (VALUES " + ",".join("(?, ?)" for _ in grads) + ") t(mint, g)",
                 [v for g in grads for v in (g[0], g[1])])
     # every trade leg of a graduated mint within [g − 30 min, g + 36 h]
-    con.execute("CREATE TEMP TABLE tr AS SELECT t.mint, t.ts, t.slot, t.pool, t.trader, t.side, t.sol, t.tokens, t.price, t.quote_in_pool, "
+    con.execute("CREATE TEMP TABLE tr0 AS SELECT t.mint, t.ts, t.slot, t.pool, t.trader, t.side, t.sol, t.tokens, t.price, t.quote_in_pool, "
                 "epoch_ms(t.ts) - epoch_ms(g.g) AS rel_ms FROM read_parquet(?) t JOIN grads g USING (mint) "
                 "WHERE t.ts >= g.g - INTERVAL 30 MINUTE AND t.ts < g.g + INTERVAL 36 HOUR AND t.price > 0 "
                 "AND (t.pool = 'pump' OR t.quote_in_pool BETWEEN 0.001 AND 100000)", [tr_files])
-    # one price scale per mint: drop legs more than 50x away from the mint's median AMM price (secondary pools in other quotes)
-    con.execute("CREATE TEMP TABLE pm AS SELECT mint, median(price) AS pmed FROM tr WHERE pool = 'pump-amm' GROUP BY mint")
-    con.execute("DELETE FROM tr WHERE pool = 'pump-amm' AND mint IN (SELECT mint FROM pm) AND price NOT BETWEEN "
-                "(SELECT pmed FROM pm WHERE pm.mint = tr.mint) / 50 AND (SELECT pmed FROM pm WHERE pm.mint = tr.mint) * 50")
+    band_amm(con, "tr0", "tr")
     (cdir := config.CORPUS_DIR / "candles").mkdir(parents=True, exist_ok=True); (tdir := config.CORPUS_DIR / "trades").mkdir(parents=True, exist_ok=True)
     win1 = int(config.CORPUS_CANDLE_1M_H * 3_600_000); trades_ms = int(config.CORPUS_TRADES_H * 3_600_000)
     # per-mint trade rows for the first hours
@@ -149,13 +157,11 @@ def assemble_loop(stop_event: threading.Event | None = None, idle_s: float = 60.
                 log.exception("assemble %s failed", d)
         if days or time.time() - _last_meta[0] > 1800:
             try:
-                from . import corpus_meta
                 corpus_meta.rebuild(); _last_meta[0] = time.time()
             except Exception:
                 log.exception("corpus_meta rebuild failed; mature build waits for the next round")
             else:
                 try:
-                    from . import mature
                     mature.loop_once()
                 except Exception:
                     log.exception("mature universe build failed")
@@ -165,8 +171,7 @@ def assemble_loop(stop_event: threading.Event | None = None, idle_s: float = 60.
 
 
 def main() -> None:
-    from ..logging_setup import setup
-    setup("replay")
+    logging_setup.setup("replay")
     days = assemblable_days()
     print(f"{len(days)} days ready")
     for d in days:

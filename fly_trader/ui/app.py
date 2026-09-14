@@ -38,12 +38,12 @@ def _age(ts):
     return f"{s:.0f}s" if s < 120 else f"{s/60:.0f}m" if s < 7200 else f"{s/3600:.1f}h"
 
 
-@st.fragment(run_every="3s")
 def _pf(v) -> str:
     """Profit factor for display: None means no losing trade (infinite)."""
     return "∞" if v is None else f"{float(v):.2f}"
 
 
+@st.fragment(run_every="3s")
 def overview():
     wealth = q("""SELECT DISTINCT ON (book) book, ts, wealth, sol_free, positions_value, exposure, n_open, peak, drawdown
                   FROM wealth_marks ORDER BY book, ts DESC""")
@@ -61,7 +61,7 @@ def overview():
         sv = sel["value"] if isinstance(sel["value"], dict) else json.loads(sel["value"] or "{}")
         st.caption(f"selector · minute {str(sv.get('minute', '—'))[11:16]} UTC · {sv.get('mints_traded', 0)} tokens traded · {sv.get('eligible', 0)} eligible · "
                    f"{sv.get('picks', 0)} picks (threshold {sv.get('threshold', 0):.3f}, p99 score {sv.get('score_p99') or 0:.3f}) · entered {sv.get('entered', 0)} · exited {sv.get('exited', 0)} · "
-                   f"open {sv.get('open', 0)} · wealth {_fmt_sol(sv.get('wealth', 0))} · updated {_age(sel['updated_at'])} ago")
+                   f"open {sv.get('open', 0)} · wealth {_fmt_sol(sv.get('wealth'))} · updated {_age(sel['updated_at'])} ago")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("kill switch", "TRIPPED" if circuit.get("kill_switch") else "armed")
     c2.metric("circuit", "TRIPPED" if circuit.get("tripped") else f"ok ({circuit.get('fail_count', 0)} fails)")

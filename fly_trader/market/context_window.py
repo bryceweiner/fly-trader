@@ -19,15 +19,14 @@ class ContextWindow:
         self.gaps = 0
 
     def observe(self, ts: float, had_activity: bool) -> None:
-        if self.start_ts is None:
-            self.start_ts = ts
-            self.last_activity_ts = ts if had_activity else None
+        if not had_activity:
             return
-        if had_activity:
-            if self.last_activity_ts is not None and ts - self.last_activity_ts > self.gap_s:
-                self.gaps += 1
-                self.start_ts = ts  # coverage restarts after an outage
-            self.last_activity_ts = ts
+        if self.start_ts is None:
+            self.start_ts = ts  # coverage starts at the first activity, not at the first (possibly silent) beat
+        elif self.last_activity_ts is not None and ts - self.last_activity_ts > self.gap_s:
+            self.gaps += 1
+            self.start_ts = ts  # coverage restarts after an outage
+        self.last_activity_ts = ts
 
     def coverage(self, now: float) -> float:
         if self.start_ts is None:

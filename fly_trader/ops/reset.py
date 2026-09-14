@@ -2,10 +2,11 @@
 
 Wiped (after being archived as CSV under data/pg_archive/reset_<ts>/): beats, beat_slots, brain_activity,
 decisions, rewards, wealth_marks, synapse_updates, slot_visits, brain_snapshots, runs (except connectome
-build/calibration provenance), and positions/orders/fills of paper and replay books. brain_state and the
-circuit (peak wealth, kill switch, failure count) are cleared; replay clocks restart. The plasticity journal
-and snapshot files are moved aside. NEVER touched: live-book positions/orders/fills, wallet events, tokens,
-pools, the swap tape, API logs, events, ui_settings other than replay clocks.
+build/calibration provenance), and positions/orders/fills of paper and replay books. brain_state is cleared;
+replay clocks restart. The plasticity journal and snapshot files are moved aside. NEVER touched: the circuit
+(kill switch, trip, failure count, peak wealth — only rails.reset_circuit re-arms it), live-book
+positions/orders/fills, wallet events, tokens, pools, the swap tape, API logs, events, ui_settings other
+than replay clocks.
 """
 from __future__ import annotations
 
@@ -63,7 +64,6 @@ def reset_training_state(reason: str = "runner start", archive: bool = True) -> 
         conn.execute("DELETE FROM runs WHERE kind NOT IN ('connectome_build','calibration')")
         conn.execute("UPDATE brain_state SET live_snapshot_id = CASE WHEN (SELECT kind FROM brain_snapshots WHERE id = live_snapshot_id) IN ('policy','selector','fly_selector') THEN live_snapshot_id END, "
                      "pending_snapshot_id = CASE WHEN (SELECT kind FROM brain_snapshots WHERE id = pending_snapshot_id) IN ('policy','selector','fly_selector') THEN pending_snapshot_id END, updated_at = now() WHERE singleton")
-        conn.execute("UPDATE circuit_state SET fail_count = 0, tripped = false, kill_switch = false, kill_reason = NULL, peak_wealth = NULL, updated_at = now() WHERE id = 1")
         conn.execute("DELETE FROM ui_settings WHERE key LIKE 'replay_clock:%'")
         conn.execute("INSERT INTO circuit_events (kind, detail) VALUES ('training_reset', %s)", (f'{{"reason": "{reason}"}}',))
     for sub in ("journal", "snapshots"):

@@ -12,7 +12,7 @@ import time
 from .. import config
 from ..brain.lif import Connectome
 from ..db.apilog import record_event
-from ..db.connection import transaction
+from ..db.connection import connect, transaction
 from ..logging_setup import setup
 from .beat import Session, SessionOptions
 
@@ -28,9 +28,40 @@ def _resume_clock(name: str) -> float | None:
     return float(v["clock"]) if v.get("corpus") == config.REPLAY_CORPUS else None
 
 
+RUNNER_LOCK_KEY = 0x666C795F72756E  # "fly_run": one runner per database, held for the runner's lifetime
+
+
+def acquire_runner_lock():
+    """Session advisory lock on a dedicated autocommit connection; closing the connection releases it.
+    Raises RuntimeError when another runner (process or console thread) already holds it."""
+    conn = connect(autocommit=True)
+    try:
+        ok = conn.execute("SELECT pg_try_advisory_lock(%s) AS ok", (RUNNER_LOCK_KEY,)).fetchone()["ok"]
+    except Exception:
+        conn.close()
+        raise
+    if not ok:
+        conn.close()
+        raise RuntimeError("another runner holds the runner lock; refusing to start a second one")
+    return conn
+
+
 def main(stop_event=None) -> None:
-    import threading
     setup("runner")
+    try:
+        lock_conn = acquire_runner_lock()
+    except RuntimeError as e:
+        log.error("%s", e)
+        record_event("error", "runner", str(e))
+        raise
+    try:
+        _main(stop_event)
+    finally:
+        lock_conn.close()
+
+
+def _main(stop_event=None) -> None:
+    import threading
     live = False
     if config.LIVE_ENABLED:
         from ..chain.cluster_guard import assert_signing_allowed

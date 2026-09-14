@@ -35,9 +35,11 @@ from .. import config
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..logging_setup import setup
-from .corpus_pull import _sleep
+from .corpus_pull import _db_retry, _sleep
 
 log = logging.getLogger(__name__)
+HOUR_SQL = ("INSERT INTO replay_hours (hour, status, last_error) VALUES (%s, %s, %s) "
+            "ON CONFLICT (hour) DO UPDATE SET status = EXCLUDED.status, last_error = EXCLUDED.last_error, done_at = now()")
 TRADE_POOLS = {"pump", "pump-amm"}
 SKIP_ACTIONS = {"buy", "sell", "transfer", "add", "remove", "claimCreatorFees"}
 TRADE_SCHEMA = pa.schema([("ts", pa.timestamp("ms", tz="UTC")), ("slot", pa.int64()), ("pool", pa.dictionary(pa.int8(), pa.string())), ("mint", pa.string()),
@@ -110,6 +112,11 @@ def plan_hours(now: datetime | None = None) -> list[datetime]:
             hours.append(h)
         h -= timedelta(hours=1)
     return hours     # newest first
+
+
+def _put_hour(sql: str, params: tuple) -> None:
+    with transaction() as conn:
+        conn.execute(sql, params)
 
 
 def _download(client: httpx.Client, hour: datetime, tmp: Path, stop: threading.Event | None) -> int:
@@ -222,7 +229,6 @@ def main(stop_event: threading.Event | None = None) -> None:
     for t in threads:
         t.start()
     try:
-        pending = len(hours)
         while not (stop is not None and stop.is_set()):
             try:
                 h, tmp, size, dl_s = ready.get(timeout=5.0)
@@ -237,14 +243,9 @@ def main(stop_event: threading.Event | None = None) -> None:
                     for t in threads:
                         t.start()
                 continue
-            pending -= 1
             replan()
-            if not fresh.empty():
-                pending += fresh.qsize()      # keep the parser loop alive for the hours just queued
             if tmp is None or size < 0:
-                with transaction() as conn:
-                    conn.execute("INSERT INTO replay_hours (hour, status, last_error) VALUES (%s, %s, %s) ON CONFLICT (hour) DO UPDATE SET status = EXCLUDED.status, last_error = EXCLUDED.last_error, done_at = now()",
-                                 (h, "missing" if size < 0 else "error", None if size < 0 else "download failed"))
+                _db_retry(stop, "replay_hours write", _put_hour, HOUR_SQL, (h, "missing" if size < 0 else "error", None if size < 0 else "download failed"))
                 status.update(errors=status.s["errors"] + (0 if size < 0 else 1)); continue
             t0 = time.time()
             try:
@@ -252,17 +253,17 @@ def main(stop_event: threading.Event | None = None) -> None:
                 day = config.REPLAY_DIR / f"{h:%Y-%m-%d}"; day.mkdir(parents=True, exist_ok=True)
                 pq.write_table(trades, day / f"{h:%H}_trades.parquet", compression="zstd"); pq.write_table(events, day / f"{h:%H}_events.parquet", compression="zstd")
                 tmp.unlink()
-                with transaction() as conn:
-                    conn.execute("INSERT INTO replay_hours (hour, status, trades, events, bytes, took_s) VALUES (%s,'done',%s,%s,%s,%s) "
-                                 "ON CONFLICT (hour) DO UPDATE SET status = 'done', trades = EXCLUDED.trades, events = EXCLUDED.events, bytes = EXCLUDED.bytes, took_s = EXCLUDED.took_s, last_error = NULL, done_at = now()",
-                                 (h, trades.num_rows, events.num_rows, size, dl_s + time.time() - t0))
+                _db_retry(stop, "replay_hours write", _put_hour,
+                          "INSERT INTO replay_hours (hour, status, trades, events, bytes, took_s) VALUES (%s,'done',%s,%s,%s,%s) "
+                          "ON CONFLICT (hour) DO UPDATE SET status = 'done', trades = EXCLUDED.trades, events = EXCLUDED.events, bytes = EXCLUDED.bytes, took_s = EXCLUDED.took_s, last_error = NULL, done_at = now()",
+                          (h, trades.num_rows, events.num_rows, size, dl_s + time.time() - t0))
                 status.update(hours_done=status.s["hours_done"] + 1, trades=status.s["trades"] + trades.num_rows, events=status.s["events"] + events.num_rows,
                               bytes=status.s["bytes"] + size, last_hour=h.isoformat(), last_parse_s=round(time.time() - t0, 1), last_dl_s=round(dl_s, 1))
                 log.info("hour %s: %d events -> %d trade rows, %d lifecycle rows (%.0f MB, dl %.0fs, parse %.1fs)", h.isoformat(), n, trades.num_rows, events.num_rows, size / 1e6, dl_s, time.time() - t0)
             except Exception as e:
                 log.exception("parse %s failed", h)
-                with transaction() as conn:
-                    conn.execute("INSERT INTO replay_hours (hour, status, last_error) VALUES (%s,'error',%s) ON CONFLICT (hour) DO UPDATE SET status = 'error', last_error = EXCLUDED.last_error, done_at = now()", (h, str(e)[:300]))
+                tmp.unlink(missing_ok=True)      # the ~400 MB download; replan() refetches the hour
+                _db_retry(stop, "replay_hours write", _put_hour, HOUR_SQL, (h, "error", str(e)[:300]))
                 status.update(errors=status.s["errors"] + 1)
     finally:
         if stop is not None:

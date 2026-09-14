@@ -13,7 +13,6 @@ from .. import config
 POOL_FEE_BPS = 30
 JUPITER_FEE_BPS = 10
 JUPITER_FEE_BPS_NEW = 50
-DLMM_LABELS = ("Meteora DLMM", "meteora", "Meteora")
 
 
 def jupiter_fee_bps(age_hours: float | None) -> int:

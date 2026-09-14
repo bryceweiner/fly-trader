@@ -225,7 +225,7 @@ def ensure_database(url: str | None = None) -> bool:
     """Create the database named in DATABASE_URL if it does not exist. Returns True if created."""
     url = url or database_url()
     name = database_name(url)
-    admin_url = url.replace(f"/{name}", "/postgres") if f"/{name}" in url else "postgresql:///postgres"
+    admin_url = psycopg.conninfo.make_conninfo(url, dbname="postgres")   # same user/host/password, URL or key=value DSN
     with psycopg.connect(admin_url, autocommit=True) as conn:
         row = conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (name,)).fetchone()
         if row:

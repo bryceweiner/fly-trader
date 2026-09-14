@@ -74,10 +74,11 @@ class PaperBroker:
         proceeds = gross * (1.0 - c)
         fee_sol = gross * (jupiter_fee_bps(age_hours) + POOL_FEE_BPS) / 1e4
         if fraction < 0.999:   # partial: shrink the position, realise the sold part
-            cost_part = float(position["cost_sol"]) * fraction
-            realized = proceeds - cost_part
-            conn.execute("UPDATE positions SET qty = qty - %s, cost_sol = cost_sol - %s, fees_sol = fees_sol + %s, last_mark_price=%s, last_mark_ts=%s WHERE id=%s",
-                         (qty_raw, cost_part, fee_sol, price, ts, int(position["id"])))
+            realized = ledger.realize_partial(conn, position_id=int(position["id"]), qty_raw=qty_raw,
+                                              cost_part=float(position["cost_sol"]) * fraction, proceeds_sol=proceeds,
+                                              fees_sol=fee_sol, price=price, ts=ts)
+            if realized is None:
+                return PaperFill(False, int(position["id"]), None, price, 0.0, 0, 0.0, "position not open")
             fid = ledger.record_fill(conn, order_id=None, book=self.book, mint=position["mint"], side="sell", token_delta=-qty_raw,
                                      sol_delta_lamports=int(proceeds * config.LAMPORTS_PER_SOL), price_sol=price * (1.0 - c),
                                      fee_lamports=int(fee_sol * config.LAMPORTS_PER_SOL), verified_by="model", ts=ts)
@@ -85,6 +86,8 @@ class PaperBroker:
         realized = ledger.close_position(conn, position_id=int(position["id"]), exit_price=price * (1.0 - c),
                                          proceeds_sol=proceeds, fees_sol=fee_sol, decision_id=decision_id,
                                          forced_kind=forced_kind, ts=ts)
+        if realized is None:
+            return PaperFill(False, int(position["id"]), None, price, 0.0, 0, 0.0, "position not open")
         fid = ledger.record_fill(conn, order_id=None, book=self.book, mint=position["mint"], side="sell", token_delta=-qty_raw,
                                  sol_delta_lamports=int(proceeds * config.LAMPORTS_PER_SOL), price_sol=price * (1.0 - c),
                                  fee_lamports=int(fee_sol * config.LAMPORTS_PER_SOL), verified_by="model", ts=ts)

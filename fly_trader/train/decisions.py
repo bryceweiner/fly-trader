@@ -18,8 +18,10 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from .. import config
-from ..market.features import FEATURES
+from ..market.features import FEATURE_VERSION, FEATURES
+from .corpus_features import _epoch_s
 from .corpus_meta import FEATURE_COLS as META_COLS, load_features
+from .mature import part_version
 
 EXTRA_COLS = ["traders_15m", "traders_1h", "n_trades_1m", "hod_s", "hod_c", "age_known", "meta_known"]
 X_COLS = FEATURES + EXTRA_COLS + META_COLS
@@ -58,8 +60,6 @@ def build(days: int | None = 45, horizon_min: int = 30, fee: float = 0.006, labe
         files = files[-days - 1:]
     if not files:
         raise RuntimeError("no mature feature parts; run build-mature")
-    from ..market.features import FEATURE_VERSION
-    from .mature import part_version
     stale = [f for f in files if part_version(f) != FEATURE_VERSION]
     if stale:
         raise RuntimeError(f"{len(stale)} feature part(s) were built with another feature version (e.g. {stale[0]}); run build-mature")
@@ -73,7 +73,7 @@ def build(days: int | None = 45, horizon_min: int = 30, fee: float = 0.006, labe
     df = df.merge(load_features(), on="mint", how="left")
     df["meta_known"] = df["ttg_min"].notna().astype(np.float32) if "ttg_min" in df else np.float32(0.0)
     H = horizon_min * 60.0
-    ts = ((df["ts"] - pd.Timestamp(0, tz="UTC")) / pd.Timedelta(seconds=1)).to_numpy(); cl = df["close"].to_numpy(); op = df["open"].to_numpy()
+    ts = _epoch_s(df["ts"]); cl = df["close"].to_numpy(); op = df["open"].to_numpy()
     mints = df["mint"].to_numpy(); starts = np.r_[0, np.flatnonzero(mints[1:] != mints[:-1]) + 1, len(mints)]
     fwd = np.full(len(df), np.nan); fwdp = np.full(len(df), np.nan)
     for s, e in zip(starts[:-1], starts[1:]):

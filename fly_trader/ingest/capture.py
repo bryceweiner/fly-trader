@@ -183,6 +183,8 @@ class Capture:
                     pool=r["pool"], mint=r["mint"], quote_mint=r["quote_mint"] or "", base_vault=r["base_vault"],
                     quote_vault=r["quote_vault"], base_decimals=int(r["base_decimals"]),
                     quote_decimals=int(r["quote_decimals"]), program_label=r["program_label"])
+            elif r["pool"] in self.learned:
+                learned[r["pool"]] = self.learned[r["pool"]]   # learned after this load read the row (its store may queue behind it)
             else:
                 unlearned[r["pool"]] = r
         addresses = sorted(learned) + sorted(unlearned)
@@ -243,9 +245,10 @@ class Capture:
             quotes = dict(swap_decoder.QUOTE_MINTS)
             if row.get("quote_mint") and row["quote_mint"] not in quotes:
                 quotes[row["quote_mint"]] = int(row.get("quote_decimals") or 0)
-            program_id = row.get("program_id") or swap_decoder.PROGRAM_IDS_BY_LABEL.get(row.get("program_label") or "")
+            # program_id only when watch_pools knows it: never inferred from program_label (discovery labels every pump.fun
+            # graduation "Pump.fun Amm", Raydium v4 ones included, and a wrong program id blocks learning for good)
             pv = swap_decoder.learn_vaults(tx, pool, quotes, mint=row["mint"], program_label=row.get("program_label"),
-                                           program_id=program_id)
+                                           program_id=row.get("program_id") or None)
             if pv is None:
                 continue
             self.unlearned.pop(pool, None)

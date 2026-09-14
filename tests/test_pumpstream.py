@@ -53,3 +53,19 @@ def test_band_dominant_pool_and_watermark():
     assert agg.flush_bound(m + 63) == m + 60       # an event 2.5 s past its end completes minute m
     agg.max_event_s = m + 20
     assert agg.flush_bound(m + 76) == m + 60       # quiet stream: 15 s of wall clock completes it
+
+
+def test_midnight_late_legs_and_lagging_stream():
+    agg = pumpstream.Aggregator(); M = 20834 * 86400     # a UTC midnight
+    for k in range(5):
+        agg.ingest(_ev("buy", "Fpump", (M + 1 + k) * 1000, 1.0, 1.0, f"t{k}"))
+    agg.ingest(_ev("buy", "Fpump", (M - 1) * 1000, 1.0, 1.0, "late"))             # a late event from the previous day
+    agg.ingest(_ev("buy", "Fpump", (M + 10) * 1000, 100.0, 1.0, "tz"))
+    assert agg.stats["dropped_band"] == 1                                         # today's references survived the late event
+    agg.flushed_through = datetime.fromtimestamp(M, timezone.utc)
+    agg.ingest(_ev("buy", "Fpump", (M + 30) * 1000, 1.0, 1.0, "t9"))              # minute M is already written
+    assert agg.stats["dropped_late"] == 1
+    agg.max_event_s = M + 55; agg.last_event_wall = M + 70
+    assert agg.flush_bound(M + 75) == M            # lagging but live: waits for the minute's events
+    agg.last_event_wall = M + 55
+    assert agg.flush_bound(M + 75) == M + 60       # quiet for 20 s: the wall clock completes it

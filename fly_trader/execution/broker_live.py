@@ -5,7 +5,8 @@ Per attempt (one in-flight order per process, guarded by a module lock):
   jupiterz) -> assert signatureFeePayer == taker -> orders row (status 'ordered') -> sign only our
   signer slot -> POST /execute -> orders row updated -> poll getSignatureStatuses every 1 s until
   confirmed or getBlockHeight() > lastValidBlockHeight (no other timeout) -> post = snapshot ->
-  fill iff the input balance decreased AND the output balance increased -> fills row.
+  fill iff the input balance decreased AND the output balance increased (a confirmed sell whose token
+  balance fell is a fill even when the SOL delta is <= 0: dust proceeds below fees) -> fills row.
 
 Jupiter's execute status is recorded but never trusted alone: 'Failed' with moved balances is a
 fill (verified_by='balance_delta_despite_failed'); 'Success' without movement is a fills row with
@@ -89,8 +90,9 @@ def _int_or_none(v) -> int | None:
 
 def await_confirmation(rpc, signature: str | None, last_valid_block_height: int | None) -> tuple[str, dict | None]:
     """Poll until the signature is confirmed/finalized, fails on chain, or the chain's block height
-    passes ``last_valid_block_height`` (the transaction can then never land). Sleeps 1 s between
-    polls; there is deliberately no other timeout."""
+    passes ``last_valid_block_height`` with no status for the signature (it can then never land; a
+    signature already seen as processed keeps being polled until it confirms or its status disappears).
+    Sleeps 1 s between polls; there is deliberately no other timeout."""
     if not signature:
         return "unsent", None
     if last_valid_block_height is None:
@@ -102,7 +104,7 @@ def await_confirmation(rpc, signature: str | None, last_valid_block_height: int 
                 return "failed_on_chain", st
             if st.get("confirmationStatus") in ("confirmed", "finalized"):
                 return "confirmed", st
-        if rpc.get_block_height() > last_valid_block_height:
+        if not st and rpc.get_block_height() > last_valid_block_height:
             return "expired", st
         time.sleep(CONFIRM_POLL_S)
 
@@ -276,13 +278,15 @@ class LiveBroker:
         delta = compute_delta(pre, post)
         lam = int(delta["lamports_delta"])
         tok = int(delta["token_deltas"].get(mint, 0))
-        verified = (lam < 0 and tok > 0) if side == "buy" else (tok < 0 and lam > 0)
+        # a confirmed sell that moved the tokens is a fill even at lam <= 0 (a rugged token's dust proceeds < fees)
+        verified = (lam < 0 and tok > 0) if side == "buy" else (tok < 0 and (lam > 0 or chain_status == "confirmed"))
         jup_status = (ex or {}).get("status")
         slot = _int_or_none((ex or {}).get("slot")) or _int_or_none((st or {}).get("slot"))
         if verified:
             verified_by = "balance_delta" if jup_status == "Success" else "balance_delta_despite_failed"
             decimals = self._decimals(conn, mint, pre, post)
-            price = (abs(lam) / config.LAMPORTS_PER_SOL) / (abs(tok) / 10 ** decimals) if decimals is not None else None
+            sol = abs(lam) if side == "buy" else max(lam, 0)
+            price = (sol / config.LAMPORTS_PER_SOL) / (abs(tok) / 10 ** decimals) if decimals is not None else None
             fee = self._fee_lamports(side, lam, amount_in, ex, order)
             fill_id = self._insert_fill(conn, order_id, book, signature, slot, mint, side, tok, lam, price, fee,
                                         order.get("platformFee"), verified_by, pre, post)

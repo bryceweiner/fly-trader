@@ -27,7 +27,7 @@ from .. import config
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from . import progress as prog
-from .decisions import DecisionSet, build, evaluate
+from .decisions import DecisionSet, build, evaluate, summarize, trades_from_picks
 
 log = logging.getLogger(__name__)
 SELECTOR_DIR = config.BRAIN_DIR / "selectors"
@@ -61,28 +61,48 @@ def fit(ds: DecisionSet, train: np.ndarray, top_frac: float, max_rows: int = 2_5
                          trained_through=str(max(ds.day[train])))
 
 
+@dataclass
+class Fold:
+    day: object
+    model: SelectorModel
+    test: np.ndarray       # [N] bool, rows of the test day
+    scores: np.ndarray     # [N] float, scores on the test rows (0 elsewhere)
+    pick: np.ndarray       # [N] bool, test rows at or above the threshold
+    auc: float | None      # None when the test day has a single class
+
+
+def fold(ds: DecisionSet, D, top_frac: float = 0.01, seed: int = 0, min_train: int = 50_000, min_test: int = 500) -> Fold | None:
+    """One walk-forward step: fit on days ≤ D−2 (one-day purge), score day D. None when either side is too small or the
+    training labels have a single class."""
+    train = ds.day < (D - timedelta(days=1)); test = ds.day == D
+    if train.sum() < min_train or test.sum() < min_test or len(np.unique(ds.y[train])) < 2:
+        return None
+    m = fit(ds, train, top_frac, seed=seed); full = np.zeros(len(ds.y)); full[test] = m.score(ds.X[test])
+    auc = float(roc_auc_score(ds.y[test], full[test])) if len(np.unique(ds.y[test])) == 2 else None
+    return Fold(day=D, model=m, test=test, scores=full, pick=test & (full >= m.threshold), auc=auc)
+
+
+def _pct(v, fmt: str = "+.2f") -> str:
+    return f"{v*100:{fmt}}%" if v is not None else "-"
+
+
 def walk_forward(ds: DecisionSet, test_days: int = 9, top_frac: float = 0.01, stop: threading.Event | None = None) -> dict:
     days = ds.days; out = {"per_day": {}, "auc": {}}; trades = []
     for k, D in enumerate(days[-test_days:]):
         if stop is not None and stop.is_set():
             break
         prog.update("selector walk-forward", k, test_days, day=str(D), force=True)
-        train = ds.day < (D - timedelta(days=1)); test = ds.day == D
-        if train.sum() < 50_000 or test.sum() < 500:
+        fo = fold(ds, D, top_frac, seed=k)
+        if fo is None:
             continue
-        m = fit(ds, train, top_frac, seed=k); s = m.score(ds.X[test])
-        auc = float(roc_auc_score(ds.y[test], s)); out["auc"][str(D)] = auc
-        full = np.zeros(len(ds.y)); full[test] = s
-        ev = evaluate(ds, full, test, m.threshold); out["per_day"][str(D)] = {**ev["pooled"], "auc": auc, "threshold": m.threshold}
-        r = ev["pooled"]; log.info("selector %s: AUC %.3f | top %.0f%%: n=%s mean %s median %s win %s PF %s", D, auc, top_frac * 100, r["n"],
-                                   f"{r['mean']*100:+.2f}%" if r["mean"] is not None else "-", f"{r['median']*100:+.2f}%" if r["median"] is not None else "-",
-                                   f"{r['win']*100:.0f}%" if r["win"] is not None else "-", f"{r['pf']:.2f}" if r["pf"] is not None else "-")
+        auc, m = fo.auc, fo.model; out["auc"][str(D)] = auc
+        ev = evaluate(ds, fo.scores, fo.test, m.threshold); out["per_day"][str(D)] = {**ev["pooled"], "auc": auc, "threshold": m.threshold}
+        r = ev["pooled"]; log.info("selector %s: AUC %s | top %.0f%%: n=%s mean %s median %s win %s PF %s", D, f"{auc:.3f}" if auc is not None else "-", top_frac * 100, r["n"],
+                                   _pct(r["mean"]), _pct(r["median"]), _pct(r["win"], ".0f"), f"{r['pf']:.2f}" if r["pf"] is not None else "-")
         record_event("info", "selector", f"walk-forward {D}", {"day": str(D), "auc": auc, **{k_: v for k_, v in r.items()}})
         if r["n"]:
-            from .decisions import trades_from_picks
-            trades.append(trades_from_picks(ds, test & (full >= m.threshold)))
+            trades.append(trades_from_picks(ds, fo.pick))
     allr = np.concatenate(trades) if trades else np.array([])
-    from .decisions import summarize
     pooled = summarize(allr); pooled["days_positive"] = sum(1 for v in out["per_day"].values() if v["mean"] and v["mean"] > 0); pooled["days"] = len(out["per_day"])
     out["pooled"] = pooled
     return out

@@ -67,6 +67,10 @@ def start(name: str, extra: list[str] | None = None, started_by: str = "console"
         raise ValueError(f"unknown worker {name}")
     if (a := alive(name)) is not None:
         return int(a["pid"])
+    with transaction() as conn:   # a console thread already running this worker: never launch a second copy
+        t = conn.execute("SELECT pid FROM processes WHERE name = %s AND stopped_at IS NULL AND cmd[1] = 'thread'", (name,)).fetchone()
+    if t:
+        raise RuntimeError(f"{name} is already running as a console thread (pid {t['pid']}); stop it there first")
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = config.LOG_DIR / f"{name}.out.log"
     env = dict(os.environ, PYTHONUNBUFFERED="1")
@@ -74,9 +78,13 @@ def start(name: str, extra: list[str] | None = None, started_by: str = "console"
     with open(log_path, "ab") as out:
         proc = subprocess.Popen(cmd, cwd=str(config.REPO_ROOT), stdout=out, stderr=subprocess.STDOUT,
                                 start_new_session=True, env=env)
-    with transaction() as conn:
-        conn.execute("INSERT INTO processes (name, pid, cmd, log_path, started_by) VALUES (%s,%s,%s,%s,%s)",
-                     (name, proc.pid, cmd, str(log_path), started_by))
+    try:
+        with transaction() as conn:
+            conn.execute("INSERT INTO processes (name, pid, cmd, log_path, started_by) VALUES (%s,%s,%s,%s,%s)",
+                         (name, proc.pid, cmd, str(log_path), started_by))
+    except Exception as e:        # e.g. processes_live_uniq raced by another starter: do not leave an unregistered worker running
+        proc.terminate()
+        raise RuntimeError(f"cannot register {name}: {type(e).__name__}: {e}") from e
     record_event("info", "procs", f"started {name}", {"pid": proc.pid, "cmd": cmd})
     return proc.pid
 

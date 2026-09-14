@@ -25,18 +25,26 @@ def _session(monkeypatch, db_conn):
     return s
 
 
-def test_minute_ready_waits_for_the_stream(monkeypatch, db_conn):
+def test_ready_through_waits_for_the_stream(monkeypatch, db_conn):
     s = _session(monkeypatch, db_conn)
     m0 = math.floor(time.time() / 60) * 60 - 60
     with db_conn.cursor() as cur:
         cur.execute("INSERT INTO ui_settings (key, value) VALUES ('pumpstream_status', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
                     (json.dumps({"flushed_through": datetime.fromtimestamp(m0 - 60, timezone.utc).isoformat()}),))
     db_conn.commit()
-    assert s.minute_ready(m0, max_wait_s=3600) is False          # the stream has not written m0 yet
+    assert s.ready_through(m0 + 60) == m0                        # minute m0 is not written yet: it waits, however late
     with db_conn.cursor() as cur:
         cur.execute("UPDATE ui_settings SET value = %s WHERE key = 'pumpstream_status'", (json.dumps({"flushed_through": datetime.fromtimestamp(m0, timezone.utc).isoformat()}),))
     db_conn.commit()
-    assert s.minute_ready(m0, max_wait_s=3600) is True
+    assert s.ready_through(m0 + 60) == m0 + 60
+
+
+def test_scale_break_blocks_the_mint_like_training(monkeypatch, db_conn):
+    s = _session(monkeypatch, db_conn); t = 1_800_000_000.0
+    a = {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "buy": 1.0, "sell": 0.0, "nb": 1, "ns": 0, "n_traders": 1, "resq": 50.0, "pool": "P", "program_label": "Pump.fun Amm"}
+    assert s._features(db_conn, "Bkpump", a, t)[1]["broken"] is False
+    assert s._features(db_conn, "Bkpump", {**a, "close": 80.0}, t + 60)[1]["broken"] is True
+    assert s._features(db_conn, "Bkpump", a, t + 120)[1]["broken"] is True          # from that minute on, as in decisions.build
 
 
 def test_aggregate_and_feature_vector(monkeypatch, db_conn):

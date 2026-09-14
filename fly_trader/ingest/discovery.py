@@ -6,7 +6,7 @@ and freeze authority disabled. Nothing else filters; liquidity/age/holders/organ
 Loop: every DISCOVER_INTERVAL_S poll /recent + 5m categories; every 5 min the 1h categories; every
 STATS_REFRESH_S refresh token_stats via /search batches for tokens in watch_status 'watch' (active) and
 'pre' (seen before graduation, re-checked until they graduate or go stale). Graduated tokens get a
-watch_pools row (pool = graduatedPool; DexScreener fallback). Pools stay active for
+watch_pools row (pool = graduatedPool; a graduated payload without one changes nothing). Pools stay active for
 WATCH_DAYS_AFTER_GRADUATION days, extended while traded in the last 24 h or held by any book.
 """
 from __future__ import annotations
@@ -17,11 +17,9 @@ import signal
 import time
 from datetime import datetime, timedelta, timezone
 
-import httpx
-
 from .. import config
 from ..chain.jupiter_tokens import JupiterTokens
-from ..db.apilog import record_api_call, record_event
+from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..logging_setup import setup
 
@@ -65,8 +63,19 @@ def evaluate(tok: dict) -> tuple[str, str]:
     if ma is not True or fa is not True:
         return "unknown", "audit missing from payload"      # transient payload variance: no status change
     if not tok.get("graduatedPool"):
-        return "excluded", "graduated without graduatedPool"
+        return "unknown", "graduated without graduatedPool"  # payload variance too: keep the stored status
     return "watch", "graduated, authorities disabled"
+
+
+def dedupe(toks: list[dict]) -> list[dict]:
+    """First payload per mint: /recent and the category lists overlap (one token_stats row per poll)."""
+    seen: set[str] = set()
+    out = []
+    for t in toks:
+        if t.get("id") and t["id"] not in seen:
+            seen.add(t["id"])
+            out.append(t)
+    return out
 
 
 def upsert_token(conn, tok: dict, status: str) -> None:
@@ -108,40 +117,15 @@ def insert_stats(conn, tok: dict) -> None:
     )
 
 
-def _dexscreener_pool(mint: str) -> dict | None:
-    t0 = time.monotonic()
-    try:
-        r = httpx.get(f"{config.DEXSCREENER_BASE}/token-pairs/v1/solana/{mint}", timeout=20)
-        record_api_call("dexscreener", "token-pairs", "GET", r.status_code, int((time.monotonic() - t0) * 1000), r.is_success)
-        if not r.is_success:
-            return None
-        pairs = [p for p in r.json() if (p.get("quoteToken") or {}).get("address") == config.WSOL_MINT]
-        if not pairs:
-            return None
-        best = max(pairs, key=lambda p: ((p.get("liquidity") or {}).get("usd") or 0))
-        return {"pool": best.get("pairAddress"), "dex": best.get("dexId")}
-    except Exception as e:
-        record_api_call("dexscreener", "token-pairs", "GET", None, int((time.monotonic() - t0) * 1000), False, str(e))
-        return None
-
-
 def ensure_watch_pool(conn, tok: dict) -> bool:
-    """Create the watch_pools row for a graduated token. Returns True if newly added."""
-    mint = tok["id"]
-    pool = tok.get("graduatedPool")
+    """Create the watch_pools row for a 'watch' token (evaluate() guarantees graduatedPool). Returns True if newly added."""
+    mint, pool, source = tok["id"], tok["graduatedPool"], "jupiter.graduatedPool"
     label = PUMP_AMM_LABEL if (tok.get("launchpad") or "").lower() == "pump.fun" else None
-    source = "jupiter.graduatedPool"
-    if not pool:
-        ds = _dexscreener_pool(mint)
-        if not ds:
-            return False
-        pool, label, source = ds["pool"], ds["dex"], "dexscreener"
     row = conn.execute("SELECT pool, active, source, reason FROM watch_pools WHERE pool = %s", (pool,)).fetchone()
     if row:
-        # re-arm only deactivations the token has now disproved (authorities disabled again, pool present); pools retired by
-        # maintain_pools (watch window elapsed) stay retired so the two do not flap
-        r = (row["reason"] or "").lower()
-        if not row["active"] and row["source"] != "smoke" and ("authority" in r or "graduatedpool" in r or "audit" in r):
+        # re-arm only a deactivation the token has now disproved (authorities disabled again, the only reason
+        # process_tokens deactivates for); pools retired by maintain_pools (watch window elapsed) stay retired so the two do not flap
+        if not row["active"] and row["source"] != "smoke" and "authority" in (row["reason"] or "").lower():
             conn.execute("UPDATE watch_pools SET active = true, deactivated_at = NULL, reason = NULL WHERE pool = %s", (pool,))
         return False
     conn.execute(
@@ -228,14 +212,14 @@ class Discoverer:
         for cat, iv in CATEGORIES_FAST:
             toks += self.client.category(cat, iv)
         with transaction() as conn:
-            return process_tokens(conn, toks, with_stats=True)
+            return process_tokens(conn, dedupe(toks), with_stats=True)
 
     def poll_slow(self) -> dict:
         toks = []
         for cat, iv in CATEGORIES_SLOW:
             toks += self.client.category(cat, iv)
         with transaction() as conn:
-            c = process_tokens(conn, toks, with_stats=True)
+            c = process_tokens(conn, dedupe(toks), with_stats=True)
             c["pools_deactivated"] = maintain_pools(conn)
             return c
 
@@ -260,6 +244,7 @@ def probe() -> None:
     toks = client.recent()
     for cat, iv in CATEGORIES_FAST + CATEGORIES_SLOW:
         toks += client.category(cat, iv)
+    toks = dedupe(toks)
     from collections import Counter
     lps = Counter(t.get("launchpad") for t in toks)
     grad = [t for t in toks if t.get("graduatedAt")]

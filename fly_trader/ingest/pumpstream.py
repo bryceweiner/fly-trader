@@ -6,7 +6,8 @@ buys and sells of pump.fun-origin mints, aggregated per (mint, minute) into the 
 derives from the archive, with the same filters: the pool's quote reserve must lie in 0.001–100,000 SOL, a leg more
 than 50× away from the median of the mint's previous 200 legs that UTC day is dropped, and each minute keeps the
 pool with the most legs. Minutes are written to ``pump_minutes`` once complete: an event stamped ≥ 2 s after the
-minute's end has arrived (event-time watermark) or 15 s have passed by wall clock; ``pumpstream_status.flushed_through``
+minute's end has arrived (event-time watermark) or, once no trade has arrived for 15 s, by wall clock; a leg for a minute
+already written is dropped (never merged into it). ``pumpstream_status.flushed_through``
 publishes the newest complete minute for the selector.
 
 Lifecycle: ``create`` events go to ``pump_events`` as they arrive; at ``migrate`` a ``corpus_meta`` row is written
@@ -67,11 +68,11 @@ class Aggregator:
     def __init__(self):
         self.minutes: dict[int, dict[str, dict[str, Minute]]] = defaultdict(lambda: defaultdict(dict))   # minute → mint → pool → Minute
         self.ref: dict[str, deque] = {}; self.ref_day: int | None = None                                  # trailing legs per mint, reset each UTC day
-        self.max_event_s = 0.0
+        self.max_event_s = 0.0; self.last_event_wall = 0.0                # newest event time; wall clock of the last trade received
         self.creates: dict[str, dict] = {}                                 # mint → create facts (24 h)
         self.pending_creates: list[tuple[str, dict]] = []                 # creates not yet written to pump_events
         self.flushed_through: datetime | None = None                       # start of the newest complete minute written
-        self.stats = {"events": 0, "trades": 0, "dropped_band": 0, "flushed_minutes": 0, "flushed_rows": 0, "creates": 0, "migrates": 0, "reconnects": 0,
+        self.stats = {"events": 0, "trades": 0, "dropped_band": 0, "dropped_late": 0,"flushed_minutes": 0, "flushed_rows": 0, "creates": 0, "migrates": 0, "reconnects": 0,
                       "outcomes_filled": 0, "started_at": datetime.now(timezone.utc).isoformat()}
 
     def row(self, minute: int, mint: str) -> Minute | None:
@@ -90,9 +91,9 @@ class Aggregator:
             price = e.get("price"); q = e.get("quoteInPool")
             if not price or price <= 0 or q is None or not (RESQ_BAND[0] <= float(q) <= RESQ_BAND[1]):
                 return
-            ts_s = ts / 1000.0; self.max_event_s = max(self.max_event_s, ts_s)
+            ts_s = ts / 1000.0; self.max_event_s = max(self.max_event_s, ts_s); self.last_event_wall = time.time()
             day = int(ts_s // 86400)
-            if day != self.ref_day:
+            if self.ref_day is None or day > self.ref_day:      # a late event from the previous day never wipes today's references
                 self.ref = {}; self.ref_day = day
             p = float(price)
             legs = e.get("breakdown") or [{"action": a, "trader": e.get("txSigner"), "quoteAmount": e.get("quoteAmount")}]
@@ -109,6 +110,9 @@ class Aggregator:
                 self.stats["dropped_band"] += 1
                 return
             m = int(ts_s // 60) * 60; pid = e.get("poolId") or ""
+            if self.flushed_through is not None and m <= self.flushed_through.timestamp():
+                self.stats["dropped_late"] += 1           # its minute is written and consumed; a partial re-write would corrupt it
+                return
             row = self.minutes[m][mint].get(pid)
             if row is None:
                 row = self.minutes[m][mint][pid] = Minute(pid or None)
@@ -218,9 +222,12 @@ class Aggregator:
         return len(rows)
 
     def flush_bound(self, now: float) -> int:
-        """Minutes strictly before this start are complete: event-time watermark, or the wall-clock fallback when quiet."""
+        """Minutes strictly before this start are complete: event-time watermark, or the wall-clock fallback once no trade
+        has arrived for ``FLUSH_FALLBACK_S`` (a lagging stream still delivers the minute's events, so it waits for them)."""
         cur = int(now // 60) * 60
-        wm = max(int((self.max_event_s - FLUSH_GRACE_S) // 60) * 60, int((now - FLUSH_FALLBACK_S) // 60) * 60)
+        wm = int((self.max_event_s - FLUSH_GRACE_S) // 60) * 60
+        if now - self.last_event_wall >= FLUSH_FALLBACK_S:
+            wm = max(wm, int((now - FLUSH_FALLBACK_S) // 60) * 60)
         return min(cur, wm)
 
 

@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
+import psycopg
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -39,6 +40,7 @@ log = logging.getLogger(__name__)
 WSOL = "So11111111111111111111111111111111111111112"
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 SLOTS_PER_S = 2.5
+RETRY_ERROR_H = 6.0       # a token that failed transiently (retries exhausted on 5xx/429, network, disk) is pulled again after this
 CANDLE_SCHEMA = pa.schema([("ts", pa.timestamp("ms", tz="UTC")), ("interval", pa.string()), ("open", pa.float64()),
                            ("high", pa.float64()), ("low", pa.float64()), ("close", pa.float64()), ("volume_sol", pa.float64())])
 TRADE_SCHEMA = pa.schema([("ts", pa.timestamp("ms", tz="UTC")), ("slot_index", pa.string()), ("tx", pa.string()), ("wallet", pa.string()),
@@ -47,6 +49,10 @@ TRADE_SCHEMA = pa.schema([("ts", pa.timestamp("ms", tz="UTC")), ("slot_index", p
 
 class Throttled(Exception):
     pass
+
+
+class Permanent(RuntimeError):
+    """A 4xx from the swap-api: the token's error row is never requeued."""
 
 
 class Status:
@@ -107,6 +113,18 @@ def _sleep(seconds: float, stop: threading.Event | None) -> None:
         time.sleep(min(1.0, end - time.time()))
 
 
+def _db_retry(stop: threading.Event | None, what: str, fn, *args):
+    """``fn(*args)``, riding out Postgres outages (log, back off 5 s → 60 s, retry); None once ``stop`` is set."""
+    delay = 5.0
+    while not (stop is not None and stop.is_set()):
+        try:
+            return fn(*args)
+        except psycopg.Error as e:
+            log.warning("%s failed (%s: %s); retrying in %.0fs", what, type(e).__name__, str(e)[:160], delay)
+            _sleep(delay, stop); delay = min(60.0, delay * 2)
+    return None
+
+
 class SwapApi:
     def __init__(self, pacer: Pacer, status: Status, stop: threading.Event | None):
         self.c = httpx.Client(base_url=config.CORPUS_SWAP_API, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, timeout=30)
@@ -129,7 +147,7 @@ class SwapApi:
                 self.pacer.throttled(self.stop, float(ra) if ra and ra.isdigit() else None); continue
             if r.status_code >= 500:
                 _sleep(5.0 * (attempt + 1), self.stop); continue
-            raise RuntimeError(f"swap-api {path} HTTP {r.status_code}: {r.text[:160]}")
+            raise (Permanent if 400 <= r.status_code < 500 else RuntimeError)(f"swap-api {path} HTTP {r.status_code}: {r.text[:160]}")
         raise RuntimeError(f"swap-api {path}: gave up after retries")
 
     def candles(self, mint: str, interval: str, created_ms: int, before_ms: int | None = None) -> list[dict]:
@@ -349,9 +367,12 @@ def pull_token(api: SwapApi, row: dict, status: Status) -> dict:
 
 
 def _next_pending(limit: int = 50) -> list[dict]:
+    """Pending tokens plus transient errors (last_error not 'permanent: …') that have cooled down RETRY_ERROR_H."""
     with transaction() as conn:
-        return conn.execute("SELECT mint, graduated_at, grad_slot FROM corpus_tokens WHERE status = 'pending' AND graduated_at < now() - %s * interval '1 hour' "
-                            "AND graduated_at < %s::timestamptz ORDER BY graduated_at DESC LIMIT %s", (config.CORPUS_MIN_AGE_H, config.CORPUS_PULL_BEFORE, limit)).fetchall()
+        return conn.execute("SELECT mint, graduated_at, grad_slot FROM corpus_tokens WHERE (status = 'pending' OR (status = 'error' "
+                            "AND updated_at < now() - %s * interval '1 hour' AND COALESCE(last_error, '') NOT LIKE 'permanent:%%')) "
+                            "AND graduated_at < now() - %s * interval '1 hour' AND graduated_at < %s::timestamptz ORDER BY graduated_at DESC LIMIT %s",
+                            (RETRY_ERROR_H, config.CORPUS_MIN_AGE_H, config.CORPUS_PULL_BEFORE, limit)).fetchall()
 
 
 def _mark(mint: str, upd: dict) -> None:
@@ -389,8 +410,10 @@ def main(stop_event: threading.Event | None = None) -> None:
             except Exception as e:
                 log.exception("enumeration failed"); record_event("error", "corpus", f"enumeration failed: {type(e).__name__}: {e}")
                 status.update(stage="enumeration error", last_error=str(e)[:200], force=True); _sleep(30, stop)
-            pending = _next_pending()
-            c = counts(); status.update(stage="pulling" if pending else "idle", pending=c.get("pending", 0), done=c.get("done", 0), empty=c.get("empty", 0),
+            pending = _db_retry(stop, "corpus pending query", _next_pending)
+            if pending is None:
+                break
+            c = _db_retry(stop, "corpus counts", counts) or {}; status.update(stage="pulling" if pending else "idle", pending=c.get("pending", 0), done=c.get("done", 0), empty=c.get("empty", 0),
                                         errors=c.get("error", 0), enumerated=sum(c.values()), pace_s=round(pacer.pace, 2), force=True)
             if not pending:
                 _sleep(60, stop); continue
@@ -401,10 +424,11 @@ def main(stop_event: threading.Event | None = None) -> None:
                     upd = pull_token(api, row, status)
                 except InterruptedError:
                     break
-                except Exception as e:
-                    log.warning("pull %s failed: %s", row["mint"], e); upd = {"status": "error", "last_error": f"{type(e).__name__}: {e}"[:300]}
-                _mark(row["mint"], upd); status.bump("tokens_pulled")
-                c = counts()
+                except Exception as e:      # a 4xx is permanent; anything else is requeued by _next_pending after RETRY_ERROR_H
+                    perm = "permanent: " if isinstance(e, Permanent) else ""
+                    log.warning("pull %s failed: %s%s", row["mint"], perm, e); upd = {"status": "error", "last_error": f"{perm}{type(e).__name__}: {e}"[:300]}
+                _db_retry(stop, "corpus mark", _mark, row["mint"], upd); status.bump("tokens_pulled")
+                c = _db_retry(stop, "corpus counts", counts) or {}
                 status.update(stage="pulling", last_mint=row["mint"], last_graduated=row["graduated_at"].isoformat(), pending=c.get("pending", 0), done=c.get("done", 0),
                               empty=c.get("empty", 0), errors=c.get("error", 0), enumerated=sum(c.values()), pace_s=round(pacer.pace, 2),
                               eta_h=(c.get("pending", 0) / status.s["tokens_per_h"]) if status.s.get("tokens_per_h") else None)

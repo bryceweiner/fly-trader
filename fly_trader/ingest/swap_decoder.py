@@ -53,17 +53,13 @@ from .tape import TapeRow
 
 log = logging.getLogger(__name__)
 
-WSOL_MINT = config.WSOL_MINT
-USDC_MINT = config.USDC_MINT
-# The real USDT mint on mainnet (observed in vault balances). config.USDT_MINT ends in "McCdmXfcxtnB",
-# which does not exist on chain, so the correct address is pinned here and reported.
-USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
-QUOTE_MINTS: dict[str, int] = {WSOL_MINT: 9, USDC_MINT: 6, USDT_MINT: 6}
+WSOL_MINT, USDC_MINT, USDT_MINT = config.WSOL_MINT, config.USDC_MINT, config.USDT_MINT
+QUOTE_MINTS: dict[str, int] = config.QUOTE_MINTS
 # Prefer the stable side as quote when both sides are quote mints (SOL/USDC pools).
 QUOTE_PRIORITY = {USDC_MINT: 3, USDT_MINT: 2, WSOL_MINT: 1}
 
-# Jupiter /program-id-to-label names (fetched 2026-09-12) for the DEX programs the watch list uses;
-# lets the capture worker pass the program id even when watch_pools.program_id is NULL.
+# Jupiter /program-id-to-label names (fetched 2026-09-12) for the DEX programs the watch list uses. Reference only:
+# capture passes watch_pools.program_id and never infers it from a label (see the Raydium v4 note above).
 PROGRAM_IDS_BY_LABEL: dict[str, str] = {
     "Pump.fun Amm": "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
     "Raydium CP": "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
