@@ -26,6 +26,7 @@ import fcntl
 import logging
 import math
 import os
+import shutil
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -47,6 +48,7 @@ MATURE_DIR = config.CORPUS_DIR / "mature"
 MATURE_FEAT_DIR = config.CORPUS_DIR / "features_mature"
 STALE_DIR = config.CORPUS_DIR / "_mature_stale"
 AGG_VERSION = 2          # 2: causal price band and per-minute dominant pool
+KNOWN_REBUILD_FRAC, KNOWN_REBUILD_MIN = 0.01, 25     # a part is rebuilt once corpus_meta dates this many more of its mints
 MASKED = ["logsigners_15m", "logsigners_1h", "hawkes", "log_since_last", "vpin_15m"]
 EXTRA = ["traders_15m", "traders_1h", "n_trades_1m"]
 SCHEMA = FEAT_SCHEMA.append(pa.field("traders_15m", pa.float32())).append(pa.field("traders_1h", pa.float32())).append(pa.field("n_trades_1m", pa.float32()))
@@ -84,6 +86,19 @@ def _retire(path, tag: str) -> None:
     if path.exists():
         STALE_DIR.mkdir(parents=True, exist_ok=True)
         path.replace(STALE_DIR / f"{tag}_v{part_version(path)}_{int(time.time())}.parquet")
+
+
+def _archive(path, tag: str) -> None:
+    """Keep a copy of an output about to be replaced (data is never deleted); unlike ``_retire`` the original stays in place,
+    so a concurrent reader (training) never sees the day missing."""
+    path = Path(path)
+    if path.exists():
+        STALE_DIR.mkdir(parents=True, exist_ok=True)
+        dst = STALE_DIR / f"{tag}_v{part_version(path)}_{int(time.time())}.parquet"
+        try:
+            os.link(path, dst)                   # the atomic replace gives the part a new inode; the link keeps the old one
+        except OSError:
+            shutil.copy2(path, dst)
 
 
 def _hour_files(d: date) -> list[str]:
@@ -206,9 +221,11 @@ def build_day(d: date, lookback_days: int = 1, grads: dict | None = None) -> int
 
 
 def _knows_more(part: Path, grads: dict) -> bool:
-    """corpus_meta now has the graduation of more of the part's mints than it had when the part was built."""
+    """corpus_meta now dates enough more of the part's mints than when it was built (≥ KNOWN_REBUILD_FRAC of them, at least
+    KNOWN_REBUILD_MIN): old tokens keep trading for months, so any lower bar rebuilds every part on each backfilled day."""
     mints = pa.compute.unique(pq.read_table(part, columns=["mint"])["mint"]).to_pylist()
-    return sum(1 for m in mints if m in grads) > part_known(part)
+    grew = sum(1 for m in mints if m in grads) - part_known(part)
+    return grew >= max(KNOWN_REBUILD_MIN, KNOWN_REBUILD_FRAC * len(mints))
 
 
 def loop_once() -> int:
@@ -243,8 +260,10 @@ def _loop_once() -> int:
             continue
         if not (MATURE_DIR / f"{(d - timedelta(days=1)).isoformat()}.parquet").exists() or d not in assembled:
             continue                    # graduation times for the day's new tokens come from the assembled day
-        _retire(part, f"feat_{d}")
-        build_day(d, grads=grads); n += 1
+        _archive(part, f"feat_{d}")             # the old part stays readable until the new one replaces it atomically
+        if not build_day(d, grads=grads) and part.exists():
+            part.unlink()                        # nothing to write: the (archived) old part must not linger
+        n += 1
     return n
 
 

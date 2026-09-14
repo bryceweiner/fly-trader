@@ -75,8 +75,15 @@ def test_mature_part_records_known_graduations_and_refreshes(tmp_path, monkeypat
     assert mature.part_version(part) == FEATURE_VERSION and mature.part_known(part) == 1
     t = pq.read_table(part, columns=["mint", "age_h"]).to_pandas()
     assert t.loc[t["mint"] == "A", "age_h"].notna().all() and t.loc[t["mint"] == "B", "age_h"].isna().all()
+    more = {**grads, "B": datetime(2026, 8, 31, tzinfo=timezone.utc)}
     assert not mature._knows_more(part, grads)
-    assert mature._knows_more(part, {**grads, "B": datetime(2026, 8, 31, tzinfo=timezone.utc)})
+    assert not mature._knows_more(part, more)                   # one more dated mint is below the rebuild bar (no rebuild storm)
+    monkeypatch.setattr(mature, "KNOWN_REBUILD_MIN", 1)
+    assert mature._knows_more(part, more)
+    # a replaced part stays readable until its successor lands; the old one is kept aside
+    monkeypatch.setattr(mature, "STALE_DIR", tmp_path / "stale")
+    mature._archive(part, "feat_2026-09-02")
+    assert part.exists() and len(list((tmp_path / "stale").glob("feat_2026-09-02_v*.parquet"))) == 1
     # a part from before the metadata key: the known count comes from its age_h column
     legacy = tmp_path / "legacy.parquet"; tab = pq.read_table(part)
     pq.write_table(tab.replace_schema_metadata({b"fly_version": str(FEATURE_VERSION).encode()}), legacy)
