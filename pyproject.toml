@@ -1,0 +1,38 @@
+[project]
+name = "fly-trader"
+version = "0.1.0"
+description = "FlyWire-connectome memecoin trader on Solana"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "torch>=2.12",
+  "numpy",
+  "pandas",
+  "pyarrow>=15",
+  "duckdb",
+  "psycopg[binary]>=3.2",
+  "solders>=0.21",
+  "base58",
+  "websockets>=12",
+  "httpx>=0.27",
+  "python-dotenv",
+  "orjson",
+  "streamlit>=1.40",
+  "altair",
+  "psutil",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov"]
+
+[project.scripts]
+fly-trader = "fly_trader.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["fly_trader"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

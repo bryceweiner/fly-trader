@@ -1,0 +1,130 @@
+"""Creation-time facts and point-in-time creator history for every graduated token (table ``corpus_meta``).
+
+From the replay lifecycle rows: the ``create`` event (creator wallet, the creator's own first buy in SOL and tokens,
+supply, mayhem flag, metadata URI) and the ``migrate`` event (graduation time, pool id, real quote reserve at
+migration). Derived: ``ttg_min`` (minutes from creation to graduation; instant graduations are bundled launches),
+``dev_share`` (creator's first buy as a share of supply).
+
+Creator history is strictly point-in-time as of the token's own graduation: ``prior_launches`` (the creator's
+earlier creates), ``prior_grads`` (the creator's earlier graduations), and among those with a known outcome,
+``prior_rug_share`` (fell 90 % within 60 min of graduation) and ``prior_moon_share`` (doubled within 60 min).
+The token's own outcome columns (``own_*``) exist only to feed other tokens' history; never use them as features.
+
+``rebuild()`` recomputes the whole table from the archive (events are small) and fills outcomes incrementally from
+the assembled candle files. Runs inside the ``replay`` worker after each assembly round and as
+``fly-trader build-corpus-meta``.
+"""
+from __future__ import annotations
+
+import logging
+import time
+from pathlib import Path
+
+import duckdb
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+
+from .. import config
+from ..db.connection import transaction
+
+log = logging.getLogger(__name__)
+FEATURE_COLS = ["ttg_min", "dev_sol", "dev_share", "mayhem", "rq0", "prior_launches", "prior_grads", "prior_known", "prior_rug_share", "prior_moon_share"]
+
+
+def _outcomes(rows: list[dict]) -> list[tuple]:
+    """(mint, dd60, max60, alive6h) from a token's candle file (post-graduation 1m candles)."""
+    out = []
+    for r in rows:
+        try:
+            t = pq.read_table(r["candle_path"], columns=["ts", "interval", "close"]).to_pandas()
+        except Exception:
+            continue
+        g = r["graduated_at"]; t = t[t["ts"] >= g].sort_values("ts")
+        if t.empty:
+            out.append((r["mint"], None, None, False)); continue
+        p0 = float(t["close"].iloc[0]); w = t[t["ts"] < g + pd.Timedelta(minutes=60)]
+        dd = float(w["close"].min() / p0 - 1) if len(w) else None; mx = float(w["close"].max() / p0 - 1) if len(w) else None
+        alive = bool((t["ts"].max() - g) >= pd.Timedelta(hours=6))
+        out.append((r["mint"], dd, mx, alive))
+    return out
+
+
+def rebuild(outcome_batch: int = 20000) -> int:
+    t0 = time.time(); con = duckdb.connect(); ev = str(config.REPLAY_DIR / "*" / "*_events.parquet")
+    if not list(config.REPLAY_DIR.glob("*/*_events.parquet")):
+        return 0
+    creates = con.execute(f"""SELECT mint, min(ts) AS create_ts, arg_min(signer, ts) AS creator, arg_min(quote_amount, ts) AS dev_sol,
+                              arg_min(initial_buy, ts) AS dev_tokens, arg_min(supply, ts) AS supply, arg_min(mayhem, ts) AS mayhem, arg_min(uri, ts) AS uri,
+                              arg_min(name, ts) AS name, arg_min(symbol, ts) AS symbol FROM read_parquet('{ev}') WHERE action = 'create' AND pool = 'pump' GROUP BY mint""").df()
+    migr = con.execute(f"""SELECT mint, min(ts) AS g, arg_min(quote_in_pool, ts) AS rq0, arg_min(pool_id, ts) AS pool_id
+                           FROM read_parquet('{ev}') WHERE action = 'migrate' AND pool = 'pump-amm' GROUP BY mint""").df()
+    con.close()
+    meta = migr.merge(creates, on="mint", how="left")
+    meta["ttg_min"] = (meta["g"] - meta["create_ts"]).dt.total_seconds() / 60.0
+    meta["dev_share"] = meta["dev_tokens"] / meta["supply"]
+    # outcomes: existing ones from the table, new ones from candle files
+    with transaction() as conn:
+        known = pd.DataFrame(conn.execute("SELECT mint, own_dd60, own_max60, own_alive6h FROM corpus_meta WHERE own_alive6h IS NOT NULL").fetchall())
+        todo = conn.execute("SELECT t.mint, t.graduated_at, t.candle_path FROM corpus_tokens t LEFT JOIN corpus_meta m USING (mint) "
+                            "WHERE t.candle_path IS NOT NULL AND t.status = 'done' AND (m.mint IS NULL OR m.own_alive6h IS NULL) ORDER BY t.graduated_at DESC LIMIT %s", (outcome_batch,)).fetchall()
+    new = pd.DataFrame(_outcomes(todo), columns=["mint", "own_dd60", "own_max60", "own_alive6h"]) if todo else pd.DataFrame(columns=["mint", "own_dd60", "own_max60", "own_alive6h"])
+    outcomes = pd.concat([known, new], ignore_index=True).drop_duplicates("mint") if len(known) or len(new) else new
+    meta = meta.merge(outcomes, on="mint", how="left")
+    # point-in-time creator history (as of this token's graduation)
+    cr = creates.sort_values("create_ts").copy(); cr["prior_launches"] = cr.groupby("creator").cumcount()
+    meta = meta.merge(cr[["mint", "prior_launches"]], on="mint", how="left")
+    hist = meta.dropna(subset=["creator"]).sort_values("g").copy()
+    hist["rug"] = (hist["own_dd60"] <= -0.9).astype(float).where(hist["own_dd60"].notna())
+    hist["moon"] = (hist["own_max60"] >= 1.0).astype(float).where(hist["own_max60"].notna())
+    grp = hist.groupby("creator")
+    hist["prior_grads"] = grp.cumcount()
+    hist["prior_known"] = grp["rug"].transform(lambda x: x.notna().cumsum().shift(1, fill_value=0))
+    hist["prior_rug_share"] = grp["rug"].transform(lambda x: x.fillna(0).cumsum().shift(1, fill_value=0)) / hist["prior_known"].replace(0, np.nan)
+    hist["prior_moon_share"] = grp["moon"].transform(lambda x: x.fillna(0).cumsum().shift(1, fill_value=0)) / hist["prior_known"].replace(0, np.nan)
+    meta = meta.merge(hist[["mint", "prior_grads", "prior_known", "prior_rug_share", "prior_moon_share"]], on="mint", how="left")
+    cols = ["mint", "create_ts", "creator", "dev_sol", "dev_tokens", "dev_share", "supply", "mayhem", "uri", "name", "symbol", "ttg_min", "rq0", "pool_id",
+            "prior_launches", "prior_grads", "prior_known", "prior_rug_share", "prior_moon_share", "own_dd60", "own_max60", "own_alive6h"]
+    def _v(x):
+        if x is None or (isinstance(x, float) and np.isnan(x)) or x is pd.NaT:
+            return None
+        if isinstance(x, (np.floating,)):
+            return float(x)
+        if isinstance(x, (np.integer,)):
+            return int(x)
+        if isinstance(x, (np.bool_,)):
+            return bool(x)
+        if isinstance(x, pd.Timestamp):
+            return x.to_pydatetime()
+        return x
+    rows = [tuple(_v(v) for v in rec) for rec in meta[cols].itertuples(index=False, name=None)]
+    with transaction() as conn:
+        conn.cursor().executemany(
+            "INSERT INTO corpus_meta (" + ",".join(cols) + ") VALUES (" + ",".join(["%s"] * len(cols)) + ") ON CONFLICT (mint) DO UPDATE SET " +
+            ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c != "mint") + ", updated_at = now()", rows)
+    log.info("corpus_meta rebuilt: %d graduated tokens (%d with creator, %d with outcomes) in %.0fs", len(meta), int(meta["creator"].notna().sum()), int(meta["own_dd60"].notna().sum()), time.time() - t0)
+    return len(meta)
+
+
+def load_features() -> pd.DataFrame:
+    with transaction() as conn:
+        rows = conn.execute("SELECT mint, " + ", ".join(FEATURE_COLS) + " FROM corpus_meta").fetchall()
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["mint"] + FEATURE_COLS)
+    df["mayhem"] = df["mayhem"].map({True: 1.0, False: 0.0})
+    return df
+
+
+def main() -> None:
+    from ..logging_setup import setup
+    setup("replay")
+    prev = None
+    while True:
+        n = rebuild()
+        with transaction() as conn:
+            left = conn.execute("SELECT count(*) AS n FROM corpus_tokens t LEFT JOIN corpus_meta m USING (mint) WHERE t.candle_path IS NOT NULL AND t.status = 'done' AND (m.mint IS NULL OR m.own_alive6h IS NULL)").fetchone()["n"]
+        print(f"corpus_meta: {n} tokens; outcomes still missing for {left}")
+        if not left or left == prev:
+            break
+        prev = left

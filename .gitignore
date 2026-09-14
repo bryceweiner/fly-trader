@@ -1,0 +1,16 @@
+.env
+.venv/
+data/
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.streamlit/secrets.toml
+.DS_Store
+.agents/
+.claude/
+
+# large media assets - deployed straight to Gandi, not tracked in GitHub source repo
+web/assets/*.mp4
+media/*.mp4
