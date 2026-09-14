@@ -57,7 +57,7 @@ def _rq(price: float, p_grad: float) -> float:
 def _row(mint: str, ts_s: float, g: float, o: float, h: float, l: float, c: float, vol: float, resq: float | None,
          has_trades: bool, f: list[float], mask: int, pre: dict) -> dict:
     r = {"mint": mint, **{k: float(pre.get(k, float("nan"))) for k in PRE_COLS}, "ts": datetime.fromtimestamp(ts_s, timezone.utc),
-         "phase": "amm" if ts_s + 60.0 > g else "curve",          # the minute containing the graduation second counts as AMM
+         "phase": "amm" if ts_s + 60.0 > g else "curve",          # rows start at the first candle that opens after graduation
          "t_rel_min": max(0, int(math.floor((ts_s - g) / 60.0))), "open": o, "high": h, "low": l, "close": c, "volume_sol": vol,
          "resq": resq if resq is not None else float("nan"), "age_h": max(0.0, (ts_s - g) / 3600.0), "has_trades": has_trades, "mask": mask}
     for i, name in enumerate(FEATURES):

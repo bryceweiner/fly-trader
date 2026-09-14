@@ -230,7 +230,7 @@ def enumerate_graduations(hel: Helius, status: Status, stop: threading.Event | N
     state = _enum_state(); added = 0
     # (1) incremental: newest first, stop when a full page adds nothing
     token = None
-    for _ in range(50):
+    for _ in range(500):          # keeps walking after an outage until a page adds nothing
         res = hel.gtfa(addr, {"limit": 100, "transactionDetails": "full", "sortOrder": "desc", "filters": {"status": "succeeded"},
                               **({"paginationToken": token} if token else {})})
         rows = _graduations_from_page(res.get("data") or []); n = _upsert_graduations(rows); added += n
@@ -266,6 +266,11 @@ def enumerate_graduations(hel: Helius, status: Status, stop: threading.Event | N
 
 
 # ---------------------------------------------------------------- per-token pull
+def _write_atomic(table: pa.Table, path: Path) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    pq.write_table(table, tmp, compression="zstd"); tmp.replace(path)
+
+
 def _candle_rows(cands: list[dict], interval: str) -> list[dict]:
     return [{"ts": datetime.fromtimestamp(int(c["timestamp"]) / 1000, timezone.utc), "interval": interval, "open": float(c["open"]),
              "high": float(c["high"]), "low": float(c["low"]), "close": float(c["close"]), "volume_sol": float(c["volume"])} for c in cands]
@@ -305,11 +310,13 @@ def pull_token(api: SwapApi, row: dict, status: Status) -> dict:
     last_ms = max(stamps); life_h = (last_ms - g_ms) / 3.6e6; upd["life_h"] = life_h
     five_m = [c for c in newest5 if win1_end <= int(c["timestamp"]) < win2_end]
     if newest5 and len(newest5) >= 1000 and min(int(c["timestamp"]) for c in newest5) > win1_end:
-        five_m += _page_back(api, mint, "5m", created_ms, min(int(c["timestamp"]) for c in newest5), win1_end, max_pages=3)
+        lo5 = min(int(c["timestamp"]) for c in newest5)
+        pages = min(20, int((min(lo5, win2_end) - win1_end) / (1000 * 300_000)) + 2)     # enough pages to reach the 1-minute window's end
+        five_m += _page_back(api, mint, "5m", created_ms, min(lo5, win2_end), win1_end, max_pages=pages)
         five_m = [c for c in five_m if int(c["timestamp"]) < win2_end]
     rows = _candle_rows(one_m, "1m") + _candle_rows(five_m, "5m"); upd["candles_1m"] = len(one_m); upd["candles_5m"] = len(five_m)
     if rows and not cpath.exists():
-        pq.write_table(pa.Table.from_pylist(rows, schema=CANDLE_SCHEMA), cpath, compression="zstd")
+        _write_atomic(pa.Table.from_pylist(rows, schema=CANDLE_SCHEMA), cpath)
     upd["candle_path"] = str(cpath) if cpath.exists() else None
     status.bump("candles_rows", len(rows))
     recent = grad >= datetime.now(timezone.utc) - timedelta(days=config.CORPUS_TRADES_DAYS)
@@ -334,7 +341,7 @@ def pull_token(api: SwapApi, row: dict, status: Status) -> dict:
             if oldest_seen < start_ms:
                 break
         if trows:
-            pq.write_table(pa.Table.from_pylist(trows, schema=TRADE_SCHEMA), tpath, compression="zstd")
+            _write_atomic(pa.Table.from_pylist(trows, schema=TRADE_SCHEMA), tpath)
             upd.update(trades=len(trows), trades_through=datetime.fromtimestamp(end_ms / 1000, timezone.utc), trade_path=str(tpath))
             status.bump("trades_rows", len(trows)); status.bump("with_trades")
     return upd

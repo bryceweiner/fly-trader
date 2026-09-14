@@ -47,12 +47,18 @@ class _ScrubFilter(logging.Filter):
 
 
 class _ThreadFilter(logging.Filter):
+    """Keep records from the worker thread and its helper threads (``<name>-*``); accept MainThread only when the worker itself
+    runs in the main thread (CLI use), never the console's Streamlit server thread."""
+
     def __init__(self, name: str):
         super().__init__()
         self.name = name
+        import threading as _t
+        self.main_ok = _t.current_thread() is _t.main_thread()
 
     def filter(self, record: logging.LogRecord) -> bool:
-        return record.threadName in (self.name, "MainThread")
+        tn = record.threadName or ""
+        return tn == self.name or tn.startswith(self.name + "-") or (self.main_ok and tn == "MainThread")
 
 
 class _JsonFormatter(logging.Formatter):

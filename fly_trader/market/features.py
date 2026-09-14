@@ -21,7 +21,7 @@ from .exit_cost import exit_cost_fraction
 
 WINDOWS = {"1m": 60.0, "5m": 300.0, "15m": 900.0, "1h": 3600.0, "3h": 10800.0}
 HAWKES_BETA = 1.0 / 60.0  # per second; intensity decays with a 1-minute time constant
-EWMA_1H_ALPHA = 1.0 / 60.0  # per swap-minute; see ewma update below
+EWMA_1H_TAU_S = 3600.0  # 1-hour time constant of the price EWMA (continuous time, seconds)
 
 FEATURES: list[str] = [
     "ret_1m", "ret_5m", "ret_15m", "ret_1h", "ret_3h",
@@ -81,7 +81,7 @@ class TokenState:
             self.hawkes = self.hawkes * math.exp(-HAWKES_BETA * dt) + 1.0
             dlp = lp - self.logp[-1]
             self.cum_sq.append(self.cum_sq[-1] + dlp * dlp)
-            w = min(1.0, dt * EWMA_1H_ALPHA)
+            w = 1.0 - math.exp(-dt / EWMA_1H_TAU_S)
             self.ewma_1h = (1 - w) * self.ewma_1h + w * price if self.ewma_1h is not None else price
         else:
             self.hawkes = 1.0
@@ -112,6 +112,12 @@ class TokenState:
             self.n_since_compact = 0
             return
         base_vol, base_buy, base_sq = self.cum_vol[i], self.cum_buy[i], self.cum_sq[i]
+        for k in self.sig_ptr:                     # entries dropped before the window pointer reached them still count: retire them
+            cnt = self.sig_cnt[k]
+            for j in range(self.sig_ptr[k], i):
+                h = self.signers[j]; cnt[h] -= 1
+                if cnt[h] <= 0:
+                    del cnt[h]
         self.ts = self.ts[i:]
         self.logp = self.logp[i:]
         self.signers = self.signers[i:]

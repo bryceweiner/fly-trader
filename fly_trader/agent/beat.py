@@ -635,10 +635,11 @@ class Session:
         except Exception as e:
             log.warning("balance refresh failed: %s", type(e).__name__)
 
-    def _enter(self, g: Group, conn, book: str, mint: str, size_sol: float, now_dt: datetime, flows: dict) -> bool:
+    def _enter(self, g: Group, conn, book: str, mint: str, size_sol: float, now_dt: datetime, flows: dict, allow_add: bool = False) -> bool:
+        """Open (or, with ``allow_add``, add to) a paper position; the ledger averages the entry on an add."""
         meta = g.meta.get(mint) or TokenMeta(mint)
         bs = g.books[book]
-        if mint in bs.held:
+        if mint in bs.held and not allow_add:
             return False
         cash = ledger.paper_cash(conn, book)
         if cash - size_sol < config.GAS_RESERVE_SOL:

@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 
 from ..db.apilog import record_event
 from ..db.connection import transaction
-from ..logging_setup import setup, tail
+from ..logging_setup import scrub, setup, tail
 
 log = logging.getLogger(__name__)
 
@@ -33,15 +33,24 @@ def _entry(name: str):
         from ..agent import runner
         return runner.main
     if name == "train":
-        from ..train import ppo
         import json as _json
         def _train(stop_event=None):
             setup("train")   # log file + ring buffer keyed by this thread's name
             with transaction() as conn:
                 r = conn.execute("SELECT value FROM ui_settings WHERE key = 'training_params'").fetchone()
             params = (r["value"] if (r and isinstance(r["value"], dict)) else _json.loads((r or {}).get("value") or "{}")) if r else {}
-            ppo.main(iterations=params.get("iterations", 24), window=params.get("window", 400), eval_every=params.get("eval_every", 4),
-                     imitate_epochs=params.get("imitate", 4), subgraph=params.get("subgraph"), init_from=params.get("init_from"), stop_event=stop_event)
+            regimen = params.get("regimen", "selector")
+            if regimen == "selector":          # the strategy: gradient-boosted selector, walk-forward, then the deployable fit
+                from ..train import selector as _sel
+                _sel.main(days=params.get("days", 45), test_days=params.get("test_days", 9), top_frac=params.get("top_frac", 0.01), stop_event=stop_event)
+            elif regimen == "fly":             # the fly trained on the same decision points, scored against the selector
+                from ..train import fly_selector as _fly
+                _fly.main(days=params.get("days", 45), test_days=params.get("test_days", 9), top_frac=params.get("top_frac", 0.01),
+                          epochs=params.get("epochs", 2), rows_per_epoch=params.get("rows_per_epoch", 600_000), stop_event=stop_event)
+            else:                              # legacy: PPO / imitation on the tape dataset
+                from ..train import ppo
+                ppo.main(iterations=params.get("iterations", 24), window=params.get("window", 400), eval_every=params.get("eval_every", 4),
+                         imitate_epochs=params.get("imitate", 4), subgraph=params.get("subgraph"), init_from=params.get("init_from"), stop_event=stop_event)
         return _train
     if name == "corpus":
         from ..ingest import corpus_pull
@@ -49,10 +58,13 @@ def _entry(name: str):
     if name == "replay":
         from ..ingest import replay_pull
         return replay_pull.main
+    if name == "pumpstream":
+        from ..ingest import pumpstream
+        return pumpstream.main
     raise KeyError(name)
 
 
-WORKERS = ("discover", "capture", "runner", "train", "corpus", "replay")
+WORKERS = ("discover", "capture", "runner", "train", "corpus", "replay", "pumpstream")
 
 
 class Supervisor:
@@ -64,6 +76,7 @@ class Supervisor:
         self.stopped_at: dict[str, datetime] = {}
         self.errors: dict[str, str] = {}
         self.row_ids: dict[str, int] = {}
+        self.autostarted = False
         self.pid = os.getpid()
         setup("console")
         with transaction() as conn:  # thread rows left by a previous console process are stale
@@ -104,6 +117,12 @@ class Supervisor:
                 return False
             if name in self.external():
                 raise RuntimeError(f"{name} is already running as an external process; stop it first")
+            try:
+                with transaction() as conn:
+                    row = conn.execute("INSERT INTO processes (name, pid, cmd, log_path, started_by) VALUES (%s,%s,%s,%s,%s) RETURNING id",
+                                       (name, self.pid, ["thread", name], f"logs/{name}.log", started_by)).fetchone()
+            except Exception as e:                       # e.g. processes_live_uniq: another console (or a stale row) owns this worker
+                raise RuntimeError(f"cannot register {name}: {type(e).__name__}: {scrub(str(e))[:200]}") from e
             ev = threading.Event()
             self.stops[name] = ev
             self.errors.pop(name, None)
@@ -112,10 +131,7 @@ class Supervisor:
             self.threads[name] = t
             self.started_at[name] = datetime.now(timezone.utc)
             self.stopped_at.pop(name, None)
-            with transaction() as conn:
-                row = conn.execute("INSERT INTO processes (name, pid, cmd, log_path, started_by) VALUES (%s,%s,%s,%s,%s) RETURNING id",
-                                   (name, self.pid, ["thread", name], f"logs/{name}.log", started_by)).fetchone()
-                self.row_ids[name] = int(row["id"])
+            self.row_ids[name] = int(row["id"])
             t.start()
         record_event("info", "console", f"started {name} thread", {"pid": self.pid, "by": started_by})
         return True
@@ -126,7 +142,7 @@ class Supervisor:
             fn(stop_event=ev)
         except Exception as e:
             code = 1
-            self.errors[name] = f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}"
+            self.errors[name] = scrub(f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}")
             log.exception("%s thread crashed", name)
             record_event("error", "console", f"{name} thread crashed: {type(e).__name__}: {e}")
         finally:
@@ -136,6 +152,15 @@ class Supervisor:
                     conn.execute("UPDATE processes SET stopped_at = now(), exit_code = %s WHERE id = %s", (code, self.row_ids.get(name)))
             except Exception:
                 pass
+
+    def request_stop(self, name: str, by: str = "console") -> bool:
+        """Ask a worker to stop without waiting (the console's buttons); the audit row is written here."""
+        ev = self.stops.get(name)
+        if ev is None or not self.alive(name):
+            return False
+        ev.set()
+        record_event("info", "console", f"stop requested for {name} thread", {"pid": self.pid, "by": by})
+        return True
 
     def stop(self, name: str, grace_s: float = 90.0) -> bool:
         t = self.threads.get(name)
@@ -158,6 +183,7 @@ class Supervisor:
                 t.join(120)
 
     def autostart(self) -> list[str]:
+        self.autostarted = True          # process-level: the console runs autostart once, not once per browser tab
         with transaction() as conn:
             r = conn.execute("SELECT value FROM ui_settings WHERE key = 'autostart'").fetchone()
         if not r:
@@ -194,12 +220,16 @@ def run_console(port: int = 8501) -> None:
     """`fly-trader ui`: start autostart workers in THIS process, then run Streamlit in the main thread."""
     from .. import config
     sup = get_supervisor()
-    started = sup.autostart()
+    try:
+        started = sup.autostart()
+    except Exception as e:
+        started = []; log.exception("autostart failed: %s", scrub(str(e)))
     log.info("console pid=%d autostarted=%s", os.getpid(), started)
     app = str(config.REPO_ROOT / "fly_trader" / "ui" / "app.py")
     from streamlit.web import bootstrap
     flag_options = {"server.port": port, "server.headless": True, "browser.gatherUsageStats": False,
                     "server.fileWatcherType": "none", "logger.level": "warning"}
+    bootstrap.load_config_options(flag_options)      # the CLI does this before run(); without it port/headless/watcher flags are ignored
     try:
         bootstrap.run(app, False, [], flag_options)
     finally:

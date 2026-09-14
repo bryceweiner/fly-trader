@@ -77,11 +77,22 @@ def rebuild(outcome_batch: int = 20000) -> int:
     hist = meta.dropna(subset=["creator"]).sort_values("g").copy()
     hist["rug"] = (hist["own_dd60"] <= -0.9).astype(float).where(hist["own_dd60"].notna())
     hist["moon"] = (hist["own_max60"] >= 1.0).astype(float).where(hist["own_max60"].notna())
-    grp = hist.groupby("creator")
-    hist["prior_grads"] = grp.cumcount()
-    hist["prior_known"] = grp["rug"].transform(lambda x: x.notna().cumsum().shift(1, fill_value=0))
-    hist["prior_rug_share"] = grp["rug"].transform(lambda x: x.fillna(0).cumsum().shift(1, fill_value=0)) / hist["prior_known"].replace(0, np.nan)
-    hist["prior_moon_share"] = grp["moon"].transform(lambda x: x.fillna(0).cumsum().shift(1, fill_value=0)) / hist["prior_known"].replace(0, np.nan)
+    hist["prior_grads"] = hist.groupby("creator").cumcount()
+    # outcomes of an earlier graduation A are known 60 min after g_A; B may only count A when g_A + 60 min <= g_B (no look-ahead)
+    known = np.zeros(len(hist), int); rugs = np.zeros(len(hist)); moons = np.zeros(len(hist))
+    g_s = (hist["g"] - pd.Timestamp(0, tz="UTC")).dt.total_seconds().to_numpy(); rug_v = hist["rug"].to_numpy(); moon_v = hist["moon"].to_numpy()
+    for _, idx in hist.groupby("creator").indices.items():
+        idx = np.asarray(idx); gs = g_s[idx]; order = np.argsort(gs, kind="stable"); idx = idx[order]; gs = gs[order]
+        j = 0; k_cnt = 0; r_sum = 0.0; m_sum = 0.0
+        for b in range(len(idx)):
+            while j < b and gs[j] + 3600.0 <= gs[b]:
+                if not np.isnan(rug_v[idx[j]]):
+                    k_cnt += 1; r_sum += rug_v[idx[j]]; m_sum += moon_v[idx[j]]
+                j += 1
+            known[idx[b]] = k_cnt; rugs[idx[b]] = r_sum; moons[idx[b]] = m_sum
+    hist["prior_known"] = known
+    hist["prior_rug_share"] = np.where(known > 0, rugs / np.maximum(known, 1), np.nan)
+    hist["prior_moon_share"] = np.where(known > 0, moons / np.maximum(known, 1), np.nan)
     meta = meta.merge(hist[["mint", "prior_grads", "prior_known", "prior_rug_share", "prior_moon_share"]], on="mint", how="left")
     cols = ["mint", "create_ts", "creator", "dev_sol", "dev_tokens", "dev_share", "supply", "mayhem", "uri", "name", "symbol", "ttg_min", "rq0", "pool_id",
             "prior_launches", "prior_grads", "prior_known", "prior_rug_share", "prior_moon_share", "own_dd60", "own_max60", "own_alive6h"]

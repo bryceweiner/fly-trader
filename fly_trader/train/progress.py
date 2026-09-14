@@ -15,6 +15,17 @@ _last_write = 0.0
 STOP: threading.Event | None = None
 
 
+def _finite(x):
+    """JSON (and Postgres jsonb) have no inf/nan: map them to null recursively."""
+    if isinstance(x, float) and (x != x or x in (float("inf"), float("-inf"))):
+        return None
+    if isinstance(x, dict):
+        return {k: _finite(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_finite(v) for v in x]
+    return x
+
+
 def set_stop_event(ev: threading.Event | None) -> None:
     global STOP
     STOP = ev
@@ -40,7 +51,7 @@ def update(stage: str, step: int | None = None, total: int | None = None, force:
         if not force and now - _last_write < 3.0:
             return
         _last_write = now
-        payload = {k: v for k, v in _state.items() if not k.startswith("_")}
+        payload = _finite({k: v for k, v in _state.items() if not k.startswith("_")})
     try:
         with transaction() as conn:
             conn.execute("INSERT INTO ui_settings (key, value) VALUES ('training_status', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",

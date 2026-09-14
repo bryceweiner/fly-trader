@@ -28,12 +28,22 @@ def record_api_call(service: str, endpoint: str, method: str = "GET", status: in
         log.warning("api_calls insert failed: %s", type(e).__name__)
 
 
+def _finite(x):
+    if isinstance(x, float) and (x != x or x in (float("inf"), float("-inf"))):
+        return None
+    if isinstance(x, dict):
+        return {k: _finite(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_finite(v) for v in x]
+    return x
+
+
 def record_event(level: str, source: str, message: str, detail: dict | None = None) -> None:
     try:
         with transaction() as conn:
             conn.execute(
                 "INSERT INTO events (level, source, message, detail) VALUES (%s,%s,%s,%s)",
-                (level, source, scrub(message), json.dumps(detail, default=str) if detail is not None else None),
+                (level, source, scrub(message), json.dumps(_finite(detail), default=str) if detail is not None else None),
             )
     except Exception as e:
         log.warning("events insert failed: %s", type(e).__name__)

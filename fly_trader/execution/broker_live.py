@@ -225,6 +225,8 @@ class LiveBroker:
             signed_b64, _idx = sign_transaction_b64(tx_b64, self.keypair)
         except (NotASigner, ValueError) as e:
             return fail("sign_error", f"{type(e).__name__}: {scrub(str(e))}", None, order_id=order_id)
+        if _idx != 0 and not order.get("gasless"):
+            return fail("sign_error", f"our key is signer {_idx}, but a non-gasless order must have the taker as fee payer", None, order_id=order_id)
         tx_sig = transaction_id(signed_b64)
 
         # 3. execute
@@ -248,12 +250,22 @@ class LiveBroker:
             self._update_order(conn, order_id, execute_request=exec_req, execute_response=ex, signature=signature,
                                status="executed", error_code=code, error=error, latency_ms=ex.get("_latency_ms"))
 
-        # 4. confirm (or expire)
-        chain_status, st = await_confirmation(self.rpc, signature, lvbh)
-        self._update_order(conn, order_id, status=chain_status)
-
-        # 5. verify by balance deltas
-        post = snapshot_balances(self.rpc, taker)
+        # 4. confirm (or expire), 5. verify by balance deltas — retried: a transport error here must not leave a landed swap unrecorded
+        chain_status = st = post = None; last_exc = None
+        for k in range(4):
+            try:
+                if chain_status is None:
+                    chain_status, st = await_confirmation(self.rpc, signature, lvbh)
+                    self._update_order(conn, order_id, status=chain_status)
+                post = snapshot_balances(self.rpc, taker); break
+            except Exception as e:                       # RPC transport / RPC errors
+                last_exc = e; log.warning("confirm/verify attempt %d for %s failed: %s", k + 1, signature, scrub(str(e)))
+                time.sleep(2.0 * (k + 1))
+        if post is None:
+            fill_id = self._insert_fill(conn, order_id, book, signature, None, mint, side, 0, 0, None, None, order.get("platformFee"), "unknown", pre, pre)
+            record_event("error", "broker_live", "fill unknown: could not confirm or verify after retries; reconcile with verify-fills",
+                         {"order_id": order_id, "signature": signature, "side": side, "mint": mint, "error": scrub(str(last_exc))[:200]})
+            raise RuntimeError(f"confirm/verify failed for {signature}: {type(last_exc).__name__}") from last_exc
         delta = compute_delta(pre, post)
         lam = int(delta["lamports_delta"])
         tok = int(delta["token_deltas"].get(mint, 0))

@@ -168,7 +168,7 @@ class Capture:
     @staticmethod
     def _load_pools(conn) -> list[dict]:
         with conn.cursor() as cur:
-            cur.execute("SELECT pool, mint, quote_mint, program_label, base_vault, quote_vault, base_decimals, "
+            cur.execute("SELECT pool, mint, quote_mint, program_label, program_id, base_vault, quote_vault, base_decimals, "
                         "quote_decimals FROM watch_pools WHERE active ORDER BY pool")
             rows = cur.fetchall()
         conn.commit()
@@ -484,7 +484,10 @@ class Capture:
             return 0
         batch, self.pending_tape = self.pending_tape, []
         try:
-            n = await self._db(self._insert, batch)
+            n = await asyncio.shield(self._db(self._insert, batch))     # a cancel at shutdown must not lose the batch in flight
+        except asyncio.CancelledError:
+            self.pending_tape = batch + self.pending_tape
+            raise
         except Exception as e:
             self.db_failures += 1
             self._note_error("tape insert", e)

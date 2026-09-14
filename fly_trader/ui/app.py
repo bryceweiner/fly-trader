@@ -51,6 +51,12 @@ def overview():
         with cols[i % 4]:
             st.metric(f"{w['book']} capital", _fmt_sol(w["wealth"]), delta=f"peak {float(w['peak'] or 0):.4f}",
                       help=f"free {_fmt_sol(w['sol_free'])}, positions {_fmt_sol(w['positions_value'])}, open {w['n_open']}")
+    sel = q1("SELECT value, updated_at FROM ui_settings WHERE key = 'selector_status'")
+    if sel:
+        sv = sel["value"] if isinstance(sel["value"], dict) else json.loads(sel["value"] or "{}")
+        st.caption(f"selector · minute {str(sv.get('minute', '—'))[11:16]} UTC · {sv.get('mints_traded', 0)} tokens traded · {sv.get('eligible', 0)} eligible · "
+                   f"{sv.get('picks', 0)} picks (threshold {sv.get('threshold', 0):.3f}, p99 score {sv.get('score_p99') or 0:.3f}) · entered {sv.get('entered', 0)} · exited {sv.get('exited', 0)} · "
+                   f"open {sv.get('open', 0)} · wealth {_fmt_sol(sv.get('wealth', 0))} · updated {_age(sel['updated_at'])} ago")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("kill switch", "TRIPPED" if circuit.get("kill_switch") else "armed")
     c2.metric("circuit", "TRIPPED" if circuit.get("tripped") else f"ok ({circuit.get('fail_count', 0)} fails)")
@@ -209,7 +215,7 @@ def workers():
                 st.error(str(e))
             st.rerun()
         if c4.button("stop", key=f"stop_{name}", disabled=not stt["alive"]):
-            sup.stops[name].set(); st.rerun()
+            sup.request_stop(name); st.rerun()
     name = st.selectbox("log", list(WORKERS), key="logsel")
     st.code(sup.log_tail(name, 40) or "(no log yet)", language="json")
     err = status[name].get("error")
@@ -292,9 +298,23 @@ def training():
     c4.metric("last update", _age(ts["updated_at"]) + " ago" if ts else "—")
     if step is not None and total:
         st.progress(min(1.0, step / max(total, 1)))
+    if st_.get("rows"):
+        st.caption(f"decision points: {st_['rows']:,} eligible minutes · {st_.get('tokens', 0):,} tokens · {st_.get('days')} days · base rate {st_.get('base_rate', 0)*100:.1f}% · universe mean {st_.get('universe_mean', 0)*100:+.2f}%")
+    wf = st_.get("walk_forward")
+    if wf:
+        st.success(f"selector walk-forward (top 1%, pessimistic fills): {wf.get('n')} trades · mean {(wf.get('mean') or 0)*100:+.2f}% · median {(wf.get('median') or 0)*100:+.2f}% · "
+                   f"win {(wf.get('win') or 0)*100:.0f}% · PF {wf.get('pf') or 0:.2f} · days positive {wf.get('days_positive')}/{wf.get('days')}")
+    if st_.get("reference_gbm"):
+        rg = st_["reference_gbm"]
+        st.caption(f"reference selector on this split: AUC {rg.get('auc', 0):.3f} · n {rg.get('n')} · mean {(rg.get('mean') or 0)*100:+.2f}% · PF {rg.get('pf') or 0:.2f}")
+    if st_.get("verdict"):
+        v = st_["verdict"]; f, g = v.get("fly", {}), v.get("gbm", {})
+        (st.success if v.get("fly_beats_gbm") else st.warning)(f"fly {(f.get('mean') or 0)*100:+.2f}%/trade (AUC {f.get('auc', 0):.3f}, n {f.get('n')}, PF {f.get('pf') or 0:.2f}) vs selector "
+                                                                f"{(g.get('mean') or 0)*100:+.2f}%/trade (AUC {g.get('auc', 0):.3f}, n {g.get('n')}, PF {g.get('pf') or 0:.2f}) → "
+                                                                f"{'the fly takes the seat' if v.get('fly_beats_gbm') else 'the selector keeps the seat'}")
     if st_.get("graph"):
         g = st_["graph"]
-        st.caption(f"graph: {g.get('N')} neurons · {g.get('edges')} synapses · {g.get('params')} trainable params · dataset {st_.get('dataset','')} · train beats {st_.get('train_beats')} · eval beats {st_.get('eval_beats')}")
+        st.caption(f"graph: {g.get('N')} neurons · {g.get('edges')} synapses · {g.get('params')} trainable params" + (f" · dataset {st_.get('dataset','')} · train beats {st_.get('train_beats')} · eval beats {st_.get('eval_beats')}" if st_.get('dataset') else ""))
     if st_.get("expert_train_net") is not None:
         st.caption(f"expert baseline: train {st_['expert_train_net']:+.3f} SOL ({st_.get('expert_train_trades')} trades)")
     if st_.get("last_imitation"):
@@ -308,26 +328,40 @@ def training():
     with st.container(horizontal=True):
         p = q1("SELECT value FROM ui_settings WHERE key = 'training_params'")
         pv = (p["value"] if p and isinstance(p["value"], dict) else json.loads((p or {}).get("value") or "{}")) if p else {}
-        imitate = st.number_input("imitation epochs", 0, 20, int(pv.get("imitate", 4)), key="tp_imitate")
-        iters = st.number_input("PPO iterations", 0, 500, int(pv.get("iterations", 24)), key="tp_iters")
-        window = st.number_input("rollout window (beats)", 50, 5000, int(pv.get("window", 400)), key="tp_window")
-        eval_every = st.number_input("eval every", 1, 50, int(pv.get("eval_every", 4)), key="tp_eval")
+        regimen = st.segmented_control("regimen", ["selector", "fly", "ppo"], default=pv.get("regimen", "selector"), key="tp_regimen",
+                                       help="selector: gradient-boosted selector, walk-forward then deployable fit · fly: connectome trained on the same decision points, scored against the selector · ppo: legacy")
+        days = st.number_input("corpus days", 5, 200, int(pv.get("days", 45)), key="tp_days")
+        test_days = st.number_input("test days", 2, 30, int(pv.get("test_days", 9)), key="tp_test_days")
+        top_frac = st.number_input("top fraction", 0.001, 0.2, float(pv.get("top_frac", 0.01)), step=0.005, format="%.3f", key="tp_top")
+        epochs = st.number_input("fly epochs", 1, 20, int(pv.get("epochs", 2)), key="tp_epochs")
+        imitate = int(pv.get("imitate", 4)); iters = int(pv.get("iterations", 24)); window = int(pv.get("window", 400)); eval_every = int(pv.get("eval_every", 4))
         if st.button("start training", disabled=alive, key="train_start"):
             from fly_trader.db.connection import transaction
             with transaction() as conn:
                 conn.execute("INSERT INTO ui_settings (key, value) VALUES ('training_params', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-                             (json.dumps({"imitate": int(imitate), "iterations": int(iters), "window": int(window), "eval_every": int(eval_every)}),))
+                             (json.dumps({"regimen": regimen or "selector", "days": int(days), "test_days": int(test_days), "top_frac": float(top_frac), "epochs": int(epochs),
+                                          "imitate": imitate, "iterations": iters, "window": window, "eval_every": eval_every}),))
             try:
                 sup.start("train", started_by="console")
             except RuntimeError as e:
                 st.error(str(e))
             st.rerun()
         if st.button("stop training", disabled=not alive, key="train_stop"):
-            sup.stops["train"].set(); st.rerun()
+            sup.request_stop("train"); st.rerun()
     err = sup.status()["train"].get("error")
     if err:
         st.error(err.splitlines()[0][:300])
     st.divider()
+    wfd = q("SELECT ts, detail->>'day' AS day, round((detail->>'auc')::numeric, 3) AS auc, (detail->>'n')::int AS trades, round((detail->>'mean')::numeric * 100, 2) AS mean_pct, "
+            "round((detail->>'median')::numeric * 100, 2) AS median_pct, round((detail->>'win')::numeric * 100) AS win_pct, round((detail->>'pf')::numeric, 2) AS pf "
+            "FROM events WHERE source = 'selector' AND message LIKE 'walk-forward%%' ORDER BY id DESC LIMIT 30")
+    if wfd:
+        st.caption("selector walk-forward days (newest first)")
+        st.dataframe(_df(wfd), width="stretch", hide_index=True)
+    fv = q("SELECT ts, detail FROM events WHERE source = 'fly_selector' AND message LIKE 'fly vs gbm%%' ORDER BY id DESC LIMIT 5")
+    if fv:
+        st.caption("fly vs selector verdicts (newest first)")
+        st.dataframe(_df(fv), width="stretch", hide_index=True)
     im = q("SELECT ts, (detail->>'epoch')::int AS epoch, (detail->>'acc')::float AS acc, (detail->>'bce')::float AS bce, (detail->>'student_eval_net')::float AS student_eval_net, "
            "(detail->>'student_eval_trades')::int AS student_trades, (detail->>'expert_eval_net')::float AS expert_eval_net FROM events WHERE source = 'ppo' AND message LIKE 'imitation epoch%%' ORDER BY id DESC LIMIT 20")
     if im:
@@ -380,7 +414,7 @@ def controls():
     st.divider()
     sup = get_supervisor()
     if sup.alive("runner"):
-        st.caption("training state resets automatically each time the runner starts (RESET_ON_START); stop the runner to reset manually")
+        st.caption("in selector mode the runner keeps its history; the legacy policy/lif modes reset training state on runner start (RESET_ON_START)")
     elif st.button("reset training state now (archives, then wipes paper/replay history and the brain)"):
         from fly_trader.ops.reset import reset_training_state
         st.json(reset_training_state(reason="console button"))
@@ -404,7 +438,7 @@ def controls():
 
 
 def _autostart_once():
-    if st.session_state.get("_autostarted"):
+    if get_supervisor().autostarted or st.session_state.get("_autostarted"):
         return
     st.session_state["_autostarted"] = True
     try:
@@ -445,6 +479,11 @@ def corpus_panel():
                    f"{rv.get('trades', 0):,} trade rows · {rv.get('events', 0):,} lifecycle rows · {rv.get('mb_s', 0):.1f} MB/s · {rv.get('hours_per_h', 0):.0f} hours/h"
                    + (f" · ETA {rv['eta_h']:.1f} h" if rv.get('eta_h') else "") + f" · last {str(rv.get('last_hour', '—'))[:13]} · errors {rv.get('errors', 0)} · "
                    f"{'running' if sup.alive('replay') else 'stopped'} · updated {_age(rs['updated_at']) + ' ago' if rs else '—'}")
+    ps = q1("SELECT value, updated_at FROM ui_settings WHERE key = 'pumpstream_status'")
+    if ps:
+        pv = ps["value"] if isinstance(ps["value"], dict) else json.loads(ps["value"] or "{}")
+        st.caption(f"live stream (pumpapi.io): {'connected' if pv.get('connected') else 'disconnected'} · {pv.get('events_per_s', 0):.0f} events/s · {pv.get('trades', 0):,} PumpSwap trades · "
+                   f"{pv.get('flushed_rows', 0):,} minute rows · {pv.get('migrates', 0)} graduations seen · reconnects {pv.get('reconnects', 0)} · updated {_age(ps['updated_at'])} ago")
     fs = q1("SELECT value FROM ui_settings WHERE key = 'corpus_features_status'")
     fv = (fs["value"] if fs and isinstance(fs["value"], dict) else json.loads((fs or {}).get("value") or "{}")) if fs else {}
     fc = q1("SELECT count(*) AS n, coalesce(sum(rows), 0) AS rows, count(*) FILTER (WHERE has_trades) AS with_trades FROM corpus_features") or {}
@@ -458,7 +497,7 @@ def corpus_panel():
                 st.error(str(e))
             st.rerun()
         if st.button("stop corpus pull", disabled=not alive, key="corpus_stop"):
-            sup.stops["corpus"].set(); st.rerun()
+            sup.request_stop("corpus"); st.rerun()
     err = sup.status()["corpus"].get("error")
     if err:
         st.error(err.splitlines()[0][:300])

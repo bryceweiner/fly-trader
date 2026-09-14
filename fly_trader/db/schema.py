@@ -198,6 +198,15 @@ BASE_DDL: list[str] = [
     "CREATE INDEX IF NOT EXISTS corpus_meta_creator_idx ON corpus_meta (creator)",
     """CREATE TABLE IF NOT EXISTS mature_days (
         day date PRIMARY KEY, mints int, rows int, took_s real, built_at timestamptz NOT NULL DEFAULT now())""",
+    """CREATE TABLE IF NOT EXISTS pump_minutes (
+        mint text NOT NULL, ts timestamptz NOT NULL, pool_id text, open double precision, high double precision, low double precision, close double precision,
+        buy_sol double precision, sell_sol double precision, n_buys int, n_sells int, n_traders int, resq_sol double precision,
+        PRIMARY KEY (mint, ts))""",
+    "CREATE INDEX IF NOT EXISTS pump_minutes_ts_idx ON pump_minutes (ts)",
+    """CREATE TABLE IF NOT EXISTS pump_events (
+        sig text PRIMARY KEY, ts timestamptz NOT NULL, action text NOT NULL, pool text, mint text, pool_id text, signer text, dev_sol double precision,
+        dev_tokens double precision, supply double precision, mayhem boolean, quote_in_pool double precision, name text, symbol text, uri text)""",
+    "CREATE INDEX IF NOT EXISTS pump_events_mint_idx ON pump_events (mint)",
     """CREATE TABLE IF NOT EXISTS ui_settings (
         key text PRIMARY KEY, value jsonb, updated_at timestamptz NOT NULL DEFAULT now())""",
 ]

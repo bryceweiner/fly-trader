@@ -20,7 +20,7 @@ from ..db.connection import connect, transaction
 
 log = logging.getLogger(__name__)
 
-WIPE_TABLES = ["beats", "beat_slots", "brain_activity", "decisions", "rewards", "wealth_marks", "synapse_updates",
+WIPE_TABLES = ["beats", "beat_slots", "brain_activity", "rewards", "wealth_marks", "synapse_updates",
                "slot_visits"]
 BOOK_TABLES = ["positions", "orders", "fills"]
 
@@ -46,18 +46,21 @@ def reset_training_state(reason: str = "runner start", archive: bool = True) -> 
             out_dir.mkdir(parents=True, exist_ok=True)
             for t in WIPE_TABLES:
                 counts[t] = _archive(conn, t, "", out_dir)
-            counts["brain_snapshots"] = _archive(conn, "brain_snapshots", "WHERE kind <> 'policy'", out_dir)
+            counts["brain_snapshots"] = _archive(conn, "brain_snapshots", "WHERE kind NOT IN ('policy','selector','fly_selector')", out_dir)
             for t in BOOK_TABLES:
                 counts[t] = _archive(conn, t, "WHERE book <> 'live'", out_dir)
             counts["runs"] = _archive(conn, "runs", "WHERE kind NOT IN ('connectome_build','calibration')", out_dir)
         for t in WIPE_TABLES:
             conn.execute(f"TRUNCATE TABLE {t}")
-        conn.execute("DELETE FROM brain_snapshots WHERE kind <> 'policy'")   # trained policy checkpoints survive a reset
+        conn.execute("DELETE FROM brain_snapshots WHERE kind NOT IN ('policy','selector','fly_selector')")   # trained models survive a reset
+        conn.execute("DELETE FROM decisions WHERE id NOT IN (SELECT decision_id FROM orders WHERE book = 'live' AND decision_id IS NOT NULL "
+                     "UNION SELECT entry_decision_id FROM positions WHERE book = 'live' AND entry_decision_id IS NOT NULL "
+                     "UNION SELECT exit_decision_id FROM positions WHERE book = 'live' AND exit_decision_id IS NOT NULL)")   # live-book references stay intact
         for t in BOOK_TABLES:
             conn.execute(f"DELETE FROM {t} WHERE book <> 'live'")
         conn.execute("DELETE FROM runs WHERE kind NOT IN ('connectome_build','calibration')")
-        conn.execute("UPDATE brain_state SET live_snapshot_id = CASE WHEN (SELECT kind FROM brain_snapshots WHERE id = live_snapshot_id) = 'policy' THEN live_snapshot_id END, "
-                     "pending_snapshot_id = CASE WHEN (SELECT kind FROM brain_snapshots WHERE id = pending_snapshot_id) = 'policy' THEN pending_snapshot_id END, updated_at = now() WHERE singleton")
+        conn.execute("UPDATE brain_state SET live_snapshot_id = CASE WHEN (SELECT kind FROM brain_snapshots WHERE id = live_snapshot_id) IN ('policy','selector','fly_selector') THEN live_snapshot_id END, "
+                     "pending_snapshot_id = CASE WHEN (SELECT kind FROM brain_snapshots WHERE id = pending_snapshot_id) IN ('policy','selector','fly_selector') THEN pending_snapshot_id END, updated_at = now() WHERE singleton")
         conn.execute("UPDATE circuit_state SET fail_count = 0, tripped = false, kill_switch = false, kill_reason = NULL, peak_wealth = NULL, updated_at = now() WHERE id = 1")
         conn.execute("DELETE FROM ui_settings WHERE key LIKE 'replay_clock:%'")
         conn.execute("INSERT INTO circuit_events (kind, detail) VALUES ('training_reset', %s)", (f'{{"reason": "{reason}"}}',))

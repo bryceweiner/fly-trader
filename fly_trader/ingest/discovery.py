@@ -132,8 +132,10 @@ def ensure_watch_pool(conn, tok: dict) -> bool:
         if not ds:
             return False
         pool, label, source = ds["pool"], ds["dex"], "dexscreener"
-    row = conn.execute("SELECT pool, active FROM watch_pools WHERE pool = %s", (pool,)).fetchone()
+    row = conn.execute("SELECT pool, active, source FROM watch_pools WHERE pool = %s", (pool,)).fetchone()
     if row:
+        if not row["active"] and row["source"] != "smoke":      # deactivated earlier (authority regained, transient payload): back on watch
+            conn.execute("UPDATE watch_pools SET active = true, deactivated_at = NULL, reason = NULL WHERE pool = %s", (pool,))
         return False
     conn.execute(
         """INSERT INTO watch_pools (pool, mint, quote_mint, program_label, base_decimals, source, active, tradable)
@@ -159,8 +161,8 @@ def process_tokens(conn, toks: list[dict], with_stats: bool) -> dict:
                 counts["new_pools"] += 1
                 record_event("info", "discover", "new watch pool", {"mint": tok["id"], "symbol": tok.get("symbol"),
                                                                       "pool": tok.get("graduatedPool"), "launchpad": tok.get("launchpad")})
-        elif status == "excluded" and tok.get("graduatedAt"):
-            # a previously watched token that regained an authority is deactivated
+        elif status == "excluded" and tok.get("graduatedAt") and "authority" in reason:
+            # only a token that regained an authority is deactivated; a payload missing graduatedPool/audit is not a reason
             n = conn.execute(
                 "UPDATE watch_pools SET active=false, deactivated_at=now(), reason=%s WHERE mint=%s AND active",
                 (reason, tok["id"]),

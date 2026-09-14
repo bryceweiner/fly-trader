@@ -9,8 +9,8 @@ This worker downloads ``REPLAY_PARALLEL`` hours at a time (measured ~2–4 MB/s 
 thread and writes, per hour, ``data/corpus/replay/<date>/<HH>_trades.parquet`` (pump.fun bonding-curve and
 PumpSwap buys/sells, one row per trader leg; signatures and per-mint constants are left out to keep it ~70 MB/hour, the
 lifecycle table carries creator, pool id, metadata URI and the reserves at migration) and ``<HH>_events.parquet`` (every non-trade lifecycle event across
-all pools, small). Hours are processed newest first so the current regime lands first; the registry is
-``replay_hours``. The compressed download is a temporary file and is removed after a successful parse — the
+all pools, small). Hours are processed newest first so the current regime lands first, and hours that close while the backfill runs
+are fetched ahead of it, so the archive stays within ~2 hours of live; the registry is ``replay_hours``. The compressed download is a temporary file and is removed after a successful parse — the
 public archive remains the source of truth. Downstream: ``train/replay_assemble.py`` turns days into per-token
 candle/trade files for the feature builder.
 """
@@ -35,6 +35,7 @@ from .. import config
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..logging_setup import setup
+from .corpus_pull import _sleep
 
 log = logging.getLogger(__name__)
 TRADE_POOLS = {"pump", "pump-amm"}
@@ -164,23 +165,45 @@ def main(stop_event: threading.Event | None = None) -> None:
         todo.put(h)
     client = httpx.Client(headers={"User-Agent": "fly-trader replay ingest"}, timeout=httpx.Timeout(60.0, read=600.0), follow_redirects=True)
 
+    newest_planned = [(datetime.now(timezone.utc) - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)]   # the plan's upper bound
+    fresh: queue.Queue = queue.Queue()      # hours that closed after the plan was made; served before the backfill
+
+    def replan():
+        last = (datetime.now(timezone.utc) - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)
+        h = newest_planned[0] + timedelta(hours=1)
+        while h <= last:
+            fresh.put(h); h += timedelta(hours=1)
+        if last > newest_planned[0]:
+            newest_planned[0] = last
+
     def downloader():
         while not (stop is not None and stop.is_set()):
             try:
-                h = todo.get_nowait()
+                h = fresh.get_nowait()
             except queue.Empty:
-                return
+                try:
+                    h = todo.get_nowait()
+                except queue.Empty:
+                    return
             tmp = tmpdir / f"{h:%Y%m%d%H}.zst"
             for attempt in range(4):
                 try:
                     t0 = time.time(); size = _download(client, h, tmp, stop)
-                    ready.put((h, tmp, size, time.time() - t0)); break
+                    while not (stop is not None and stop.is_set()):
+                        try:
+                            ready.put((h, tmp, size, time.time() - t0), timeout=5.0); break
+                        except queue.Full:
+                            continue
+                    break
                 except InterruptedError:
                     return
                 except Exception as e:
                     log.warning("download %s failed (%d): %s", h, attempt, e); time.sleep(10 * (attempt + 1))
             else:
-                ready.put((h, None, 0, 0.0))
+                try:
+                    ready.put((h, None, 0, 0.0), timeout=5.0)
+                except queue.Full:
+                    pass
 
     from ..train import replay_assemble
     assembler = threading.Thread(target=replay_assemble.assemble_loop, args=(stop,), name="replay-assemble", daemon=True); assembler.start()
@@ -189,14 +212,24 @@ def main(stop_event: threading.Event | None = None) -> None:
         t.start()
     try:
         pending = len(hours)
-        while pending and not (stop is not None and stop.is_set()):
+        while not (stop is not None and stop.is_set()):
             try:
                 h, tmp, size, dl_s = ready.get(timeout=5.0)
             except queue.Empty:
+                replan()
                 if not any(t.is_alive() for t in threads) and ready.empty():
-                    break
+                    if fresh.empty():
+                        _sleep(300, stop); replan()          # caught up: poll for the next closed hour
+                        if fresh.empty():
+                            continue
+                    threads = [threading.Thread(target=downloader, name=f"replay-dl-{i}", daemon=True) for i in range(config.REPLAY_PARALLEL)]
+                    for t in threads:
+                        t.start()
                 continue
             pending -= 1
+            replan()
+            if not fresh.empty():
+                pending += fresh.qsize()      # keep the parser loop alive for the hours just queued
             if tmp is None or size < 0:
                 with transaction() as conn:
                     conn.execute("INSERT INTO replay_hours (hour, status, last_error) VALUES (%s, %s, %s) ON CONFLICT (hour) DO UPDATE SET status = EXCLUDED.status, last_error = EXCLUDED.last_error, done_at = now()",

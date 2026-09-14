@@ -40,7 +40,7 @@ def _refuse_production_under_pytest(url: str) -> None:
 def connect(url: str | None = None, *, autocommit: bool = False) -> psycopg.Connection:
     url = url or database_url()
     _refuse_production_under_pytest(url)
-    return psycopg.connect(url, autocommit=autocommit, row_factory=dict_row)
+    return psycopg.connect(url, autocommit=autocommit, row_factory=dict_row, options="-c timezone=UTC")
 
 
 @contextmanager

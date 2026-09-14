@@ -212,7 +212,7 @@ EDGE_MIN = env_float("EDGE_MIN", 0.0)              # realized edge <= this -> no
 NO_EDGE_BITTER = env_float("NO_EDGE_BITTER", 1.0)  # bitter input (dopamine units) per unit of negative edge
 
 # ---- brain mode ----
-BRAIN_MODE = env_str("BRAIN_MODE", "policy")     # policy (FlyGM-style trained connectome) | lif (frozen spiking + KC->MBON plasticity)
+BRAIN_MODE = env_str("BRAIN_MODE", "selector")   # selector (the strategy, 2026-09-14) | policy (FlyGM-style trained connectome) | lif (frozen spiking + KC->MBON plasticity)
 POLICY_MIN_TRADE_FRAC = env_float("POLICY_MIN_TRADE_FRAC", 0.25)
 
 # ---- training lifecycle ----
@@ -245,6 +245,8 @@ def summary() -> dict:
                 out[k] = str(v)
             elif isinstance(v, dict):
                 out[k] = v
+    if "DATABASE_URL" in out:                      # may carry a password; the database name is enough
+        out["DATABASE_URL"] = "postgresql:///" + str(out["DATABASE_URL"]).rsplit("/", 1)[-1].split("?")[0]
     return out
 
 
@@ -270,7 +272,7 @@ def live_prerequisites_missing() -> list[str]:
 
 # ---- historical corpus (every pump.fun graduation, pulled from the migration wallet + pump.fun's swap-api) ----
 CORPUS_DIR = DATA_DIR / "corpus"
-CORPUS_DAYS = env_int("CORPUS_DAYS", 120)                          # enumerate graduations this far back
+CORPUS_DAYS = env_int("CORPUS_DAYS", 240)                          # enumerate graduations this far back (must reach before CORPUS_PULL_BEFORE)
 CORPUS_MIGRATION_AUTHORITY = env_str("CORPUS_MIGRATION_AUTHORITY", "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg")
 CORPUS_SWAP_API = env_str("CORPUS_SWAP_API", "https://swap-api.pump.fun")
 CORPUS_PACE_S = env_float("CORPUS_PACE_S", 2.2)                    # seconds between swap-api requests (~30/min bucket; 1/s throttles after ~20)
@@ -279,7 +281,7 @@ CORPUS_CANDLE_1M_H = env_float("CORPUS_CANDLE_1M_H", 12.0)          # 1-minute c
 CORPUS_CANDLE_5M_D = env_float("CORPUS_CANDLE_5M_D", 7.0)          # then 5-minute candles until this many days
 CORPUS_MIN_LIFE_H = env_float("CORPUS_MIN_LIFE_H", 1.0)             # per-trade rows only for tokens that traded at least this long
 CORPUS_TRADES_H = env_float("CORPUS_TRADES_H", 3.0)                 # per-trade rows for the first hours after graduation
-CORPUS_TRADES_DAYS = env_int("CORPUS_TRADES_DAYS", 60)              # ... and only for graduations this recent
+CORPUS_TRADES_DAYS = env_int("CORPUS_TRADES_DAYS", 400)             # ... and only for graduations this recent (the 10 % sample bounds the cost)
 CORPUS_TRADES_MAX_PAGES = env_int("CORPUS_TRADES_MAX_PAGES", 200)   # 100 trades per page
 CORPUS_TRADES_SAMPLE = env_float("CORPUS_TRADES_SAMPLE", 0.10)      # share of surviving tokens that get per-trade rows (deterministic by mint)
 CORPUS_MIN_AGE_H = env_float("CORPUS_MIN_AGE_H", 6.0)                # pull a token only once its first hours are complete
@@ -292,3 +294,8 @@ REPLAY_START = env_str("REPLAY_START", "2026-04-18")
 REPLAY_PARALLEL = env_int("REPLAY_PARALLEL", 4)                     # concurrent hour downloads (~2-4 MB/s each)
 REPLAY_DIR = CORPUS_DIR / "replay"
 CORPUS_PULL_BEFORE = env_str("CORPUS_PULL_BEFORE", REPLAY_START)     # swap-api puller only handles graduations before the replay archive begins
+
+# ---- PumpAPI live stream (free firehose, same events as the replay archive; the selector's parity feed) ----
+PUMPSTREAM_URL = env_str("PUMPSTREAM_URL", "wss://stream.pumpapi.io")
+PUMP_MINUTES_KEEP_DAYS = env_int("PUMP_MINUTES_KEEP_DAYS", 7)       # older minute rows are archived to Parquet, then removed from the table
+SELECTOR_SOURCE = env_str("SELECTOR_SOURCE", "stream")               # stream (pump_minutes from PumpAPI) | tape (Helius swap_tape, watched pools only)

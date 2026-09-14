@@ -37,7 +37,7 @@ def _cmd_discover(args):
 
 def _cmd_capture(args):
     from .ingest import capture
-    capture.main()
+    return capture.main()
 
 
 def _cmd_build_connectome(args):
@@ -155,9 +155,33 @@ def _cmd_corpus_pull(args):
     corpus_pull.main()
 
 
+def _cmd_replay_pull(args):
+    from .ingest import replay_pull
+    replay_pull.main()
+
+
+def _cmd_pumpstream(args):
+    from .ingest import pumpstream
+    pumpstream.main()
+
+
 def _cmd_build_corpus_features(args):
     from .train import corpus_features
     corpus_features.main()
+
+
+def _cmd_train_selector(args):
+    from .logging_setup import setup
+    from .train import selector
+    setup("train")
+    selector.main(days=args.days, test_days=args.test_days, top_frac=args.top_frac)
+
+
+def _cmd_train_fly_selector(args):
+    from .logging_setup import setup
+    from .train import fly_selector
+    setup("train")
+    fly_selector.main(days=args.days, test_days=args.test_days, top_frac=args.top_frac, epochs=args.epochs, rows_per_epoch=args.rows)
 
 
 def _cmd_selector_eval(args):
@@ -203,11 +227,18 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("discover"); d.add_argument("--once", action="store_true"); d.add_argument("--probe", action="store_true"); d.set_defaults(fn=_cmd_discover)
     sub.add_parser("capture").set_defaults(fn=_cmd_capture)
     sub.add_parser("corpus-pull").set_defaults(fn=_cmd_corpus_pull)
+    sub.add_parser("replay-pull").set_defaults(fn=_cmd_replay_pull)
+    sub.add_parser("pumpstream").set_defaults(fn=_cmd_pumpstream)
     sub.add_parser("build-corpus-features").set_defaults(fn=_cmd_build_corpus_features)
     sub.add_parser("assemble-replay").set_defaults(fn=_cmd_assemble_replay)
     sub.add_parser("build-corpus-meta").set_defaults(fn=_cmd_build_corpus_meta)
     sub.add_parser("build-mature").set_defaults(fn=_cmd_build_mature)
     sub.add_parser("selector-eval").set_defaults(fn=_cmd_selector_eval)
+    ts_ = sub.add_parser("train-selector"); ts_.add_argument("--days", type=int, default=45); ts_.add_argument("--test-days", type=int, default=9)
+    ts_.add_argument("--top-frac", type=float, default=0.01); ts_.set_defaults(fn=_cmd_train_selector)
+    tf_ = sub.add_parser("train-fly-selector"); tf_.add_argument("--days", type=int, default=45); tf_.add_argument("--test-days", type=int, default=9)
+    tf_.add_argument("--top-frac", type=float, default=0.01); tf_.add_argument("--epochs", type=int, default=2); tf_.add_argument("--rows", type=int, default=600000)
+    tf_.set_defaults(fn=_cmd_train_fly_selector)
     bc = sub.add_parser("backtest-corpus"); bc.add_argument("--max-tokens", type=int, default=None); bc.add_argument("--days", type=int, default=None)
     bc.add_argument("--fees", default="0.003,0.0055"); bc.add_argument("--only", default=None); bc.add_argument("--universe", default="graduation", choices=["graduation", "mature"]); bc.set_defaults(fn=_cmd_backtest_corpus)
     b = sub.add_parser("build-connectome"); b.add_argument("--annotations", default=None); b.set_defaults(fn=_cmd_build_connectome)

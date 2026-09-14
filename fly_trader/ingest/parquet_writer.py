@@ -137,8 +137,14 @@ class Writer:
         for day, rs in sorted(groups.items()):
             path = self._next_path(day)
             tmp = path.with_name(path.name + ".tmp")
-            pq.write_table(self._table(rs), tmp, compression="snappy")
-            os.replace(tmp, path)
+            try:
+                pq.write_table(self._table(rs), tmp, compression="snappy")
+                os.replace(tmp, path)
+            except Exception:
+                self.buf = rs + self.buf                     # nothing is dropped: the rows wait for the next flush
+                if tmp.exists():
+                    tmp.unlink()
+                raise
             written.append(path)
             self.files_written += 1
             self.rows_written += len(rs)

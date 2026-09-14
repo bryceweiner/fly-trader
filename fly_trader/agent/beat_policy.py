@@ -128,7 +128,7 @@ class PolicySession(Session):
                         if b == "live":
                             ok = self._enter_live(g, SimpleNamespace(mint=m, size_sol=size), meta)
                         else:
-                            ok = self._enter(g, conn, b, m, size, now_dt, flows)
+                            ok = self._enter(g, conn, b, m, size, now_dt, flows, allow_add=bool(pos))
                         if ok:
                             n_trades += 1
                             kind = "resize" if pos else "enter"

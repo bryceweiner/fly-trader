@@ -18,7 +18,8 @@ files = sorted(glob.glob(str(config.CORPUS_DIR / "features_mature" / "*" / "part
 cols = ["mint", "ts", "open", "close", "resq", "age_h", "traders_15m", "traders_1h", "n_trades_1m"] + FEATURES
 df = pd.concat([pq.read_table(f, columns=cols).to_pandas() for f in files], ignore_index=True).sort_values(["mint", "ts"]).reset_index(drop=True)
 jump = (df["close"] / df.groupby("mint")["close"].shift(1)).fillna(1.0)
-bad = set(df.loc[(jump > 50) | (jump < 1 / 50) | (df["resq"] > 1e5), "mint"]); df = df[~df["mint"].isin(bad)].reset_index(drop=True)
+df["_off"] = ((jump > 50) | (jump < 1 / 50) | (df["resq"] > 1e5)).astype(np.int8)
+df = df[~df.groupby("mint")["_off"].cummax().astype(bool)].reset_index(drop=True)     # past-only: rows before a scale break keep their labels
 df = df.merge(load_features(), on="mint", how="left")
 ts = ((df["ts"] - pd.Timestamp(0, tz="UTC")) / pd.Timedelta(seconds=1)).to_numpy(); cl = df["close"].to_numpy(); op = df["open"].to_numpy(); mints = df["mint"].to_numpy()
 fwd = np.full(len(df), np.nan); entry_pess = cl.copy(); gap_next = np.full(len(df), np.nan)

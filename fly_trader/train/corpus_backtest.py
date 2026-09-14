@@ -51,10 +51,11 @@ def load(feature_dir=None, max_tokens: int | None = None, days: int | None = Non
     # drop tokens whose series mixes price scales (secondary pools in other quotes) or carries impossible reserves
     df = df.sort_values(["mint", "ts"])
     jump = (df["close"] / df.groupby("mint")["close"].shift(1)).fillna(1.0)
-    bad = set(df.loc[(jump > 50) | (jump < 1 / 50) | (df["resq"] > 100000), "mint"])
-    if bad:
-        print(f"(dropping {len(bad):,} tokens with mixed price scales or impossible reserves)")
-        df = df[~df["mint"].isin(bad)]
+    off = ((jump > 50) | (jump < 1 / 50) | (df["resq"] > 100000)).astype(np.int8)
+    broken = off.groupby(df["mint"]).cummax().astype(bool)
+    if broken.any():
+        print(f"(dropping {int(broken.sum()):,} rows from the first scale break of a token onward, past-only)")
+        df = df[~broken]
     try:
         from .corpus_meta import load_features
         meta = load_features()
@@ -85,15 +86,21 @@ def _s3(d: pd.DataFrame, top: float, pre_top: float, hc: float) -> np.ndarray:
             & (d["imb_5m"].to_numpy() > 0) & (d["dd_1h"].to_numpy() >= -0.05) & d["has_trades"].to_numpy())
 
 
+def _grad_price(d: pd.DataFrame) -> np.ndarray:
+    """First post-graduation close per mint, from candle rows only (sampled tokens also carry trade-path rows)."""
+    c = d["close"].where(~d["has_trades"])
+    return c.groupby(d["mint"]).transform("first").to_numpy()
+
+
 def _s3b(d: pd.DataFrame, r: float, a_lo: float) -> np.ndarray:
-    p0 = d.groupby("mint")["close"].transform("first").to_numpy()
+    p0 = _grad_price(d)
     age = d["age_h"].to_numpy()
     return ((age >= a_lo) & (age <= 1.0) & (d["close"].to_numpy() >= p0) & (d["ret_15m"].to_numpy() >= r) & (d["logvol_15m"].to_numpy() >= math.log1p(5.0))
             & ~d["has_trades"].to_numpy())
 
 
 def _s4(d: pd.DataFrame, age_min: float, rel_min: float, ret15_min: float) -> np.ndarray:
-    p0 = d.groupby("mint")["close"].transform("first").to_numpy()
+    p0 = _grad_price(d)
     return ((d["age_h"].to_numpy() * 60 >= age_min) & (d["close"].to_numpy() >= rel_min * p0) & (d["ret_15m"].to_numpy() >= ret15_min) & ~d["has_trades"].to_numpy())
 
 

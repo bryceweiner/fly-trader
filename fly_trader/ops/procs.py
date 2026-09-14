@@ -23,6 +23,9 @@ WORKERS: dict[str, list[str]] = {
     "runner": ["run"],
     "pretrain": ["pretrain"],
     "train": ["train-policy"],
+    "corpus": ["corpus-pull"],
+    "replay": ["replay-pull"],
+    "pumpstream": ["pumpstream"],
 }
 PYTHON = str(config.REPO_ROOT / ".venv" / "bin" / "python")
 

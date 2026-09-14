@@ -160,9 +160,13 @@ def loop_once() -> int:
     for d in days_ready():
         aggregate_day(d); n += 1
     # features for days whose aggregate and previous day's aggregate exist and no feature part yet
+    with transaction() as conn:
+        assembled = {r["day"] for r in conn.execute("SELECT day FROM replay_days").fetchall()}
     for f in sorted(MATURE_DIR.glob("*.parquet"), reverse=True):
         d = date.fromisoformat(f.stem)
         if (MATURE_FEAT_DIR / d.isoformat() / "part.parquet").exists() or not (MATURE_DIR / f"{(d - timedelta(days=1)).isoformat()}.parquet").exists():
+            continue
+        if d not in assembled:          # graduation times for the day's new tokens come from the assembled day
             continue
         build_day(d); n += 1
     return n
