@@ -67,14 +67,14 @@ def _main(stop_event=None) -> None:
         from ..chain.cluster_guard import assert_signing_allowed
         assert_signing_allowed()
         live = True
+    if config.RESET_ON_START:                      # every mode: a fresh runner never carries over a previous run's books or stats
+        from ..ops.reset import reset_training_state
+        reset_training_state(reason="runner start")
     if config.BRAIN_MODE == "selector":            # the strategy: minute-by-minute selector on the live tape (paper book, live once wired)
         from . import selector_session
         record_event("info", "runner", "runner started", {"mode": "selector", "live": live})
         selector_session.main(stop_event=stop_event, live=live)
         return
-    if config.RESET_ON_START:
-        from ..ops.reset import reset_training_state
-        reset_training_state(reason="runner start")
     c = Connectome.load()
     if config.BRAIN_MODE == "policy":
         from .beat_policy import PolicySession

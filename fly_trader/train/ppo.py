@@ -222,7 +222,9 @@ def main(iterations: int | None = None, window: int | None = None, dataset: str 
          eval_every: int | None = None, imitate_epochs: int = 0, init_from: int | None = None, stop_event=None) -> None:
     import glob, uuid
     from ..logging_setup import setup
+    from ..ops.reset import reset_training_stats
     setup("ppo")
+    reset_training_stats(reason="ppo training")
     prog.clear(); prog.set_stop_event(stop_event)
     prog.update("loading dataset", force=True)
     path = dataset or sorted(glob.glob(str(config.DATA_DIR / "train" / "obs_*.npz")))[-1]

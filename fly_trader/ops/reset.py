@@ -3,10 +3,13 @@
 Wiped (after being archived as CSV under data/pg_archive/reset_<ts>/): beats, beat_slots, brain_activity,
 decisions, rewards, wealth_marks, synapse_updates, slot_visits, brain_snapshots, runs (except connectome
 build/calibration provenance), and positions/orders/fills of paper and replay books. brain_state is cleared;
-replay clocks restart. The plasticity journal and snapshot files are moved aside. NEVER touched: the circuit
-(kill switch, trip, failure count, peak wealth — only rails.reset_circuit re-arms it), live-book
-positions/orders/fills, wallet events, tokens, pools, the swap tape, API logs, events, ui_settings other
-than replay clocks.
+replay clocks and the selector session status restart. The plasticity journal and snapshot files are moved aside.
+Runs on every runner start (``RESET_ON_START``, all modes). NEVER touched: the circuit (kill switch, trip, failure
+count, peak wealth — only rails.reset_circuit re-arms it), live-book positions/orders/fills, wallet events, tokens,
+pools, the swap tape, API logs, events, other ui_settings.
+
+``reset_training_stats`` is the training-side counterpart, run at the start of every training run: the previous runs'
+walk-forward / iteration events and the console's training status are archived and cleared (models are kept).
 """
 from __future__ import annotations
 
@@ -27,6 +30,7 @@ _LIVE_DECISIONS = ("SELECT decision_id FROM orders WHERE book = 'live' AND decis
 WIPE_TABLES = ["beats", "beat_slots", "brain_activity", "rewards", "wealth_marks", "synapse_updates",
                "slot_visits"]
 BOOK_TABLES = ["positions", "orders", "fills"]
+TRAINING_EVENTS = ("(source IN ('fly_selector', 'ppo') OR (source = 'selector' AND (message LIKE 'walk-forward%' OR message LIKE 'selector saved%')))")
 
 
 def _archive(conn, table: str, where: str, out_dir: Path) -> int:
@@ -64,7 +68,7 @@ def reset_training_state(reason: str = "runner start", archive: bool = True) -> 
         conn.execute("DELETE FROM runs WHERE kind NOT IN ('connectome_build','calibration')")
         conn.execute("UPDATE brain_state SET live_snapshot_id = CASE WHEN (SELECT kind FROM brain_snapshots WHERE id = live_snapshot_id) IN ('policy','selector','fly_selector') THEN live_snapshot_id END, "
                      "pending_snapshot_id = CASE WHEN (SELECT kind FROM brain_snapshots WHERE id = pending_snapshot_id) IN ('policy','selector','fly_selector') THEN pending_snapshot_id END, updated_at = now() WHERE singleton")
-        conn.execute("DELETE FROM ui_settings WHERE key LIKE 'replay_clock:%'")
+        conn.execute("DELETE FROM ui_settings WHERE key LIKE 'replay_clock:%' OR key = 'selector_status'")
         conn.execute("INSERT INTO circuit_events (kind, detail) VALUES ('training_reset', %s)", (f'{{"reason": "{reason}"}}',))
     for sub in ("journal", "snapshots"):
         src = config.BRAIN_DIR / sub
@@ -76,3 +80,18 @@ def reset_training_state(reason: str = "runner start", archive: bool = True) -> 
     record_event("info", "reset", f"training state reset ({reason})", {"archived_to": str(out_dir) if archive else None, "rows": counts})
     log.info("training state reset (%s): %s", reason, counts)
     return {"archived_to": str(out_dir) if archive else None, "rows": counts}
+
+
+def reset_training_stats(reason: str = "training start", archive: bool = True) -> dict:
+    """Clear the previous training runs' statistics (walk-forward, iteration and comparison events; the console's training
+    status) so a new run's numbers are never shown next to an old run's. Trained models (brain_snapshots) are kept."""
+    out_dir = config.PG_ARCHIVE_DIR / f"training_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    with transaction() as conn:
+        n = 0
+        if archive:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            n = _archive(conn, "events", "WHERE " + TRAINING_EVENTS, out_dir)
+        conn.execute("DELETE FROM events WHERE " + TRAINING_EVENTS)
+        conn.execute("DELETE FROM ui_settings WHERE key = 'training_status'")
+    log.info("training stats reset (%s): %d events", reason, n)
+    return {"archived_to": str(out_dir) if archive else None, "events": n}

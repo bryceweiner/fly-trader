@@ -20,3 +20,36 @@ def test_reset_wipes_paper_but_keeps_live_and_market_data(db_conn, tmp_path, mon
         assert conn.execute("SELECT count(*) AS n FROM ui_settings WHERE key LIKE 'replay_clock:%%'").fetchone()["n"] == 0
         conn.execute("DELETE FROM positions WHERE book='live' AND mint='M2'")
     assert (tmp_path / "arch").exists() and out["rows"]["positions"] >= 1
+
+
+def test_selector_status_cleared_and_training_stats_reset(db_conn, tmp_path, monkeypatch):
+    from fly_trader.ops.reset import reset_training_stats
+    monkeypatch.setattr(config, "PG_ARCHIVE_DIR", tmp_path / "arch")
+    monkeypatch.setattr(config, "BRAIN_DIR", tmp_path / "brain")
+    with transaction() as conn:
+        conn.execute("INSERT INTO ui_settings (key, value) VALUES ('selector_status', '{}'::jsonb), ('training_status', '{}'::jsonb) ON CONFLICT (key) DO NOTHING")
+        conn.execute("INSERT INTO events (level, source, message) VALUES ('info','selector','walk-forward 2026-09-01'), ('info','selector','selector saved (snapshot 1)'), "
+                     "('info','ppo','iteration 3'), ('info','selector','selector session started')")
+    reset_training_state(reason="test")
+    with transaction() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM ui_settings WHERE key = 'selector_status'").fetchone()["n"] == 0
+    out = reset_training_stats(reason="test")
+    with transaction() as conn:
+        left = [r["message"] for r in conn.execute("SELECT message FROM events WHERE source IN ('selector','ppo') AND message IN "
+                                                    "('walk-forward 2026-09-01','selector saved (snapshot 1)','iteration 3','selector session started')").fetchall()]
+        assert left == ["selector session started"]                         # session events are not training stats
+        assert conn.execute("SELECT count(*) AS n FROM ui_settings WHERE key = 'training_status'").fetchone()["n"] == 0
+        conn.execute("DELETE FROM events WHERE message = 'selector session started'")
+    assert out["events"] >= 3
+
+
+def test_selector_runner_resets_on_start(monkeypatch):
+    from fly_trader.agent import runner, selector_session
+    from fly_trader.ops import reset
+    calls = []
+    monkeypatch.setattr(config, "LIVE_ENABLED", False); monkeypatch.setattr(config, "BRAIN_MODE", "selector"); monkeypatch.setattr(config, "RESET_ON_START", True)
+    monkeypatch.setattr(reset, "reset_training_state", lambda reason="": calls.append("reset"))
+    monkeypatch.setattr(selector_session, "main", lambda stop_event=None, live=False: calls.append("session"))
+    monkeypatch.setattr(runner, "record_event", lambda *a, **k: None)
+    runner._main()
+    assert calls == ["reset", "session"]

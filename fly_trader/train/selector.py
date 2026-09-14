@@ -126,6 +126,8 @@ def load_latest() -> SelectorModel | None:
 
 
 def main(days: int = 45, test_days: int = 9, top_frac: float = 0.01, horizon_min: int = 30, stop_event: threading.Event | None = None) -> dict:
+    from ..ops.reset import reset_training_stats
+    reset_training_stats(reason="selector training")
     prog.set_stop_event(stop_event); prog.clear()
     prog.update("selector: building decision points", 0, 1, force=True)
     t0 = time.time(); ds = build(days=days, horizon_min=horizon_min)

@@ -102,6 +102,8 @@ class FlyScorer:
 def main(days: int = 45, test_days: int = 9, top_frac: float = 0.01, horizon_min: int = 30, epochs: int = 2, rows_per_epoch: int = 600_000,
          stop_event: threading.Event | None = None) -> dict:
     """Single-split comparison: train on days ≤ D_cut−2, score the last ``test_days`` days, same protocol for the GBM."""
+    from ..ops.reset import reset_training_stats
+    reset_training_stats(reason="fly selector training")
     prog.set_stop_event(stop_event); prog.clear()
     prog.update("fly selector: building decision points", 0, 1, force=True)
     ds = build(days=days, horizon_min=horizon_min); dl = ds.days; D_cut = dl[-test_days]
