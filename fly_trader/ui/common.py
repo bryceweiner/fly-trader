@@ -11,7 +11,7 @@ import streamlit as st
 from fly_trader import config
 from fly_trader.db.queries import q, q1
 from fly_trader.ops.supervisor import WORKERS, get_supervisor
-from fly_trader.train.selector import is_current
+from fly_trader.train.selector import is_current, is_deployable
 
 BOOK = "paper_selector"
 STALE_FEED_S = 180            # agent/selector_session.py: no entries or exits when the newest complete minute is older
@@ -88,11 +88,12 @@ def snapshot(sid: int) -> dict | None:
     return _snap(q1("SELECT id, ts, kind, note FROM brain_snapshots WHERE id = %s", (sid,)))
 
 
-def latest_snapshot(kind: str = "selector") -> dict | None:
-    """The newest snapshot of this kind trained on the current data definitions (older ones are never loaded)."""
+def latest_snapshot(kind: str = "selector", deployable: bool = False) -> dict | None:
+    """The newest snapshot of this kind trained on the current data definitions (older ones are never loaded);
+    with ``deployable`` only one whose backtest qualified it to trade."""
     for r in q("SELECT id, ts, kind, note FROM brain_snapshots WHERE kind = %s ORDER BY id DESC LIMIT 50", (kind,)):
         s = _snap(r)
-        if is_current(s["meta"]):
+        if (is_deployable if deployable else is_current)(s["meta"]):
             return s
     return None
 
@@ -117,7 +118,10 @@ def backtest_line(meta: dict) -> str:
         return "No backtest recorded."
     s = (f"Backtest on {wf.get('days')} held-out days: {pct(wf.get('mean'))} average per trade over {wf.get('n')} trades, "
          f"profitable on {wf.get('days_positive')} of those {wf.get('days')} days")
-    return s + (f"; random picks made {pct(rb['mean'])} per trade under the same costs." if rb.get("mean") is not None else ".")
+    s += (f"; random picks made {pct(rb['mean'])} per trade under the same costs." if rb.get("mean") is not None else ".")
+    if meta.get("deploy_reason"):
+        s += (" Put to work: " if meta.get("deployable") else " Not put to work: ") + meta["deploy_reason"] + "."
+    return s
 
 
 def labels(mints) -> dict[str, str]:
@@ -144,6 +148,8 @@ def system_state() -> dict:
     if not runner:
         err = (ws["runner"].get("error") or "").splitlines()
         trading, why = "stopped", ("The trading engine is stopped: " + err[0].split(": ", 1)[-1]) if err else "The trading engine is stopped."
+    elif str(sel.get("stage", "")).startswith("waiting for a model"):
+        trading, why = "waiting", "No model has qualified to trade yet: a model trades only if its backtest made money after costs and beat random picks. It starts as soon as one does."
     elif circuit.get("kill_switch"):
         trading, why = "blocked", "Kill switch tripped" + (f" ({circuit['kill_reason']})" if circuit.get("kill_reason") else "") + ": no new entries."
     elif circuit.get("entries_paused"):
@@ -155,13 +161,15 @@ def system_state() -> dict:
     else:
         trading, why = "trading", "Trading every minute."
     return {"workers": ws, "runner": runner, "trading": trading, "trading_why": why, "live_money": bool(config.LIVE_ENABLED and config.BRAIN_MODE != "selector"),
-            "model": loaded_model() if runner else None, "latest": latest_snapshot("selector"), "training": training, "train_status": tr, "train_at": tr_at,
+            "model": loaded_model() if runner else None, "latest": latest_snapshot("selector"), "deployable": latest_snapshot("selector", deployable=True),
+            "training": training, "train_status": tr, "train_at": tr_at,
             "train_external": training and not ws["train"]["alive"], "selector": sel, "selector_at": sel_at, "feed": ps, "feed_ok": feed_ok, "feed_age": feed_age,
             "circuit": circuit}
 
 
 TRADING_BADGE = {"trading": ("Trading", "green"), "holding": ("Holding: feed stale", "orange"), "paused": ("Entries paused", "orange"),
-                 "blocked": ("Kill switch tripped", "red"), "starting": ("Starting", "blue"), "stopped": ("Not trading", "gray")}
+                 "blocked": ("Kill switch tripped", "red"), "starting": ("Starting", "blue"), "stopped": ("Not trading", "gray"),
+                 "waiting": ("Waiting for a qualified model", "gray")}
 
 
 @st.fragment(run_every="5s")
@@ -174,11 +182,15 @@ def status_strip() -> None:
             st.badge("Paper — no real SOL", icon=":material/receipt:", color="blue", help="Trades are simulated at market prices with real fees; no wallet funds are used.")
         text, color = TRADING_BADGE[s["trading"]]
         st.badge(text, icon=":material/candlestick_chart:", color=color, help=s["trading_why"])
-        m, latest = s["model"], s["latest"]
-        st.badge(f"Model #{m['id']}" if m else "No model loaded", icon=":material/psychology:", color="violet" if m else "gray",
-                 help=backtest_line(m["meta"]) if m else ("No model has been trained on the current data yet." if not latest else "The trading engine is stopped, so no model is in use."))
-        if m and latest and latest["id"] > m["id"]:
-            st.badge(f"Newer model #{latest['id']} saved", icon=":material/upgrade:", color="orange", help="Load it from Model & training.")
+        m, latest, dep = s["model"], s["latest"], s["deployable"]
+        st.badge(f"Model #{m['id']}" if m else "No model at work", icon=":material/psychology:", color="violet" if m else "gray",
+                 help=backtest_line(m["meta"]) if m else ("No model has been trained on the current data yet." if not latest
+                                                         else "No model has earned a place yet: " + (latest["meta"].get("deploy_reason") or "none qualified") if not dep
+                                                         else "The trading engine is stopped, so no model is in use."))
+        if latest and not is_deployable(latest["meta"]) and (not m or latest["id"] > m["id"]):
+            st.badge(f"Model #{latest['id']} not put to work", icon=":material/block:", color="orange", help=backtest_line(latest["meta"]))
+        if m and dep and dep["id"] > m["id"]:
+            st.badge(f"Switching to model #{dep['id']}", icon=":material/upgrade:", color="blue", help="The trading engine picks it up within 10 minutes.")
         tr = s["train_status"]
         st.badge(f"Training · {tr.get('stage', '')}" if s["training"] else "Not training", icon=":material/model_training:", color="blue" if s["training"] else "gray")
         st.badge("Market feed live" if s["feed_ok"] else "Market feed stale", icon=":material/sensors:", color="green" if s["feed_ok"] else "red",

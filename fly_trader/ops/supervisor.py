@@ -32,26 +32,9 @@ def _entry(name: str):
     if name == "runner":
         from ..agent import runner
         return runner.main
-    if name == "train":
-        import json as _json
-        def _train(stop_event=None):
-            setup("train")   # log file + ring buffer keyed by this thread's name
-            with transaction() as conn:
-                r = conn.execute("SELECT value FROM ui_settings WHERE key = 'training_params'").fetchone()
-            params = (r["value"] if (r and isinstance(r["value"], dict)) else _json.loads((r or {}).get("value") or "{}")) if r else {}
-            regimen = params.get("regimen", "selector")
-            if regimen == "selector":          # the strategy: gradient-boosted selector, walk-forward, then the deployable fit
-                from ..train import selector as _sel
-                _sel.main(days=params.get("days"), top_frac=params.get("top_frac", 0.01), stop_event=stop_event)     # days None: the whole corpus
-            elif regimen == "fly":             # the fly trained on the same decision points, scored against the selector
-                from ..train import fly_selector as _fly
-                _fly.main(days=params.get("days"), test_days=params.get("test_days", 21), top_frac=params.get("top_frac", 0.01),
-                          epochs=params.get("epochs", 2), rows_per_epoch=params.get("rows_per_epoch", 600_000), stop_event=stop_event)
-            else:                              # legacy: PPO / imitation on the tape dataset
-                from ..train import ppo
-                ppo.main(iterations=params.get("iterations", 24), window=params.get("window", 400), eval_every=params.get("eval_every", 4),
-                         imitate_epochs=params.get("imitate", 4), subgraph=params.get("subgraph"), init_from=params.get("init_from"), stop_event=stop_event)
-        return _train
+    if name == "train":                        # the training pipeline: selector, then the fly imitating it, every 7 days (train/pipeline.py)
+        from ..train import pipeline
+        return pipeline.main
     if name == "corpus":
         from ..ingest import corpus_pull
         return corpus_pull.main

@@ -14,8 +14,8 @@ from fly_trader.train.mature import SCHEMA
 
 def _part(tmp_path, rows, version=None):
     from fly_trader.market.features import FEATURE_VERSION
-    from fly_trader.train.mature import write_part
-    write_part(pa.Table.from_pylist(rows, schema=SCHEMA), tmp_path / "2026-09-01" / "part.parquet", FEATURE_VERSION if version is None else version)
+    from fly_trader.train.mature import AGG_VERSION, write_part
+    write_part(pa.Table.from_pylist(rows, schema=SCHEMA), tmp_path / "2026-09-01" / "part.parquet", FEATURE_VERSION if version is None else version, {"fly_agg": AGG_VERSION})
     return tmp_path
 
 
@@ -89,5 +89,5 @@ def test_trades_respect_hold_and_summaries():
 def test_stale_feature_parts_are_refused(tmp_path):
     t0 = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
     rows = [_row("A", t0 + timedelta(minutes=k), 1.0) for k in range(80)]
-    with pytest.raises(RuntimeError, match="feature version"):
+    with pytest.raises(RuntimeError, match="feature or aggregation version"):
         decisions.build(days=None, feature_dir=_part(tmp_path, rows, version=1), horizon_min=30, fee=0.0)

@@ -42,6 +42,21 @@ def is_current(meta: dict | None) -> bool:
     return bool(meta) and meta.get("data") == DATA_VERSION
 
 
+def is_deployable(meta: dict | None) -> bool:
+    """Trained on the current data AND its backtest made money after costs and beat random picks: only such a model trades."""
+    return is_current(meta) and bool(meta.get("deployable"))
+
+
+def deploy_decision(p: dict, rb: dict) -> tuple[bool, str]:
+    if (p.get("n") or 0) < 100:
+        return False, f"too few backtest trades ({p.get('n') or 0})"
+    if p.get("mean") is None or p["mean"] <= 0:
+        return False, f"its backtest lost money ({(p.get('mean') or 0) * 100:+.2f}% per trade after costs)"
+    if rb.get("mean") is not None and p["mean"] <= rb["mean"]:
+        return False, "it did not beat random picks"
+    return True, f"its backtest made {p['mean'] * 100:+.2f}% per trade after costs (random {(rb.get('mean') or 0) * 100:+.2f}%)"
+
+
 @dataclass
 class SelectorModel:
     gbm: HistGradientBoostingClassifier
@@ -143,13 +158,13 @@ def save(m: SelectorModel, run_id: str | None = None) -> tuple[Path, int]:
 
 
 def latest_current(conn) -> dict | None:
-    """The newest selector snapshot trained on the current data definitions (``DATA_VERSION``), or None."""
+    """The newest deployable selector snapshot (current data definitions, profitable backtest), or None."""
     for r in conn.execute("SELECT id, path, note FROM brain_snapshots WHERE kind = 'selector' ORDER BY id DESC").fetchall():
         try:
             meta = json.loads(r["note"] or "{}")
         except ValueError:
             continue
-        if is_current(meta) and Path(r["path"]).exists():
+        if is_deployable(meta) and Path(r["path"]).exists():
             return dict(r)
     return None
 
@@ -178,9 +193,12 @@ def main(days: int | None = None, top_frac: float = 0.01, horizon_min: int = 30,
     if stop_event is not None and stop_event.is_set():
         return wf
     prog.update("selector: fitting deployable model", 0, 1, force=True)
-    final = fit(ds, np.ones(len(ds.y), bool), top_frac, seed=99); final.metrics = {"walk_forward": p, "random_baseline": rb, "costs": "paper broker model", "data": DATA_VERSION, "auc_by_day": wf["auc"], "rows": int(len(ds.y)), "days": len(ds.days)}
+    deployable, why = deploy_decision(p, rb)
+    final = fit(ds, np.ones(len(ds.y), bool), top_frac, seed=99)
+    final.metrics = {"walk_forward": p, "random_baseline": rb, "costs": "paper broker model", "data": DATA_VERSION, "deployable": deployable, "deploy_reason": why,
+                     "auc_by_day": wf["auc"], "rows": int(len(ds.y)), "days": len(ds.days), "first_day": str(ds.days[0]), "last_day": str(ds.days[-1])}
     path, sid = save(final)
-    record_event("info", "selector", f"selector saved (snapshot {sid})", {"path": str(path), "threshold": final.threshold, **p})
-    prog.update("selector: saved", 1, 1, force=True, snapshot_id=sid, path=str(path), threshold=final.threshold)
-    log.info("selector saved: %s (snapshot %d, threshold %.4f)", path, sid, final.threshold)
-    return wf
+    record_event("info", "selector", f"selector saved (snapshot {sid})", {"path": str(path), "threshold": final.threshold, "deployable": deployable, "reason": why, **p})
+    prog.update("selector: saved", 1, 1, force=True, snapshot_id=sid, path=str(path), threshold=final.threshold, deployable=deployable, deploy_reason=why)
+    log.info("selector saved: %s (snapshot %d, threshold %.4f) — %s: %s", path, sid, final.threshold, "put to work" if deployable else "NOT put to work", why)
+    return {**wf, "snapshot_id": sid, "deployable": deployable, "deploy_reason": why}

@@ -43,6 +43,7 @@ WARMUP_MIN = 1440            # training warms each day on the previous day's can
 IDLE_EVICT_S = 86400         # training has no history for a mint idle since before the previous day
 STREAM_STALE_S = 180         # no entries or exits when the stream's newest complete minute is older than this
 META_TTL_S = 600
+MODEL_CHECK_S = 600          # how often the session looks for a newer deployable model (train/pipeline.py)
 
 
 class MintState:
@@ -55,12 +56,16 @@ class MintState:
         self.prev_close: float | None = None; self.broken = False
 
 
+class NoModel(RuntimeError):
+    """No selector has qualified to trade (current data and a profitable backtest after costs)."""
+
+
 class SelectorSession:
     def __init__(self, live: bool = False, horizon_min: int | None = None):
         from ..train import selector as sel
         self.model = sel.load_latest()
         if self.model is None:
-            raise RuntimeError("no model trained on the current data yet: train a selector (Model & training), then start the trading engine")
+            raise NoModel("no model has qualified to trade yet (trained on the current data, with a backtest that made money after costs and beat random picks)")
         missing = [c for c in self.model.cols if c not in X_COLS]
         if missing:
             raise RuntimeError(f"selector expects features the live engine does not produce: {missing}")
@@ -76,10 +81,32 @@ class SelectorSession:
         self.meta_cache: dict[str, dict] = {}; self.last_sweep = time.time()
         with transaction() as conn:
             sid = sel.latest_current(conn)["id"]                  # the snapshot load_latest returned
+            self.snapshot_id = sid
             conn.execute("INSERT INTO runs (run_id, kind, config, brain_snapshot_id, status) VALUES (%s,'selector',%s,%s,'running')",
                          (self.run_id, json.dumps({"threshold": self.model.threshold, "horizon_min": self.model.horizon_min, "book": BOOK}, default=str), sid))
         record_event("info", "selector", "selector session started", {"run_id": self.run_id, "snapshot": sid, "threshold": self.model.threshold, "horizon_min": self.model.horizon_min})
         log.info("selector session: snapshot %d threshold %.4f horizon %d min", sid, self.model.threshold, self.model.horizon_min)
+
+    def maybe_reload(self) -> bool:
+        """Switch to a newer deployable model without a restart (the paper book and open positions carry on)."""
+        import joblib
+        from ..train import selector as sel
+        with transaction() as conn:
+            r = sel.latest_current(conn)
+        if not r or r["id"] == getattr(self, "snapshot_id", None):
+            return False
+        m = joblib.load(r["path"])
+        missing = [c for c in m.cols if c not in X_COLS]
+        if missing:
+            log.error("model #%d expects features the live engine does not produce: %s; keeping #%s", r["id"], missing, self.snapshot_id)
+            return False
+        old = self.snapshot_id; self.model = m; self.snapshot_id = r["id"]
+        with transaction() as conn:
+            conn.execute("UPDATE runs SET brain_snapshot_id = %s, config = %s WHERE run_id = %s",
+                         (r["id"], json.dumps({"threshold": m.threshold, "horizon_min": m.horizon_min, "book": BOOK}, default=str), self.run_id))
+        record_event("info", "selector", f"switched to model #{r['id']}", {"from": old, "to": r["id"], "threshold": m.threshold})
+        log.info("switched from model #%s to #%d (threshold %.4f)", old, r["id"], m.threshold)
+        return True
 
     # ---- lookups ----
     def _meta(self, conn, mint: str) -> dict | None:
@@ -296,13 +323,38 @@ class SelectorSession:
         record_event("info", "selector", "selector session stopped", {"run_id": self.run_id, "minutes": self.beat_no})
 
 
+def _wait_for_model(stop_event: threading.Event | None, live: bool) -> "SelectorSession | None":
+    """Start a session as soon as a model qualifies (the training pipeline produces one); until then say so and wait."""
+    while not (stop_event is not None and stop_event.is_set()):
+        try:
+            return SelectorSession(live=live)
+        except NoModel as e:
+            try:
+                with transaction() as conn:
+                    conn.execute("INSERT INTO ui_settings (key, value) VALUES ('selector_status', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+                                 (json.dumps({"stage": "waiting for a model", "detail": str(e), "updated_at": datetime.now(timezone.utc).isoformat()}),))
+            except Exception:
+                log.debug("selector status write failed", exc_info=True)
+            log.info("trading engine waiting: %s", e)
+            (stop_event or threading.Event()).wait(MODEL_CHECK_S)
+    return None
+
+
 def main(stop_event: threading.Event | None = None, live: bool = False) -> None:
-    s = SelectorSession(live=live)
+    s = _wait_for_model(stop_event, live)
+    if s is None:
+        return
     m_start = math.floor(time.time() / 60) * 60
-    s.warm_up(m_start); s.last_minute = m_start - 60
+    s.warm_up(m_start); s.last_minute = m_start - 60; last_reload = time.time()
     try:
         while not (stop_event is not None and stop_event.is_set()):
             now = time.time(); m1 = math.floor(now / 60) * 60
+            if now - last_reload >= MODEL_CHECK_S:
+                last_reload = now
+                try:
+                    s.maybe_reload()
+                except Exception:
+                    log.exception("model reload check failed")
             if m1 > s.last_minute and now - m1 >= 4.0 and (upto := s.ready_through(m1)) > s.last_minute:   # only minutes the stream has written
                 for minute in range(int(s.last_minute) + 60, int(upto) + 1, 60):
                     try:

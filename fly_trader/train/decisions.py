@@ -24,7 +24,7 @@ from .. import config
 from ..market.features import FEATURE_VERSION, FEATURES
 from .corpus_features import _epoch_s
 from .corpus_meta import FEATURE_COLS as META_COLS, load_features
-from .mature import part_version
+from .mature import part_current
 
 EXTRA_COLS = ["traders_15m", "traders_1h", "n_trades_1m", "hod_s", "hod_c", "age_known", "meta_known"]
 X_COLS = FEATURES + EXTRA_COLS + META_COLS
@@ -63,9 +63,9 @@ def build(days: int | None = 45, horizon_min: int = 30, fee: float | None = None
         files = files[-days - 1:]
     if not files:
         raise RuntimeError("no mature feature parts; run build-mature")
-    stale = [f for f in files if part_version(f) != FEATURE_VERSION]
+    stale = [f for f in files if not part_current(f)]
     if stale:
-        raise RuntimeError(f"{len(stale)} feature part(s) were built with another feature version (e.g. {stale[0]}); run build-mature")
+        raise RuntimeError(f"{len(stale)} feature part(s) were built with another feature or aggregation version (e.g. {stale[0]}); run build-mature")
     need = ["mint", "ts", "open", "close", "resq", "age_h", "traders_15m", "traders_1h", "n_trades_1m"] + FEATURES
     df = pd.concat([pq.read_table(f, columns=need).to_pandas() for f in files], ignore_index=True).sort_values(["mint", "ts"]).reset_index(drop=True)
     # a mint whose series breaks scale (secondary pool in another quote, impossible reserve) is ineligible FROM THAT MINUTE ON —

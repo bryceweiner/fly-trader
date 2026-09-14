@@ -65,6 +65,38 @@ def part_version(path) -> int:
         return 0
 
 
+def part_agg(path) -> int:
+    """The aggregation version a feature part was built from (parts from before the key: 0 = unknown, rebuilt)."""
+    md = pq.read_schema(path).metadata or {}
+    try:
+        return int(md.get(b"fly_agg", b"0"))
+    except ValueError:
+        return 0
+
+
+def part_current(path) -> bool:
+    p = Path(path)
+    return p.exists() and part_version(p) == FEATURE_VERSION and part_agg(p) == AGG_VERSION
+
+
+def build_complete() -> tuple[bool, str]:
+    """Is the training data complete: every aggregate from the current version, no ingested day left unaggregated, and
+    a current feature part for every non-empty aggregate day that has a previous day? (reason when not)"""
+    aggs = sorted(MATURE_DIR.glob("*.parquet"))
+    if not aggs:
+        return False, "no aggregated days yet"
+    old = [f for f in aggs if part_version(f) != AGG_VERSION]
+    if old:
+        return False, f"{len(old)} day(s) still to re-aggregate"
+    pending = days_ready()
+    if pending:
+        return False, f"{len(pending)} ingested day(s) not aggregated yet"
+    missing = [f.stem for f in aggs[1:] if pq.read_metadata(f).num_rows and not part_current(MATURE_FEAT_DIR / f.stem / "part.parquet")]
+    if missing:
+        return False, f"{len(missing)} day(s) of features still to build (e.g. {missing[0]})"
+    return True, f"{len(aggs)} days ready"
+
+
 def part_known(path) -> int:
     """Mints of a feature part whose graduation time was known when it was built (parts from before the key: from age_h)."""
     md = pq.read_schema(path).metadata or {}
@@ -221,7 +253,7 @@ def build_day(d: date, lookback_days: int = 1, grads: dict | None = None) -> int
             out.append(row)
     if not out:
         return 0
-    write_part(pa.Table.from_pylist(out, schema=SCHEMA), MATURE_FEAT_DIR / d.isoformat() / "part.parquet", FEATURE_VERSION, {"fly_known": n_known})
+    write_part(pa.Table.from_pylist(out, schema=SCHEMA), MATURE_FEAT_DIR / d.isoformat() / "part.parquet", FEATURE_VERSION, {"fly_known": n_known, "fly_agg": AGG_VERSION})
     log.info("mature features %s: %d mints (%d with graduation), %d rows in %.0fs", d, n_mints, n_known, len(out), time.time() - t0)
     return len(out)
 
@@ -262,7 +294,7 @@ def _loop_once() -> int:
         d = date.fromisoformat(f.stem)
         part = MATURE_FEAT_DIR / d.isoformat() / "part.parquet"
         # a current part is rebuilt when graduations assembled since (the backfill runs newest-first) date more of its mints
-        if part.exists() and part_version(part) == FEATURE_VERSION and not _knows_more(part, grads):
+        if part_current(part) and not _knows_more(part, grads):
             continue
         if not (MATURE_DIR / f"{(d - timedelta(days=1)).isoformat()}.parquet").exists() or d not in assembled:
             continue                    # graduation times for the day's new tokens come from the assembled day
