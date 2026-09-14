@@ -103,54 +103,69 @@ def rebuild(outcome_batch: int = 20000) -> int:
     meta["graduated_at"] = meta["g"]
     cols = ["mint", "graduated_at", "create_ts", "creator", "dev_sol", "dev_tokens", "dev_share", "supply", "mayhem", "uri", "name", "symbol", "ttg_min", "rq0", "pool_id",
             "prior_launches", "prior_grads", "prior_known", "prior_rug_share", "prior_moon_share", "own_dd60", "own_max60", "own_alive6h"]
-    def _v(x):
-        if x is None or (isinstance(x, float) and np.isnan(x)) or x is pd.NaT:
-            return None
-        if isinstance(x, (np.floating,)):
-            return float(x)
-        if isinstance(x, (np.integer,)):
-            return int(x)
-        if isinstance(x, (np.bool_,)):
-            return bool(x)
-        if isinstance(x, pd.Timestamp):
-            return x.to_pydatetime()
-        return x
-    rows = [tuple(_v(v) for v in rec) for rec in meta[cols].itertuples(index=False, name=None)]
+    rows = [tuple(_pg(v) for v in rec) for rec in meta[cols].itertuples(index=False, name=None)]
     with transaction() as conn:
         conn.cursor().executemany(
             "INSERT INTO corpus_meta (" + ",".join(cols) + ") VALUES (" + ",".join(["%s"] * len(cols)) + ") ON CONFLICT (mint) DO UPDATE SET " +
             ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c != "mint") + ", updated_at = now()", rows)
-    n_cr = _backfill_creates(creates, _v)
+    n_cr = _backfill_creates(creates)
     log.info("corpus_meta rebuilt: %d graduated tokens (%d with creator, %d with outcomes), %d archive creates added to pump_events, in %.0fs",
              len(meta), int(meta["creator"].notna().sum()), int(meta["own_dd60"].notna().sum()), n_cr, time.time() - t0)
     return len(meta)
 
 
-def _backfill_creates(creates: pd.DataFrame, _v) -> int:
-    """Copy the archive's creates into ``pump_events`` (newer than the last backfill), so live creator lookups count the
-    same launches training counts."""
+def _pg(x):
+    """A pandas/numpy value as a Postgres parameter (text cannot hold NUL bytes; token names sometimes do)."""
+    if x is None or (isinstance(x, float) and np.isnan(x)) or x is pd.NaT:
+        return None
+    if isinstance(x, str):
+        return x.replace("\x00", "")
+    if isinstance(x, (np.floating,)):
+        return float(x)
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    if isinstance(x, (np.bool_,)):
+        return bool(x)
+    if isinstance(x, pd.Timestamp):
+        return x.to_pydatetime()
+    return x
+
+
+def _complete_days(conn) -> set[str]:
+    """UTC days whose 24 replay hours are all ingested (their creates can no longer change)."""
+    rows = conn.execute("SELECT (hour AT TIME ZONE 'UTC')::date AS d, count(*) AS n FROM replay_hours WHERE status IN ('done','missing') GROUP BY 1").fetchall()
+    return {r["d"].isoformat() for r in rows if r["n"] >= 24}
+
+
+def _backfill_creates(creates: pd.DataFrame) -> int:
+    """Copy the archive's creates into ``pump_events``, so live creator lookups count the same launches training counts.
+    Replay ingests hours newest first, so a time watermark would skip older hours that arrive later; instead every
+    create day not yet recorded as complete is sent (duplicates are no-ops) and complete days are recorded."""
     import json
     from datetime import datetime
     with transaction() as conn:
-        r = conn.execute("SELECT value->>'through' AS t FROM ui_settings WHERE key = 'pump_events_backfill'").fetchone()
-    wm = pd.Timestamp(r["t"]) if r and r["t"] else None
-    new = creates[creates["create_ts"] > wm] if wm is not None else creates
-    new = new[new["sig"].notna()]
-    if new.empty:
-        return 0
-    cols = ["sig", "create_ts", "mint", "creator", "dev_sol", "dev_tokens", "supply", "mayhem", "name", "symbol", "uri"]
+        r = conn.execute("SELECT value FROM ui_settings WHERE key = 'pump_events_backfill'").fetchone()
+        complete = _complete_days(conn)
+    done = set(((r or {}).get("value") or {}).get("days") or [])
+    day = pd.to_datetime(creates["create_ts"], utc=True).dt.strftime("%Y-%m-%d")
+    new = creates[~day.isin(done) & creates["sig"].notna()]
+    n = 0
+    if not new.empty:
+        cols = ["sig", "create_ts", "mint", "creator", "dev_sol", "dev_tokens", "supply", "mayhem", "name", "symbol", "uri"]
+        with transaction() as conn:
+            with conn.cursor() as cur:
+                cur.execute("CREATE TEMP TABLE _cr (sig text, ts timestamptz, mint text, signer text, dev_sol float8, dev_tokens float8, supply float8, "
+                            "mayhem boolean, name text, symbol text, uri text) ON COMMIT DROP")
+                with cur.copy("COPY _cr FROM STDIN") as cp:
+                    for rec in new[cols].itertuples(index=False, name=None):
+                        cp.write_row(tuple(_pg(x) for x in rec))
+                cur.execute("INSERT INTO pump_events (sig, ts, action, pool, mint, signer, dev_sol, dev_tokens, supply, mayhem, name, symbol, uri) "
+                            "SELECT sig, ts, 'create', 'pump', mint, signer, dev_sol, dev_tokens, supply, mayhem, name, symbol, uri FROM _cr ON CONFLICT (sig) DO NOTHING")
+                n = cur.rowcount
+    done |= set(day.unique()) & complete
     with transaction() as conn:
-        with conn.cursor() as cur:
-            cur.execute("CREATE TEMP TABLE _cr (sig text, ts timestamptz, mint text, signer text, dev_sol float8, dev_tokens float8, supply float8, "
-                        "mayhem boolean, name text, symbol text, uri text) ON COMMIT DROP")
-            with cur.copy("COPY _cr FROM STDIN") as cp:
-                for rec in new[cols].itertuples(index=False, name=None):
-                    cp.write_row(tuple(_v(x) for x in rec))
-            cur.execute("INSERT INTO pump_events (sig, ts, action, pool, mint, signer, dev_sol, dev_tokens, supply, mayhem, name, symbol, uri) "
-                        "SELECT sig, ts, 'create', 'pump', mint, signer, dev_sol, dev_tokens, supply, mayhem, name, symbol, uri FROM _cr ON CONFLICT (sig) DO NOTHING")
-            n = cur.rowcount
         conn.execute("INSERT INTO ui_settings (key, value) VALUES ('pump_events_backfill', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-                     (json.dumps({"through": pd.Timestamp(new["create_ts"].max()).isoformat(), "at": datetime.now().isoformat()}),))
+                     (json.dumps({"days": sorted(done), "at": datetime.now().isoformat()}),))
     return int(n)
 
 

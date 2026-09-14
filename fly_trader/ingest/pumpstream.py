@@ -50,6 +50,11 @@ FLUSH_FALLBACK_S = 15.0
 MAX_PENDING_CREATES = 200_000
 
 
+def _txt(v):
+    """Postgres text cannot hold NUL bytes; one in a token name would otherwise wedge the create queue."""
+    return v.replace("\x00", "") if isinstance(v, str) else v
+
+
 class Minute:
     __slots__ = ("open", "high", "low", "close", "buy", "sell", "nb", "ns", "traders", "resq", "pool_id")
 
@@ -114,13 +119,14 @@ class Aggregator:
                     row.buy += sol; row.nb += 1
                 else:
                     row.sell += sol; row.ns += 1
-                if b.get("trader"):
-                    row.traders.add(b["trader"])
+                trader = b.get("trader") or e.get("txSigner")          # as replay_pull writes the archive's trader column
+                if trader:
+                    row.traders.add(trader)
             row.resq = float(q)
             self.stats["trades"] += 1
         elif a == "create" and pool == "pump":
             c = {"ts": ts, "creator": e.get("txSigner"), "dev_sol": e.get("quoteAmount"), "dev_tokens": e.get("initialBuy"), "supply": e.get("supply"),
-                 "mayhem": e.get("mayhemMode"), "name": e.get("name"), "symbol": e.get("symbol"), "uri": e.get("uri"), "sig": e.get("signature")}
+                 "mayhem": e.get("mayhemMode"), "name": _txt(e.get("name")), "symbol": _txt(e.get("symbol")), "uri": _txt(e.get("uri")), "sig": e.get("signature")}
             self.creates[mint] = c; self.pending_creates.append((mint, c))
             self.stats["creates"] += 1
             if len(self.creates) > 200_000:

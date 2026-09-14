@@ -28,6 +28,24 @@ def test_creator_history_point_in_time(db_conn):
     db_conn.commit()
 
 
+def test_nul_bytes_never_reach_postgres_text():
+    import numpy as np
+    from fly_trader.ingest import pumpstream
+    from fly_trader.train.corpus_meta import _pg
+    assert _pg("a\x00b") == "ab" and _pg(np.float64("nan")) is None and _pg(np.int64(3)) == 3
+    agg = pumpstream.Aggregator()
+    agg.ingest({"action": "create", "pool": "pump", "mint": "Npump", "timestamp": 1, "txSigner": "c", "name": "x\x00y", "symbol": "S\x00", "uri": None, "signature": "s"})
+    assert agg.creates["Npump"]["name"] == "xy" and agg.creates["Npump"]["symbol"] == "S"
+
+
+def test_stream_trader_falls_back_to_signer_like_the_archive():
+    from fly_trader.ingest import pumpstream
+    agg = pumpstream.Aggregator(); m = 1_800_000_000
+    agg.ingest({"action": "buy", "pool": "pump-amm", "mint": "Tpump", "timestamp": (m + 1) * 1000, "price": 1.0, "quoteMint": pumpstream.WSOL, "quoteInPool": 80.0,
+                "txSigner": "signer1", "breakdown": [{"action": "buy", "quoteAmount": 1.0}], "poolId": "P1"})
+    assert agg.row(m, "Tpump").traders == {"signer1"}
+
+
 def test_discovery_missing_audit_is_unknown(monkeypatch):
     monkeypatch.setattr(config, "LAUNCHPADS", ["pump.fun"])
     tok = {"id": "X", "launchpad": "pump.fun", "graduatedAt": "2026-09-01T00:00:00Z", "graduatedPool": "P"}
