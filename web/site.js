@@ -5,7 +5,7 @@ const CONFIG = {
   GITHUB_URL: "https://github.com/bryceweiner/fly-trader",
   X_URL: "",            // X community link, e.g. "https://x.com/i/communities/..."; empty = placeholder
   FLY_CA: "",           // $FLY contract address once launched; empty = TBA
-  PUMP_URL: "https://pump.fun/coin/", // CA is appended
+  VENUE_URL: "https://ponsfamily.com/coin/", // CA is appended
 };
 
 (function () {
@@ -38,7 +38,7 @@ const CONFIG = {
       caEl.textContent = CONFIG.FLY_CA;
       copyBtn.removeAttribute("aria-disabled");
       buyBtn.removeAttribute("aria-disabled");
-      buyBtn.href = CONFIG.PUMP_URL + CONFIG.FLY_CA;
+      buyBtn.href = CONFIG.VENUE_URL + CONFIG.FLY_CA;
       copyBtn.addEventListener("click", async () => {
         try {
           await navigator.clipboard.writeText(CONFIG.FLY_CA);
