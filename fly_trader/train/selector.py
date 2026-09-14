@@ -118,7 +118,7 @@ def save(m: SelectorModel, run_id: str | None = None) -> tuple[Path, int]:
     with transaction() as conn:
         row = conn.execute("INSERT INTO brain_snapshots (run_id, path, sha256, kind, note) VALUES (%s,%s,%s,'selector',%s) RETURNING id",
                            (run_id, str(path), sha, json.dumps({"threshold": m.threshold, "top_frac": m.top_frac, "horizon_min": m.horizon_min,
-                                                                "trained_through": m.trained_through, **m.metrics}, default=str)[:900])).fetchone()
+                                                                "trained_through": m.trained_through, **m.metrics}, default=str))).fetchone()
     return path, int(row["id"])
 
 
