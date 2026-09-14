@@ -65,6 +65,17 @@ def test_replay_parses_both_archive_formats(tmp_path):
     assert len(e) == 1 and e[0]["action"] == "migrate" and e[0]["quote_in_pool"] == 85.0 and e[0]["pool_created_by"] == "pump"
 
 
+def test_replay_keeps_finished_downloads_across_restarts(tmp_path):
+    from fly_trader.ingest.replay_pull import _kept_downloads
+    h1 = datetime(2026, 5, 14, 19, tzinfo=timezone.utc); h2 = datetime(2026, 5, 14, 20, tzinfo=timezone.utc)
+    (tmp_path / "2026051419.zst").write_bytes(b"x" * 10)        # finished, still planned: kept
+    (tmp_path / "2026051420.part").write_bytes(b"x" * 5)        # partial: cannot resume, removed
+    (tmp_path / "2026051321.zst").write_bytes(b"x")             # finished but no longer planned: removed
+    kept = _kept_downloads(tmp_path, {h1, h2})
+    assert [(h, p.name, n) for h, p, n, _ in kept] == [(h1, "2026051419.zst", 10)]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["2026051419.zst"]
+
+
 def test_discovery_missing_audit_is_unknown(monkeypatch):
     monkeypatch.setattr(config, "LAUNCHPADS", ["pump.fun"])
     tok = {"id": "X", "launchpad": "pump.fun", "graduatedAt": "2026-09-01T00:00:00Z", "graduatedPool": "P"}

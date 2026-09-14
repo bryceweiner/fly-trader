@@ -126,6 +126,23 @@ def _put_hour(sql: str, params: tuple) -> None:
         conn.execute(sql, params)
 
 
+def _kept_downloads(tmpdir: Path, planned: set[datetime]) -> list[tuple[datetime, Path, int, float]]:
+    """Complete hour files left by a stopped worker, for hours still planned: parsed instead of downloaded again.
+    Partial files are removed (the archive ignores Range requests, so a download cannot resume), as are complete
+    files for hours no longer planned."""
+    out = []
+    for f in sorted(tmpdir.glob("*")):
+        if f.suffix == ".zst":
+            try:
+                h = datetime.strptime(f.stem, "%Y%m%d%H").replace(tzinfo=timezone.utc)
+            except ValueError:
+                h = None
+            if h in planned:
+                out.append((h, f, f.stat().st_size, 0.0)); continue
+        f.unlink()
+    return out
+
+
 def _download(client: httpx.Client, hour: datetime, tmp: Path, stop: threading.Event | None) -> int:
     url = f"{config.REPLAY_URL}/{hour:%Y/%m/%d/%H}.jsonl.zst"
     part = tmp.with_suffix(".part"); size = 0
@@ -169,9 +186,11 @@ class _Status:
 def main(stop_event: threading.Event | None = None) -> None:
     setup("replay"); stop = stop_event
     tmpdir = config.REPLAY_DIR / "_tmp"; tmpdir.mkdir(parents=True, exist_ok=True)
-    for stale in tmpdir.glob("*"):
-        stale.unlink()
     now0 = datetime.now(timezone.utc); hours = plan_hours(now0); status = _Status(len(hours))
+    preloaded = _kept_downloads(tmpdir, set(hours))                 # finished before a restart: parse, don't download again
+    if preloaded:
+        kept = {p[0] for p in preloaded}; hours = [h for h in hours if h not in kept]
+        log.info("replay ingest: %d complete hour file(s) kept from before the restart", len(preloaded))
     record_event("info", "replay", "replay ingest started", {"hours_pending": len(hours), "parallel": config.REPLAY_PARALLEL})
     log.info("replay ingest: %d hours pending (newest first)", len(hours))
     todo: queue.Queue = queue.Queue(); ready: queue.Queue = queue.Queue(maxsize=config.REPLAY_PARALLEL + 2)
@@ -238,7 +257,7 @@ def main(stop_event: threading.Event | None = None) -> None:
     try:
         while not (stop is not None and stop.is_set()):
             try:
-                h, tmp, size, dl_s = ready.get(timeout=5.0)
+                h, tmp, size, dl_s = preloaded.pop(0) if preloaded else ready.get(timeout=5.0)
             except queue.Empty:
                 replan()
                 if not any(t.is_alive() for t in threads) and ready.empty():
