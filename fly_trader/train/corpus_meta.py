@@ -17,7 +17,8 @@ the stream fills ``own_dd60``/``own_max60`` from its own minutes at that time, t
 
 ``rebuild()`` recomputes the whole table from the archive (events are small) and fills outcomes incrementally from
 the assembled candle files. Runs inside the ``replay`` worker after each assembly round and as
-``fly-trader build-corpus-meta``.
+``fly-trader build-corpus-meta``. It first copies the archive's directly created PumpSwap pools into ``pump_pools``
+(``backfill_pump_pools``), which the stream and ``train/mature.py`` exclude from the universe (``blocked_pool_ids``).
 """
 from __future__ import annotations
 
@@ -59,7 +60,8 @@ def rebuild(outcome_batch: int = 20000) -> int:
     t0 = time.time(); con = duckdb.connect(); ev = str(config.REPLAY_DIR / "*" / "*_events.parquet")
     if not list(config.REPLAY_DIR.glob("*/*_events.parquet")):
         return 0
-    creates = con.execute(f"""SELECT mint, min(ts) AS create_ts, arg_min(signer, ts) AS creator, arg_min(quote_amount, ts) AS dev_sol,
+    n_pp = backfill_pump_pools()               # before mature.loop_once aggregates the new days
+    creates =con.execute(f"""SELECT mint, min(ts) AS create_ts, arg_min(signer, ts) AS creator, arg_min(quote_amount, ts) AS dev_sol,
                               arg_min(initial_buy, ts) AS dev_tokens, arg_min(supply, ts) AS supply, arg_min(mayhem, ts) AS mayhem, arg_min(uri, ts) AS uri,
                               arg_min(name, ts) AS name, arg_min(symbol, ts) AS symbol, arg_min(sig, ts) AS sig FROM read_parquet('{ev}') WHERE action = 'create' AND pool = 'pump' GROUP BY mint""").df()
     migr = con.execute(f"""SELECT mint, min(ts) AS g, arg_min(quote_in_pool, ts) AS rq0, arg_min(pool_id, ts) AS pool_id
@@ -109,8 +111,8 @@ def rebuild(outcome_batch: int = 20000) -> int:
             "INSERT INTO corpus_meta (" + ",".join(cols) + ") VALUES (" + ",".join(["%s"] * len(cols)) + ") ON CONFLICT (mint) DO UPDATE SET " +
             ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c != "mint") + ", updated_at = now()", rows)
     n_cr = _backfill_creates(creates)
-    log.info("corpus_meta rebuilt: %d graduated tokens (%d with creator, %d with outcomes), %d archive creates added to pump_events, in %.0fs",
-             len(meta), int(meta["creator"].notna().sum()), int(meta["own_dd60"].notna().sum()), n_cr, time.time() - t0)
+    log.info("corpus_meta rebuilt: %d graduated tokens (%d with creator, %d with outcomes), %d archive creates added to pump_events, %d custom pools to pump_pools, in %.0fs",
+             len(meta), int(meta["creator"].notna().sum()), int(meta["own_dd60"].notna().sum()), n_cr, n_pp, time.time() - t0)
     return len(meta)
 
 
@@ -167,6 +169,48 @@ def _backfill_creates(creates: pd.DataFrame) -> int:
         conn.execute("INSERT INTO ui_settings (key, value) VALUES ('pump_events_backfill', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
                      (json.dumps({"days": sorted(done), "at": datetime.now().isoformat()}),))
     return int(n)
+
+
+def backfill_pump_pools() -> int:
+    """Copy the archive's directly created PumpSwap pools (``createPool`` on ``pump-amm`` not by a pump.fun migration;
+    missing ``pool_created_by`` counts as custom) into ``pump_pools``. Only day directories not yet recorded as complete
+    are read (duplicates are no-ops), so a re-run costs the newest day's files."""
+    import json
+    from datetime import datetime
+    with transaction() as conn:
+        r = conn.execute("SELECT value FROM ui_settings WHERE key = 'pump_pools_backfill'").fetchone()
+        complete = _complete_days(conn)
+    done = set(((r or {}).get("value") or {}).get("days") or [])
+    days = {p.name: sorted(str(f) for f in p.glob("*_events.parquet")) for p in config.REPLAY_DIR.glob("*") if p.is_dir() and p.name not in done}
+    days = {d: fs for d, fs in days.items() if fs}
+    if not days:
+        return 0
+    files = [f for fs in days.values() for f in fs]; con = duckdb.connect()
+    cols = [c[0] for c in con.execute("SELECT * FROM read_parquet(?, union_by_name = true) LIMIT 0", [files]).description]
+    by = "pool_created_by" if "pool_created_by" in cols else "NULL::VARCHAR"
+    pools = con.execute(f"""SELECT pool_id, arg_min(mint, ts) AS mint, arg_min({by}, ts) AS created_by, min(ts) AS ts FROM read_parquet(?, union_by_name = true)
+                            WHERE action = 'createPool' AND pool = 'pump-amm' AND coalesce({by}, 'custom') <> 'pump' AND pool_id IS NOT NULL GROUP BY pool_id""", [files]).df()
+    con.close(); n = 0
+    if not pools.empty:
+        with transaction() as conn:
+            with conn.cursor() as cur:
+                cur.execute("CREATE TEMP TABLE _pp (pool_id text, mint text, created_by text, ts timestamptz) ON COMMIT DROP")
+                with cur.copy("COPY _pp FROM STDIN") as cp:
+                    for rec in pools[["pool_id", "mint", "created_by", "ts"]].itertuples(index=False, name=None):
+                        cp.write_row(tuple(_pg(x) for x in rec))
+                cur.execute("INSERT INTO pump_pools (pool_id, mint, created_by, ts, source) SELECT pool_id, mint, created_by, ts, 'archive' FROM _pp ON CONFLICT (pool_id) DO NOTHING")
+                n = cur.rowcount
+    done |= set(days) & complete
+    with transaction() as conn:
+        conn.execute("INSERT INTO ui_settings (key, value) VALUES ('pump_pools_backfill', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+                     (json.dumps({"days": sorted(done), "at": datetime.now().isoformat()}),))
+    return int(n)
+
+
+def blocked_pool_ids(conn) -> list[str]:
+    """Blocked pools that can carry universe legs. The stream and ``train/mature.py`` both keep only pump.fun-origin mints
+    (suffix ``pump``) before this check, so pools of other mints never match either way."""
+    return [r["pool_id"] for r in conn.execute("SELECT pool_id FROM pump_pools WHERE mint IS NULL OR right(mint, 4) = 'pump'").fetchall()]
 
 
 def creator_history(conn, creator: str | None, create_ts, graduated_at) -> dict:

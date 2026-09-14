@@ -129,6 +129,7 @@ def main(days: int = 45, test_days: int = 9, top_frac: float = 0.01, horizon_min
                "per_day_fly": f_ev["per_day"], "per_day_gbm": g_ev["per_day"], "fit": fit_info, "test_days": [str(D_cut), str(dl[-1])]}
     log.info("fly selector: AUC %.3f | %s | beats GBM: %s", f_auc, f_ev["pooled"], verdict["fly_beats_gbm"])
     record_event("info", "fly_selector", "fly vs gbm (single split)", {"fly": verdict["fly"], "gbm": verdict["gbm"], "random": rnd, "fly_beats_gbm": verdict["fly_beats_gbm"]})
-    path, sid = fly.save({k: verdict[k] for k in ("fly", "gbm", "random", "fly_beats_gbm", "test_days")})
+    from .selector import DATA_VERSION
+    path, sid = fly.save({**{k: verdict[k] for k in ("fly", "gbm", "random", "fly_beats_gbm", "test_days")}, "data": DATA_VERSION})
     prog.update("fly selector: done", 1, 1, force=True, snapshot_id=sid, verdict={k: verdict[k] for k in ("fly", "gbm", "random", "fly_beats_gbm")})
     return verdict

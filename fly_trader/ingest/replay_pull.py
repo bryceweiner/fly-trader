@@ -60,6 +60,12 @@ def _f(x) -> float | None:
         return None
 
 
+def _q(d: dict, new: str, old: str):
+    """A quote-side field under its current name, else under the archive's pre-2026-05-21 SOL-only name."""
+    v = d.get(new)
+    return v if v is not None else d.get(old)
+
+
 def parse_hour(path: Path) -> tuple[pa.Table, pa.Table, int]:
     """Stream-decompress one hour file into (trades, events, n_events)."""
     T = {name: [] for name in TRADE_SCHEMA.names}; E = {name: [] for name in EVENT_SCHEMA.names}; n = 0
@@ -73,7 +79,8 @@ def parse_hour(path: Path) -> tuple[pa.Table, pa.Table, int]:
             except orjson.JSONDecodeError:
                 continue
             n += 1
-            a = e.get("action"); pool = e.get("pool")
+            # the archive before 2026-05-21 names fields txType / solAmount / solInPool / vSolInBondingCurve; later: action / quote*
+            a = e.get("action") or e.get("txType"); pool = e.get("pool")
             ts = e.get("timestamp")
             if ts is None:
                 continue
@@ -81,20 +88,20 @@ def parse_hour(path: Path) -> tuple[pa.Table, pa.Table, int]:
             if a in ("buy", "sell"):
                 if pool not in TRADE_POOLS:
                     continue
-                legs = e.get("breakdown") or [{"action": a, "trader": e.get("txSigner"), "tokenAmount": e.get("tokenAmount"), "quoteAmount": e.get("quoteAmount")}]
-                vq = e.get("vQuoteInBondingCurve") if pool == "pump" else e.get("virtualQuoteInPool")
+                legs = e.get("breakdown") or [{"action": a, "trader": e.get("txSigner"), "tokenAmount": e.get("tokenAmount"), "quoteAmount": _q(e, "quoteAmount", "solAmount")}]
+                vq = _q(e, "vQuoteInBondingCurve", "vSolInBondingCurve") if pool == "pump" else _q(e, "virtualQuoteInPool", "virtualSolInPool")
                 for b in legs:
                     T["ts"].append(tsdt); T["slot"].append(int(e.get("block") or 0)); T["pool"].append(pool); T["mint"].append(e.get("mint"))
-                    T["trader"].append(b.get("trader") or e.get("txSigner")); T["side"].append(1 if b.get("action") == "buy" else -1)
-                    T["sol"].append(_f(b.get("quoteAmount")) or 0.0); T["tokens"].append(_f(b.get("tokenAmount")) or 0.0); T["price"].append(_f(e.get("price")))
-                    T["quote_in_pool"].append(_f(e.get("quoteInPool"))); T["tokens_in_pool"].append(_f(e.get("tokensInPool"))); T["vquote"].append(_f(vq))
+                    T["trader"].append(b.get("trader") or e.get("txSigner")); T["side"].append(1 if (b.get("action") or b.get("txType")) == "buy" else -1)
+                    T["sol"].append(_f(_q(b, "quoteAmount", "solAmount")) or 0.0); T["tokens"].append(_f(b.get("tokenAmount")) or 0.0); T["price"].append(_f(e.get("price")))
+                    T["quote_in_pool"].append(_f(_q(e, "quoteInPool", "solInPool"))); T["tokens_in_pool"].append(_f(e.get("tokensInPool"))); T["vquote"].append(_f(vq))
                     T["n_legs"].append(len(legs)); T["quote_mint"].append(e.get("quoteMint")); T["pool_id"].append(e.get("poolId"))
             elif a not in SKIP_ACTIONS:
                 E["ts"].append(tsdt); E["slot"].append(int(e.get("block") or 0)); E["sig"].append(e.get("signature")); E["action"].append(a); E["pool"].append(pool)
                 E["mint"].append(e.get("mint")); E["pool_id"].append(e.get("poolId")); E["signer"].append(e.get("txSigner")); E["creator_fee_addr"].append(e.get("creatorFeeAddress"))
                 E["name"].append(e.get("name")); E["symbol"].append(e.get("symbol")); E["uri"].append(e.get("uri")); E["supply"].append(_f(e.get("supply")))
                 E["decimals"].append(int(e["decimals"]) if e.get("decimals") is not None else None); E["token_program"].append(e.get("tokenProgram"))
-                E["initial_buy"].append(_f(e.get("initialBuy"))); E["quote_amount"].append(_f(e.get("quoteAmount"))); E["quote_in_pool"].append(_f(e.get("quoteInPool")))
+                E["initial_buy"].append(_f(e.get("initialBuy"))); E["quote_amount"].append(_f(_q(e, "quoteAmount", "solAmount"))); E["quote_in_pool"].append(_f(_q(e, "quoteInPool", "solInPool")))
                 E["tokens_in_pool"].append(_f(e.get("tokensInPool"))); E["mayhem"].append(bool(e.get("mayhemMode")) if e.get("mayhemMode") is not None else None)
                 E["pool_created_by"].append(e.get("poolCreatedBy")); E["mint_authority"].append(e.get("mintAuthority")); E["freeze_authority"].append(e.get("freezeAuthority"))
     return pa.table(T, schema=TRADE_SCHEMA), pa.table(E, schema=EVENT_SCHEMA), n

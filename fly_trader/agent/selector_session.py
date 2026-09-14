@@ -60,7 +60,7 @@ class SelectorSession:
         from ..train import selector as sel
         self.model = sel.load_latest()
         if self.model is None:
-            raise RuntimeError("no selector snapshot; run training (regimen 'selector') first")
+            raise RuntimeError("no model trained on the current data yet: train a selector (Model & training), then start the trading engine")
         missing = [c for c in self.model.cols if c not in X_COLS]
         if missing:
             raise RuntimeError(f"selector expects features the live engine does not produce: {missing}")
@@ -75,7 +75,7 @@ class SelectorSession:
         self.run_id = str(uuid.uuid4()); self.beat_no = 0; self.last_minute: float | None = None
         self.meta_cache: dict[str, dict] = {}; self.last_sweep = time.time()
         with transaction() as conn:
-            sid = conn.execute("SELECT id FROM brain_snapshots WHERE kind = 'selector' ORDER BY id DESC LIMIT 1").fetchone()["id"]
+            sid = sel.latest_current(conn)["id"]                  # the snapshot load_latest returned
             conn.execute("INSERT INTO runs (run_id, kind, config, brain_snapshot_id, status) VALUES (%s,'selector',%s,%s,'running')",
                          (self.run_id, json.dumps({"threshold": self.model.threshold, "horizon_min": self.model.horizon_min, "book": BOOK}, default=str), sid))
         record_event("info", "selector", "selector session started", {"run_id": self.run_id, "snapshot": sid, "threshold": self.model.threshold, "horizon_min": self.model.horizon_min})

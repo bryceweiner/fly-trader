@@ -9,7 +9,8 @@ from fly_trader import config
 from fly_trader.db.connection import transaction
 from fly_trader.db.queries import q, q1
 from fly_trader.ops.supervisor import get_supervisor
-from fly_trader.ui.common import ago, backtest_line, jv, parse_note, pct, restart_runner, setting, system_state
+from fly_trader.train.selector import is_current
+from fly_trader.ui.common import ago, backtest_line, jv, latest_snapshot, parse_note, pct, restart_runner, setting, system_state
 
 
 def _pf(v) -> str:
@@ -21,18 +22,26 @@ def loaded() -> None:
     s = system_state(); m, latest = s["model"], s["latest"]
     with st.container(border=True):
         st.markdown("**Model in use**")
-        if m:
+        if m and not is_current(m["meta"]):
+            st.warning(f"Model #{m['id']} is in use but was trained on outdated data (before the data fixes of 2026-09-14). Its backtest is not valid and is hidden; "
+                       "restart the trading engine after training a new model.", icon=":material/warning:")
+        elif m:
             meta = m["meta"]; wf = meta.get("walk_forward") or {}; rb = meta.get("random_baseline") or {}; run = m.get("run") or {}
             st.caption(f"Model #{m['id']} · gradient-boosted selector · trained through {meta.get('trained_through', '—')} · saved {ago(m['ts'])} · loaded {ago(m['since'])}")
             with st.container(horizontal=True):
-                st.metric("Buy when score ≥", f"{float(run.get('threshold') or meta.get('threshold') or 0):.3f}", help="The top 1 % of scores on the training days.")
-                st.metric("Hold", f"{run.get('horizon_min') or meta.get('horizon_min') or 30} min")
-                st.metric("Backtest trades", wf.get("n", "—"))
-                st.metric("Per trade", pct(wf.get("mean")), delta=(f"random {pct(rb['mean'])}" if rb.get("mean") is not None else None), delta_color="off")
-                st.metric("Winners", pct(wf.get("win"), 0, False))
-                st.metric("Profit factor", _pf(wf.get("pf")))
-                st.metric("Days positive", f"{wf.get('days_positive', '—')}/{wf.get('days', '—')}")
+                st.metric("Buys when score ≥", f"{float(run.get('threshold') or meta.get('threshold') or 0):.3f}",
+                          help="The model scores every eligible token each minute (0–1). It buys only above this line: the top 1 % of scores seen in training.")
+                st.metric("Holds for", f"{run.get('horizon_min') or meta.get('horizon_min') or 30} min", help="Each position is sold this long after the buy.")
+                st.metric("Test trades", wf.get("n", "—"), help=f"Trades the model would have made on the {wf.get('days', '—')} most recent days, which it never saw in training.")
+                st.metric("Average per trade", pct(wf.get("mean")), delta=(f"random {pct(rb['mean'])}" if rb.get("mean") is not None else None), delta_color="off",
+                          help="Net return per trade on the test days, after fees and price impact. 'random' is the same number of random buys under the same rules.")
+                st.metric("Winning trades", pct(wf.get("win"), 0, False), help="Share of test trades that made money.")
+                st.metric("Profit factor", _pf(wf.get("pf")), help="Total gains divided by total losses on the test trades. Above 1 makes money.")
+                st.metric("Profitable test days", f"{wf.get('days_positive', '—')} of {wf.get('days', '—')}",
+                          help="Test days whose average trade made money after costs.")
             st.caption(backtest_line(meta))
+        elif not latest:
+            st.info("No model has been trained on the current data yet, so nothing is trading. Start a selector training run below.", icon=":material/info:")
         else:
             st.caption("No model in use: the trading engine is stopped.")
         if latest and (not m or latest["id"] > m["id"]):
@@ -97,7 +106,9 @@ def results() -> None:
     wfd = q("SELECT detail FROM events WHERE source = 'selector' AND message LIKE 'walk-forward%%' ORDER BY id")
     with st.container(border=True):
         st.markdown("**Latest selector backtest, day by day**")
-        if wfd:
+        if wfd and not system_state()["latest"]:
+            st.caption("The last backtest ran on outdated data and is hidden. Start a selector training run for results on the current data.")
+        elif wfd:
             df = pd.DataFrame([{"day": d.get("day"), "AUC": d.get("auc"), "trades": d.get("n"), "model": (d["mean"] * 100) if d.get("mean") is not None else None,
                                 "random": (d["random_mean"] * 100) if d.get("random_mean") is not None else None, "winners": (d["win"] * 100) if d.get("win") is not None else None,
                                 "profit factor": d.get("pf")} for d in (jv(r["detail"]) for r in wfd)])
@@ -111,7 +122,7 @@ def results() -> None:
         else:
             st.caption("No selector backtest recorded since the last training reset.")
     fv = q1("SELECT ts, detail FROM events WHERE source = 'fly_selector' AND message LIKE 'fly vs gbm%%' ORDER BY id DESC LIMIT 1")
-    if fv:
+    if fv and latest_snapshot("fly_selector"):
         d = jv(fv["detail"])
         with st.container(border=True):
             st.markdown("**Fly vs selector vs random** (same test days)")
@@ -132,16 +143,18 @@ def history() -> None:
         rows = []
         for r in snaps:
             m = parse_note(r["note"]); wf = m.get("walk_forward") or m.get("fly") or {}; rb = m.get("random_baseline") or m.get("random") or {}
-            rows.append({"model": f"#{r['id']}", "type": "selector" if r["kind"] == "selector" else "fly", "saved": r["ts"], "trained through": m.get("trained_through"),
-                         "trades": wf.get("n"), "% / trade": (wf["mean"] * 100) if wf.get("mean") is not None else None,
-                         "random %": (rb["mean"] * 100) if rb.get("mean") is not None else None, "profit factor": wf.get("pf"),
-                         "costs": "real" if (m.get("costs") or rb) else "flat 0.6 %", "in use": r["id"] == in_use})
+            ok = is_current(m)
+            rows.append({"model": f"#{r['id']}", "type": "selector" if r["kind"] == "selector" else "fly", "saved": r["ts"], "data": "current" if ok else "outdated",
+                         "trained through": m.get("trained_through"), "trades": wf.get("n") if ok else None,
+                         "% / trade": (wf["mean"] * 100) if ok and wf.get("mean") is not None else None,
+                         "random %": (rb["mean"] * 100) if ok and rb.get("mean") is not None else None, "profit factor": wf.get("pf") if ok else None,
+                         "in use": r["id"] == in_use})
         if rows:
             st.dataframe(pd.DataFrame(rows), hide_index=True, column_config={"saved": st.column_config.DatetimeColumn(format="MMM D HH:mm"),
                                                                              "% / trade": st.column_config.NumberColumn(format="%+.2f"),
                                                                              "random %": st.column_config.NumberColumn(format="%+.2f"),
                                                                              "profit factor": st.column_config.NumberColumn(format="%.2f")})
-            st.caption("Models trained before the look-ahead and cost fixes of 2026-09-14 report optimistic numbers.")
+            st.caption("Outdated models were trained before the data fixes of 2026-09-14; their numbers are not valid, are hidden, and they are never loaded.")
         else:
             st.caption("No saved models.")
     with st.expander("Trainer log", icon=":material/terminal:"):

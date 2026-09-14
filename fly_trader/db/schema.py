@@ -210,6 +210,10 @@ BASE_DDL: list[str] = [
         dev_tokens double precision, supply double precision, mayhem boolean, quote_in_pool double precision, name text, symbol text, uri text)""",
     "CREATE INDEX IF NOT EXISTS pump_events_mint_idx ON pump_events (mint)",
     "CREATE INDEX IF NOT EXISTS pump_events_creates_idx ON pump_events (signer, ts) WHERE action = 'create'",
+    # PumpSwap pools NOT created by a pump.fun migration (createPool by anyone): unburned liquidity, blocked from the universe
+    """CREATE TABLE IF NOT EXISTS pump_pools (
+        pool_id text PRIMARY KEY, mint text, created_by text, ts timestamptz, source text NOT NULL, added_at timestamptz NOT NULL DEFAULT now())""",
+    "CREATE INDEX IF NOT EXISTS pump_pools_mint_idx ON pump_pools (mint)",
     """CREATE TABLE IF NOT EXISTS ui_settings (
         key text PRIMARY KEY, value jsonb, updated_at timestamptz NOT NULL DEFAULT now())""",
 ]

@@ -27,10 +27,18 @@ from .. import config
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from . import progress as prog
+from ..market.features import FEATURE_VERSION
 from .decisions import DecisionSet, build, evaluate, random_trades, summarize, trades_from_picks
+from .mature import AGG_VERSION
 
 log = logging.getLogger(__name__)
 SELECTOR_DIR = config.BRAIN_DIR / "selectors"
+# the data definitions a model was trained on; a model from other definitions is never loaded and its backtest is not shown
+DATA_VERSION = {"agg": AGG_VERSION, "features": FEATURE_VERSION, "costs": "paper"}
+
+
+def is_current(meta: dict | None) -> bool:
+    return bool(meta) and meta.get("data") == DATA_VERSION
 
 
 @dataclass
@@ -122,10 +130,22 @@ def save(m: SelectorModel, run_id: str | None = None) -> tuple[Path, int]:
     return path, int(row["id"])
 
 
+def latest_current(conn) -> dict | None:
+    """The newest selector snapshot trained on the current data definitions (``DATA_VERSION``), or None."""
+    for r in conn.execute("SELECT id, path, note FROM brain_snapshots WHERE kind = 'selector' ORDER BY id DESC").fetchall():
+        try:
+            meta = json.loads(r["note"] or "{}")
+        except ValueError:
+            continue
+        if is_current(meta) and Path(r["path"]).exists():
+            return dict(r)
+    return None
+
+
 def load_latest() -> SelectorModel | None:
     with transaction() as conn:
-        r = conn.execute("SELECT path FROM brain_snapshots WHERE kind = 'selector' ORDER BY id DESC LIMIT 1").fetchone()
-    return joblib.load(r["path"]) if r and Path(r["path"]).exists() else None
+        r = latest_current(conn)
+    return joblib.load(r["path"]) if r else None
 
 
 def main(days: int = 45, test_days: int = 9, top_frac: float = 0.01, horizon_min: int = 30, stop_event: threading.Event | None = None) -> dict:
@@ -145,7 +165,7 @@ def main(days: int = 45, test_days: int = 9, top_frac: float = 0.01, horizon_min
     if stop_event is not None and stop_event.is_set():
         return wf
     prog.update("selector: fitting deployable model", 0, 1, force=True)
-    final = fit(ds, np.ones(len(ds.y), bool), top_frac, seed=99); final.metrics = {"walk_forward": p, "random_baseline": rb, "costs": "paper broker model", "auc_by_day": wf["auc"], "rows": int(len(ds.y)), "days": len(ds.days)}
+    final = fit(ds, np.ones(len(ds.y), bool), top_frac, seed=99); final.metrics = {"walk_forward": p, "random_baseline": rb, "costs": "paper broker model", "data": DATA_VERSION, "auc_by_day": wf["auc"], "rows": int(len(ds.y)), "days": len(ds.days)}
     path, sid = save(final)
     record_event("info", "selector", f"selector saved (snapshot {sid})", {"path": str(path), "threshold": final.threshold, **p})
     prog.update("selector: saved", 1, 1, force=True, snapshot_id=sid, path=str(path), threshold=final.threshold)

@@ -11,6 +11,7 @@ import streamlit as st
 from fly_trader import config
 from fly_trader.db.queries import q, q1
 from fly_trader.ops.supervisor import WORKERS, get_supervisor
+from fly_trader.train.selector import is_current
 
 BOOK = "paper_selector"
 STALE_FEED_S = 180            # agent/selector_session.py: no entries or exits when the newest complete minute is older
@@ -88,7 +89,12 @@ def snapshot(sid: int) -> dict | None:
 
 
 def latest_snapshot(kind: str = "selector") -> dict | None:
-    return _snap(q1("SELECT id, ts, kind, note FROM brain_snapshots WHERE kind = %s ORDER BY id DESC LIMIT 1", (kind,)))
+    """The newest snapshot of this kind trained on the current data definitions (older ones are never loaded)."""
+    for r in q("SELECT id, ts, kind, note FROM brain_snapshots WHERE kind = %s ORDER BY id DESC LIMIT 50", (kind,)):
+        s = _snap(r)
+        if is_current(s["meta"]):
+            return s
+    return None
 
 
 def loaded_model() -> dict | None:
@@ -100,14 +106,18 @@ def loaded_model() -> dict | None:
     return {**s, "run": jv(r["config"]), "since": r["started_at"]} if s else None
 
 
+OUTDATED = "Trained on outdated data (before the data fixes of 2026-09-14), so its backtest is not valid and it will not be loaded."
+
+
 def backtest_line(meta: dict) -> str:
-    wf, rb = meta.get("walk_forward") or {}, meta.get("random_baseline")
+    if not is_current(meta):
+        return OUTDATED
+    wf, rb = meta.get("walk_forward") or {}, meta.get("random_baseline") or {}
     if not wf:
         return "No backtest recorded."
-    s = f"Backtest: {pct(wf.get('mean'))} per trade over {wf.get('n')} trades, {wf.get('days_positive')}/{wf.get('days')} days positive"
-    if rb and rb.get("mean") is not None:
-        return s + f"; random picks made {pct(rb['mean'])} under the same costs."
-    return s + " (flat 0.6 % fee, no random baseline — retrain for cost-accurate numbers)."
+    s = (f"Backtest on {wf.get('days')} held-out days: {pct(wf.get('mean'))} average per trade over {wf.get('n')} trades, "
+         f"profitable on {wf.get('days_positive')} of those {wf.get('days')} days")
+    return s + (f"; random picks made {pct(rb['mean'])} per trade under the same costs." if rb.get("mean") is not None else ".")
 
 
 def labels(mints) -> dict[str, str]:
@@ -132,7 +142,8 @@ def system_state() -> dict:
     stage = str(tr.get("stage") or "")
     training = ws["train"]["alive"] or (tr_at is not None and (now - tr_at).total_seconds() < 180 and not stage.endswith(("saved", "done")))
     if not runner:
-        trading, why = "stopped", "The trading engine is stopped."
+        err = (ws["runner"].get("error") or "").splitlines()
+        trading, why = "stopped", ("The trading engine is stopped: " + err[0].split(": ", 1)[-1]) if err else "The trading engine is stopped."
     elif circuit.get("kill_switch"):
         trading, why = "blocked", "Kill switch tripped" + (f" ({circuit['kill_reason']})" if circuit.get("kill_reason") else "") + ": no new entries."
     elif circuit.get("entries_paused"):
@@ -165,7 +176,7 @@ def status_strip() -> None:
         st.badge(text, icon=":material/candlestick_chart:", color=color, help=s["trading_why"])
         m, latest = s["model"], s["latest"]
         st.badge(f"Model #{m['id']}" if m else "No model loaded", icon=":material/psychology:", color="violet" if m else "gray",
-                 help=backtest_line(m["meta"]) if m else "The trading engine is stopped, so no model is in use.")
+                 help=backtest_line(m["meta"]) if m else ("No model has been trained on the current data yet." if not latest else "The trading engine is stopped, so no model is in use."))
         if m and latest and latest["id"] > m["id"]:
             st.badge(f"Newer model #{latest['id']} saved", icon=":material/upgrade:", color="orange", help="Load it from Model & training.")
         tr = s["train_status"]

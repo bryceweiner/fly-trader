@@ -46,6 +46,25 @@ def test_stream_trader_falls_back_to_signer_like_the_archive():
     assert agg.row(m, "Tpump").traders == {"signer1"}
 
 
+def test_replay_parses_both_archive_formats(tmp_path):
+    import orjson
+    import zstandard
+    from fly_trader.ingest.replay_pull import parse_hour
+    old = {"txType": "buy", "pool": "pump-amm", "poolId": "P", "mint": "Mpump", "quoteMint": "So11111111111111111111111111111111111111112", "txSigner": "T",
+           "tokenAmount": 10.0, "solAmount": 0.5, "solInPool": 80.0, "tokensInPool": 1e6, "price": 1e-5, "timestamp": 1778414399974, "block": 1}
+    new = {"action": "sell", "pool": "pump-amm", "poolId": "P", "mint": "Mpump", "quoteMint": "So11111111111111111111111111111111111111112", "txSigner": "U",
+           "tokenAmount": 5.0, "quoteAmount": 0.2, "quoteInPool": 79.8, "tokensInPool": 1e6, "price": 1e-5, "timestamp": 1778414400974, "block": 2,
+           "breakdown": [{"action": "sell", "trader": "U", "tokenAmount": 5.0, "quoteAmount": 0.2}]}
+    mig = {"txType": "migrate", "pool": "pump-amm", "poolId": "P", "mint": "Mpump", "solAmount": 1.1, "solInPool": 85.0, "poolCreatedBy": "pump", "timestamp": 1778414401974, "signature": "s"}
+    path = tmp_path / "h.zst"
+    path.write_bytes(zstandard.ZstdCompressor().compress(b"\n".join(orjson.dumps(e) for e in (old, new, mig))))
+    trades, events, n = parse_hour(path)
+    t = trades.to_pylist()
+    assert n == 3 and [(r["side"], r["sol"], r["quote_in_pool"]) for r in t] == [(1, 0.5, 80.0), (-1, 0.2, 79.8)]    # the pre-2026-05-21 fields are read
+    e = events.to_pylist()
+    assert len(e) == 1 and e[0]["action"] == "migrate" and e[0]["quote_in_pool"] == 85.0 and e[0]["pool_created_by"] == "pump"
+
+
 def test_discovery_missing_audit_is_unknown(monkeypatch):
     monkeypatch.setattr(config, "LAUNCHPADS", ["pump.fun"])
     tok = {"id": "X", "launchpad": "pump.fun", "graduatedAt": "2026-09-01T00:00:00Z", "graduatedPool": "P"}

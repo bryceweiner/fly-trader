@@ -3,6 +3,8 @@ as feature rows — the population the live bot actually meets on Jupiter's list
 after graduation covered by ``replay_assemble``.
 
 Stage 1 (``aggregate_day``): all ``pump-amm`` trade legs of pump.fun-origin mints (suffix ``pump``, SOL-quoted) of a UTC day,
+except legs in pools created directly rather than by a pump.fun migration (``pump_pools``: their owner can pull the unburned
+liquidity, and the withdrawal is not in the trade data, so the price just stops after a pump),
 with causal filters only (the live stream applies the same ones): quote reserve 0.001–100,000 SOL, a leg more than 50× away
 from the median of the mint's previous 200 legs that day is dropped, and each (mint, minute) keeps the pool with the most
 legs → per (mint, minute): open/high/low/close,
@@ -42,12 +44,13 @@ from .. import config, logging_setup
 from ..db.connection import transaction
 from ..market.features import FEATURE_VERSION, FIDX, TokenMeta, TokenState
 from .corpus_features import SCHEMA as FEAT_SCHEMA, PRE_COLS, _epoch_s, _row
+from .corpus_meta import blocked_pool_ids
 
 log = logging.getLogger(__name__)
 MATURE_DIR = config.CORPUS_DIR / "mature"
 MATURE_FEAT_DIR = config.CORPUS_DIR / "features_mature"
 STALE_DIR = config.CORPUS_DIR / "_mature_stale"
-AGG_VERSION = 2          # 2: causal price band and per-minute dominant pool
+AGG_VERSION = 3          # 2: causal price band and per-minute dominant pool; 3: directly created (custom) PumpSwap pools excluded
 KNOWN_REBUILD_FRAC, KNOWN_REBUILD_MIN = 0.01, 25     # a part is rebuilt once corpus_meta dates this many more of its mints
 MASKED = ["logsigners_15m", "logsigners_1h", "hawkes", "log_since_last", "vpin_15m"]
 EXTRA = ["traders_15m", "traders_1h", "n_trades_1m"]
@@ -129,11 +132,14 @@ def aggregate_day(d: date) -> int:
     cols = [c[0] for c in con.execute("SELECT * FROM read_parquet(?, union_by_name = true) LIMIT 0", [files]).description]
     quote_filter = "AND (quote_mint IS NULL OR quote_mint = 'So11111111111111111111111111111111111111112')" if "quote_mint" in cols else ""
     pool_sel = "pool_id" if "pool_id" in cols else "NULL AS pool_id"
+    with transaction() as conn:
+        con.register("blocked", pa.table({"pool_id": pa.array(blocked_pool_ids(conn), pa.string())}))
+    pool_filter = "AND (pool_id IS NULL OR pool_id NOT IN (SELECT pool_id FROM blocked))" if "pool_id" in cols else ""
     # causal filters only (nothing later in the day decides which earlier trades exist); the live stream applies the same:
-    # reserve band, a leg within 50x of the median of the mint's previous 200 legs, and per (mint, minute) the pool with the most legs
+    # no directly created pool, reserve band, a leg within 50x of the median of the mint's previous 200 legs, and per (mint, minute) the pool with the most legs
     con.execute(f"""CREATE TEMP TABLE raw AS SELECT mint, ts, slot, trader, side, sol, price, quote_in_pool, {pool_sel}
                     FROM read_parquet(?, union_by_name = true)
-                    WHERE pool = 'pump-amm' AND price > 0 AND mint LIKE '%pump' AND quote_in_pool BETWEEN 0.001 AND 100000 {quote_filter}""", [files])
+                    WHERE pool = 'pump-amm' AND price > 0 AND mint LIKE '%pump' AND quote_in_pool BETWEEN 0.001 AND 100000 {quote_filter} {pool_filter}""", [files])
     con.execute("""CREATE TEMP TABLE banded AS SELECT * EXCLUDE (pref) FROM (
                       SELECT *, median(price) OVER (PARTITION BY mint ORDER BY ts, slot ROWS BETWEEN 200 PRECEDING AND 1 PRECEDING) AS pref FROM raw)
                     WHERE pref IS NULL OR price BETWEEN pref / 50 AND pref * 50""")

@@ -3,7 +3,10 @@
 ``wss://stream.pumpapi.io`` is a free, keyless firehose (~400–800 events/s, one connection per IP) whose events are
 identical to the replay archive. This worker keeps only what the selector needs: PumpSwap (``pump-amm``, SOL-quoted)
 buys and sells of pump.fun-origin mints, aggregated per (mint, minute) into the same fields ``train/mature.py``
-derives from the archive, with the same filters: the pool's quote reserve must lie in 0.001–100,000 SOL, a leg more
+derives from the archive, with the same filters: legs in a pool created directly rather than by a pump.fun migration
+(``createPool`` with ``poolCreatedBy`` other than ``pump``; the owner can pull its unburned liquidity) are dropped — such pools
+go to ``pump_pools`` as they are created, and the blocked set is reloaded from that table (archive backfill included) at
+start and every 5 minutes —, the pool's quote reserve must lie in 0.001–100,000 SOL, a leg more
 than 50× away from the median of the mint's previous 200 legs that UTC day is dropped, and each minute keeps the
 pool with the most legs. Minutes are written to ``pump_minutes`` once complete: an event stamped ≥ 2 s after the
 minute's end has arrived (event-time watermark) or, once no trade has arrived for 15 s, by wall clock; a leg for a minute
@@ -39,7 +42,7 @@ from .. import config
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..logging_setup import setup
-from ..train.corpus_meta import creator_history
+from ..train.corpus_meta import blocked_pool_ids, creator_history
 
 log = logging.getLogger(__name__)
 WSOL = "So11111111111111111111111111111111111111112"
@@ -71,9 +74,11 @@ class Aggregator:
         self.max_event_s = 0.0; self.last_event_wall = 0.0                # newest event time; wall clock of the last trade received
         self.creates: dict[str, dict] = {}                                 # mint → create facts (24 h)
         self.pending_creates: list[tuple[str, dict]] = []                 # creates not yet written to pump_events
+        self.blocked: set[str] = set()                                     # pool ids of directly created (custom) PumpSwap pools
+        self.pending_pools: list[tuple] = []                               # custom pools not yet written to pump_pools
         self.flushed_through: datetime | None = None                       # start of the newest complete minute written
-        self.stats = {"events": 0, "trades": 0, "dropped_band": 0, "dropped_late": 0,"flushed_minutes": 0, "flushed_rows": 0, "creates": 0, "migrates": 0, "reconnects": 0,
-                      "outcomes_filled": 0, "started_at": datetime.now(timezone.utc).isoformat()}
+        self.stats = {"events": 0, "trades": 0, "dropped_band": 0, "dropped_late": 0, "dropped_custom_pool": 0, "flushed_minutes": 0, "flushed_rows": 0, "creates": 0, "migrates": 0,
+                      "custom_pools": 0, "blocked_pools": 0, "reconnects": 0, "outcomes_filled": 0, "started_at": datetime.now(timezone.utc).isoformat()}
 
     def row(self, minute: int, mint: str) -> Minute | None:
         """The minute's candle for a mint: the pool with the most legs (as in training)."""
@@ -83,10 +88,19 @@ class Aggregator:
     def ingest(self, e: dict) -> None:
         self.stats["events"] += 1
         a = e.get("action"); pool = e.get("pool"); mint = e.get("mint"); ts = e.get("timestamp")
+        if a == "createPool" and pool == "pump-amm" and (e.get("poolCreatedBy") or "custom") != "pump":
+            pid = e.get("poolId")                   # not a pump.fun migration: the owner can pull the liquidity unseen
+            if pid:
+                self.block([pid]); self.stats["custom_pools"] += 1
+                self.pending_pools.append((pid, mint, e.get("poolCreatedBy"), datetime.fromtimestamp(ts / 1000, timezone.utc) if ts is not None else None))
+            return
         if ts is None or not mint:
             return
         if a in ("buy", "sell"):
             if pool != "pump-amm" or e.get("quoteMint") != WSOL or not str(mint).endswith("pump"):
+                return
+            if e.get("poolId") in self.blocked:
+                self.stats["dropped_custom_pool"] += 1
                 return
             price = e.get("price"); q = e.get("quoteInPool")
             if not price or price <= 0 or q is None or not (RESQ_BAND[0] <= float(q) <= RESQ_BAND[1]):
@@ -155,6 +169,23 @@ class Aggregator:
         except Exception:
             self.pending_creates = (rows + self.pending_creates)[-MAX_PENDING_CREATES:]
             log.exception("create rows failed; %d queued for the next attempt", len(self.pending_creates))
+            return 0
+        return len(rows)
+
+    def block(self, pool_ids) -> None:
+        self.blocked.update(pool_ids); self.stats["blocked_pools"] = len(self.blocked)
+
+    def write_pools(self) -> int:
+        """Persist custom pools seen on the stream (training excludes the same pools); on failure they stay queued."""
+        rows, self.pending_pools = self.pending_pools, []
+        if not rows:
+            return 0
+        try:
+            with transaction() as conn:
+                conn.cursor().executemany("INSERT INTO pump_pools (pool_id, mint, created_by, ts, source) VALUES (%s,%s,%s,%s,'stream') ON CONFLICT (pool_id) DO NOTHING", rows)
+        except Exception:
+            self.pending_pools = (rows + self.pending_pools)[-MAX_PENDING_CREATES:]
+            log.exception("custom pool rows failed; %d queued for the next attempt", len(self.pending_pools))
             return 0
         return len(rows)
 
@@ -289,8 +320,18 @@ def _logged(name: str, fn, *args):
         return 0
 
 
+def _load_blocked(agg: Aggregator) -> None:
+    """Union the custom pools in ``pump_pools`` (stream rows and the archive backfill) into the blocked set."""
+    try:
+        with transaction() as conn:
+            agg.block(blocked_pool_ids(conn))
+    except Exception:
+        log.exception("custom pool load failed; retried in 5 min")
+
+
 async def _run(stop: threading.Event | None, agg: Aggregator) -> None:
     ctx = ssl.create_default_context(cafile=certifi.where()); backoff = 1.0
+    _load_blocked(agg); last_pools = time.time()
     last_status = last_flush = last_outcomes = 0.0; last_archive = time.time() - 3000; last_msg = 0.0; rate_n = 0; rate_t = time.time()
     bg: dict[str, asyncio.Task | None] = {"archive": None, "outcomes": None}
     while not (stop is not None and stop.is_set()):
@@ -316,8 +357,10 @@ async def _run(stop: threading.Event | None, agg: Aggregator) -> None:
                         except Exception:
                             log.exception("minute flush failed; rows kept for the next attempt")
                         last_flush = now
+                    if now - last_pools >= 300:
+                        _load_blocked(agg); last_pools = now
                     if now - last_status >= 5.0:
-                        agg.write_creates()
+                        agg.write_creates(); agg.write_pools()
                         _status(agg, {"events_per_s": rate_n / max(now - rate_t, 1e-9), "pending_minutes": len(agg.minutes), "lag_s": now - last_msg, "connected": True,
                                       "flushed_through": agg.flushed_through.isoformat() if agg.flushed_through else None,
                                       "event_watermark": datetime.fromtimestamp(agg.max_event_s, timezone.utc).isoformat() if agg.max_event_s else None})
@@ -340,7 +383,7 @@ async def _run(stop: threading.Event | None, agg: Aggregator) -> None:
         agg.flush(int(time.time() // 60) * 60 + 60)
     except Exception:
         log.exception("final minute flush failed")
-    agg.write_creates()
+    agg.write_creates(); agg.write_pools()
 
 
 def main(stop_event: threading.Event | None = None) -> None:
@@ -350,4 +393,5 @@ def main(stop_event: threading.Event | None = None) -> None:
         asyncio.run(_run(stop_event, agg))
     finally:
         _status(agg, {"connected": False, "stage": "stopped"})
-        record_event("info", "pumpstream", "pumpstream stopped", {k: agg.stats.get(k) for k in ("events", "trades", "dropped_band", "flushed_rows", "creates", "migrates", "reconnects")})
+        record_event("info", "pumpstream", "pumpstream stopped", {k: agg.stats.get(k) for k in ("events", "trades", "dropped_band", "dropped_custom_pool", "flushed_rows", "creates",
+                                                                                                  "custom_pools", "migrates", "reconnects")})
