@@ -158,7 +158,8 @@ def system_state() -> dict:
         trading, why = "starting", "Warming up on the last 24 hours of market minutes."
     else:
         trading, why = "trading", "Trading every minute."
-    return {"workers": ws, "runner": runner, "trading": trading, "trading_why": why, "live_money": bool(config.LIVE_ENABLED and config.BRAIN_MODE != "selector"),
+    return {"workers": ws, "runner": runner, "trading": trading, "trading_why": why, "live_money": False,   # the selector trades the paper book; live execution is not wired to it yet
+           
             "model": loaded_model() if runner else None, "latest": latest_snapshot("selector"), "deployable": latest_snapshot("selector", deployable=True),
             "training": training, "train_status": tr, "train_at": tr_at,
             "train_external": training and not ws["train"]["alive"], "selector": sel, "selector_at": sel_at, "feed": ps, "feed_ok": feed_ok, "feed_age": feed_age,

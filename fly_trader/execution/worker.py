@@ -1,8 +1,8 @@
-"""Execution queue for the live book: the beat loop never blocks on Jupiter.
+"""Execution queue for the live book: the caller never blocks on Jupiter.
 
-The beat enqueues ExecRequest objects; one background thread executes them sequentially through
-LiveBroker (one in-flight order at a time, balance-verified); results are drained by the beat, which
-opens/closes positions accordingly. Mints with an in-flight request are skipped by the beat.
+The caller enqueues ExecRequest objects; one background thread executes them sequentially through
+LiveBroker (one in-flight order at a time, balance-verified); results are drained by the caller, which
+opens/closes positions accordingly. Mints with an in-flight request are skipped.
 """
 from __future__ import annotations
 

@@ -15,9 +15,8 @@ flybrain does, which reproduces its 2,698,236 edges in ``flybrain`` mode.
 
 Scale: s0 = 0.99 / rho(|W_raw|) (spectral radius by shifted power iteration) is only the INITIAL
 guess, motivated by Costi et al. 2025 (PMC12109256), who ran the FlyWire connectome as an echo-state
-reservoir rescaled to rho = 0.99 (tanh units, glutamate treated as excitatory there). The scale the
-LIF actually runs with comes from ``scale.json`` (calibrate-brain, then the encoder-input sweep);
-at that scale rho(s*|W|) is ~9, i.e. the spiking network is not at the reservoir operating point.
+reservoir rescaled to rho = 0.99 (tanh units, glutamate treated as excitatory there). The fly
+(``train/fly_selector.py``) initialises its synaptic magnitudes from s (``scale.json`` when present, else s0).
 KC->MBON magnitudes are forced positive because KC output synapses are cholinergic (Barnstedt et
 al. 2016 Neuron), regardless of FlyWire's per-cell NT prediction.
 """

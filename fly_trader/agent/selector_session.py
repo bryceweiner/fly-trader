@@ -1,10 +1,10 @@
-"""Selector session (``BRAIN_MODE=selector``): the strategy running on the live stream.
+"""Selector session: the strategy running on the live stream.
 
 Every UTC minute, once the stream has written it (``pumpstream_status.flushed_through``), the minute's rich candle per
 mint (``pump_minutes``: open/high/low/close, SOL volume by side, buy/sell counts, distinct traders, quote reserve; the
 same fields and filters ``train/mature.py`` builds from the archive) is fed to the live feature engine as two
 synthetic trades, exactly as in training. Graduation time and creation/creator facts come from ``corpus_meta``, the
-same source training uses. Rows that pass the eligibility gate (pool ≥ 20 SOL, 15-minute volume ≥ 5 SOL, no scale break —
+same source training uses. Rows that pass the eligibility gate (pool ≥ ``MIN_RESQ_SOL``, 15-minute volume ≥ ``MIN_VOL_15M_SOL``, no scale break —
 a close 50× from the previous one or a reserve above 100,000 SOL — since the mint's state began) are scored
 by the deployed selector (``brain_snapshots`` kind 'selector') with the feature vector assembled by name in the
 model's column order; scores at or above its threshold open a position sized from the model's measured certainty
@@ -148,31 +148,11 @@ class SelectorSession:
 
     # ---- one minute ----
     def _aggregate(self, conn, m0: datetime, m1: datetime) -> dict[str, dict]:
-        if config.SELECTOR_SOURCE == "stream":       # PumpAPI minutes: every SOL-quoted PumpSwap pump.fun token, same fields as the archive
-            rows = conn.execute("SELECT mint, pool_id, open, high, low, close, buy_sol, sell_sol, n_buys, n_sells, n_traders, resq_sol, fee_rate FROM pump_minutes WHERE ts = %s", (m0,)).fetchall()
-            return {r["mint"]: {"open": r["open"], "high": r["high"], "low": r["low"], "close": r["close"], "buy": r["buy_sol"] or 0.0, "sell": r["sell_sol"] or 0.0,
-                                "nb": r["n_buys"] or 0, "ns": r["n_sells"] or 0, "n_traders": int(r["n_traders"] or 0), "resq": r["resq_sol"],
-                                "pool": r["pool_id"], "program_label": "Pump.fun Amm", "fee_rate": r["fee_rate"]} for r in rows if r["close"]}
-        rows = conn.execute("""SELECT s.mint, s.pool, s.ts, s.side, s.amount_quote, s.price_sol, s.signer, s.res_quote, wp.program_label
-                               FROM swap_tape s LEFT JOIN watch_pools wp ON wp.pool = s.pool
-                               WHERE s.ts >= %s AND s.ts < %s AND s.side <> 0 AND s.price_sol > 0 ORDER BY s.ts, s.id""", (m0, m1)).fetchall()
-        agg: dict[str, dict] = {}
-        for r in rows:
-            a = agg.setdefault(r["mint"], {"open": None, "high": -1.0, "low": math.inf, "close": None, "buy": 0.0, "sell": 0.0, "nb": 0, "ns": 0, "traders": set(),
-                                           "resq": None, "pool": r["pool"], "program_label": r["program_label"], "fee_rate": None})
-            p = float(r["price_sol"]); sol = float(r["amount_quote"] or 0) / config.LAMPORTS_PER_SOL
-            a["open"] = p if a["open"] is None else a["open"]; a["high"] = max(a["high"], p); a["low"] = min(a["low"], p); a["close"] = p
-            if int(r["side"]) == 1:
-                a["buy"] += sol; a["nb"] += 1
-            else:
-                a["sell"] += sol; a["ns"] += 1
-            if r["signer"]:
-                a["traders"].add(r["signer"])
-            if r["res_quote"]:
-                a["resq"] = float(r["res_quote"]) / config.LAMPORTS_PER_SOL
-        for a in agg.values():
-            a["n_traders"] = len(a.pop("traders"))
-        return agg
+        """PumpAPI minutes: every SOL-quoted PumpSwap pump.fun token, the same fields as the archive."""
+        rows = conn.execute("SELECT mint, pool_id, open, high, low, close, buy_sol, sell_sol, n_buys, n_sells, n_traders, resq_sol, fee_rate FROM pump_minutes WHERE ts = %s", (m0,)).fetchall()
+        return {r["mint"]: {"open": r["open"], "high": r["high"], "low": r["low"], "close": r["close"], "buy": r["buy_sol"] or 0.0, "sell": r["sell_sol"] or 0.0,
+                            "nb": r["n_buys"] or 0, "ns": r["n_sells"] or 0, "n_traders": int(r["n_traders"] or 0), "resq": r["resq_sol"],
+                            "pool": r["pool_id"], "program_label": "Pump.fun Amm", "fee_rate": r["fee_rate"]} for r in rows if r["close"]}
 
     def _features(self, conn, mint: str, a: dict, t_end: float) -> tuple[np.ndarray, dict]:
         s = self._state(conn, mint, a["pool"], a["program_label"])
@@ -211,16 +191,12 @@ class SelectorSession:
         return datetime.fromisoformat(r["ft"]).timestamp() if r and r["ft"] else None
 
     def ready_through(self, m1_epoch: float) -> float:
-        """End of the newest minute (at most ``m1``) the stream has written; the tape source is always current. A minute is
+        """End of the newest minute (at most ``m1``) the stream has written; A minute is
         never read before it is written, so a lagging stream delays minutes instead of feeding them empty or partial."""
-        if config.SELECTOR_SOURCE != "stream":
-            return m1_epoch
         ft = self._stream_through()
         return min(m1_epoch, ft + 60.0) if ft is not None else float("-inf")
 
     def stream_fresh(self, m0_epoch: float) -> bool:
-        if config.SELECTOR_SOURCE != "stream":
-            return True
         ft = self._stream_through()
         return ft is not None and m0_epoch - ft <= STREAM_STALE_S
 

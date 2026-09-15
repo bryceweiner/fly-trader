@@ -1,13 +1,9 @@
-"""Ingest/db/market review fixes (2026-09-14): discovery gate + dedupe, capture learning, corpus/replay DB resilience,
-DSN parsing, context coverage, danger units."""
+"""Ingest/db review fixes (2026-09-14): DSN parsing, corpus/replay DB resilience, token stats for the selector's universe."""
 from __future__ import annotations
 
-import asyncio
-import json
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import httpx
 import psycopg
@@ -17,15 +13,6 @@ from fly_trader import config
 from fly_trader.db import schema
 from fly_trader.db.connection import database_name
 from fly_trader.ingest import corpus_pull, discovery
-from fly_trader.ingest import swap_decoder as sd
-from fly_trader.ingest.capture import Capture
-from fly_trader.market.context_window import ContextWindow
-from fly_trader.market.danger import _frac
-
-FX = Path(__file__).parent / "fixtures"
-MANIFEST = json.loads((FX / "manifest.json").read_text())
-GRAD = {"launchpad": "pump.fun", "graduatedAt": "2026-09-01T00:00:00Z", "decimals": 6,
-        "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True}}
 
 
 def _tx_on(conn):
@@ -65,76 +52,6 @@ def test_ensure_database_admin_dsn_keeps_user_and_host(monkeypatch):
     assert psycopg.conninfo.conninfo_to_dict(seen[0]) == {"user": "fly_trader", "password": "pw", "host": "localhost", "dbname": "postgres"}
     schema.ensure_database("dbname=fly_trader user=fly_trader host=/tmp")
     assert psycopg.conninfo.conninfo_to_dict(seen[1]) == {"user": "fly_trader", "host": "/tmp", "dbname": "postgres"}
-
-
-# ---- 5: graduated payload without graduatedPool ----
-def test_graduated_without_pool_is_unknown_and_keeps_watch(db_conn):
-    mint = "TestFix5Mint1111111111111111111111111111111"
-    tok = {**GRAD, "id": mint, "graduatedPool": "TestFix5Pool"}
-    discovery.upsert_token(db_conn, tok, "watch")
-    bare = {**tok, "graduatedPool": None}
-    assert discovery.evaluate(bare) == ("unknown", "graduated without graduatedPool")
-    c = discovery.process_tokens(db_conn, [bare], with_stats=False)
-    assert c["unknown"] == 1 and c["excluded"] == 0 and c["deactivated"] == 0
-    assert db_conn.execute("SELECT watch_status FROM tokens WHERE mint = %s", (mint,)).fetchone()["watch_status"] == "watch"
-
-
-# ---- 8: /recent + categories dedupe ----
-def test_dedupe_keeps_first_payload_per_mint():
-    a1, b, a2 = {"id": "A", "v": 1}, {"id": "B"}, {"id": "A", "v": 2}
-    assert discovery.dedupe([a1, b, {"symbol": "no id"}, a2]) == [a1, b]
-
-
-# ---- 9: context coverage ----
-def test_context_coverage_starts_at_first_activity():
-    cw = ContextWindow(window_s=100.0, gap_s=50.0, ready_cov=0.9)
-    for t in (0.0, 10.0, 20.0):
-        cw.observe(t, had_activity=False)
-    assert cw.start_ts is None and cw.coverage(20.0) == 0.0 and cw.feed_age_s(20.0) is None
-    cw.observe(30.0, True)
-    assert cw.coverage(80.0) == pytest.approx(0.5) and not cw.ready(110.0) and cw.ready(120.0)
-    cw.observe(200.0, True)                                            # silence > gap_s: coverage restarts
-    assert cw.gaps == 1 and cw.coverage(200.0) == 0.0
-
-
-# ---- 10: danger units ----
-def test_danger_audit_fields_are_percents():
-    assert _frac(0.5) == pytest.approx(0.005) and _frac(40.0) == pytest.approx(0.4) and _frac(None) == 0.0
-
-
-# ---- 1 / 6: capture learning ----
-def _raydium_v4():
-    fx = MANIFEST["fixtures"]["raydium_v4_buy"]
-    return MANIFEST["pools"][fx["pool_key"]], json.loads((FX / fx["file"]).read_text())
-
-
-def test_raydium_v4_graduation_labelled_pumpswap_still_learns():
-    p, tx = _raydium_v4()
-    cap = Capture.__new__(Capture)
-    cap.learned, cap.vault_index = {}, {}
-    cap.unlearned = {p["pool"]: {"pool": p["pool"], "mint": p["mint"], "quote_mint": p["quote_mint"],
-                                 "program_label": "Pump.fun Amm", "program_id": None, "quote_decimals": p["quote_decimals"]}}
-
-    async def noop(*a, **k):
-        return None
-    cap._db = noop
-    cap.event = noop
-    keys, _ = sd.account_keys(*sd.unwrap(tx)[:2])
-    asyncio.run(cap._maybe_learn(tx, set(keys)))
-    got = cap.learned[p["pool"]]
-    assert (got.base_vault, got.quote_vault) == (p["base_vault"], p["quote_vault"]) and not cap.unlearned
-
-
-def test_pool_reload_keeps_vaults_learned_in_memory():
-    p, _ = _raydium_v4()
-    pv = sd.PoolVaults(pool=p["pool"], mint=p["mint"], quote_mint=p["quote_mint"], base_vault=p["base_vault"],
-                       quote_vault=p["quote_vault"], base_decimals=p["base_decimals"], quote_decimals=p["quote_decimals"])
-    cap = Capture.__new__(Capture)
-    cap.learned, cap.pool_addresses = {p["pool"]: pv}, [p["pool"]]
-    stale = {"pool": p["pool"], "mint": p["mint"], "quote_mint": None, "program_label": "Pump.fun Amm", "program_id": None,
-             "base_vault": None, "quote_vault": None, "base_decimals": 6, "quote_decimals": None}
-    assert cap._apply_pools([stale]) is False
-    assert cap.learned[p["pool"]] is pv and not cap.unlearned and cap.vault_index[p["base_vault"]] is pv
 
 
 # ---- 2 / 3: corpus + replay resilience ----
@@ -190,7 +107,7 @@ def test_refresh_stats_covers_selector_universe_without_watching(db_conn):
     class Client:
         def search_many(self, mints):
             asked.append(list(mints))
-            return [{**GRAD, "id": mint, "graduatedPool": "TestUniversePool", "organicScore": 42.0}] if mint in mints else []
+            return [{"id": mint, "organicScore": 42.0}] if mint in mints else []
 
     c = discovery.refresh_stats(db_conn, Client())
     assert c["universe"] >= 1 and c["refreshed"] == 1 and any(mint in a for a in asked)

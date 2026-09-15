@@ -1,9 +1,9 @@
-"""Per-token rolling state from the swap tape and the beat-time feature vector.
+"""Per-token rolling state and the feature vector, one engine for training (``train/mature.py``) and trading.
 
 Feature definitions follow VOC dexlp/env/obs_spec.py (multi-timeframe momentum / realized vol /
 imbalance / toxicity, Hawkes burstiness, drawdown, overextension, exit cost) restricted to the
 token-intrinsic subset; LP-position slots are dropped. Every feature is standardized downstream
-(Welford running moments in the encoder), so scales only need to be consistent.
+(robust scaling, ``train/scaling.py``), so scales only need to be consistent.
 
 Data structures: append-only Python lists with prefix sums, so each window statistic is O(log n)
 via bisect; window highs use per-block maxima; unique-signer counts use sliding counters with eviction
@@ -270,68 +270,3 @@ class TokenState:
             mask |= STATS_BIT
         f[FIDX["token2022"]] = 1.0 if meta.token2022 else 0.0
         return f, mask
-
-
-class FeatureBank:
-    """All watched tokens' rolling states; the runner and the replay feed both drive it."""
-
-    def __init__(self):
-        self.states: dict[str, TokenState] = {}
-        self.pool_to_mint: dict[str, str] = {}
-        self.sol_usd: float | None = None
-
-    def state(self, mint: str) -> TokenState:
-        st = self.states.get(mint)
-        if st is None:
-            st = TokenState(mint)
-            self.states[mint] = st
-        return st
-
-    def ingest_tape_row(self, row: dict) -> None:
-        """row: a swap_tape dict (ts datetime or epoch, side, amount_quote, price_sol/price_quote, signer, res_quote, mint, pool)."""
-        side = row.get("side") or 0
-        if side == 0:
-            return
-        mint = row.get("mint") or self.pool_to_mint.get(row.get("pool"))
-        if not mint:
-            return
-        ts = row["ts"]
-        ts = ts.timestamp() if hasattr(ts, "timestamp") else float(ts)
-        price = row.get("price_sol")
-        aq = row.get("amount_quote") or 0
-        rq = row.get("res_quote")
-        qdec = row.get("quote_decimals")
-        if price is None:
-            pq = row.get("price_quote")
-            if pq is not None and self.sol_usd:
-                price = pq / self.sol_usd
-        if price is None:
-            return
-        if qdec is None or qdec == 9:
-            sol_vol = float(aq) / config.LAMPORTS_PER_SOL
-            res_q = float(rq) / config.LAMPORTS_PER_SOL if rq is not None else None
-        else:
-            usd = float(aq) / (10 ** qdec)
-            sol_vol = usd / self.sol_usd if self.sol_usd else 0.0
-            res_q = (float(rq) / (10 ** qdec)) / self.sol_usd if (rq is not None and self.sol_usd) else None
-        self.state(mint).append(ts, float(price), sol_vol, side > 0, row.get("signer"), res_q)
-
-    def activity_sol(self, mint: str, now: float, window_s: float = 10800.0) -> float:
-        st = self.states.get(mint)
-        return st.volume_since(now - window_s) if st else 0.0
-
-    def last_price(self, mint: str) -> float | None:
-        st = self.states.get(mint)
-        return st.last_price if st else None
-
-    def last_swap_ts(self, mint: str) -> float | None:
-        st = self.states.get(mint)
-        return st.last_ts if st else None
-
-    def rvol(self, mint: str, now: float, window_s: float = 900.0) -> float:
-        st = self.states.get(mint)
-        return st.rvol(now, window_s) if st else 0.0
-
-    def res_quote_sol(self, mint: str) -> float | None:
-        st = self.states.get(mint)
-        return st.last_res_quote_sol if st else None

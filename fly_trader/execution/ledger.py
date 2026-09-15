@@ -1,4 +1,4 @@
-"""Positions and fills bookkeeping per book (live, paper_free, paper_mirror).
+"""Positions and fills bookkeeping per book (live, paper_selector).
 
 Paper cash is derived, never stored: cash = CAPITAL_SOL + Σ realized_sol(all) − Σ cost_sol(open).
 realized_sol accumulates per position: each partial sale books proceeds − the cost it retires (cost_sol

@@ -37,7 +37,7 @@ import torch.nn.functional as Fn
 
 from .. import config
 from ..agent import sizing
-from ..brain.policy import AFFERENT_POPS, EFFERENT_POP, SubConnectome
+from ..brain.connectome import AFFERENT_POPS, EFFERENT_POP, Connectome, SubConnectome
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from . import progress as prog
@@ -115,7 +115,6 @@ def _device() -> torch.device:
 
 
 def _graph():
-    from ..brain.lif import Connectome
     return SubConnectome(Connectome.load(), exclude=("VISUAL",))
 
 

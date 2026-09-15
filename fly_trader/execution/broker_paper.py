@@ -32,7 +32,7 @@ class PaperFill:
 
 class PaperBroker:
     def __init__(self, book: str):
-        assert book in ("paper_free", "paper_mirror", "paper_selector") or book.startswith(("pretrain:", "replay_"))
+        assert book == "paper_selector" or book.startswith("replay_"), book   # the selector's book; replay_* for tests
         self.book = book
 
     def buy(self, conn, *, decision_id: int | None, mint: str, pool: str | None, size_sol: float, price: float | None,

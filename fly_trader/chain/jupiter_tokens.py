@@ -1,9 +1,7 @@
 """Jupiter Tokens API v2 client (https://api.jup.ag/tokens/v2).
 
-Endpoints verified 2026-09-12 with the paid key: /recent (30 newest mints with firstPool),
-/{toporganicscore|toptraded|toptrending}/{5m|1h|6h|24h}?limit<=100, /search?query=<csv of up to 100 mints>.
-Graduated tokens carry graduatedAt + graduatedPool; for pump.fun the bonding curve appears as
-firstPool.id == mint and graduatedPool is the PumpSwap pool. audit has mintAuthorityDisabled,
+Endpoint (verified 2026-09-12 with the paid key): /search?query=<csv of up to 100 mints>. Tokens carry organicScore,
+holderCount, liquidity, mcap, stats5m/1h/6h/24h and audit: mintAuthorityDisabled,
 freezeAuthorityDisabled, topHoldersPercentage, devBalancePercentage, devMints, devMigrations (isSus is
 absent unless flagged). Rate limit headers: x-ratelimit-remaining/current/reset.
 """
@@ -73,12 +71,6 @@ class JupiterTokens:
         finally:
             record_api_call("jupiter", f"tokens{path}", "GET", status, int((time.monotonic() - t0) * 1000),
                             err is None, err, request={"params": params} if params else None)
-
-    def recent(self) -> list[dict]:
-        return self._get("/recent")
-
-    def category(self, category: str, interval: str, limit: int = 100) -> list[dict]:
-        return self._get(f"/{category}/{interval}", {"limit": limit})
 
     def search(self, query: str) -> list[dict]:
         return self._get("/search", {"query": query})

@@ -19,11 +19,8 @@ from ..db.connection import connect, transaction
 
 WORKERS: dict[str, list[str]] = {
     "discover": ["discover"],
-    "capture": ["capture"],
     "runner": ["run"],
-    "pretrain": ["pretrain"],
-    "train": ["train-policy"],
-    "corpus": ["corpus-pull"],
+    "train": ["train-selector"],
     "replay": ["replay-pull"],
     "pumpstream": ["pumpstream"],
 }

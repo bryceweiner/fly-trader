@@ -19,7 +19,6 @@ class _Model:
 
 
 def _session(monkeypatch, db_conn):
-    monkeypatch.setattr(config, "SELECTOR_SOURCE", "stream")
     s = ss.SelectorSession.__new__(ss.SelectorSession)
     s.model = _Model(); s.horizon_s = 1800; s.states = {}; s.meta_cache = {}; s.last_sweep = 0.0; s.live = False
     return s

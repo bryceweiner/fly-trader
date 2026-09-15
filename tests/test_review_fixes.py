@@ -4,8 +4,6 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from fly_trader import config
-from fly_trader.ingest import discovery
-from fly_trader.ingest.parquet_writer import Writer
 from fly_trader.train.corpus_meta import creator_history
 
 
@@ -74,29 +72,6 @@ def test_replay_keeps_finished_downloads_across_restarts(tmp_path):
     kept = _kept_downloads(tmp_path, {h1, h2})
     assert [(h, p.name, n) for h, p, n, _ in kept] == [(h1, "2026051419.zst", 10)]
     assert sorted(p.name for p in tmp_path.iterdir()) == ["2026051419.zst"]
-
-
-def test_discovery_missing_audit_is_unknown(monkeypatch):
-    monkeypatch.setattr(config, "LAUNCHPADS", ["pump.fun"])
-    tok = {"id": "X", "launchpad": "pump.fun", "graduatedAt": "2026-09-01T00:00:00Z", "graduatedPool": "P"}
-    assert discovery.evaluate(tok)[0] == "unknown"
-    assert discovery.evaluate({**tok, "audit": {"mintAuthorityDisabled": False, "freezeAuthorityDisabled": True}})[0] == "excluded"
-    assert discovery.evaluate({**tok, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True}})[0] == "watch"
-
-
-def test_parquet_writer_keeps_every_unwritten_group(tmp_path, monkeypatch):
-    w = Writer(tmp_path, "t", flush_rows=10, flush_s=999)
-    w.add({"ts": datetime(2026, 9, 1, 23, 59, tzinfo=timezone.utc), "v": 1})
-    w.add({"ts": datetime(2026, 9, 2, 0, 1, tzinfo=timezone.utc), "v": 2})
-    import fly_trader.ingest.parquet_writer as pw
-    calls = {"n": 0}
-    def boom(*a, **k):
-        calls["n"] += 1
-        raise OSError("disk full")
-    monkeypatch.setattr(pw.pq, "write_table", boom)
-    with pytest.raises(OSError):
-        w.flush()
-    assert sorted(r["v"] for r in w.buf) == [1, 2]
 
 
 def test_summary_redacts_every_dsn_form(monkeypatch):

@@ -15,7 +15,6 @@ import streamlit as st
 
 st.set_page_config(page_title="fly-trader", page_icon="🪰", layout="wide")
 
-from fly_trader import config
 from fly_trader.ops.supervisor import get_supervisor
 from fly_trader.ui.common import status_strip
 
@@ -39,8 +38,6 @@ pages = [
     st.Page("app_pages/processes.py", title="Processes", icon=":material/settings_applications:"),
     st.Page("app_pages/safety.py", title="Safety & wallet", icon=":material/shield:"),
 ]
-if config.BRAIN_MODE != "selector":
-    pages.append(st.Page("app_pages/legacy_brain.py", title="Brain (legacy)", icon=":material/neurology:"))
 page = st.navigation(pages, position="top")
 status_strip()
 try:

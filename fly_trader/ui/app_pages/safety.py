@@ -39,11 +39,8 @@ def rails_panel() -> None:
 def settings_panel() -> None:
     with st.container(border=True):
         st.markdown(":material/tune: **Mode and limits**")
-        live_money = config.LIVE_ENABLED and config.BRAIN_MODE != "selector"
-        rows = [("Brain mode", config.BRAIN_MODE, "selector: the gradient-boosted model on the market feed; policy / lif: legacy brains."),
-                ("Money", "live (real SOL)" if live_money else "paper (simulated)",
-                 "The selector trades paper only; live execution is not wired to it yet." if config.BRAIN_MODE == "selector" else "LIVE_ENABLED decides."),
-                ("LIVE_ENABLED", "1" if config.LIVE_ENABLED else "0", "Allows signing real transactions (legacy modes)."),
+        rows = [("Money", "paper (simulated)", "The selector trades the paper book; live execution is not wired to it yet."),
+                ("LIVE_ENABLED", "1" if config.LIVE_ENABLED else "0", "Allows signing real transactions once live execution is wired to the selector."),
                 ("Cluster", config.SOLANA_CLUSTER, "Solana network for live orders."),
                 ("Starting capital", f"{config.CAPITAL_SOL:g} SOL", "Paper books start here."),
                 ("Position sizing", f"{config.KELLY_FRACTION:g} × Kelly", "Each buy is sized from how certain the model is: this share of the growth-optimal bet for its score band."),
