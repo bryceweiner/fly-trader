@@ -197,3 +197,21 @@ def test_corpus_requeues_cooled_transient_errors_only(db_conn, monkeypatch):
     picked = {r["mint"] for r in corpus_pull._next_pending(limit=1_000_000)}
     assert {"TestFix3Pending", "TestFix3TransientOld"} <= picked
     assert not {"TestFix3TransientNew", "TestFix3Permanent"} & picked
+
+
+# ---- stats for the selector's universe: token_stats only, no tokens/watch_pools side effects ----
+def test_refresh_stats_covers_selector_universe_without_watching(db_conn):
+    mint = "TestUniverseMint111111111111111111111111111"
+    db_conn.execute("INSERT INTO pump_minutes (mint, ts, close, resq_sol) VALUES (%s, date_trunc('minute', now()) - interval '5 minutes', 1e-7, 30.0)", (mint,))
+    asked = []
+
+    class Client:
+        def search_many(self, mints):
+            asked.append(list(mints))
+            return [{**GRAD, "id": mint, "graduatedPool": "TestUniversePool", "organicScore": 42.0}] if mint in mints else []
+
+    c = discovery.refresh_stats(db_conn, Client())
+    assert c["universe"] == 1 and any(mint in a for a in asked)
+    assert db_conn.execute("SELECT organic_score FROM token_stats WHERE mint = %s", (mint,)).fetchone()["organic_score"] == 42.0
+    assert db_conn.execute("SELECT 1 FROM tokens WHERE mint = %s", (mint,)).fetchone() is None
+    assert db_conn.execute("SELECT 1 FROM watch_pools WHERE mint = %s", (mint,)).fetchone() is None

@@ -5,7 +5,8 @@ and freeze authority disabled. Nothing else filters; liquidity/age/holders/organ
 
 Loop: every DISCOVER_INTERVAL_S poll /recent + 5m categories; every 5 min the 1h categories; every
 STATS_REFRESH_S refresh token_stats via /search batches for tokens in watch_status 'watch' (active) and
-'pre' (seen before graduation, re-checked until they graduate or go stale). Graduated tokens get a
+'pre' (seen before graduation, re-checked until they graduate or go stale), plus — stats only — every token of the
+selector's universe (traded on the stream in the last hour, pool above its gate). Graduated tokens get a
 watch_pools row (pool = graduatedPool; a graduated payload without one changes nothing). Pools stay active for
 WATCH_DAYS_AFTER_GRADUATION days, extended while traded in the last 24 h or held by any book.
 """
@@ -192,11 +193,18 @@ def refresh_stats(conn, client: JupiterTokens) -> dict:
         (PRE_STALE_HOURS,),
     ).fetchall()
     mints = [r["mint"] for r in rows]
-    if not mints:
-        return {"refreshed": 0}
-    toks = client.search_many(mints)
-    counts = process_tokens(conn, toks, with_stats=True)
-    counts["refreshed"] = len(toks)
+    from ..train.decisions import MIN_RESQ_SOL   # lazy: keeps the training stack out of the worker's import
+    # the selector's universe (every pump.fun PumpSwap token the stream saw trade in the last hour with a pool above the
+    # selector's gate): stats only, so a point-in-time history accrues for the tokens actually traded — no watch pools
+    uni = conn.execute("SELECT DISTINCT mint FROM pump_minutes WHERE ts > now() - interval '1 hour' AND resq_sol >= %s",
+                       (MIN_RESQ_SOL,)).fetchall()
+    extra = sorted({r["mint"] for r in uni} - set(mints))
+    counts = process_tokens(conn, client.search_many(mints), with_stats=True) if mints else {}
+    ut = [t for t in client.search_many(extra) if t.get("id")] if extra else []
+    for tok in ut:
+        insert_stats(conn, tok)
+    counts["refreshed"] = counts.get("seen", 0) + len(ut)
+    counts["universe"] = len(ut)
     return counts
 
 
