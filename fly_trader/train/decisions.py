@@ -27,7 +27,18 @@ from .corpus_meta import FEATURE_COLS as META_COLS, load_features
 from .mature import part_current
 
 EXTRA_COLS = ["traders_15m", "traders_1h", "n_trades_1m", "hod_s", "hod_c", "age_known", "meta_known"]
-X_COLS = FEATURES + EXTRA_COLS + META_COLS
+# Inputs that carry no information (feature ablation 2026-09-15: the 120-min walk-forward over 149 days at real costs,
+# repeated with each group removed; removing these lowered neither the rank correlation with net returns nor the
+# out-of-sample profit): five stream features the archive cannot reproduce and the eleven Jupiter stats (always 0 — no
+# history before 2026-09-12), realized volatility (IC 0.1221 → 0.1240, +0.29 → +0.38 SOL/day without it) and the
+# creator's launch history (0.1221 → 0.1218, +0.29 → +0.29). All removed together (37 of 62 inputs): IC 0.1191,
+# +0.50 SOL/day, +3.0 % per trade (all inputs: +1.5 %).
+DROPPED_COLS = frozenset(["logsigners_15m", "logsigners_1h", "hawkes", "log_since_last", "vpin_15m",
+                          "organic_score", "log_holders", "log_liq_usd", "top_holders_pct", "dev_balance_pct", "is_sus", "is_verified",
+                          "net_buyers_1h", "holder_change_1h", "price_change_24h", "token2022",
+                          "rvol_5m", "rvol_15m", "rvol_1h", "rvol_3h",
+                          "prior_launches", "prior_grads", "prior_known", "prior_rug_share", "prior_moon_share"])
+X_COLS = [c for c in FEATURES + EXTRA_COLS + META_COLS if c not in DROPPED_COLS]
 # Hold and gates fitted to the market at real costs (2026-09-15 sweep over 149 days: holds 10–240 min × age × pool ×
 # 15-min volume × buy line, walk-forward): a 120-minute hold with pools ≥ 10 SOL and ≥ 5 SOL traded in 15 minutes (and
 # tokens ≥ 6 h past graduation, train/selector.MIN_AGE_H) made money in every month and on 46–49 of 64 days in each
