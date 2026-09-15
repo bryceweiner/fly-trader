@@ -46,7 +46,7 @@ from .scaling import RobustScaler
 log = logging.getLogger(__name__)
 SELECTOR_DIR = config.BRAIN_DIR / "selectors"
 # the data and model definitions a model was trained on; a model from other definitions is never loaded or shown
-DATA_VERSION = {"agg": AGG_VERSION, "features": FEATURE_VERSION, "costs": "paper", "selector": "ev-aged-2", "fly": "flynet-1"}
+DATA_VERSION = {"agg": AGG_VERSION, "features": FEATURE_VERSION, "costs": "real-fees-1", "selector": "ev-aged-2", "fly": "flynet-1"}
 WARMUP_DAYS, BLOCK_DAYS = 21, 7      # walk-forward: the first 21 days only train; every later day is tested, refit every 7 days
 MIN_AGE_H = 24.0                     # trade only tokens at least this long past graduation (unknown age = graduated before the archive)
 MIN_EV = 0.01                        # the buy line of a model before its walk-forward chose one
@@ -255,7 +255,7 @@ def main(days: int | None = None, horizon_min: int = 30, stop_event: threading.E
         log.info("bankroll replay of the backtest trades: sized %.2fx (worst drawdown %.0f%%) vs fixed %g SOL %.2fx (worst drawdown %.0f%%)",
                  bk["sized"]["multiple"] or 0, bk["sized"]["max_drawdown"] * 100, config.MAX_POSITION_SOL, bk["fixed"]["multiple"] or 0, bk["fixed"]["max_drawdown"] * 100)
     final.metrics = {"walk_forward": p, "random_baseline": rb, "line": wf["line"], "lines": wf["lines"], "selection_days": wf.get("selection_days"),
-                     "evaluation_days": wf.get("evaluation_days"), "costs": "paper broker model", "data": DATA_VERSION, "deployable": deployable, "deploy_reason": why,
+                     "evaluation_days": wf.get("evaluation_days"), "costs": "real fees (pool fee by market cap, Jupiter 10 bps, network fee) + impact", "data": DATA_VERSION, "deployable": deployable, "deploy_reason": why,
                      "sizing": wf["sizing"], "bankroll": bk, "model": {"kind": "ev", "line": wf["line"], "min_age_h": MIN_AGE_H},
                      "ic_by_day": wf["ic"], "rows": int(len(ds.y)), "days": len(ds.days), "first_day": str(ds.days[0]), "last_day": str(ds.days[-1])}
     path, sid = save(final)

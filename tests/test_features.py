@@ -1,7 +1,9 @@
 import math, random, time
 from fly_trader.market.features import FeatureBank, TokenMeta, FIDX, D
 from fly_trader.market.danger import danger_score
-from fly_trader.market.exit_cost import impact_fraction, exit_cost_fraction
+import numpy as np
+import pytest
+from fly_trader.market.exit_cost import impact_fraction, exit_cost_fraction, fee_fraction, pool_fee_rate
 
 
 def _fill(bank, mint, now, n=600, up=True):
@@ -27,5 +29,11 @@ def test_exit_cost_and_danger():
     assert abs(impact_fraction(0.1, 100.0) - 0.1 / 100.1) < 1e-9
     assert impact_fraction(0.1, None) == 1.0
     assert 0 < exit_cost_fraction(0.1, 100.0, 1.0) < 0.02
+    # measured pump.fun schedule: 1.25 % below 420 SOL market cap, stepping down to 0.30 % above 98,178 SOL
+    assert pool_fee_rate(100.0) == 0.0125 and pool_fee_rate(5000.0) == 0.01 and pool_fee_rate(2e5) == 0.003
+    assert pool_fee_rate(None) == 0.0125 and list(pool_fee_rate(np.array([100.0, np.nan, 2e5]))) == [0.0125, 0.0125, 0.003]
+    # fees = pool fee + Jupiter 10 bps + 5,000-lamport network fee; a stream-reported pool fee overrides the schedule
+    assert fee_fraction(0.1, 2e5) == pytest.approx(0.003 + 0.001 + 5e-6 / 0.1)
+    assert fee_fraction(0.1, 2e5, pool_fee=0.0095) == pytest.approx(0.0095 + 0.001 + 5e-6 / 0.1)
     f = [0.0] * D; f[FIDX["exit_cost_0p1"]] = 1.0; f[FIDX["is_sus"]] = 1.0
     assert danger_score(f, 0, 0.5) > danger_score([0.0] * D, 0, 100.0)

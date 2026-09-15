@@ -42,6 +42,7 @@ import pyarrow.parquet as pq
 
 from .. import config, logging_setup
 from ..db.connection import transaction
+from ..market.exit_cost import PUMP_SUPPLY
 from ..market.features import FEATURE_VERSION, FIDX, TokenMeta, TokenState
 from .corpus_features import SCHEMA as FEAT_SCHEMA, PRE_COLS, _epoch_s, _row
 from .corpus_meta import blocked_pool_ids
@@ -201,7 +202,13 @@ def _graduations() -> dict:
         return {r["mint"]: r["graduated_at"] for r in conn.execute("SELECT mint, graduated_at FROM corpus_meta WHERE graduated_at IS NOT NULL").fetchall()}
 
 
-def build_day(d: date, lookback_days: int = 1, grads: dict | None = None) -> int:
+def _supplies() -> dict:
+    """mint → token supply from the create event (mayhem tokens: 2 billion); tokens not in corpus_meta use PUMP_SUPPLY."""
+    with transaction() as conn:
+        return {r["mint"]: float(r["supply"]) for r in conn.execute("SELECT mint, supply FROM corpus_meta WHERE supply > 0").fetchall()}
+
+
+def build_day(d: date, lookback_days: int = 1, grads: dict | None = None, supplies: dict | None = None) -> int:
     """Feature rows for every minute of day D, warmed up on the previous day's candles. ``grads``: mint → graduated_at
     (default: read from ``corpus_meta``); the part records how many of its mints had one (metadata ``fly_known``)."""
     t0 = time.time()
@@ -215,6 +222,7 @@ def build_day(d: date, lookback_days: int = 1, grads: dict | None = None) -> int
     cd = pd.concat(frames, ignore_index=True).sort_values(["mint", "ts"])
     day_start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp(); day_end = day_start + 86400
     grads = _graduations() if grads is None else grads
+    supplies = _supplies() if supplies is None else supplies
     out: list[dict] = []; n_mints = 0; n_known = 0
     for mint, x in cd.groupby("mint", sort=False):
         ts_s = _epoch_s(x["ts"])
@@ -223,7 +231,7 @@ def build_day(d: date, lookback_days: int = 1, grads: dict | None = None) -> int
         n_mints += 1
         g = grads[mint].timestamp() if grads.get(mint) else None
         n_known += g is not None
-        st = TokenState(mint); tm = TokenMeta(mint=mint, program_label="Pump.fun Amm", graduated_at=g)
+        st = TokenState(mint); tm = TokenMeta(mint=mint, program_label="Pump.fun Amm", graduated_at=g, supply=supplies.get(mint) or PUMP_SUPPLY)
         pre = {k: float("nan") for k in PRE_COLS}
         o, h, l, c = x["open"].to_numpy(), x["high"].to_numpy(), x["low"].to_numpy(), x["close"].to_numpy()
         bs, ss, nb, ns, nt, rq = x["buy_sol"].to_numpy(), x["sell_sol"].to_numpy(), x["n_buys"].to_numpy(), x["n_sells"].to_numpy(), x["n_traders"].to_numpy(), x["resq_sol"].to_numpy()

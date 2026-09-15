@@ -2,8 +2,8 @@
 
 One "body" per token; the policy is shared. Action a ∈ [0, 1] = target exposure as a fraction of
 MAX_POSITION_SOL. Trades execute only when |a − pos| ≥ MIN_TRADE_FRAC (dust control) at the last trade price
-with the round-trip cost model of market/exit_cost.py (Jupiter fee by token age + pool fee + constant-product
-impact against the quote reserve). Reward per beat = change in the position's marked value plus cash flows,
+with the cost model of market/exit_cost.py (the highest pump.fun pool-fee tier, as the tape has no market cap, + Jupiter's
+10 bps + constant-product impact against the quote reserve). Reward per beat = change in the position's marked value plus cash flows,
 in percent of MAX_POSITION_SOL — i.e. the money, net of fees. Tokens without data are flat and rewardless.
 """
 from __future__ import annotations
@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .. import config
-from ..market.exit_cost import POOL_FEE_BPS, jupiter_fee_bps
+from ..market.exit_cost import JUPITER_FEE_BPS, pool_fee_rate
 from .dataset import Dataset
 
 PORTFOLIO_DIM = 3          # pos, unrealized return, log1p(beats held)
@@ -21,8 +21,9 @@ MIN_TRADE_FRAC = 0.25
 DEFAULT_RESQ_SOL = 20.0
 
 
-def fee_frac(age_h: float | None) -> float:
-    return (jupiter_fee_bps(age_h) + POOL_FEE_BPS) / 1e4
+def fee_frac(age_h: float | None = None) -> float:
+    """Fees per side for the legacy tape environment, which has no market cap: the highest pool-fee tier + Jupiter's fee."""
+    return pool_fee_rate(None) + JUPITER_FEE_BPS / 1e4
 
 
 class TradingEnv:

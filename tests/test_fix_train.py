@@ -52,7 +52,7 @@ def test_exit_cost_uses_fixed_size(monkeypatch):
     monkeypatch.setattr(config, "MAX_POSITION_SOL", 7.0)
     st = TokenState("M"); st.append(0.0, 1.0, 1.0, True, None, 30.0)
     f, _ = st.features(60.0, TokenMeta("M", graduated_at=-3600.0, program_label="Pump.fun Amm"))
-    assert f[FIDX["exit_cost_0p1"]] == pytest.approx(exit_cost_fraction(0.1, 30.0, 3600.0 / 3600 + 60 / 3600, "Pump.fun Amm"))
+    assert f[FIDX["exit_cost_0p1"]] == pytest.approx(exit_cost_fraction(0.1, 30.0, 1.0 * 1e9, "Pump.fun Amm"))   # market cap = price × supply
 
 
 # ---------------------------------------------------------------- train/mature.py

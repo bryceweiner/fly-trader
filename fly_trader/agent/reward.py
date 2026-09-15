@@ -11,7 +11,7 @@ import math
 from dataclasses import dataclass, field
 
 from .. import config
-from ..market.exit_cost import exit_cost_fraction
+from ..market.exit_cost import PUMP_SUPPLY, exit_cost_fraction
 
 
 @dataclass
@@ -37,7 +37,7 @@ def mark_book(sol_free: float, positions: list[dict], last_price: dict[str, floa
         qty = float(p["qty"]) / (10 ** int(p.get("decimals") or 6))
         price = last_price.get(mint) or p.get("last_mark_price") or p.get("entry_price") or 0.0
         gross = qty * float(price)
-        c = exit_cost_fraction(gross, res_quote.get(mint), age_hours.get(mint), program_label.get(mint))
+        c = exit_cost_fraction(gross, res_quote.get(mint), float(price) * PUMP_SUPPLY, program_label.get(mint))    # real fees at this market cap
         net = gross * (1.0 - c)
         value += net
         cost_total += gross * c

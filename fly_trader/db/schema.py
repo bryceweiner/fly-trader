@@ -17,7 +17,7 @@ from .connection import connect, database_name, database_url
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _LOCK_KEY = 0x666C795F6D6967  # "fly_mig"
 
 BASE_DDL: list[str] = [
@@ -202,7 +202,7 @@ BASE_DDL: list[str] = [
         day date PRIMARY KEY, mints int, rows int, took_s real, built_at timestamptz NOT NULL DEFAULT now())""",
     """CREATE TABLE IF NOT EXISTS pump_minutes (
         mint text NOT NULL, ts timestamptz NOT NULL, pool_id text, open double precision, high double precision, low double precision, close double precision,
-        buy_sol double precision, sell_sol double precision, n_buys int, n_sells int, n_traders int, resq_sol double precision,
+        buy_sol double precision, sell_sol double precision, n_buys int, n_sells int, n_traders int, resq_sol double precision, fee_rate double precision,
         PRIMARY KEY (mint, ts))""",
     "CREATE INDEX IF NOT EXISTS pump_minutes_ts_idx ON pump_minutes (ts)",
     """CREATE TABLE IF NOT EXISTS pump_events (
@@ -222,6 +222,7 @@ BASE_DDL: list[str] = [
 MIGRATIONS: dict[int, list[str]] = {
     2: ["ALTER TABLE beat_slots ALTER COLUMN feature_mask TYPE bigint"],
     3: ["ALTER TABLE positions ADD COLUMN IF NOT EXISTS satiety double precision NOT NULL DEFAULT 0"],
+    4: ["ALTER TABLE pump_minutes ADD COLUMN IF NOT EXISTS fee_rate double precision"],       # the pool fee the stream reports as charged
 }
 
 

@@ -60,11 +60,11 @@ def _txt(v):
 
 
 class Minute:
-    __slots__ = ("open", "high", "low", "close", "buy", "sell", "nb", "ns", "traders", "resq", "pool_id")
+    __slots__ = ("open", "high", "low", "close", "buy", "sell", "nb", "ns", "traders", "resq", "pool_id", "fee_rate")
 
     def __init__(self, pool_id: str | None = None):
         self.open = None; self.high = -math.inf; self.low = math.inf; self.close = None; self.buy = 0.0; self.sell = 0.0
-        self.nb = 0; self.ns = 0; self.traders = set(); self.resq = None; self.pool_id = pool_id
+        self.nb = 0; self.ns = 0; self.traders = set(); self.resq = None; self.pool_id = pool_id; self.fee_rate = None   # the pool fee charged (poolFeeRate)
 
 
 class Aggregator:
@@ -141,6 +141,8 @@ class Aggregator:
                 if trader:
                     row.traders.add(trader)
             row.resq = float(q)
+            if e.get("poolFeeRate") is not None:
+                row.fee_rate = float(e["poolFeeRate"])
             self.stats["trades"] += 1
         elif a == "create" and pool == "pump":
             c = {"ts": ts, "creator": e.get("txSigner"), "dev_sol": e.get("quoteAmount"), "dev_tokens": e.get("initialBuy"), "supply": e.get("supply"),
@@ -237,13 +239,14 @@ class Aggregator:
                 r = self.row(m, mint)
                 if r is None or r.close is None:
                     continue
-                rows.append((mint, ts, r.pool_id, r.open, r.high, r.low, r.close, r.buy, r.sell, r.nb, r.ns, len(r.traders), r.resq))
+                rows.append((mint, ts, r.pool_id, r.open, r.high, r.low, r.close, r.buy, r.sell, r.nb, r.ns, len(r.traders), r.resq, r.fee_rate))
         if rows:
             with transaction() as conn:
-                conn.cursor().executemany("INSERT INTO pump_minutes (mint, ts, pool_id, open, high, low, close, buy_sol, sell_sol, n_buys, n_sells, n_traders, resq_sol) "
-                                          "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (mint, ts) DO UPDATE SET close = EXCLUDED.close, high = greatest(pump_minutes.high, EXCLUDED.high), "
+                conn.cursor().executemany("INSERT INTO pump_minutes (mint, ts, pool_id, open, high, low, close, buy_sol, sell_sol, n_buys, n_sells, n_traders, resq_sol, fee_rate) "
+                                          "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (mint, ts) DO UPDATE SET close = EXCLUDED.close, high = greatest(pump_minutes.high, EXCLUDED.high), "
                                           "low = least(pump_minutes.low, EXCLUDED.low), buy_sol = pump_minutes.buy_sol + EXCLUDED.buy_sol, sell_sol = pump_minutes.sell_sol + EXCLUDED.sell_sol, "
-                                          "n_buys = pump_minutes.n_buys + EXCLUDED.n_buys, n_sells = pump_minutes.n_sells + EXCLUDED.n_sells, n_traders = greatest(pump_minutes.n_traders, EXCLUDED.n_traders), resq_sol = EXCLUDED.resq_sol", rows)
+                                          "n_buys = pump_minutes.n_buys + EXCLUDED.n_buys, n_sells = pump_minutes.n_sells + EXCLUDED.n_sells, n_traders = greatest(pump_minutes.n_traders, EXCLUDED.n_traders), "
+                                          "resq_sol = EXCLUDED.resq_sol, fee_rate = COALESCE(EXCLUDED.fee_rate, pump_minutes.fee_rate)", rows)
         for m in done:
             self.minutes.pop(m, None)
         self.stats["flushed_minutes"] += len(done); self.stats["flushed_rows"] += len(rows)

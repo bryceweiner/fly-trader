@@ -21,6 +21,7 @@ from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..execution import ledger
 from ..ingest import tape
+from ..market.exit_cost import PUMP_SUPPLY
 from ..market.features import TokenMeta
 from . import rails
 from .beat import Group, Session, SessionOptions, _git_sha
@@ -219,7 +220,7 @@ class PolicySession(Session):
             return {"slot": None, "mint": mint, "pool": pos.get("pool"), "kind": kind, "m_hat": target, "size_sol": float(pos.get("cost_sol") or 0.0) * frac,
                     "forced": False, "reason": f"target {target:.2f}", "book_targets": [book], "detail": {"book": book, "fraction": frac}}
         fr = g.books[book].broker.sell(conn, position=pos, decision_id=None, price=g.bank.last_price(mint), res_quote_sol=g.bank.res_quote_sol(mint),
-                                       age_hours=self._age_h(g, mint, now_dt.timestamp()), program_label=meta.program_label, forced_kind=None,
+                                       mcap_sol=(g.bank.last_price(mint) or 0.0) * getattr(meta, "supply", PUMP_SUPPLY), program_label=meta.program_label, forced_kind=None,
                                        ts=now_dt, fraction=frac)
         if not fr.ok:
             return None

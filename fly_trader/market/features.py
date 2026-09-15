@@ -17,14 +17,15 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 from .. import config
-from .exit_cost import exit_cost_fraction
+from .exit_cost import PUMP_SUPPLY, exit_cost_fraction
 
 WINDOWS = {"1m": 60.0, "5m": 300.0, "15m": 900.0, "1h": 3600.0, "3h": 10800.0}
 HAWKES_BETA = 1.0 / 60.0  # per second; intensity decays with a 1-minute time constant
 EWMA_1H_TAU_S = 3600.0  # 1-hour time constant of the price EWMA (continuous time, seconds)
 EXIT_COST_SIZE_SOL = 0.1  # exit_cost_0p1 is priced for a fixed 0.1 SOL position (not the configured size)
 HIGH_BLOCK = 256         # block size of the running window-high index
-FEATURE_VERSION = 2      # bump on any change to feature values; stored feature parts from another version are rebuilt
+FEATURE_VERSION = 3      # bump on any change to feature values; stored feature parts from another version are rebuilt
+                         # 3: exit_cost_0p1 at the real fees (pool fee tier by market cap, Jupiter 10 bps, network fee)
 
 FEATURES: list[str] = [
     "ret_1m", "ret_5m", "ret_15m", "ret_1h", "ret_3h",
@@ -52,6 +53,7 @@ class TokenMeta:
     graduated_at: float | None = None  # epoch seconds
     token2022: bool = False
     stats: dict | None = None  # latest token_stats row (dict) or None
+    supply: float = PUMP_SUPPLY  # token supply: market cap = price × supply sets the pool fee tier
 
 
 @dataclass
@@ -248,7 +250,7 @@ class TokenState:
         f[FIDX["vol_divergence"]] = math.log1p((self.cum_vol[-1] - self.cum_vol[idx["5m"]]) / 5.0) - \
             math.log1p((self.cum_vol[-1] - self.cum_vol[idx["1h"]]) / 60.0)
         mask |= (1 << FIDX["mom_decel"]) | (1 << FIDX["vol_divergence"])
-        f[FIDX["exit_cost_0p1"]] = exit_cost_fraction(EXIT_COST_SIZE_SOL, liq, age_h, meta.program_label)
+        f[FIDX["exit_cost_0p1"]] = exit_cost_fraction(EXIT_COST_SIZE_SOL, liq, p_now * meta.supply, meta.program_label)   # real fees at this market cap
         mask |= 1 << FIDX["exit_cost_0p1"]
         # Jupiter token stats
         st = meta.stats

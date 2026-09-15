@@ -33,7 +33,7 @@ from ..db.connection import transaction
 from . import sizing
 from ..execution import ledger
 from ..execution.broker_paper import PaperBroker
-from ..market.exit_cost import exit_cost_fraction
+from ..market.exit_cost import PUMP_SUPPLY, exit_cost_fraction
 from ..market.features import FEATURES, FIDX, TokenMeta, TokenState
 from ..train.corpus_meta import FEATURE_COLS as META_COLS
 from ..train.decisions import EXTRA_COLS, MIN_RESQ_SOL, MIN_VOL_15M_SOL, X_COLS
@@ -116,7 +116,7 @@ class SelectorSession:
         graduation and the archive rebuild later replaces stream values, so the cache is refreshed."""
         hit = self.meta_cache.get(mint)
         if hit is None or time.time() - hit["at"] > META_TTL_S:
-            r = conn.execute("SELECT graduated_at, " + ", ".join(META_COLS) + " FROM corpus_meta WHERE mint = %s", (mint,)).fetchone()
+            r = conn.execute("SELECT graduated_at, supply, " + ", ".join(META_COLS) + " FROM corpus_meta WHERE mint = %s", (mint,)).fetchone()
             hit = self.meta_cache[mint] = {"row": dict(r) if r else None, "at": time.time()}
         return hit["row"]
 
@@ -131,6 +131,7 @@ class SelectorSession:
         g = row["graduated_at"].timestamp() if row and row.get("graduated_at") else None
         if g != s.graduated_at:                     # same source as training: corpus_meta.graduated_at
             s.graduated_at = g; s.meta.graduated_at = g
+        s.meta.supply = float(row["supply"]) if row and row.get("supply") else PUMP_SUPPLY   # as training (train/mature.build_day)
         return s
 
     def _last_resq(self, conn, mint: str) -> float | None:
@@ -140,24 +141,25 @@ class SelectorSession:
         r = conn.execute("SELECT resq_sol FROM pump_minutes WHERE mint = %s AND resq_sol IS NOT NULL ORDER BY ts DESC LIMIT 1", (mint,)).fetchone()
         return float(r["resq_sol"]) if r else None
 
-    def _age_h(self, mint: str, now_s: float) -> float | None:
+    def _mcap(self, mint: str, price: float | None) -> float | None:
+        """Market cap in SOL (price × supply), which sets the pool fee tier; None without a price."""
         s = self.states.get(mint)
-        return (now_s - s.graduated_at) / 3600.0 if s is not None and s.graduated_at else None
+        return float(price) * (s.meta.supply if s is not None else PUMP_SUPPLY) if price else None
 
     # ---- one minute ----
     def _aggregate(self, conn, m0: datetime, m1: datetime) -> dict[str, dict]:
         if config.SELECTOR_SOURCE == "stream":       # PumpAPI minutes: every SOL-quoted PumpSwap pump.fun token, same fields as the archive
-            rows = conn.execute("SELECT mint, pool_id, open, high, low, close, buy_sol, sell_sol, n_buys, n_sells, n_traders, resq_sol FROM pump_minutes WHERE ts = %s", (m0,)).fetchall()
+            rows = conn.execute("SELECT mint, pool_id, open, high, low, close, buy_sol, sell_sol, n_buys, n_sells, n_traders, resq_sol, fee_rate FROM pump_minutes WHERE ts = %s", (m0,)).fetchall()
             return {r["mint"]: {"open": r["open"], "high": r["high"], "low": r["low"], "close": r["close"], "buy": r["buy_sol"] or 0.0, "sell": r["sell_sol"] or 0.0,
                                 "nb": r["n_buys"] or 0, "ns": r["n_sells"] or 0, "n_traders": int(r["n_traders"] or 0), "resq": r["resq_sol"],
-                                "pool": r["pool_id"], "program_label": "Pump.fun Amm"} for r in rows if r["close"]}
+                                "pool": r["pool_id"], "program_label": "Pump.fun Amm", "fee_rate": r["fee_rate"]} for r in rows if r["close"]}
         rows = conn.execute("""SELECT s.mint, s.pool, s.ts, s.side, s.amount_quote, s.price_sol, s.signer, s.res_quote, wp.program_label
                                FROM swap_tape s LEFT JOIN watch_pools wp ON wp.pool = s.pool
                                WHERE s.ts >= %s AND s.ts < %s AND s.side <> 0 AND s.price_sol > 0 ORDER BY s.ts, s.id""", (m0, m1)).fetchall()
         agg: dict[str, dict] = {}
         for r in rows:
             a = agg.setdefault(r["mint"], {"open": None, "high": -1.0, "low": math.inf, "close": None, "buy": 0.0, "sell": 0.0, "nb": 0, "ns": 0, "traders": set(),
-                                           "resq": None, "pool": r["pool"], "program_label": r["program_label"]})
+                                           "resq": None, "pool": r["pool"], "program_label": r["program_label"], "fee_rate": None})
             p = float(r["price_sol"]); sol = float(r["amount_quote"] or 0) / config.LAMPORTS_PER_SOL
             a["open"] = p if a["open"] is None else a["open"]; a["high"] = max(a["high"], p); a["low"] = min(a["low"], p); a["close"] = p
             if int(r["side"]) == 1:
@@ -200,7 +202,7 @@ class SelectorSession:
                    **{c: float(meta.get(c)) if meta.get(c) is not None else 0.0 for c in META_COLS}}
         x = np.nan_to_num(np.asarray([by_name.get(c, 0.0) for c in self.model.cols], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         info = {"price": price, "resq": resq, "logvol_15m": f[FIDX["logvol_15m"]], "age_h": (t_end - s.graduated_at) / 3600 if s.graduated_at else None,
-                "decimals": s.decimals, "pool": s.pool, "program_label": s.program_label, "broken": s.broken}
+                "mcap": price * s.meta.supply, "fee_rate": a.get("fee_rate"), "decimals": s.decimals, "pool": s.pool, "program_label": s.program_label, "broken": s.broken}
         return x, info
 
     def _stream_through(self) -> float | None:
@@ -267,7 +269,7 @@ class SelectorSession:
             self.beat_no += 1
             beat = conn.execute("INSERT INTO beats (run_id, ts, beat_no, n_slots_active, notes) VALUES (%s,%s,%s,%s,%s) RETURNING id",
                                 (self.run_id, m1, self.beat_no, len(mints), json.dumps({"minute": m1.isoformat(), "mints_traded": len(agg)}))).fetchone()["id"]
-            prices = {m: float(a["close"]) for m, a in agg.items()}; resqs = {m: a["resq"] for m, a in agg.items()}
+            prices = {m: float(a["close"]) for m, a in agg.items()}; resqs = {m: a["resq"] for m, a in agg.items()}; fees = {m: a.get("fee_rate") for m, a in agg.items()}
             # exits: positions past the horizon, at this minute's price or the last traded price (the label's exit)
             n_exit = 0
             for p in ledger.open_positions(conn, BOOK):
@@ -276,8 +278,9 @@ class SelectorSession:
                     continue
                 did = conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, size_sol, forced, reason, detail) VALUES (%s,%s,%s,%s,%s,'selector_exit',%s,false,%s,%s) RETURNING id",
                                    (beat, self.run_id, m1, p["mint"], p["pool"], float(p["cost_sol"]), f"held {held/60:.0f} min", json.dumps({"book": BOOK}))).fetchone()["id"]
+                px = prices.get(p["mint"]) or float(p.get("last_mark_price") or p["entry_price"])
                 self.broker.sell(conn, position=p, decision_id=did, price=prices.get(p["mint"]), res_quote_sol=resqs.get(p["mint"]) or self._last_resq(conn, p["mint"]),
-                                 age_hours=self._age_h(p["mint"], m1_epoch), program_label=p.get("program_label"), forced_kind=None, ts=m1)
+                                 mcap_sol=self._mcap(p["mint"], px), program_label=p.get("program_label"), forced_kind=None, pool_fee=fees.get(p["mint"]), ts=m1)
                 n_exit += 1
             # entries: scores at/above threshold, one position per mint, rails
             opens_now = ledger.open_positions(conn, BOOK); open_mints = {p["mint"] for p in opens_now}
@@ -301,7 +304,7 @@ class SelectorSession:
                                    (beat, self.run_id, m1, m, i["pool"], float(sc), size, f"score {sc:.3f} ≥ {self.model.threshold:.3f}; {why}", [BOOK],
                                     json.dumps({"score": float(sc), "threshold": self.model.threshold, "size_sol": size, "sizing": why, "resq": i["resq"], "age_h": i["age_h"], "price": i["price"]}))).fetchone()["id"]
                 fill = self.broker.buy(conn, decision_id=did, mint=m, pool=i["pool"], size_sol=size, price=i["price"], res_quote_sol=i["resq"],
-                                       age_hours=i["age_h"], decimals=i["decimals"], program_label=i["program_label"], ts=m1)
+                                       mcap_sol=i["mcap"], decimals=i["decimals"], program_label=i["program_label"], pool_fee=i["fee_rate"], ts=m1)
                 if fill.ok:
                     n_enter += 1; open_mints.add(m); cash -= size
                 else:
@@ -310,10 +313,11 @@ class SelectorSession:
             ledger.mark_positions(conn, BOOK, prices, {}, m1)
             opens = ledger.open_positions(conn, BOOK); gross_v = 0.0; exit_cost = 0.0; exposure = 0.0
             for p in opens:
-                gross = int(p["qty"]) / 10 ** int(p.get("decimals") or 6) * float(p.get("last_mark_price") or p["entry_price"])
+                px = float(p.get("last_mark_price") or p["entry_price"])
+                gross = int(p["qty"]) / 10 ** int(p.get("decimals") or 6) * px
                 rq = resqs.get(p["mint"]) or self._last_resq(conn, p["mint"])
                 gross_v += gross; exposure += float(p["cost_sol"])
-                exit_cost += gross * exit_cost_fraction(gross, rq, self._age_h(p["mint"], m1_epoch), p.get("program_label"))
+                exit_cost += gross * exit_cost_fraction(gross, rq, self._mcap(p["mint"], px), p.get("program_label"), fees.get(p["mint"]))
             cash = ledger.paper_cash(conn, BOOK); positions_net = gross_v - exit_cost; wealth = cash + positions_net
             peak_row = conn.execute("SELECT max(wealth) AS pk FROM wealth_marks WHERE book = %s", (BOOK,)).fetchone(); peak = max(float(peak_row["pk"] or 0.0), wealth)
             conn.execute("INSERT INTO wealth_marks (beat_id, book, ts, sol_free, positions_value, exit_cost, wealth, peak, drawdown, exposure, n_open) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",

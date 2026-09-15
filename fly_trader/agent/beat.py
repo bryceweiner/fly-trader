@@ -37,6 +37,7 @@ from ..execution.broker_paper import PaperBroker
 from ..ingest import tape
 from ..market.context_window import ContextWindow
 from ..market.danger import danger_score
+from ..market.exit_cost import PUMP_SUPPLY
 from ..market.features import D, FeatureBank, TokenMeta
 from . import rails
 from .decide import DecisionState, decide
@@ -645,7 +646,7 @@ class Session:
         if cash - size_sol < config.GAS_RESERVE_SOL:
             return False
         fr = bs.broker.buy(conn, decision_id=None, mint=mint, pool=meta.pool, size_sol=size_sol, price=g.bank.last_price(mint),
-                           res_quote_sol=g.bank.res_quote_sol(mint), age_hours=self._age_h(g, mint, now_dt.timestamp()),
+                           res_quote_sol=g.bank.res_quote_sol(mint), mcap_sol=(g.bank.last_price(mint) or 0.0) * getattr(meta, "supply", PUMP_SUPPLY),
                            decimals=getattr(meta, "decimals", 6), program_label=meta.program_label, ts=now_dt)
         if fr.ok:
             flows[book][mint] = flows[book].get(mint, 0.0) + fr.sol_delta
@@ -676,7 +677,7 @@ class Session:
             g.exec_worker.submit(req)
             return row
         fr = g.books[book].broker.sell(conn, position=pos, decision_id=None, price=g.bank.last_price(mint),
-                                       res_quote_sol=g.bank.res_quote_sol(mint), age_hours=self._age_h(g, mint, now_dt.timestamp()),
+                                       res_quote_sol=g.bank.res_quote_sol(mint), mcap_sol=(g.bank.last_price(mint) or 0.0) * getattr(meta, "supply", PUMP_SUPPLY),
                                        program_label=meta.program_label, forced_kind=forced_kind, ts=now_dt)
         if fr.ok:
             flows[book][mint] = flows[book].get(mint, 0.0) + fr.sol_delta

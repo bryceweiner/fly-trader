@@ -24,7 +24,7 @@ def test_paper_partial_then_close_accumulates_realized(db_conn):
                                decision_id=None, fees_sol=0.0)
     assert ledger.paper_cash(db_conn, book) == pytest.approx(config.CAPITAL_SOL - 1.0)
     pb = PaperBroker(book)
-    kw = dict(decision_id=None, res_quote_sol=100.0, age_hours=10.0, program_label=None, forced_kind=None)
+    kw = dict(decision_id=None, res_quote_sol=100.0, mcap_sol=100.0, program_label=None, forced_kind=None)
     f1 = pb.sell(db_conn, position=ledger.open_positions(db_conn, book)[0], price=1.2, fraction=0.5, **kw)
     assert f1.ok and 0 < f1.sol_delta < 0.6
     p = _pos(db_conn, pid)

@@ -1,6 +1,6 @@
 """PaperBroker: the same decisions executed at model prices.
 
-Fill price = last tape price; cost = Jupiter fee (10/50 bps by age) + pool fee + constant-product impact
+Fill price = last tape price; cost = the real fees (pool fee by market cap, Jupiter 10 bps, network fee) + constant-product impact
 of the position size against the pool's quote reserve (market/exit_cost.py). Deviation from the plan's
 "first tape price ≥ 2 s after the decision" rule: fills are immediate at the last price; the
 live-vs-mirror gap measures the difference.
@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .. import config
-from ..market.exit_cost import exit_cost_fraction, impact_fraction, jupiter_fee_bps, POOL_FEE_BPS
+from ..market.exit_cost import exit_cost_fraction, fee_fraction, impact_fraction
 from . import ledger
 
 log = logging.getLogger(__name__)
@@ -36,14 +36,16 @@ class PaperBroker:
         self.book = book
 
     def buy(self, conn, *, decision_id: int | None, mint: str, pool: str | None, size_sol: float, price: float | None,
-            res_quote_sol: float | None, age_hours: float | None, decimals: int, program_label: str | None,
+            res_quote_sol: float | None, mcap_sol: float | None, decimals: int, program_label: str | None, pool_fee: float | None = None,
             ts: datetime | None = None) -> PaperFill:
+        """Fill at ``price`` pushed up by the constant-product impact, paying the real fees (market/exit_cost.py): the pool
+        fee the stream reports (``pool_fee``) or the schedule's rate for ``mcap_sol``, Jupiter's platform fee, the network fee."""
         ts = ts or datetime.now(timezone.utc)
         if not price or price <= 0:
             return PaperFill(False, None, None, 0.0, 0.0, 0, 0.0, "no price")
         if res_quote_sol is None or res_quote_sol <= 0:
             return PaperFill(False, None, None, price, 0.0, 0, 0.0, "no liquidity estimate")
-        fee_frac = (jupiter_fee_bps(age_hours) + POOL_FEE_BPS) / 1e4
+        fee_frac = fee_fraction(size_sol, mcap_sol, pool_fee)
         impact = impact_fraction(size_sol, res_quote_sol, program_label)
         if impact > config.EXECUTABILITY_MAX_IMPACT:
             # a router would not fill this either; refuse like the live executability check
@@ -62,17 +64,17 @@ class PaperBroker:
         return PaperFill(True, pid, fid, eff_price, -size_sol, qty_raw, fee_sol)
 
     def sell(self, conn, *, position: dict, decision_id: int | None, price: float | None, res_quote_sol: float | None,
-             age_hours: float | None, program_label: str | None, forced_kind: str | None, ts: datetime | None = None,
-             fraction: float = 1.0) -> PaperFill:
+             mcap_sol: float | None, program_label: str | None, forced_kind: str | None, pool_fee: float | None = None,
+             ts: datetime | None = None, fraction: float = 1.0) -> PaperFill:
         ts = ts or datetime.now(timezone.utc)
         price = price or float(position.get("last_mark_price") or position.get("entry_price") or 0.0)
         fraction = float(min(1.0, max(0.0, fraction)))
         qty_raw = int(int(position["qty"]) * fraction) if fraction < 0.999 else int(position["qty"])
         decimals = int(position.get("decimals") or 6)
         gross = qty_raw / (10 ** decimals) * price
-        c = exit_cost_fraction(gross, res_quote_sol, age_hours, program_label)
+        c = exit_cost_fraction(gross, res_quote_sol, mcap_sol, program_label, pool_fee)
         proceeds = gross * (1.0 - c)
-        fee_sol = gross * (jupiter_fee_bps(age_hours) + POOL_FEE_BPS) / 1e4
+        fee_sol = gross * fee_fraction(gross, mcap_sol, pool_fee)
         if fraction < 0.999:   # partial: shrink the position, realise the sold part
             realized = ledger.realize_partial(conn, position_id=int(position["id"]), qty_raw=qty_raw,
                                               cost_part=float(position["cost_sol"]) * fraction, proceeds_sol=proceeds,
