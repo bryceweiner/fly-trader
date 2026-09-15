@@ -124,18 +124,31 @@ def build(days: int | None = 45, horizon_min: int = HOLD_MIN, fee: float | None 
                        day=df["ts"].dt.date.to_numpy(), ts=ts, mint=df["mint"].to_numpy(), cols=list(X_COLS), horizon_s=H)
 
 
-def taken_rows(ds: DecisionSet, pick: np.ndarray) -> np.ndarray:
-    """Row indices of the trades a picker takes (the same rule as ``trades_from_picks``)."""
-    idx = np.flatnonzero(pick)
+def taken_idx(ts: np.ndarray, mint: np.ndarray, horizon_s: float, idx: np.ndarray) -> np.ndarray:
+    """Of the candidate row indices ``idx``, the ones a picker takes: one position per token, re-entry only once the hold
+    has passed (the rule of ``trades_from_picks``), in (mint, ts) order. Vectorised: each taken pick jumps to the token's
+    first candidate at least ``horizon_s`` later, so the loop runs once per trade of the busiest token, not once per row."""
+    idx = np.asarray(idx, dtype=int)
     if len(idx) == 0:
         return idx
-    idx = idx[np.lexsort((ds.ts[idx], ds.mint[idx]))]; out = []; last_mint = None; last_t = -1e18
-    for i in idx:
-        if ds.mint[i] != last_mint:
-            last_mint = ds.mint[i]; last_t = -1e18
-        if ds.ts[i] >= last_t + ds.horizon_s:
-            out.append(i); last_t = ds.ts[i]
-    return np.asarray(out, dtype=int)
+    idx = idx[np.lexsort((ts[idx], mint[idx]))]
+    t = np.asarray(ts[idx], dtype=np.float64); m = mint[idx]
+    first = np.r_[True, m[1:] != m[:-1]]; gid = np.cumsum(first) - 1; starts = np.flatnonzero(first)
+    ends = np.r_[starts[1:], len(idx)]
+    span = float(t.max() - t.min()) + horizon_s + 1.0
+    key = gid * span + (t - t.min())                  # sorted: (token, time) in one exact float64 key
+    nxt = np.searchsorted(key, key + horizon_s, side="left")
+    has_next = nxt < ends[gid]
+    out = []; frontier = starts
+    while len(frontier):
+        out.append(frontier)
+        frontier = nxt[frontier[has_next[frontier]]]
+    return idx[np.sort(np.concatenate(out))]
+
+
+def taken_rows(ds: DecisionSet, pick: np.ndarray) -> np.ndarray:
+    """Row indices of the trades a picker takes (the same rule as ``trades_from_picks``)."""
+    return taken_idx(ds.ts, ds.mint, ds.horizon_s, np.flatnonzero(pick))
 
 
 def trades_from_picks(ds: DecisionSet, pick: np.ndarray, returns: np.ndarray | None = None, with_days: bool = False):

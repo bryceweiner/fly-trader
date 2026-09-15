@@ -1,5 +1,5 @@
 """Overview: what the system is doing in plain words, the paper book, this minute's scoring and open positions."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
@@ -21,6 +21,10 @@ def narrative(s: dict) -> str:
                      f"model is (up to {config.MAX_POSITION_FRACTION:.0%} of the bankroll, never the {config.GAS_RESERVE_SOL:g} SOL gas reserve) — "
                      f"and sells it **{run.get('horizon_min') or meta.get('horizon_min') or 30} minutes** later. {money}")
         lines.append(backtest_line(meta))
+    fly = s["fly"]
+    if fly.get("stage") and fly.get("stage") != "not trading":
+        lines.append("**The plastic fly** " + ("holds the seat" if s["handover"] else "races the selector on its own paper book")
+                     + f": it buys at a predicted {pct(fly.get('line'), 1)} and learns every minute from each scored token's realized return, two hours later.")
     else:
         lines.append(f"**{s['trading_why']}** Start the trading engine on the Processes page to trade.")
     if s["training"]:
@@ -79,7 +83,7 @@ def book() -> None:
             if hist:
                 st.line_chart(pd.DataFrame(hist), x="ts", y="wealth", x_label="", y_label="SOL", height=240)
             else:
-                st.caption("No marks yet: the book starts fresh each time the trading engine starts.")
+                st.caption("No marks yet.")
     with right:
         with st.container(border=True):
             st.markdown("**Open positions**")
@@ -99,5 +103,35 @@ def book() -> None:
                                                                  "return": st.column_config.NumberColumn("return (gross)", format="%+.2f%%")})
 
 
+@st.fragment(run_every="30s")
+def race() -> None:
+    s = system_state(); ho = s["handover"]; fly = s["fly"]
+    marks = q("SELECT ts, book, wealth FROM wealth_marks WHERE book IN ('paper_selector', 'paper_fly', 'live') AND ts > now() - interval '30 days' ORDER BY ts")
+    if not marks and not (fly.get("stage") and fly.get("stage") != "not trading"):
+        return
+    since = datetime.now(timezone.utc) - timedelta(days=14)
+    pnl = {r["book"]: r for r in q("SELECT book, COALESCE(sum(realized_sol), 0) AS pnl, count(*) AS n FROM positions WHERE book IN ('paper_selector', 'paper_fly', 'live') "
+                                   "AND status = 'closed' AND closed_at >= %s GROUP BY book", (since,))}
+    start = (q1("SELECT min(ts) AS t FROM wealth_marks WHERE book = 'paper_fly'") or {}).get("t")
+    with st.container(border=True):
+        st.markdown(":material/sports_score: **The race: selector vs plastic fly**")
+        if ho:
+            st.success(f"The fly took the selector's seat {ago(ho.get('at'))}: {float(ho.get('fly_pnl_sol') or 0):+.3f} SOL vs {float(ho.get('selector_pnl_sol') or 0):+.3f} SOL "
+                       f"over {ho.get('days')} days. " + ("It trades the bot wallet; its paper book is the mirror." if s["live_money"]
+                                                          else "Live trading waits for LIVE_ENABLED=1, the live prerequisites and a funded wallet."), icon=":material/swap_horiz:")
+        else:
+            days = (datetime.now(timezone.utc) - start).total_seconds() / 86400 if start else 0.0
+            st.caption("The fly takes the seat when its realized P&L over the last 14 days is at least the selector's, with at least 30 trades"
+                       + (f" · racing for {days:.1f} days." if start else " · the race starts when the fly first trades."))
+        with st.container(horizontal=True):
+            for book, title in (("paper_selector", "Selector · 14 days"), ("paper_fly", "Fly · 14 days")) + ((("live", "Live · 14 days"),) if ho else ()):
+                r = pnl.get(book) or {}
+                st.metric(title, sol(r.get("pnl"), signed=True), delta=f"{int(r.get('n') or 0)} trades", delta_color="off", border=True, help="Realized P&L of closed trades.")
+        if marks:
+            df = pd.DataFrame(marks).pivot_table(index="ts", columns="book", values="wealth")
+            st.line_chart(df, x_label="", y_label="SOL", height=240)
+
+
 summary()
+race()
 book()

@@ -58,22 +58,48 @@ def _scale_for(connectome_file: str) -> dict | None:
     return d if d.get("connectome") in (connectome_file, Path(connectome_file).name) else None
 
 
+MB_POPS = ("KC", "MBON_APP", "MBON_AV", "MBON_OTHER")    # the mushroom-body block the build keeps apart from the sparse graph
+
+
+def apply_pathway_gains(indices: torch.Tensor, values_raw: torch.Tensor, pop_ranges: dict, gains: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """Multiply the edges from population A to population B by ``gains['A->B']``; edges scaled to 0 are dropped.
+    scale.json silences the direct DAN→MBON/KC edges: dopamine acts on the mushroom body through KC→MBON plasticity,
+    not fast excitation (Hige 2015, Handler 2019)."""
+    post, pre = indices[0], indices[1]
+    v = values_raw.clone()
+    for key, g in (gains or {}).items():
+        a, _, b = key.partition("->")
+        if a not in pop_ranges or b not in pop_ranges:
+            continue
+        (a0, a1), (b0, b1) = pop_ranges[a], pop_ranges[b]
+        v[(pre >= a0) & (pre < a1) & (post >= b0) & (post < b1)] *= float(g)
+    keep = v != 0
+    return indices[:, keep], v[keep]
+
+
 class Connectome:
     """Signed synapse counts ``values_raw`` [E] on edges ``indices`` [2, E] (row = post, col = pre) over ``N`` neurons,
     population ``pop_ranges``, and the weight scale ``s`` (scale.json when it refers to this artifact, else the build's
-    s0). Tensors stay on the CPU; ``device`` is where models built on it should run."""
+    s0). The KC→MBON synapses are not in the sparse graph: the build keeps them as the dense block ``W_KM0``
+    [n_KC, n_MBON] (synapse counts; MBON columns = MBON_APP, MBON_AV, MBON_OTHER in population order) with the mask
+    ``M_KM`` of the pairs that exist. scale.json's ``pathway_gains`` are applied to the sparse graph. Tensors stay on
+    the CPU; ``device`` is where models built on it should run."""
 
     def __init__(self, path: str | Path | None = None, device: torch.device | str | None = None):
         path = Path(path) if path else current_connectome_path()
         z = np.load(path, allow_pickle=False)
         self.path = path
         self.N = int(z["N"])
-        self.indices = torch.from_numpy(np.ascontiguousarray(z["indices"])).to(torch.int64)
-        self.values_raw = torch.from_numpy(np.ascontiguousarray(z["values_raw"])).to(torch.float32)
         self.pop_ranges = {k: (int(a), int(b)) for k, (a, b) in json.loads(str(z["pop_ranges"])).items()}
+        scale = _scale_for(path.name)
+        self.pathway_gains = dict((scale or {}).get("pathway_gains") or {})
+        self.indices, self.values_raw = apply_pathway_gains(torch.from_numpy(np.ascontiguousarray(z["indices"])).to(torch.int64),
+                                                            torch.from_numpy(np.ascontiguousarray(z["values_raw"])).to(torch.float32),
+                                                            self.pop_ranges, self.pathway_gains)
+        self.W_KM0 = torch.from_numpy(np.ascontiguousarray(z["W_KM0"])).to(torch.float32)
+        self.M_KM = torch.from_numpy(np.ascontiguousarray(z["M_KM"])).to(torch.bool)
         self.spectral_radius_raw = float(z["spectral_radius_raw"])
         self.content_sha256 = str(z["content_sha256"])
-        scale = _scale_for(path.name)
         self.s = float(scale["s"]) if scale and "s" in scale else float(z["s0"])
         self.device = device if isinstance(device, torch.device) else resolve_device(device)
 
@@ -107,5 +133,11 @@ class SubConnectome:
         self.s = getattr(c, "s", None)
         self.spectral_radius_raw = getattr(c, "spectral_radius_raw", None)
         self.content_sha256 = getattr(c, "content_sha256", None)
+        lost = [p for p in MB_POPS if p in c.pop_ranges and not bool(keep[c.pop_ranges[p][0]:c.pop_ranges[p][1]].all())]
+        if lost:
+            raise ValueError(f"a sub-connectome must keep the whole mushroom body (KC→MBON block); excluded: {lost}")
+        self.W_KM0 = getattr(c, "W_KM0", None)          # unchanged: KC and MBON rows keep their order and ranges
+        self.M_KM = getattr(c, "M_KM", None)
+        self.pathway_gains = getattr(c, "pathway_gains", {})
         self.excluded = exclude
         self.keep = keep

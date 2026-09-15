@@ -67,6 +67,34 @@ def check_drawdown(conn, wealth: float, peak: float) -> bool:
     return False
 
 
+def check_book_drawdown(conn, book: str, wealth: float, peak: float) -> bool:
+    """A paper race book's own kill switch: KILL_SWITCH_DRAWDOWN below the book's peak halts that book's entries only,
+    so one book's drawdown never stops the other during the race. Returns whether the book is halted."""
+    if book_halted(conn, book):
+        return True
+    if peak > 0 and wealth <= peak * (1.0 - config.KILL_SWITCH_DRAWDOWN):
+        reason = f"wealth {wealth:.4f} SOL <= {1 - config.KILL_SWITCH_DRAWDOWN:.2f} x peak {peak:.4f} SOL"
+        conn.execute("INSERT INTO book_state (book, halted, reason, peak, updated_at) VALUES (%s, true, %s, %s, now()) "
+                     "ON CONFLICT (book) DO UPDATE SET halted = true, reason = EXCLUDED.reason, peak = EXCLUDED.peak, updated_at = now()",
+                     (book, reason, peak))
+        _event(conn, "book_halt", {"book": book, "wealth": wealth, "peak": peak})
+        record_event("error", "rails", f"{book}: drawdown halt, entries blocked", {"wealth": wealth, "peak": peak})
+        return True
+    return False
+
+
+def book_halted(conn, book: str) -> bool:
+    r = conn.execute("SELECT halted FROM book_state WHERE book = %s", (book,)).fetchone()
+    return bool(r and r["halted"])
+
+
+def clear_book_halt(book: str) -> None:
+    with transaction() as conn:
+        conn.execute("UPDATE book_state SET halted = false, reason = NULL, peak = NULL, updated_at = now() WHERE book = %s", (book,))
+        _event(conn, "book_resumed", {"book": book})
+    record_event("info", "rails", f"{book}: drawdown halt cleared")
+
+
 def notional_24h(conn) -> float:
     r = conn.execute("SELECT COALESCE(sum(sol), 0) AS s FROM notional_ledger WHERE ts > now() - interval '24 hours'").fetchone()
     return float(r["s"])

@@ -39,14 +39,17 @@ from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..market.features import FEATURE_VERSION
 from . import progress as prog
-from .decisions import HOLD_MIN, MIN_RESQ_SOL, MIN_VOL_15M_SOL, DecisionSet, build, evaluate, random_trades, rank_corr, summarize, taken_rows
+from .decisions import HOLD_MIN, MIN_RESQ_SOL, MIN_VOL_15M_SOL, X_COLS, DecisionSet, build, evaluate, random_trades, rank_corr, summarize, taken_rows
 from .mature import AGG_VERSION
 from .scaling import RobustScaler
 
 log = logging.getLogger(__name__)
 SELECTOR_DIR = config.BRAIN_DIR / "selectors"
-# the data and model definitions a model was trained on; a model from other definitions is never loaded or shown
-DATA_VERSION = {"agg": AGG_VERSION, "features": FEATURE_VERSION, "costs": "real-fees-1", "selector": "ev-hold120-1", "fly": "flynet-1"}
+# the data and model definitions a selector was trained on (the input columns by hash, so dropping or adding one retires
+# old models); a model from other definitions is never loaded or shown. The fly has its own (train/fly_selector.FLY_VERSION),
+# so a change to the fly never retires a selector.
+DATA_VERSION = {"agg": AGG_VERSION, "features": FEATURE_VERSION, "costs": "real-fees-1", "selector": "ev-hold120-1",
+                "cols": hashlib.sha1(",".join(X_COLS).encode()).hexdigest()[:8]}
 WARMUP_DAYS, BLOCK_DAYS = 21, 7      # walk-forward: the first 21 days only train; every later day is tested, refit every 7 days
 MIN_AGE_H = 6.0                      # trade only tokens at least this long past graduation (unknown age = graduated before the archive); fitted, see decisions.HOLD_MIN
 MIN_EV = 0.01                        # the buy line of a model before its walk-forward chose one
@@ -63,7 +66,10 @@ def in_universe(X: np.ndarray, cols: list[str]) -> np.ndarray:
 
 
 def is_current(meta: dict | None) -> bool:
-    return bool(meta) and meta.get("data") == DATA_VERSION
+    """Trained on every definition in ``DATA_VERSION``. Keys a model carries that are no longer definitions (the fly's,
+    which moved to ``FLY_VERSION``) are ignored; a model saved before the column hash existed is judged on the rest."""
+    d = (meta or {}).get("data")
+    return bool(meta) and isinstance(d, dict) and all(d.get(k) == v for k, v in DATA_VERSION.items() if k != "cols" or "cols" in d)
 
 
 def is_deployable(meta: dict | None) -> bool:

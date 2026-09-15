@@ -1,14 +1,16 @@
-"""Model & training: which model trades and how it tested against random picks, the automatic retraining pipeline
-(selector, then the fly imitating it, every 7 days), the latest results, and every saved model."""
+"""Model & training: which model trades and how it tested against random picks, the automatic retraining pipeline (the
+selector every 7 days until the fly holds its seat; the fly bootstrapped once), the plastic fly, and every saved model."""
 from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
 
 from fly_trader import config
+from fly_trader.agent import fly_session
 from fly_trader.db.queries import q, q1
+from fly_trader.ops.reset import reset_fly
 from fly_trader.ops.supervisor import get_supervisor
-from fly_trader.train import pipeline
+from fly_trader.train import fly_selector, pipeline
 from fly_trader.train.selector import is_current, is_deployable
 from fly_trader.ui.common import ago, backtest_line, jv, latest_snapshot, parse_note, pct, system_state
 
@@ -91,7 +93,7 @@ def retraining() -> None:
     running = alive and str(ps.get("stage", "")).startswith("training")
     with st.container(border=True):
         with st.container(horizontal=True, vertical_alignment="center"):
-            st.markdown(f":material/autorenew: **Automatic retraining** · every {pipeline.INTERVAL_DAYS} days")
+            st.markdown(f":material/autorenew: **Automatic retraining** · every {pipeline.INTERVAL_DAYS} days" if not s["handover"] else ":material/autorenew: **Retraining** · on request only: the fly holds the seat")
             st.space("stretch")
             if st.button("Retrain now", icon=":material/play_arrow:", type="primary", key="retrain_now", disabled=running,
                          help="Runs the whole pipeline now; the 7-day schedule restarts from this run."):
@@ -106,7 +108,8 @@ def retraining() -> None:
                 sup.request_stop("train"); st.rerun()
         st.caption("1 · The selector retrains on every day of history. Every day after the first 21 is backtested by a model that never saw it, against random picks, "
                    "with real fees and price impact.  \n2 · It goes to work only if that backtest made money and beat random picks; the trading engine switches to it "
-                   "without a restart.  \n3 · The fly then learns to imitate the selector and is tested on the last 21 days.")
+                   "without a restart.  \n3 · The fly is taught by the selector once — when none exists for the current definitions, or on request — "
+                   "and from then on learns from the market; weekly retraining stops when the fly takes the selector's seat.")
         if not alive:
             st.warning("Automatic retraining is off because the Trainer is not running. Click Retrain now, or start the Trainer on the Processes page.", icon=":material/warning:")
         last = ps.get("last_run_at"); nxt = ps.get("next_run_at")
@@ -147,24 +150,78 @@ def results() -> None:
                        "The buy line is chosen on the selection half and judged on the evaluation half.")
         else:
             st.caption("No selector backtest on the current data yet.")
-    fv = q1("SELECT ts, detail FROM events WHERE source = 'fly_selector' AND message LIKE 'fly%%vs gbm%%' ORDER BY id DESC LIMIT 1")
-    if fv and latest_snapshot("fly_selector"):
-        d = jv(fv["detail"]); ag = d.get("agreement") or {}
-        with st.container(border=True):
-            st.markdown("**The fly, imitating the selector** (same test days)")
-            rows = [(n, d.get(k) or {}) for n, k in (("Fly (connectome)", "fly"), ("Selector (its teacher)", "gbm"), ("Random picks", "random"))]
-            st.dataframe(pd.DataFrame([{"model": n, "trades": v.get("n"), "% / trade": (v["mean"] * 100) if v.get("mean") is not None else None,
-                                        "median %": (v["median"] * 100) if v.get("median") is not None else None, "winners %": (v["win"] * 100) if v.get("win") is not None else None,
-                                        "profit factor": v.get("pf"), "IC": v.get("ic")} for n, v in rows]), hide_index=True,
-                         column_config={"% / trade": st.column_config.NumberColumn(format="%+.2f"), "median %": st.column_config.NumberColumn(format="%+.2f"),
-                                        "winners %": st.column_config.NumberColumn(format="%.0f"), "profit factor": st.column_config.NumberColumn(format="%.2f"),
-                                        "IC": st.column_config.NumberColumn(format="%.3f", help="Rank correlation of the predictions with the realised returns.")})
-            parts = [f"run {ago(fv['ts'])}"]
-            if ag.get("pick_overlap") is not None:
-                parts.append(f"the fly picks {ag['pick_overlap'] * 100:.0f}% of what the selector picks")
-            if ag.get("rank_corr") is not None:
-                parts.append(f"score agreement {ag['rank_corr']:.2f} (1 = identical ranking)")
-            st.caption(" · ".join(parts))
+
+
+def _fly_bootstrap() -> dict | None:
+    for r in q("SELECT id, ts, note FROM brain_snapshots WHERE kind = 'fly_selector' ORDER BY id DESC LIMIT 10"):
+        m = parse_note(r["note"])
+        if fly_selector.is_current(m):
+            return {**r, "meta": m}
+    return None
+
+
+@st.fragment(run_every="15s")
+def plastic_fly() -> None:
+    s = system_state(); fly = s["fly"]; rp = s["replay"]; sup = get_supervisor()
+    running = bool(fly.get("stage")) and fly.get("stage") != "not trading"; frozen = bool(fly.get("learning_frozen"))
+    with st.container(border=True):
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.markdown(":material/neurology: **The plastic fly** · taught once by the selector, then learning from the market")
+            st.space("stretch")
+            if st.button("Resume learning" if frozen else "Pause learning", key="fly_learn", disabled=not running,
+                         help="Pause: the fly keeps trading with what it has learned; its mushroom body stops changing."):
+                fly_session.send_command("resume" if frozen else "pause"); st.toast("Sent: applied at the next minute")
+            if st.button("Roll back", key="fly_rollback", disabled=not running,
+                         help="Restore the newest good hourly snapshot at least a day old (or the bootstrap). Does not count toward the automatic re-bootstrap."):
+                fly_session.send_command("rollback"); st.toast("Sent: applied at the next minute")
+            if st.button("Re-bootstrap", key="fly_reboot", help="The selector retrains and teaches a new fly; it trades at once if it qualifies."):
+                pipeline.request_run(fly=True, reason="console"); st.toast("Re-bootstrap requested")
+            with st.popover("Reset fly", disabled=sup.alive("runner"), help="Stop the trading engine first." if sup.alive("runner") else None):
+                st.markdown("Archive and clear the fly's paper book and everything it learned? It restarts from its bootstrap and the race starts over.")
+                if st.button("Reset", type="primary", key="fly_reset_confirm"):
+                    st.success(f"Archived to {reset_fly(reason='console button')['archived_to']}")
+        if not rp:
+            st.info("The replay has not run on the current definitions. It is the proof required before the fly trades: `fly-trader fly-replay` "
+                    "bootstraps a fly, lets it learn over months of history without retraining, and judges it.", icon=":material/info:")
+        else:
+            ev, rnd, fr = rp.get("evaluation") or {}, rp.get("random") or {}, rp.get("frozen") or {}
+            (st.success if rp.get("passed") else st.warning)(f"Replay {'passed' if rp.get('passed') else 'failed'}: {rp.get('reason')}",
+                                                            icon=":material/verified:" if rp.get("passed") else ":material/block:")
+            with st.container(horizontal=True):
+                st.metric("Replay trades", ev.get("n", "—"), border=True, help="Trades on the evaluation half of the replay.")
+                st.metric("Average per trade", pct(ev.get("mean")), delta=(f"random {pct(rnd.get('mean'))}" if rnd.get("mean") is not None else None), delta_color="off", border=True)
+                st.metric("Frozen fly", pct(fr.get("mean")), border=True, help="The same bootstrap without plasticity, on the same days.")
+                st.metric("Profitable days", f"{ev.get('days_positive', '—')} of {ev.get('days', '—')}", border=True)
+                st.metric("Learning rate α", f"{rp.get('alpha') or 0:g}", border=True)
+                st.metric("Forgetting half-life", f"{rp['half_life_days']:g} days" if rp.get("half_life_days") else "none", border=True)
+            st.caption(f"Bootstrapped for {rp.get('S')} and never retrained: every scored minute taught its mushroom body with the realized return two hours later. "
+                       f"Configuration chosen on {' → '.join(rp.get('selection_days') or ['—'])}, judged on {' → '.join(rp.get('evaluation_days') or ['—'])}.")
+        if running:
+            ch = fly.get("checks") or {}; sh = ch.get("shadow") or {}
+            with st.container(horizontal=True):
+                st.metric("Buy line", pct(fly.get("line")), delta=f"shadow {pct(fly.get('frozen_line'))}", delta_color="off",
+                          help="Recalibrated every day from its own scores and the realized returns of the last 7 days.")
+                st.metric("Drift", pct(fly.get("drift"), 1, False), help="Size of the learned KC→MBON change relative to the bootstrap weights; rolled back above 50 %.")
+                st.metric("Labels pending", fly.get("pending", "—"), help="Scored minutes waiting for their two-hour outcome.")
+                st.metric("24 h IC", f"{ch['ic']:.3f}" if ch.get("ic") is not None else "—", help="Rank correlation of its scores with the realized returns; rolled back below 0.")
+                st.metric("Picks vs shadow (3 d)", pct(sh.get("mean_plastic")), delta=f"shadow {pct(sh.get('mean_frozen'))}", delta_color="off",
+                          help="Average realized return of its picks vs the frozen bootstrap's picks; rolled back when it trails by more than one standard error.")
+                st.metric("Learning", "frozen" if frozen else "on")
+            upd = q("SELECT hour, n, mean_abs_delta, drift, ic FROM fly_updates ORDER BY hour DESC LIMIT 72")
+            if upd:
+                st.line_chart(pd.DataFrame(upd), x="hour", y=["drift", "ic"], x_label="", height=200)
+            rb = q("SELECT ts, reason, from_snapshot, to_snapshot FROM fly_rollbacks ORDER BY id DESC LIMIT 20")
+            if rb:
+                with st.expander(f"Rollbacks ({len(rb)})", icon=":material/history:"):
+                    st.dataframe(pd.DataFrame(rb), hide_index=True, column_config={"ts": st.column_config.DatetimeColumn("when", format="MMM D HH:mm")})
+        else:
+            st.caption(f"Not trading: {fly.get('detail') or 'the trading engine is stopped'}.")
+        b = _fly_bootstrap()
+        if b:
+            d = b["meta"].get("diagnostics") or {}; ok, why = fly_selector.deployable(b["meta"])
+            st.caption(f"Bootstrap #{b['id']} ({ago(b['ts'])}): the mushroom body carries {pct(d.get('mbon_share'), 0, False)} of the score, "
+                       f"{pct(d.get('mbon_saturated'), 0, False)} of MBONs saturated, {pct(d.get('kc_active'), 0, False)} of Kenyon cells active, "
+                       f"slope {d.get('slope') or 0:.2f} against its teacher. " + ("May trade: " if ok else "May not trade: ") + why + ".")
 
 
 def history() -> None:
@@ -174,11 +231,14 @@ def history() -> None:
         rows = []
         for r in snaps:
             m = parse_note(r["note"]); wf = m.get("walk_forward") or m.get("fly") or {}; rb = m.get("random_baseline") or m.get("random") or {}
-            ok = is_current(m)
-            rows.append({"model": f"#{r['id']}", "type": "selector" if r["kind"] == "selector" else "fly", "saved": r["ts"], "data": "current" if ok else "outdated",
+            sel = r["kind"] == "selector"; ok = is_current(m) if sel else fly_selector.is_current(m)
+            if not sel:
+                wf, rb = m.get("calibration") or {}, {}
+                wf = {"n": wf.get("trades"), "mean": wf.get("mean")}
+            rows.append({"model": f"#{r['id']}", "type": "selector" if sel else "fly bootstrap", "saved": r["ts"], "data": "current" if ok else "outdated",
                          "trades": wf.get("n") if ok else None, "% / trade": (wf["mean"] * 100) if ok and wf.get("mean") is not None else None,
                          "random %": (rb["mean"] * 100) if ok and rb.get("mean") is not None else None, "profit factor": wf.get("pf") if ok else None,
-                         "put to work": bool(m.get("deployable")) if ok and r["kind"] == "selector" else None, "in use": r["id"] == in_use})
+                         "put to work": (bool(m.get("deployable")) if sel else fly_selector.deployable(m)[0]) if ok else None, "in use": r["id"] == in_use})
         if rows:
             st.dataframe(pd.DataFrame(rows), hide_index=True, column_config={"saved": st.column_config.DatetimeColumn(format="MMM D HH:mm"),
                                                                              "% / trade": st.column_config.NumberColumn(format="%+.2f"),
@@ -194,4 +254,5 @@ def history() -> None:
 loaded()
 retraining()
 results()
+plastic_fly()
 history()

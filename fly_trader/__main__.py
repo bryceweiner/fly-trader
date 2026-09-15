@@ -3,6 +3,7 @@ Streamlit console also calls. Always run as ``.venv/bin/python -m fly_trader <co
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
 
@@ -115,7 +116,15 @@ def _cmd_train_fly_selector(args):
     from .logging_setup import setup
     from .train import fly_selector
     setup("train")
-    fly_selector.main(days=args.days, test_days=args.test_days, line=args.line, epochs=args.epochs)
+    fly_selector.main(days=args.days, epochs=args.epochs)
+
+
+def _cmd_fly_replay(args):
+    from .logging_setup import setup
+    from .train import fly_replay
+    setup("train")
+    out = fly_replay.main(days=args.days, start_day=args.start_day)
+    print(json.dumps({k: out.get(k) for k in ("S", "passed", "reason", "alpha", "half_life_days", "evaluation", "random", "frozen", "plastic_beats_frozen")}, indent=1, default=str))
 
 
 def _cmd_selector_eval(args):
@@ -169,9 +178,12 @@ def build_parser() -> argparse.ArgumentParser:
     ts_ = sub.add_parser("train-selector"); ts_.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
     ts_.set_defaults(fn=_cmd_train_selector)
     tf_ = sub.add_parser("train-fly-selector"); tf_.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
-    tf_.add_argument("--test-days", type=int, default=21); tf_.add_argument("--line", type=float, default=None, help="buy line (default: the selector's)")
-    tf_.add_argument("--epochs", type=int, default=1, help="full passes over every training minute")
+    tf_.add_argument("--epochs", type=int, default=1, help="full passes over the distillation rows")
     tf_.set_defaults(fn=_cmd_train_fly_selector)
+    fr = sub.add_parser("fly-replay", help="bootstrap the fly once, let it learn over the corpus, judge it (the gate before it trades)")
+    fr.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
+    fr.add_argument("--start-day", type=int, default=30, help="day index of the bootstrap (the selector teaches on the days before it)")
+    fr.set_defaults(fn=_cmd_fly_replay)
     bc = sub.add_parser("backtest-corpus"); bc.add_argument("--max-tokens", type=int, default=None); bc.add_argument("--days", type=int, default=None)
     bc.add_argument("--fees", default="0.003,0.0055"); bc.add_argument("--only", default=None); bc.add_argument("--universe", default="graduation", choices=["graduation", "mature"]); bc.set_defaults(fn=_cmd_backtest_corpus)
     b = sub.add_parser("build-connectome"); b.add_argument("--annotations", default=None); b.set_defaults(fn=_cmd_build_connectome)

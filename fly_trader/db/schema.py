@@ -17,7 +17,7 @@ from .connection import connect, database_name, database_url
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5          # 5: the plastic fly's tables and per-book halts (BASE_DDL)
 _LOCK_KEY = 0x666C795F6D6967  # "fly_mig"
 
 BASE_DDL: list[str] = [
@@ -216,6 +216,24 @@ BASE_DDL: list[str] = [
     "CREATE INDEX IF NOT EXISTS pump_pools_mint_idx ON pump_pools (mint)",
     """CREATE TABLE IF NOT EXISTS ui_settings (
         key text PRIMARY KEY, value jsonb, updated_at timestamptz NOT NULL DEFAULT now())""",
+    # the plastic fly (agent/fly_session.py): every scored minute (pending rows are its synaptic tags; x is dropped once
+    # the label resolves), daily calibrations per arm (plastic / frozen), hourly learning statistics, rollbacks
+    """CREATE TABLE IF NOT EXISTS fly_scored (
+        ts timestamptz NOT NULL, mint text NOT NULL, x real[], score real, frozen_score real, line real, frozen_line real,
+        label real, state text NOT NULL DEFAULT 'pending', resolved_at timestamptz, bootstrap_id bigint,
+        PRIMARY KEY (ts, mint))""",
+    "CREATE INDEX IF NOT EXISTS fly_scored_state_ts_idx ON fly_scored (state, ts)",
+    """CREATE TABLE IF NOT EXISTS fly_calibrations (
+        day date NOT NULL, arm text NOT NULL, line real, sizing jsonb, trades int, total real, mean real, window_days int,
+        created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (day, arm))""",
+    """CREATE TABLE IF NOT EXISTS fly_updates (
+        hour timestamptz PRIMARY KEY, n int, mean_delta real, mean_abs_delta real, step real, capped int, drift real, ic real, detail jsonb)""",
+    """CREATE TABLE IF NOT EXISTS fly_rollbacks (
+        id bigserial PRIMARY KEY, ts timestamptz NOT NULL DEFAULT now(), reason text, checks jsonb, from_snapshot bigint, to_snapshot bigint)""",
+    # per-book entry halts of the paper race books (agent/rails.check_book_drawdown); the live book uses circuit_state
+    """CREATE TABLE IF NOT EXISTS book_state (
+        book text PRIMARY KEY, halted boolean NOT NULL DEFAULT false, reason text, peak double precision,
+        updated_at timestamptz NOT NULL DEFAULT now())""",
 ]
 
 # Version-gated migrations: {version: [statements]} applied when stored version < version.

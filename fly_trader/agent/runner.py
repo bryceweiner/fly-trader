@@ -53,6 +53,6 @@ def _main(stop_event=None) -> None:
     if config.RESET_ON_START:                      # a fresh runner never carries over a previous run's books or stats
         from ..ops.reset import reset_training_state
         reset_training_state(reason="runner start")
-    from . import selector_session
+    from . import minute_engine
     record_event("info", "runner", "runner started", {"live": live})
-    selector_session.main(stop_event=stop_event, live=live)
+    minute_engine.main(stop_event=stop_event, live=live)

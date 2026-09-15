@@ -34,13 +34,20 @@ def rails_panel() -> None:
             st.space("stretch")
             if st.button("Resume entries" if c.get("entries_paused") else "Pause entries", key="entries_toggle"):
                 rails.set_entries_paused(not c.get("entries_paused")); st.rerun()
+        for b in q("SELECT book, halted, reason FROM book_state WHERE halted ORDER BY book"):
+            with st.container(horizontal=True, vertical_alignment="center"):
+                st.badge(f"{b['book']} halted", color="red")
+                st.caption(f"The paper book fell too far below its own peak ({b['reason']}); its entries are blocked, the other book trades on.")
+                st.space("stretch")
+                if st.button("Clear", key=f"halt_{b['book']}"):
+                    rails.clear_book_halt(b["book"]); st.rerun()
 
 
 def settings_panel() -> None:
     with st.container(border=True):
         st.markdown(":material/tune: **Mode and limits**")
-        rows = [("Money", "paper (simulated)", "The selector trades the paper book; live execution is not wired to it yet."),
-                ("LIVE_ENABLED", "1" if config.LIVE_ENABLED else "0", "Allows signing real transactions once live execution is wired to the selector."),
+        rows = [("Money", "paper, then live once the fly holds the seat", "The race runs on paper books; after the handover the fly also trades the bot wallet, its paper book as the mirror."),
+                ("LIVE_ENABLED", "1" if config.LIVE_ENABLED else "0", "Allows signing real transactions: the fly trades the bot wallet once it holds the selector's seat."),
                 ("Cluster", config.SOLANA_CLUSTER, "Solana network for live orders."),
                 ("Starting capital", f"{config.CAPITAL_SOL:g} SOL", "Paper books start here."),
                 ("Position sizing", f"{config.KELLY_FRACTION:g} × Kelly", "Each buy is sized from how certain the model is: this share of the growth-optimal bet for its score band."),
@@ -49,7 +56,7 @@ def settings_panel() -> None:
                 ("Smallest position", f"{config.MIN_POSITION_SOL:g} SOL", "Smaller sized buys are skipped."),
                 ("Fixed size (older models)", f"{config.MAX_POSITION_SOL:g} SOL", "Models trained before sizing trade this size."),
                 ("Gas reserve", f"{config.GAS_RESERVE_SOL:g} SOL", "Never spent on positions."),
-                ("Reset on start", "yes" if config.RESET_ON_START else "no", "Starting the trading engine archives and clears the paper books.")]
+                ("Reset on start", "yes" if config.RESET_ON_START else "no", "Starting the trading engine archives and clears books other than the race books and the live book.")]
         st.dataframe(pd.DataFrame(rows, columns=["setting", "value", "meaning"]), hide_index=True)
         st.caption("Set in the project .env; changes apply after the console restarts.")
 
@@ -69,10 +76,10 @@ def maintenance_panel() -> None:
     with st.container(border=True):
         st.markdown(":material/build: **Maintenance**")
         with st.container(horizontal=True, vertical_alignment="center"):
-            st.caption("Archive, then clear the paper books, decisions and wealth marks (trained models and live records are kept). Happens automatically when the trading engine starts.")
+            st.caption("Archive, then clear old books, their decisions and wealth marks — never the race books (selector, fly), the live book, the fly's learning or the models. Happens automatically when the trading engine starts.")
             st.space("stretch")
             with st.popover("Reset paper history", disabled=sup.alive("runner"), help="Stop the trading engine first." if sup.alive("runner") else None):
-                st.markdown("Archive and clear the paper books now?")
+                st.markdown("Archive and clear the old books now? The race and live books are kept.")
                 if st.button("Reset", type="primary", key="reset_confirm"):
                     from fly_trader.ops.reset import reset_training_state
                     out = reset_training_state(reason="console button")

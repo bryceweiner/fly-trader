@@ -14,10 +14,10 @@ from fly_trader.ops.supervisor import WORKERS, get_supervisor
 from fly_trader.train.selector import is_current, is_deployable
 
 BOOK = "paper_selector"
-STALE_FEED_S = 180            # agent/selector_session.py: no entries or exits when the newest complete minute is older
+STALE_FEED_S = 180            # agent/minute_engine.py: no entries or exits when the newest complete minute is older
 
 WORKER_INFO = {   # name → (title, icon, what it does, role)
-    "runner": ("Trading engine", ":material/candlestick_chart:", "Scores every traded token once a minute with the loaded model and trades the paper book.", "trade"),
+    "runner": ("Trading engine", ":material/candlestick_chart:", "Scores every traded token once a minute with the selector and the plastic fly, trades their books and lets the fly learn.", "trade"),
     "pumpstream": ("Market feed", ":material/sensors:", "Streams every PumpSwap trade from pumpapi.io into 1-minute candles. The trading engine reads these.", "trade"),
     "train": ("Trainer", ":material/model_training:", "On demand: builds decision points from the archive, backtests day by day and saves a new model.", "train"),
     "replay": ("History archive", ":material/history:", "Downloads the hourly trade archive and builds the training feature set.", "train"),
@@ -136,6 +136,7 @@ def labels(mints) -> dict[str, str]:
 def system_state() -> dict:
     sup = get_supervisor(); ws = sup.status(); now = datetime.now(timezone.utc)
     sel, sel_at = setting("selector_status"); tr, tr_at = setting("training_status"); ps, _ = setting("pumpstream_status")
+    fly, fly_at = setting("fly_status"); ho, _ = setting("handover"); rp, _ = setting("fly_replay")
     circuit = q1("SELECT kill_switch, kill_reason, tripped, fail_count, entries_paused FROM circuit_state WHERE id = 1") or {}
     ft = ps.get("flushed_through")
     feed_age = (now - datetime.fromisoformat(ft)).total_seconds() - 60 if ft else None     # since the newest complete minute closed
@@ -146,7 +147,7 @@ def system_state() -> dict:
     if not runner:
         err = (ws["runner"].get("error") or "").splitlines()
         trading, why = "stopped", ("The trading engine is stopped: " + err[0].split(": ", 1)[-1]) if err else "The trading engine is stopped."
-    elif str(sel.get("stage", "")).startswith("waiting for a model"):
+    elif str(sel.get("stage", "")).startswith("waiting for a model") and fly.get("stage") != "trading":
         trading, why = "waiting", "No model has qualified to trade yet: a model trades only if its backtest made money after costs and beat random picks. It starts as soon as one does."
     elif circuit.get("kill_switch"):
         trading, why = "blocked", "Kill switch tripped" + (f" ({circuit['kill_reason']})" if circuit.get("kill_reason") else "") + ": no new entries."
@@ -154,12 +155,14 @@ def system_state() -> dict:
         trading, why = "paused", "New entries are paused by the operator; open positions still exit on time."
     elif str(sel.get("stage", "")).startswith("stream stale") or not feed_ok:
         trading, why = "holding", "The market feed is stale: no entries or exits until it recovers."
-    elif not sel:
+    elif not sel and not fly:
         trading, why = "starting", "Warming up on the last 24 hours of market minutes."
     else:
         trading, why = "trading", "Trading every minute."
-    return {"workers": ws, "runner": runner, "trading": trading, "trading_why": why, "live_money": False,   # the selector trades the paper book; live execution is not wired to it yet
-           
+    from fly_trader.chain.cluster_guard import signing_allowed
+    live_money = bool(ho) and runner and fly.get("stage") == "trading" and signing_allowed()      # the fly holds the seat and may sign (agent/fly_live.py)
+    return {"workers": ws, "runner": runner, "trading": trading, "trading_why": why, "live_money": live_money,
+            "fly": fly, "fly_at": fly_at, "handover": ho or None, "replay": rp or None,
             "model": loaded_model() if runner else None, "latest": latest_snapshot("selector"), "deployable": latest_snapshot("selector", deployable=True),
             "training": training, "train_status": tr, "train_at": tr_at,
             "train_external": training and not ws["train"]["alive"], "selector": sel, "selector_at": sel_at, "feed": ps, "feed_ok": feed_ok, "feed_age": feed_age,
@@ -190,6 +193,14 @@ def status_strip() -> None:
             st.badge(f"Model #{latest['id']} not put to work", icon=":material/block:", color="orange", help=backtest_line(latest["meta"]))
         if m and dep and dep["id"] > m["id"]:
             st.badge(f"Switching to model #{dep['id']}", icon=":material/upgrade:", color="blue", help="The trading engine picks it up within 10 minutes.")
+        fly = s["fly"]
+        if fly.get("stage") and fly.get("stage") != "not trading":
+            st.badge(f"Fly learning · drift {float(fly.get('drift') or 0):.1%}" if not fly.get("learning_frozen") else "Fly: learning frozen", icon=":material/neurology:",
+                     color="violet" if not fly.get("learning_frozen") else "orange", help=f"Plastic fly: buy line {pct(fly.get('line'))}, {fly.get('pending', 0)} labels pending.")
+        else:
+            st.badge("Fly not trading", icon=":material/neurology:", color="gray", help=fly.get("detail") or "The trading engine is stopped.")
+        if s["handover"]:
+            st.badge("Fly holds the seat", icon=":material/swap_horiz:", color="green", help="The fly won the race; the selector no longer trades while the fly can.")
         tr = s["train_status"]
         st.badge(f"Training · {tr.get('stage', '')}" if s["training"] else "Not training", icon=":material/model_training:", color="blue" if s["training"] else "gray")
         st.badge("Market feed live" if s["feed_ok"] else "Market feed stale", icon=":material/sensors:", color="green" if s["feed_ok"] else "red",

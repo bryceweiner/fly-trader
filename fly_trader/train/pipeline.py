@@ -3,8 +3,9 @@
 1. The selector retrains on the whole corpus (``train/selector.main``): every day after the warm-up is backtested by a
    model that never saw it, then the model is fit on every day and saved. It is put to work only if its backtest made
    money after costs and beat random picks (``deployable``); the trading engine switches to it without a restart.
-2. The fly learns to imitate the selector (``train/fly_selector.main``: the selector's scores are its training targets)
-   and is scored on the last 21 days against the selector and random picks.
+2. The fly is bootstrapped (``train/fly_selector.main``: the selector teaches it once) only when no fly exists for the
+   current definitions or the operator (or an automatic re-bootstrap) asks for one. A weekly run never replaces a fly:
+   after its bootstrap the fly learns from the market through its mushroom body (``brain/plastic.py``).
 
 A run starts only when the feature build is complete (every day aggregated and built with the current definitions);
 otherwise it waits and checks again every hour. State for the console: ``ui_settings['training_pipeline']``.
@@ -45,21 +46,39 @@ def _save(**kv) -> dict:
     return v
 
 
-def request_run() -> None:
-    """Run as soon as the worker sees it (the console's Retrain now)."""
-    _save(run_requested=True, retry_after=None)
+def request_run(fly: bool = False, reason: str | None = None) -> None:
+    """Run as soon as the worker sees it (the console's Retrain now); ``fly`` also bootstraps a new fly."""
+    kv = {"run_requested": True, "retry_after": None}
+    if fly:
+        kv.update(fly_requested=True, fly_reason=reason or "requested")
+    _save(**kv)
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def due(st: dict, now: datetime | None = None) -> bool:
+def due(st: dict, now: datetime | None = None, handed_over: bool = False) -> bool:
+    """Every ``INTERVAL_DAYS`` or on request; once the fly holds the selector's seat (agent/handover.py), on request only."""
     now = now or _now()
     if st.get("retry_after") and now < datetime.fromisoformat(st["retry_after"]):
         return False
+    if handed_over:
+        return bool(st.get("run_requested"))
     last = st.get("last_run_at")
     return bool(st.get("run_requested")) or last is None or now >= datetime.fromisoformat(last) + timedelta(days=INTERVAL_DAYS)
+
+
+def _handed_over() -> bool:
+    from ..agent import handover
+    with transaction() as conn:
+        return handover.state(conn) is not None
+
+
+def _current_fly() -> dict | None:
+    from . import fly_selector
+    with transaction() as conn:
+        return fly_selector.latest_current(conn)
 
 
 def run(stop_event: threading.Event | None = None) -> dict:
@@ -67,16 +86,22 @@ def run(stop_event: threading.Event | None = None) -> dict:
     ok, why = mature.build_complete()
     if not ok:
         raise NotReady(why)
+    st = state()
     _save(stage="training the selector", started_at=_now().isoformat(), run_requested=False, retry_after=None, last_error=None, waiting=None)
     wf = selector.main(stop_event=stop_event)
     if stop_event is not None and stop_event.is_set():
         return _save(stage="stopped")
-    _save(stage="training the fly to imitate the selector", selector_snapshot=wf.get("snapshot_id"), selector_deployable=wf.get("deployable"))
-    verdict = fly_selector.main(line=wf.get("line"), stop_event=stop_event)       # the fly trades the selector's line, unaltered
-    if stop_event is not None and stop_event.is_set():
-        return _save(stage="stopped")
+    _save(selector_snapshot=wf.get("snapshot_id"), selector_deployable=wf.get("deployable"))
+    fly_snapshot = st.get("fly_snapshot")
+    if st.get("fly_requested") or _current_fly() is None:
+        _save(stage="bootstrapping the fly (the selector teaches it once)")
+        boot = fly_selector.main(stop_event=stop_event)
+        if stop_event is not None and stop_event.is_set():
+            return _save(stage="stopped")
+        fly_snapshot = boot.get("snapshot_id")
     now = _now()
-    out = _save(stage="done", last_run_at=now.isoformat(), next_run_at=(now + timedelta(days=INTERVAL_DAYS)).isoformat(), fly_snapshot=verdict.get("snapshot_id"))
+    out = _save(stage="done", last_run_at=now.isoformat(), next_run_at=(now + timedelta(days=INTERVAL_DAYS)).isoformat(), fly_snapshot=fly_snapshot,
+                fly_requested=False, fly_reason=None)
     record_event("info", "pipeline", "training pipeline finished", {k: out.get(k) for k in ("selector_snapshot", "selector_deployable", "fly_snapshot")})
     return out
 
@@ -85,7 +110,7 @@ def main(stop_event: threading.Event | None = None) -> None:
     setup("train")
     record_event("info", "pipeline", "training pipeline worker started", {"interval_days": INTERVAL_DAYS})
     while not (stop_event is not None and stop_event.is_set()):
-        if due(state()):
+        if due(state(), handed_over=_handed_over()):
             try:
                 run(stop_event)
             except NotReady as e:
