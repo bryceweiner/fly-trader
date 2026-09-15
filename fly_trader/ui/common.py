@@ -21,12 +21,10 @@ WORKER_INFO = {   # name → (title, icon, what it does, role)
     "pumpstream": ("Market feed", ":material/sensors:", "Streams every PumpSwap trade from pumpapi.io into 1-minute candles. The trading engine reads these.", "trade"),
     "train": ("Trainer", ":material/model_training:", "On demand: builds decision points from the archive, backtests day by day and saves a new model.", "train"),
     "replay": ("History archive", ":material/history:", "Downloads the hourly trade archive and builds the training feature set.", "train"),
-    "corpus": ("Pre-April corpus", ":material/inventory_2:", "Pulls candles for graduations older than the archive. Not used by the selector.", "optional"),
-    "discover": ("Watch list", ":material/travel_explore:", "Polls Jupiter for graduated tokens and their stats. Used by the legacy brain modes.", "optional"),
-    "capture": ("Swap tape", ":material/receipt_long:", "Helius websocket swaps for watched pools. Used by the legacy brain modes.", "optional"),
+    "discover": ("Token stats", ":material/query_stats:", "Records Jupiter stats (holders, organic score, top-holder share) every 10 minutes for every token the selector can trade: history for future model inputs.", "optional"),
 }
 ROLE_LABEL = {"trade": "needed to trade", "train": "needed to train", "optional": "optional"}
-ORDER = [n for n in ("runner", "pumpstream", "train", "replay", "corpus", "discover", "capture") if n in WORKERS]
+ORDER = [n for n in ("runner", "pumpstream", "train", "replay", "discover") if n in WORKERS]
 
 
 # ---------------------------------------------------------------- formatting

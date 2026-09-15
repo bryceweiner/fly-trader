@@ -1,14 +1,11 @@
-"""Token discovery and watch-list maintenance (the `discover` worker).
+"""Jupiter token stats (the `discover` worker) and the legacy watch-list helpers.
 
-Hard gate (operator decision): graduated (graduatedAt set, launchpad in config.LAUNCHPADS) AND mint
-and freeze authority disabled. Nothing else filters; liquidity/age/holders/organic score are sensory.
+Worker: every STATS_REFRESH_S, token_stats via /search batches (100 mints per call) for every token of the selector's
+universe (traded on the stream in the last hour, pool above its gate). Jupiter serves only current values, so this
+is how a point-in-time history accrues for future model inputs.
 
-Loop: every DISCOVER_INTERVAL_S poll /recent + 5m categories; every 5 min the 1h categories; every
-STATS_REFRESH_S refresh token_stats via /search batches for tokens in watch_status 'watch' (active) and
-'pre' (seen before graduation, re-checked until they graduate or go stale), plus — stats only — every token of the
-selector's universe (traded on the stream in the last hour, pool above its gate). Graduated tokens get a
-watch_pools row (pool = graduatedPool; a graduated payload without one changes nothing). Pools stay active for
-WATCH_DAYS_AFTER_GRADUATION days, extended while traded in the last 24 h or held by any book.
+The watch-list helpers below (graduation gate, tokens/watch_pools upserts, category polling for ``--probe``) fed the
+legacy brain modes and are no longer run by the worker.
 """
 from __future__ import annotations
 
@@ -187,63 +184,22 @@ def maintain_pools(conn) -> int:
 
 
 def refresh_stats(conn, client: JupiterTokens) -> dict:
-    rows = conn.execute(
-        """SELECT mint FROM tokens WHERE watch_status = 'watch' AND mint IN (SELECT mint FROM watch_pools WHERE active)
-           UNION SELECT mint FROM tokens WHERE watch_status = 'pre' AND first_seen > now() - (%s * interval '1 hour')""",
-        (PRE_STALE_HOURS,),
-    ).fetchall()
-    mints = [r["mint"] for r in rows]
+    """token_stats for the selector's universe: every pump.fun PumpSwap token the stream saw trade in the last hour with a
+    pool above the selector's gate, so a point-in-time history accrues for the tokens actually traded."""
     from ..train.decisions import MIN_RESQ_SOL   # lazy: keeps the training stack out of the worker's import
-    # the selector's universe (every pump.fun PumpSwap token the stream saw trade in the last hour with a pool above the
-    # selector's gate): stats only, so a point-in-time history accrues for the tokens actually traded — no watch pools
     uni = conn.execute("SELECT DISTINCT mint FROM pump_minutes WHERE ts > now() - interval '1 hour' AND resq_sol >= %s",
                        (MIN_RESQ_SOL,)).fetchall()
-    extra = sorted({r["mint"] for r in uni} - set(mints))
-    counts = process_tokens(conn, client.search_many(mints), with_stats=True) if mints else {}
-    ut = [t for t in client.search_many(extra) if t.get("id")] if extra else []
-    for tok in ut:
+    mints = sorted(r["mint"] for r in uni)
+    toks = [t for t in client.search_many(mints) if t.get("id")] if mints else []
+    for tok in toks:
         insert_stats(conn, tok)
-    counts["refreshed"] = counts.get("seen", 0) + len(ut)
-    counts["universe"] = len(ut)
-    return counts
-
-
-class Discoverer:
-    def __init__(self):
-        self.client = JupiterTokens()
-        self.last_slow = 0.0
-        self.last_stats = 0.0
-        self.stop = False
-
-    def poll_fast(self) -> dict:
-        toks = self.client.recent()
-        for cat, iv in CATEGORIES_FAST:
-            toks += self.client.category(cat, iv)
-        with transaction() as conn:
-            return process_tokens(conn, dedupe(toks), with_stats=True)
-
-    def poll_slow(self) -> dict:
-        toks = []
-        for cat, iv in CATEGORIES_SLOW:
-            toks += self.client.category(cat, iv)
-        with transaction() as conn:
-            c = process_tokens(conn, dedupe(toks), with_stats=True)
-            c["pools_deactivated"] = maintain_pools(conn)
-            return c
-
-    def once(self) -> dict:
-        c = self.poll_fast()
-        c2 = self.poll_slow()
-        with transaction() as conn:
-            c3 = refresh_stats(conn, self.client)
-        return {"fast": c, "slow": c2, "stats": c3}
+    return {"universe": len(mints), "refreshed": len(toks)}
 
 
 def run_once() -> None:
     setup("discover")
-    d = Discoverer()
-    out = d.once()
-    print(json.dumps(out, indent=1))
+    with transaction() as conn:
+        print(json.dumps(refresh_stats(conn, JupiterTokens()), indent=1))
 
 
 def probe() -> None:
@@ -268,31 +224,24 @@ def run_forever(stop_event=None) -> None:
     """Loop until stop_event is set (console thread) or SIGTERM/SIGINT (CLI, main thread only)."""
     import threading
     setup("discover")
-    d = Discoverer()
+    client = JupiterTokens(); stopped = {"v": False}
     if stop_event is None and threading.current_thread() is threading.main_thread():
         def _stop(*_):
-            d.stop = True
+            stopped["v"] = True
         signal.signal(signal.SIGTERM, _stop)
         signal.signal(signal.SIGINT, _stop)
-    record_event("info", "discover", "discover worker started", {"launchpads": config.LAUNCHPADS})
-    while not d.stop and not (stop_event is not None and stop_event.is_set()):
+    record_event("info", "discover", "token stats worker started", {"refresh_s": config.STATS_REFRESH_S})
+    while not stopped["v"] and not (stop_event is not None and stop_event.is_set()):
         t0 = time.monotonic()
         try:
-            c = d.poll_fast()
-            log.info("fast poll %s", c)
-            if time.monotonic() - d.last_slow > 300:
-                log.info("slow poll %s", d.poll_slow())
-                d.last_slow = time.monotonic()
-            if time.monotonic() - d.last_stats > config.STATS_REFRESH_S:
-                with transaction() as conn:
-                    log.info("stats refresh %s", refresh_stats(conn, d.client))
-                d.last_stats = time.monotonic()
+            with transaction() as conn:
+                log.info("stats refresh %s", refresh_stats(conn, client))
         except Exception as e:
-            log.exception("discover loop error")
-            record_event("error", "discover", f"loop error: {type(e).__name__}: {e}")
+            log.exception("token stats refresh error")
+            record_event("error", "discover", f"stats refresh error: {type(e).__name__}: {e}")
         # sleep the remainder of the interval, waking early on stop
-        remaining = config.DISCOVER_INTERVAL_S - (time.monotonic() - t0)
-        while remaining > 0 and not d.stop and not (stop_event is not None and stop_event.is_set()):
+        remaining = config.STATS_REFRESH_S - (time.monotonic() - t0)
+        while remaining > 0 and not stopped["v"] and not (stop_event is not None and stop_event.is_set()):
             time.sleep(min(1.0, remaining))
             remaining -= 1.0
     record_event("info", "discover", "discover worker stopped")

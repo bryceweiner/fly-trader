@@ -26,18 +26,12 @@ def _entry(name: str):
     if name == "discover":
         from ..ingest import discovery
         return discovery.run_forever
-    if name == "capture":
-        from ..ingest import capture
-        return capture.main
     if name == "runner":
         from ..agent import runner
         return runner.main
     if name == "train":                        # the training pipeline: selector, then the fly imitating it, every 7 days (train/pipeline.py)
         from ..train import pipeline
         return pipeline.main
-    if name == "corpus":
-        from ..ingest import corpus_pull
-        return corpus_pull.main
     if name == "replay":
         from ..ingest import replay_pull
         return replay_pull.main
@@ -47,7 +41,7 @@ def _entry(name: str):
     raise KeyError(name)
 
 
-WORKERS = ("discover", "capture", "runner", "train", "corpus", "replay", "pumpstream")
+WORKERS = ("discover", "runner", "train", "replay", "pumpstream")
 
 
 class Supervisor:

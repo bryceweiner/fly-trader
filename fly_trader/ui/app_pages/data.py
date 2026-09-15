@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import streamlit as st
 
 from fly_trader import config
-from fly_trader.db.queries import q, q1
+from fly_trader.db.queries import q1
 from fly_trader.market.features import FEATURE_VERSION
 from fly_trader.ops.supervisor import get_supervisor
 from fly_trader.ui.common import ago, setting
@@ -27,7 +27,7 @@ def feature_parts() -> dict:
 @st.fragment(run_every="10s")
 def pipelines() -> None:
     sup = get_supervisor(); ws = sup.status(); now = datetime.now(timezone.utc)
-    ps, ps_at = setting("pumpstream_status"); rs, rs_at = setting("replay_status"); cs, cs_at = setting("corpus_status")
+    ps, ps_at = setting("pumpstream_status"); rs, rs_at = setting("replay_status")
     a, b = st.columns(2)
     with a:
         with st.container(border=True):
@@ -76,31 +76,26 @@ def pipelines() -> None:
                 st.metric("With creator", f"{int(m.get('creators') or 0):,}")
                 st.metric("Token launches", f"{int(cr.get('n') or 0):,}", help="Creates in pump_events, used for each creator's launch history.")
             st.caption("Graduation time, creation facts and each creator's track record, shared by training and live scoring.")
-    a, b = st.columns(2)
-    with a:
-        with st.container(border=True):
-            with st.container(horizontal=True, vertical_alignment="center"):
-                st.markdown(":material/inventory_2: **Pre-April corpus**")
-                _state_badge(ws["corpus"]["alive"])
-            cnt = {r["status"]: int(r["n"]) for r in q("SELECT status, count(*) AS n FROM corpus_tokens GROUP BY status")}
-            with st.container(horizontal=True):
-                st.metric("Tokens pulled", f"{cnt.get('done', 0):,}")
-                st.metric("Pending", f"{cnt.get('pending', 0):,}")
-                st.metric("Errors", f"{cnt.get('error', 0):,}")
-            st.caption(f"swap-api candles for graduations before the archive · not used by the selector · {cs.get('stage', '—')} · updated {ago(cs_at)}")
-    with b:
-        with st.container(border=True):
-            with st.container(horizontal=True, vertical_alignment="center"):
-                st.markdown(":material/receipt_long: **Swap tape & watch list** (legacy modes)")
-                _state_badge(ws["capture"]["alive"] or ws["discover"]["alive"])
-            cap = q1("SELECT pools_subscribed, last_swap_ts FROM capture_status") or {}
-            wp = q1("SELECT count(*) FILTER (WHERE active) AS active FROM watch_pools") or {}
-            tape = q1("SELECT count(*) AS n FROM swap_tape WHERE ts > now() - interval '1 minute'") or {}
-            with st.container(horizontal=True):
-                st.metric("Pools watched", int(wp.get("active") or 0))
-                st.metric("Swaps / min", int(tape.get("n") or 0))
-                st.metric("Last swap", ago(cap.get("last_swap_ts")))
-            st.caption("Helius websocket swaps for Jupiter-listed graduated pools. The selector trades on the market feed instead.")
+    with st.container(border=True):
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.markdown(":material/query_stats: **Token stats** (Jupiter)")
+            _state_badge(ws["discover"]["alive"])
+        cov = token_stats_coverage()
+        with st.container(horizontal=True):
+            st.metric("Tradable tokens with stats", f"{cov['covered']:,}/{cov['universe']:,}",
+                      help="Tokens that traded in the last hour with a pool above the selector's gate, and how many have Jupiter stats from the last hour.")
+            st.metric("History since", str(cov["first"])[:10] if cov["first"] else "—")
+        st.caption("Holders, organic score and top-holder share, recorded every 10 minutes for every token the selector can trade. "
+                   "Not a model input yet: Jupiter serves only current values, so these need weeks of recorded history first.")
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def token_stats_coverage() -> dict:
+    from fly_trader.train.decisions import MIN_RESQ_SOL
+    c = q1("""SELECT count(*) AS universe, count(*) FILTER (WHERE EXISTS (SELECT 1 FROM token_stats s WHERE s.mint = u.mint AND s.ts > now() - interval '1 hour')) AS covered
+              FROM (SELECT DISTINCT mint FROM pump_minutes WHERE ts > now() - interval '1 hour' AND resq_sol >= %s) u""", (MIN_RESQ_SOL,)) or {}
+    first = q1("SELECT min(ts) AS first FROM token_stats") or {}
+    return {"universe": int(c.get("universe") or 0), "covered": int(c.get("covered") or 0), "first": first.get("first")}
 
 
 pipelines()

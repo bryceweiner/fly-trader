@@ -85,24 +85,6 @@ def test_dedupe_keeps_first_payload_per_mint():
     assert discovery.dedupe([a1, b, {"symbol": "no id"}, a2]) == [a1, b]
 
 
-def test_poll_fast_writes_one_stats_row_per_mint(db_conn, monkeypatch):
-    mint = "TestFix8Mint1111111111111111111111111111111"
-    tok = {"id": mint, "launchpad": "pump.fun", "symbol": "T8"}      # pre-graduation: no watch pool, no events
-
-    class Client:
-        def recent(self):
-            return [dict(tok)]
-
-        def category(self, cat, iv):
-            return [dict(tok)]
-
-    monkeypatch.setattr(discovery, "transaction", _tx_on(db_conn))
-    d = discovery.Discoverer.__new__(discovery.Discoverer)
-    d.client = Client()
-    assert d.poll_fast()["seen"] == 1
-    assert db_conn.execute("SELECT count(*) AS n FROM token_stats WHERE mint = %s", (mint,)).fetchone()["n"] == 1
-
-
 # ---- 9: context coverage ----
 def test_context_coverage_starts_at_first_activity():
     cw = ContextWindow(window_s=100.0, gap_s=50.0, ready_cov=0.9)
@@ -211,7 +193,7 @@ def test_refresh_stats_covers_selector_universe_without_watching(db_conn):
             return [{**GRAD, "id": mint, "graduatedPool": "TestUniversePool", "organicScore": 42.0}] if mint in mints else []
 
     c = discovery.refresh_stats(db_conn, Client())
-    assert c["universe"] == 1 and any(mint in a for a in asked)
+    assert c["universe"] >= 1 and c["refreshed"] == 1 and any(mint in a for a in asked)
     assert db_conn.execute("SELECT organic_score FROM token_stats WHERE mint = %s", (mint,)).fetchone()["organic_score"] == 42.0
     assert db_conn.execute("SELECT 1 FROM tokens WHERE mint = %s", (mint,)).fetchone() is None
     assert db_conn.execute("SELECT 1 FROM watch_pools WHERE mint = %s", (mint,)).fetchone() is None
