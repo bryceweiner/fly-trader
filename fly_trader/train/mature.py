@@ -287,17 +287,15 @@ def _loop_once() -> int:
                 conn.execute("DELETE FROM mature_days WHERE day = %s", (d,))
     for d in days_ready():
         aggregate_day(d); n += 1
-    with transaction() as conn:
-        assembled = {r["day"] for r in conn.execute("SELECT day FROM replay_days").fetchall()}
-    grads = _graduations()
+    grads = _graduations()          # corpus_meta.rebuild reads the day's events before every round, so its graduations are known
     for f in sorted(MATURE_DIR.glob("*.parquet"), reverse=True):
         d = date.fromisoformat(f.stem)
         part = MATURE_FEAT_DIR / d.isoformat() / "part.parquet"
         # a current part is rebuilt when graduations assembled since (the backfill runs newest-first) date more of its mints
         if part_current(part) and not _knows_more(part, grads):
             continue
-        if not (MATURE_DIR / f"{(d - timedelta(days=1)).isoformat()}.parquet").exists() or d not in assembled:
-            continue                    # graduation times for the day's new tokens come from the assembled day
+        if not (MATURE_DIR / f"{(d - timedelta(days=1)).isoformat()}.parquet").exists():
+            continue                    # the previous day is the lookback
         _archive(part, f"feat_{d}")             # the old part stays readable until the new one replaces it atomically
         if not build_day(d, grads=grads) and part.exists():
             part.unlink()                        # nothing to write: the (archived) old part must not linger
