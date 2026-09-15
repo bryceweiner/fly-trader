@@ -52,21 +52,19 @@ def record_success(conn) -> None:
     conn.execute("UPDATE circuit_state SET fail_count = 0, updated_at = now() WHERE id = 1")
 
 
-def update_peak(conn, wealth: float) -> tuple[float, bool]:
-    """Update the live peak; trip the kill switch on drawdown. Returns (peak, kill_switch)."""
+def check_drawdown(conn, wealth: float, peak: float) -> bool:
+    """Trip the kill switch when ``wealth`` has fallen KILL_SWITCH_DRAWDOWN below ``peak`` (the book's own peak: the
+    trading engine passes the highest wealth mark of the current run). Returns whether the kill switch is on."""
     st = load_circuit(conn)
-    peak = st.peak_wealth if st.peak_wealth is not None else wealth
-    if wealth > peak:
-        peak = wealth
-    kill = st.kill_switch
-    if not kill and peak > 0 and wealth <= peak * (1.0 - config.KILL_SWITCH_DRAWDOWN):
-        kill = True
-        conn.execute("UPDATE circuit_state SET kill_switch = true, kill_reason = %s, updated_at = now() WHERE id = 1",
-                     (f"wealth {wealth:.4f} <= {1 - config.KILL_SWITCH_DRAWDOWN:.2f} x peak {peak:.4f}",))
+    if st.kill_switch:
+        return True
+    if peak > 0 and wealth <= peak * (1.0 - config.KILL_SWITCH_DRAWDOWN):
+        conn.execute("UPDATE circuit_state SET kill_switch = true, kill_reason = %s, peak_wealth = %s, updated_at = now() WHERE id = 1",
+                     (f"wealth {wealth:.4f} SOL <= {1 - config.KILL_SWITCH_DRAWDOWN:.2f} x peak {peak:.4f} SOL", peak))
         _event(conn, "kill_switch", {"wealth": wealth, "peak": peak})
         record_event("error", "rails", "kill switch tripped: entries blocked", {"wealth": wealth, "peak": peak})
-    conn.execute("UPDATE circuit_state SET peak_wealth = %s, updated_at = now() WHERE id = 1", (peak,))
-    return peak, kill
+        return True
+    return False
 
 
 def notional_24h(conn) -> float:

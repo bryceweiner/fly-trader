@@ -30,7 +30,7 @@ import numpy as np
 from .. import config
 from ..db.apilog import record_event
 from ..db.connection import transaction
-from . import sizing
+from . import rails, sizing
 from ..execution import ledger
 from ..execution.broker_paper import PaperBroker
 from ..market.exit_cost import PUMP_SUPPLY, exit_cost_fraction
@@ -298,6 +298,7 @@ class SelectorSession:
             peak_row = conn.execute("SELECT max(wealth) AS pk FROM wealth_marks WHERE book = %s", (BOOK,)).fetchone(); peak = max(float(peak_row["pk"] or 0.0), wealth)
             conn.execute("INSERT INTO wealth_marks (beat_id, book, ts, sol_free, positions_value, exit_cost, wealth, peak, drawdown, exposure, n_open) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                          (beat, BOOK, m1, cash, positions_net, exit_cost, wealth, peak, (1.0 - wealth / peak) if peak > 0 else 0.0, exposure, len(opens)))
+            rails.check_drawdown(conn, wealth, peak)       # the kill switch: blocks the next minutes' entries
             self._sweep(m1_epoch, open_mints)
             status = {**summary, "entered": n_enter, "exited": n_exit, "open": len(opens), "cash": cash, "wealth": wealth, "threshold": self.model.threshold,
                       "top_scores": sorted(picks, key=lambda x: -x[1])[:5], "latency_s": (now - m1).total_seconds(), "updated_at": datetime.now(timezone.utc).isoformat()}
