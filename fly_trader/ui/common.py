@@ -63,7 +63,7 @@ def pct(x, nd: int = 2, signed: bool = True) -> str:
 
 # ---------------------------------------------------------------- models
 _NOTE_OBJ = re.compile(r'"(walk_forward|random_baseline|fly|gbm|random)": (\{[^{}]*\})')
-_NOTE_SCALAR = re.compile(r'"(threshold|trained_through|horizon_min|top_frac|costs|rows|days|fly_beats_gbm)": ("[^"]*"|[-0-9.eE]+|true|false)')
+_NOTE_SCALAR = re.compile(r'"(threshold|trained_through|horizon_min|line|costs|rows|days|fly_beats_gbm)": ("[^"]*"|[-0-9.eE]+|true|false)')
 
 
 def parse_note(note) -> dict:

@@ -153,6 +153,23 @@ def random_trades(ds: DecisionSet, rows: np.ndarray, n_picks: int, seeds: int = 
     return np.concatenate(out)
 
 
+def _ranks(a: np.ndarray) -> np.ndarray:
+    """1-based ranks with ties sharing their average rank (what Spearman needs)."""
+    _, inv, cnt = np.unique(np.asarray(a), return_inverse=True, return_counts=True)
+    avg = np.cumsum(cnt) - (cnt - 1) / 2.0
+    return avg[inv.ravel()]
+
+
+def rank_corr(a: np.ndarray, b: np.ndarray) -> float | None:
+    """Spearman correlation (Pearson on average ranks); None when either side is constant or empty."""
+    a = np.asarray(a, dtype=np.float64); b = np.asarray(b, dtype=np.float64)
+    if len(a) < 2 or len(a) != len(b):
+        return None
+    ra = _ranks(a); rb = _ranks(b); ra -= ra.mean(); rb -= rb.mean()
+    den = float(np.sqrt((ra * ra).sum() * (rb * rb).sum()))
+    return float((ra * rb).sum() / den) if den > 0 else None
+
+
 def summarize(r: np.ndarray) -> dict:
     if len(r) == 0:
         return {"n": 0, "mean": None, "median": None, "win": None, "pf": None}

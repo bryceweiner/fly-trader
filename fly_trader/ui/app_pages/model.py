@@ -63,7 +63,8 @@ def loaded() -> None:
                           help=f"Each minute the model predicts every eligible token's net 30-minute return after fees and price impact. It buys tokens at least "
                                f"{mi.get('min_age_h', 24):g} h past graduation (or older than the archive) whose prediction clears this line.")
                 st.metric("Holds for", f"{run.get('horizon_min') or meta.get('horizon_min') or 30} min", help="Each position is sold this long after the buy.")
-                st.metric("Test trades", wf.get("n", "—"), help=f"Trades the model would have made on {wf.get('days', '—')} test days, each traded by a model that never saw that day.")
+                st.metric("Test trades", wf.get("n", "—"), help=f"Trades on the backtest's evaluation half ({wf.get('days', '—')} days), each traded by a model that never saw "
+                                                                "that day, at a buy line chosen on the earlier selection half.")
                 st.metric("Average per trade", pct(wf.get("mean")), delta=(f"random {pct(rb['mean'])}" if rb.get("mean") is not None else None), delta_color="off",
                           help="Net return per trade on the test days, after fees and price impact. 'random' is the same number of random buys under the same rules.")
                 st.metric("Winning trades", pct(wf.get("win"), 0, False), help="Share of test trades that made money.")
@@ -132,16 +133,18 @@ def results() -> None:
         if wfd and not system_state()["latest"]:
             st.caption("The last backtest ran on outdated data and is hidden.")
         elif wfd:
-            df = pd.DataFrame([{"day": d.get("day"), "AUC": d.get("auc"), "trades": d.get("n"), "model": (d["mean"] * 100) if d.get("mean") is not None else None,
+            df = pd.DataFrame([{"day": d.get("day"), "half": d.get("half"), "IC": d.get("ic"), "trades": d.get("n"), "model": (d["mean"] * 100) if d.get("mean") is not None else None,
                                 "random": (d["random_mean"] * 100) if d.get("random_mean") is not None else None, "winners": (d["win"] * 100) if d.get("win") is not None else None,
                                 "profit factor": d.get("pf")} for d in (jv(r["detail"]) for r in wfd)])
             st.bar_chart(df, x="day", y=[c for c in ("model", "random") if df[c].notna().any()], stack=False, x_label="", y_label="% per trade", height=220)
-            st.dataframe(df, hide_index=True, column_config={"AUC": st.column_config.NumberColumn(format="%.3f", help="Ranking quality of the scores (0.5 = chance)."),
+            st.dataframe(df, hide_index=True, column_config={"IC": st.column_config.NumberColumn(format="%.3f", help="Rank correlation of the predictions with the realised returns (0 = no skill)."),
+                                                             "half": st.column_config.TextColumn(help="selection: the days that chose the buy line; evaluation: the days that judge it."),
                                                              "model": st.column_config.NumberColumn("model % / trade", format="%+.2f"),
                                                              "random": st.column_config.NumberColumn("random % / trade", format="%+.2f", help="Random picks, same count, costs and fills."),
                                                              "winners": st.column_config.NumberColumn("winners %", format="%.0f"),
                                                              "profit factor": st.column_config.NumberColumn(format="%.2f")})
-            st.caption("Each day is traded by a model trained only on days at least two days earlier, with the paper broker's fees and price impact.")
+            st.caption("Each day is traded by a model trained only on days at least two days earlier, with the paper broker's fees and price impact. "
+                       "The buy line is chosen on the selection half and judged on the evaluation half.")
         else:
             st.caption("No selector backtest on the current data yet.")
     fv = q1("SELECT ts, detail FROM events WHERE source = 'fly_selector' AND message LIKE 'fly%%vs gbm%%' ORDER BY id DESC LIMIT 1")
@@ -152,10 +155,10 @@ def results() -> None:
             rows = [(n, d.get(k) or {}) for n, k in (("Fly (connectome)", "fly"), ("Selector (its teacher)", "gbm"), ("Random picks", "random"))]
             st.dataframe(pd.DataFrame([{"model": n, "trades": v.get("n"), "% / trade": (v["mean"] * 100) if v.get("mean") is not None else None,
                                         "median %": (v["median"] * 100) if v.get("median") is not None else None, "winners %": (v["win"] * 100) if v.get("win") is not None else None,
-                                        "profit factor": v.get("pf"), "AUC": v.get("auc")} for n, v in rows]), hide_index=True,
+                                        "profit factor": v.get("pf"), "IC": v.get("ic")} for n, v in rows]), hide_index=True,
                          column_config={"% / trade": st.column_config.NumberColumn(format="%+.2f"), "median %": st.column_config.NumberColumn(format="%+.2f"),
                                         "winners %": st.column_config.NumberColumn(format="%.0f"), "profit factor": st.column_config.NumberColumn(format="%.2f"),
-                                        "AUC": st.column_config.NumberColumn(format="%.3f")})
+                                        "IC": st.column_config.NumberColumn(format="%.3f", help="Rank correlation of the predictions with the realised returns.")})
             parts = [f"run {ago(fv['ts'])}"]
             if ag.get("pick_overlap") is not None:
                 parts.append(f"the fly picks {ag['pick_overlap'] * 100:.0f}% of what the selector picks")

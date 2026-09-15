@@ -72,7 +72,7 @@ def run(stop_event: threading.Event | None = None) -> dict:
     if stop_event is not None and stop_event.is_set():
         return _save(stage="stopped")
     _save(stage="training the fly to imitate the selector", selector_snapshot=wf.get("snapshot_id"), selector_deployable=wf.get("deployable"))
-    verdict = fly_selector.main(stop_event=stop_event)
+    verdict = fly_selector.main(line=wf.get("line"), stop_event=stop_event)       # the fly trades the selector's line, unaltered
     if stop_event is not None and stop_event.is_set():
         return _save(stage="stopped")
     now = _now()

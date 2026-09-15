@@ -209,12 +209,11 @@ def _ds(n_days=5, per_day=400, seed=0):
 
 def test_selector_fold_guards():
     ds = _ds(); days = ds.days
-    fo = selector.fold(ds, days[-1], 0.05, min_train=100, min_test=10)
-    assert fo is not None and fo.auc is not None and fo.auc > 0.7 and fo.pick.any() and not (fo.pick & ~fo.test).any()
-    assert selector.fold(ds, days[0], 0.05, min_train=100, min_test=10) is None                  # empty train
-    assert selector.fold(ds, days[-1], 0.05) is None                                                # below the default sizes
-    ds.y[ds.day == days[-1]] = 0
-    assert selector.fold(ds, days[-1], 0.05, min_train=100, min_test=10).auc is None              # single-class test day: no crash
+    fo = selector.fold(ds, days[-1], min_train=100, min_test=10)
+    pick = fo.test & (fo.scores >= selector.MIN_EV)
+    assert fo is not None and fo.ic is not None and fo.ic > 0.5 and pick.any() and np.isnan(fo.scores[~fo.test]).all()
+    assert selector.fold(ds, days[0], min_train=100, min_test=10) is None                         # empty train
+    assert selector.fold(ds, days[-1]) is None                                                      # below the default sizes
     from fly_trader.train import selector_eval                                                      # importable: runs only as a script
     assert selector_eval.fold is selector.fold
 
@@ -222,7 +221,16 @@ def test_selector_fold_guards():
 def test_selector_trades_only_aged_tokens():
     ds = _ds(); days = ds.days; young = (ds.mint == "M0")
     ds.X[young, 3] = 1.0; ds.X[young, 4] = np.log1p(2.0)                                           # M0: known graduation, 2 h old
-    fo = selector.fold(ds, days[-1], 0.05, min_train=100, min_test=10)
-    assert fo.pick.any() and not (fo.pick & young).any() and not (fo.test & young).any()           # never a test row or a pick
+    fo = selector.fold(ds, days[-1], min_train=100, min_test=10); pick = fo.test & (fo.scores >= selector.MIN_EV)
+    assert pick.any() and not (pick & young).any() and not (fo.test & young).any()                 # never a test row or a pick
     assert list(selector.in_universe(np.array([[0, 0, 0, 1, np.log1p(30.0)], [0, 0, 0, 1, np.log1p(5.0)], [0, 0, 0, 0, 0]]), ds.cols)) == [True, False, True]
-    assert fo.model.kind == "ev" and fo.model.threshold == selector.MIN_EV
+    assert fo.model.threshold == selector.MIN_EV and fo.model.scaler is not None
+
+
+def test_buy_line_is_chosen_by_total_profit():
+    ds = _ds(); rows = np.ones(len(ds.y), bool)
+    scores = ds.fwd_pess.astype(np.float64) - 0.01                                                 # good rows +4 %, bad rows -3 %
+    line, table = selector.choose_line(ds, scores, rows)
+    assert line in selector.LINE_CANDIDATES and [t["line"] for t in table] == list(selector.LINE_CANDIDATES)
+    best = max((t for t in table if t["trades"] >= selector.MIN_LINE_TRADES), key=lambda t: t["total"])
+    assert line == best["line"] and best["mean"] > 0

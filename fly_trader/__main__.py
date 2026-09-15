@@ -174,14 +174,14 @@ def _cmd_train_selector(args):
     from .logging_setup import setup
     from .train import selector
     setup("train")
-    selector.main(days=args.days, top_frac=args.top_frac)
+    selector.main(days=args.days)
 
 
 def _cmd_train_fly_selector(args):
     from .logging_setup import setup
     from .train import fly_selector
     setup("train")
-    fly_selector.main(days=args.days, test_days=args.test_days, top_frac=args.top_frac, epochs=args.epochs, rows_per_epoch=args.rows)
+    fly_selector.main(days=args.days, test_days=args.test_days, line=args.line, epochs=args.epochs)
 
 
 def _cmd_selector_eval(args):
@@ -235,10 +235,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("build-mature").set_defaults(fn=_cmd_build_mature)
     sub.add_parser("selector-eval").set_defaults(fn=_cmd_selector_eval)
     ts_ = sub.add_parser("train-selector"); ts_.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
-    ts_.add_argument("--top-frac", type=float, default=0.01); ts_.set_defaults(fn=_cmd_train_selector)
+    ts_.set_defaults(fn=_cmd_train_selector)
     tf_ = sub.add_parser("train-fly-selector"); tf_.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
-    tf_.add_argument("--test-days", type=int, default=21)
-    tf_.add_argument("--top-frac", type=float, default=0.01); tf_.add_argument("--epochs", type=int, default=2); tf_.add_argument("--rows", type=int, default=600000)
+    tf_.add_argument("--test-days", type=int, default=21); tf_.add_argument("--line", type=float, default=None, help="buy line (default: the selector's)")
+    tf_.add_argument("--epochs", type=int, default=1, help="full passes over every training minute")
     tf_.set_defaults(fn=_cmd_train_fly_selector)
     bc = sub.add_parser("backtest-corpus"); bc.add_argument("--max-tokens", type=int, default=None); bc.add_argument("--days", type=int, default=None)
     bc.add_argument("--fees", default="0.003,0.0055"); bc.add_argument("--only", default=None); bc.add_argument("--universe", default="graduation", choices=["graduation", "mature"]); bc.set_defaults(fn=_cmd_backtest_corpus)

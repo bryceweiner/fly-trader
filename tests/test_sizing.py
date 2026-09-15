@@ -50,3 +50,6 @@ def test_bankroll_replay_enforces_cash_and_compounds(monkeypatch):
     table = [{"lo": 0.0, "n": 200, "mean": 0.05, "win": 1.0, "kelly": 0.99}]
     sized = sizing.simulate_bankroll(ts, 1800.0, m, r, table, start_sol=5.0); fixed = sizing.simulate_bankroll(ts, 1800.0, m, r, None, start_sol=5.0)
     assert sized["final_sol"] > fixed["final_sol"] > 5.0 and sized["max_drawdown"] == 0.0 and sized["trades"] == 200
+    monkeypatch.setattr(config, "MAX_POOL_SHARE", 0.02)
+    shallow = sizing.simulate_bankroll(ts, 1800.0, m, r, table, start_sol=5.0, res_quote=np.full(200, 1.0))   # 1 SOL pools: 0.02 SOL cap
+    assert shallow["final_sol"] < sized["final_sol"] and shallow["trades"] == 200                            # the pool-depth cap binds, as live

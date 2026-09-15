@@ -81,9 +81,10 @@ def size_position(score: float, threshold: float, table: list[dict] | None, bank
 
 
 def simulate_bankroll(ts: np.ndarray, horizon_s: float, margins: np.ndarray, returns: np.ndarray, table: list[dict] | None,
-                      start_sol: float | None = None) -> dict:
-    """Replay out-of-sample trades in entry order with the sizing rule (positions overlap for ``horizon_s``; cash and the
-    reserve are enforced; pool depth is not known here). Returns the final bankroll, its multiple and the worst drawdown."""
+                      start_sol: float | None = None, res_quote: np.ndarray | None = None) -> dict:
+    """Replay out-of-sample trades in entry order with the sizing rule (positions overlap for ``horizon_s``; cash, the
+    reserve and — given ``res_quote``, each trade's pool quote reserve — the pool-depth cap are enforced, as live).
+    Returns the final bankroll, its multiple and the worst drawdown."""
     start = float(start_sol or config.CAPITAL_SOL or 1.0); cash = start; open_: list[tuple[float, float, float]] = []   # (exit_ts, cost, return)
     peak = start; mdd = 0.0; n = 0
     for i in np.argsort(ts, kind="stable"):
@@ -96,7 +97,7 @@ def simulate_bankroll(ts: np.ndarray, horizon_s: float, margins: np.ndarray, ret
                 still.append(x)
         open_ = still
         bankroll = cash + sum(x[1] for x in open_)
-        size, _ = size_position(float(margins[i]), 0.0, table, bankroll, cash, None)
+        size, _ = size_position(float(margins[i]), 0.0, table, bankroll, cash, float(res_quote[i]) if res_quote is not None else None)
         if size > 0:
             cash -= size; open_.append((t + horizon_s, size, float(returns[i]))); n += 1
         w = cash + sum(x[1] for x in open_); peak = max(peak, w); mdd = max(mdd, 1 - w / peak if peak > 0 else 0.0)

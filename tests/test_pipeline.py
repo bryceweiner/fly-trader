@@ -30,10 +30,10 @@ def test_run_trains_selector_then_fly(monkeypatch):
     monkeypatch.setattr(pipeline, "_save", lambda **kv: saved.update(kv) or dict(saved))
     monkeypatch.setattr(pipeline, "record_event", lambda *a, **k: None)
     from fly_trader.train import fly_selector, selector
-    monkeypatch.setattr(selector, "main", lambda stop_event=None: calls.append("selector") or {"snapshot_id": 7, "deployable": False})
-    monkeypatch.setattr(fly_selector, "main", lambda stop_event=None: calls.append("fly") or {"snapshot_id": 8})
+    monkeypatch.setattr(selector, "main", lambda stop_event=None: calls.append("selector") or {"snapshot_id": 7, "deployable": False, "line": 0.005})
+    monkeypatch.setattr(fly_selector, "main", lambda stop_event=None, line=None: calls.append(("fly", line)) or {"snapshot_id": 8})
     out = pipeline.run()
-    assert calls == ["selector", "fly"] and out["selector_snapshot"] == 7 and out["fly_snapshot"] == 8 and out["stage"] == "done"
+    assert calls == ["selector", ("fly", 0.005)] and out["selector_snapshot"] == 7 and out["fly_snapshot"] == 8 and out["stage"] == "done"   # same line
     assert datetime.fromisoformat(out["next_run_at"]) - datetime.fromisoformat(out["last_run_at"]) == timedelta(days=7)
 
 
