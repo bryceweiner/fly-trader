@@ -1,9 +1,9 @@
-"""The selector: a gradient-boosted model of each minute's net 30-minute return (``train/decisions.py``).
+"""The selector: a gradient-boosted model of each minute's net return over the hold (``train/decisions.HOLD_MIN``).
 
-Strategy: the model predicts the net return of buying a token now and selling 30 minutes later, after the paper
-broker's fees and price impact; it trains on every eligible minute. It trades only tokens at least ``MIN_AGE_H`` hours
-past graduation (or graduated before the archive began) — fresh graduations are where the rugs and the 0.5 % Jupiter
-fee are. ``in_universe`` is the one definition of that universe for training, backtest and the live engine.
+Strategy: the model predicts the net return of buying a token now and selling ``HOLD_MIN`` minutes later, after the
+real fees and price impact; it trains on every eligible minute. It trades only tokens at least ``MIN_AGE_H`` hours
+past graduation (or graduated before the archive began) — random entries into younger tokens lose 4–28 % per trade at
+real costs. ``in_universe`` is the one definition of that universe for training, backtest and the live engine.
 
 Trading configuration, shared verbatim with the fly (``train/fly_selector.py``): features robust-scaled
 (``train/scaling.py``); buy when the predicted net return clears the buy line; the line is the one (of
@@ -39,16 +39,16 @@ from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..market.features import FEATURE_VERSION
 from . import progress as prog
-from .decisions import DecisionSet, build, evaluate, random_trades, rank_corr, summarize, taken_rows
+from .decisions import HOLD_MIN, MIN_RESQ_SOL, MIN_VOL_15M_SOL, DecisionSet, build, evaluate, random_trades, rank_corr, summarize, taken_rows
 from .mature import AGG_VERSION
 from .scaling import RobustScaler
 
 log = logging.getLogger(__name__)
 SELECTOR_DIR = config.BRAIN_DIR / "selectors"
 # the data and model definitions a model was trained on; a model from other definitions is never loaded or shown
-DATA_VERSION = {"agg": AGG_VERSION, "features": FEATURE_VERSION, "costs": "real-fees-1", "selector": "ev-aged-2", "fly": "flynet-1"}
+DATA_VERSION = {"agg": AGG_VERSION, "features": FEATURE_VERSION, "costs": "real-fees-1", "selector": "ev-hold120-1", "fly": "flynet-1"}
 WARMUP_DAYS, BLOCK_DAYS = 21, 7      # walk-forward: the first 21 days only train; every later day is tested, refit every 7 days
-MIN_AGE_H = 24.0                     # trade only tokens at least this long past graduation (unknown age = graduated before the archive)
+MIN_AGE_H = 6.0                      # trade only tokens at least this long past graduation (unknown age = graduated before the archive); fitted, see decisions.HOLD_MIN
 MIN_EV = 0.01                        # the buy line of a model before its walk-forward chose one
 LINE_CANDIDATES = (0.0, 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03)
 MIN_LINE_TRADES = 100
@@ -93,7 +93,7 @@ class SelectorModel:
     sizing: list = field(default_factory=list)  # agent/sizing.py table from the backtest's out-of-sample trades
 
     def score(self, X: np.ndarray) -> np.ndarray:
-        """Predicted net 30-minute return."""
+        """Predicted net return over the hold."""
         return self.gbm.predict(self.scaler.transform(X))
 
     def universe(self, X: np.ndarray) -> np.ndarray:
@@ -230,7 +230,7 @@ def load_latest() -> SelectorModel | None:
     return joblib.load(r["path"]) if r else None
 
 
-def main(days: int | None = None, horizon_min: int = 30, stop_event: threading.Event | None = None) -> dict:
+def main(days: int | None = None, horizon_min: int = HOLD_MIN, stop_event: threading.Event | None = None) -> dict:
     """``days``: None = every day of the corpus (the default; a number keeps only the most recent days)."""
     from ..ops.reset import reset_training_stats
     reset_training_stats("selector", reason="selector training")
@@ -256,7 +256,8 @@ def main(days: int | None = None, horizon_min: int = 30, stop_event: threading.E
                  bk["sized"]["multiple"] or 0, bk["sized"]["max_drawdown"] * 100, config.MAX_POSITION_SOL, bk["fixed"]["multiple"] or 0, bk["fixed"]["max_drawdown"] * 100)
     final.metrics = {"walk_forward": p, "random_baseline": rb, "line": wf["line"], "lines": wf["lines"], "selection_days": wf.get("selection_days"),
                      "evaluation_days": wf.get("evaluation_days"), "costs": "real fees (pool fee by market cap, Jupiter 10 bps, network fee) + impact", "data": DATA_VERSION, "deployable": deployable, "deploy_reason": why,
-                     "sizing": wf["sizing"], "bankroll": bk, "model": {"kind": "ev", "line": wf["line"], "min_age_h": MIN_AGE_H},
+                     "sizing": wf["sizing"], "bankroll": bk, "model": {"kind": "ev", "line": wf["line"], "min_age_h": MIN_AGE_H,
+                                                                               "min_resq_sol": MIN_RESQ_SOL, "min_vol_15m_sol": MIN_VOL_15M_SOL},
                      "ic_by_day": wf["ic"], "rows": int(len(ds.y)), "days": len(ds.days), "first_day": str(ds.days[0]), "last_day": str(ds.days[-1])}
     path, sid = save(final)
     record_event("info", "selector", f"selector saved (snapshot {sid})", {"path": str(path), "line": final.threshold, "deployable": deployable, "reason": why, **p})

@@ -5,7 +5,7 @@ scaler) are injected in full — every feature, no bottleneck — into the 5,460
 learned projection; activity propagates ``K_STEPS`` steps along the real, signed synapses (leaky tanh rate units,
 synaptic magnitudes initialised from synapse counts, signs and topology fixed); the 1,303 descending neurons'
 activity is normalised with running statistics (homeostasis: the signal reaching the output is weak, so it is
-rescaled rather than lost); a non-saturating decoder (GELU) and a linear head give the predicted net 30-minute return.
+rescaled rather than lost); a non-saturating decoder (GELU) and a linear head give the predicted net return over the hold.
 The head starts at the mean target.
 
 Training (distillation, full budget): every training minute, in every epoch (``EPOCHS``), shuffled; target = the
@@ -42,7 +42,7 @@ from ..db.apilog import record_event
 from ..db.connection import transaction
 from . import progress as prog
 from . import selector
-from .decisions import DecisionSet, build, evaluate, random_trades, rank_corr, summarize, taken_rows
+from .decisions import HOLD_MIN, DecisionSet, build, evaluate, random_trades, rank_corr, summarize, taken_rows
 from .scaling import RobustScaler
 
 log = logging.getLogger(__name__)
@@ -100,7 +100,7 @@ class FlyModel:
 
     @torch.no_grad()
     def score(self, X: np.ndarray, batch: int = 2048) -> np.ndarray:
-        """Predicted net 30-minute return."""
+        """Predicted net return over the hold."""
         self.net.eval(); out = np.empty(len(X), np.float64)
         for i in range(0, len(X), batch):
             out[i:i + batch] = (self.net(torch.tensor(self.scaler.transform(X[i:i + batch]), device=self.net.dev)) / SCALE).float().cpu().numpy()
@@ -175,7 +175,7 @@ def save(fly: FlyModel, metrics: dict, run_id: str | None = None) -> tuple[Path,
     return path, int(row["id"])
 
 
-def main(days: int | None = None, test_days: int = 21, line: float | None = None, epochs: int = EPOCHS, horizon_min: int = 30,
+def main(days: int | None = None, test_days: int = 21, line: float | None = None, epochs: int = EPOCHS, horizon_min: int = HOLD_MIN,
          stop_event: threading.Event | None = None) -> dict:
     """Train on every day before the last ``test_days`` (one-day purge), score both models on the last ``test_days``
     at the same buy line (``line``: the selector's walk-forward choice)."""

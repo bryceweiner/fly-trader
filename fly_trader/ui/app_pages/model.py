@@ -60,9 +60,9 @@ def loaded() -> None:
             with st.container(horizontal=True):
                 mi = meta.get("model") or {}
                 st.metric("Buys when predicted return ≥", pct(float(run.get('threshold') or meta.get('threshold') or 0), 1),
-                          help=f"Each minute the model predicts every eligible token's net 30-minute return after fees and price impact. It buys tokens at least "
-                               f"{mi.get('min_age_h', 24):g} h past graduation (or older than the archive) whose prediction clears this line.")
-                st.metric("Holds for", f"{run.get('horizon_min') or meta.get('horizon_min') or 30} min", help="Each position is sold this long after the buy.")
+                          help=f"Each minute the model predicts every eligible token's net return over the hold after fees and price impact. It buys tokens at least "
+                               f"{mi.get('min_age_h', '—')} h past graduation (or older than the archive) whose prediction clears this line.")
+                st.metric("Holds for", f"{run.get('horizon_min') or meta.get('horizon_min') or '—'} min", help="Each position is sold this long after the buy.")
                 st.metric("Test trades", wf.get("n", "—"), help=f"Trades on the backtest's evaluation half ({wf.get('days', '—')} days), each traded by a model that never saw "
                                                                 "that day, at a buy line chosen on the earlier selection half.")
                 st.metric("Average per trade", pct(wf.get("mean")), delta=(f"random {pct(rb['mean'])}" if rb.get("mean") is not None else None), delta_color="off",

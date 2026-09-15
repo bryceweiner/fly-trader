@@ -15,8 +15,8 @@ def narrative(s: dict) -> str:
         run = m.get("run") or {}; meta = m["meta"]
         money = "No real money is at risk." if not s["live_money"] else "Trades spend real SOL from the bot wallet."
         lines.append(f"**{s['trading_why']}** The selector is paper trading with model **#{m['id']}** (trained through {meta.get('trained_through', '—')}). "
-                     f"Every minute it predicts the net 30-minute return of each PumpSwap token that traded, at least {(meta.get('model') or {}).get('min_age_h', 24):g} hours "
-                     f"past graduation, with a pool of at least 20 SOL and 5 SOL traded in the last 15 minutes, and buys those predicted to make at least "
+                     f"Every minute it predicts the net {meta.get('horizon_min', '—')}-minute return of each PumpSwap token that traded, at least {(meta.get('model') or {}).get('min_age_h', '—')} hours "
+                     f"past graduation, with a pool of at least {(meta.get('model') or {}).get('min_resq_sol', '—')} SOL and {(meta.get('model') or {}).get('min_vol_15m_sol', '—')} SOL traded in the last 15 minutes, and buys those predicted to make at least "
                      f"**{pct(float(run.get('threshold') or meta.get('threshold') or 0), 1)}** — sized by how certain the "
                      f"model is (up to {config.MAX_POSITION_FRACTION:.0%} of the bankroll, never the {config.GAS_RESERVE_SOL:g} SOL gas reserve) — "
                      f"and sells it **{run.get('horizon_min') or meta.get('horizon_min') or 30} minutes** later. {money}")

@@ -2,11 +2,11 @@
 
 Rows come from ``train/mature.py`` feature parts (pump.fun-origin PumpSwap tokens of any age, 1-minute candles
 fed through the live feature engine) joined with ``corpus_meta`` creation-time and creator columns. Eligible =
-pool ≥ 20 SOL, 15-minute volume ≥ 5 SOL, contamination-free series, and a full label horizon ahead.
+pool ≥ ``MIN_RESQ_SOL``, 15-minute volume ≥ ``MIN_VOL_15M_SOL``, contamination-free series, and a full label horizon ahead.
 Label: net forward return over ``horizon_min`` (fill at the signal minute's close; ``fwd_pess`` fills at the
 next traded minute's open) after trading costs; ``y`` = return above ``label_thr``. Costs default to the paper
-broker's model on both sides (``exit_cost_0p1``: Jupiter fee by token age + pool fee + constant-product impact of a
-0.1 SOL position; entry at the signal minute, exit at the exit minute) — the same costs the paper book pays. A flat
+broker's model on both sides (``exit_cost_0p1``: the real fees — pool fee tier by market cap, Jupiter 10 bps, network
+fee — + constant-product impact of a 0.1 SOL position; entry at the signal minute, exit at the exit minute) — the same costs the paper book pays. A flat
 ``fee`` round trip can be given instead (tests, sensitivity runs). ``random_trades`` is the no-skill baseline.
 """
 from __future__ import annotations
@@ -28,7 +28,12 @@ from .mature import part_current
 
 EXTRA_COLS = ["traders_15m", "traders_1h", "n_trades_1m", "hod_s", "hod_c", "age_known", "meta_known"]
 X_COLS = FEATURES + EXTRA_COLS + META_COLS
-MIN_RESQ_SOL, MIN_VOL_15M_SOL = 20.0, 5.0
+# Hold and gates fitted to the market at real costs (2026-09-15 sweep over 149 days: holds 10–240 min × age × pool ×
+# 15-min volume × buy line, walk-forward): a 120-minute hold with pools ≥ 10 SOL and ≥ 5 SOL traded in 15 minutes (and
+# tokens ≥ 6 h past graduation, train/selector.MIN_AGE_H) made money in every month and on 46–49 of 64 days in each
+# half; the old 30 min / 20 SOL / 24 h lost money May–July.
+HOLD_MIN = 120
+MIN_RESQ_SOL, MIN_VOL_15M_SOL = 10.0, 5.0
 
 
 @dataclass
@@ -56,7 +61,7 @@ class DecisionSet:
         return m
 
 
-def build(days: int | None = 45, horizon_min: int = 30, fee: float | None = None, label_thr: float = 0.03, feature_dir=None) -> DecisionSet:
+def build(days: int | None = 45, horizon_min: int = HOLD_MIN, fee: float | None = None, label_thr: float = 0.03, feature_dir=None) -> DecisionSet:
     root = feature_dir or (config.CORPUS_DIR / "features_mature")
     files = sorted(glob.glob(str(root / "*" / "part.parquet")))
     if days:
