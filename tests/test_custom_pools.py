@@ -71,7 +71,7 @@ def test_aggregate_day_excludes_custom_pools(db_conn, tmp_path, monkeypatch):
         assert mature.aggregate_day(d) == 3
         out = pq.read_table(tmp_path / "mature" / f"{d.isoformat()}.parquet").to_pandas()
         assert set(out["mint"]) == {"Xpump"} and (out["close"] == 1.0).all() and len(out) == 3
-        assert mature.part_version(tmp_path / "mature" / f"{d.isoformat()}.parquet") == mature.AGG_VERSION == 3
+        assert mature.part_version(tmp_path / "mature" / f"{d.isoformat()}.parquet") == mature.AGG_VERSION == 4
     finally:
         db_conn.execute("DELETE FROM pump_pools WHERE pool_id = 'AGG_BAD'"); db_conn.execute("DELETE FROM mature_days WHERE day = %s", (d,)); db_conn.commit()
 

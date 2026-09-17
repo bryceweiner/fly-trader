@@ -87,14 +87,15 @@ def book() -> None:
     with right:
         with st.container(border=True):
             st.markdown("**Open positions**")
-            rows = q("SELECT mint, opened_at, cost_sol, entry_price, last_mark_price FROM positions WHERE book = %s AND status = 'open' ORDER BY opened_at", (BOOK,))
+            rows = q("SELECT mint, opened_at, cost_sol, entry_price, last_mark_price, hold_s, strategy FROM positions WHERE book = %s AND status = 'open' ORDER BY opened_at", (BOOK,))
             if not rows:
                 st.caption("None open.")
             else:
                 hold = int((system_state().get("model") or {}).get("run", {}).get("horizon_min") or 30)
                 now = datetime.now(timezone.utc); names = labels([r["mint"] for r in rows])
-                df = pd.DataFrame([{"token": names.get(r["mint"], r["mint"][:6]), "held (min)": (now - r["opened_at"]).total_seconds() / 60,
-                                    "exits in (min)": max(0.0, hold - (now - r["opened_at"]).total_seconds() / 60), "cost (SOL)": float(r["cost_sol"]),
+                df = pd.DataFrame([{"token": names.get(r["mint"], r["mint"][:6]), "strategy": r["strategy"] or "—", "held (min)": (now - r["opened_at"]).total_seconds() / 60,
+                                    "exits in (min)": max(0.0, (float(r["hold_s"]) / 60 if r["hold_s"] else hold) - (now - r["opened_at"]).total_seconds() / 60),
+                                    "cost (SOL)": float(r["cost_sol"]),
                                     "return": (float(r["last_mark_price"]) / float(r["entry_price"]) - 1) * 100 if r["entry_price"] and r["last_mark_price"] else None}
                                    for r in rows])
                 st.dataframe(df, hide_index=True, column_config={"held (min)": st.column_config.NumberColumn(format="%.0f"),

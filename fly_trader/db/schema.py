@@ -17,7 +17,7 @@ from .connection import connect, database_name, database_url
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5          # 5: the plastic fly's tables and per-book halts (BASE_DDL)
+SCHEMA_VERSION = 6          # 5: the plastic fly's tables and per-book halts (BASE_DDL); 6: the selector's strategy stack (MIGRATIONS[6])
 _LOCK_KEY = 0x666C795F6D6967  # "fly_mig"
 
 BASE_DDL: list[str] = [
@@ -241,6 +241,26 @@ MIGRATIONS: dict[int, list[str]] = {
     2: ["ALTER TABLE beat_slots ALTER COLUMN feature_mask TYPE bigint"],
     3: ["ALTER TABLE positions ADD COLUMN IF NOT EXISTS satiety double precision NOT NULL DEFAULT 0"],
     4: ["ALTER TABLE pump_minutes ADD COLUMN IF NOT EXISTS fee_rate double precision"],       # the pool fee the stream reports as charged
+    # 6: the selector's strategy stack — per-minute wallet flow (train/flow.py), graduation-time curve facts and insiders
+    # (train/corpus_meta.py), per-position hold and strategy, the fly's per-strategy scored rows
+    6: ["ALTER TABLE pump_minutes ADD COLUMN IF NOT EXISTS n_buyers int",
+        "ALTER TABLE pump_minutes ADD COLUMN IF NOT EXISTS wash_sol double precision",
+        "ALTER TABLE pump_minutes ADD COLUMN IF NOT EXISTS wash_buy_sol double precision",
+        "ALTER TABLE pump_minutes ADD COLUMN IF NOT EXISTS top_sell_sol double precision",
+        "ALTER TABLE pump_minutes ADD COLUMN IF NOT EXISTS insider_sell_sol double precision",
+        "ALTER TABLE pump_minutes ADD COLUMN IF NOT EXISTS skill_buy real[]",
+        "ALTER TABLE corpus_meta ADD COLUMN IF NOT EXISTS bundle_share real",
+        "ALTER TABLE corpus_meta ADD COLUMN IF NOT EXISTS dev_hold_share real",
+        "ALTER TABLE corpus_meta ADD COLUMN IF NOT EXISTS dev_sold_frac real",
+        "ALTER TABLE corpus_meta ADD COLUMN IF NOT EXISTS grad_hhi real",
+        "ALTER TABLE corpus_meta ADD COLUMN IF NOT EXISTS curve_known boolean",
+        "CREATE TABLE IF NOT EXISTS token_insiders (mint text NOT NULL, wallet text NOT NULL, kind text NOT NULL, PRIMARY KEY (mint, wallet))",
+        "ALTER TABLE positions ADD COLUMN IF NOT EXISTS hold_s double precision",
+        "ALTER TABLE positions ADD COLUMN IF NOT EXISTS strategy text",
+        "ALTER TABLE fly_scored ADD COLUMN IF NOT EXISTS strategy text NOT NULL DEFAULT 'ev'",
+        "ALTER TABLE fly_scored ADD COLUMN IF NOT EXISTS hold_min int",
+        "ALTER TABLE fly_scored DROP CONSTRAINT IF EXISTS fly_scored_pkey",
+        "ALTER TABLE fly_scored ADD PRIMARY KEY (ts, mint, strategy)"],
 }
 
 

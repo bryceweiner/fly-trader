@@ -177,6 +177,7 @@ CORPUS_FEATURES_DIR = CORPUS_DIR / "features"
 REPLAY_URL = env_str("REPLAY_URL", "https://replay.pumpapi.io")
 REPLAY_START = env_str("REPLAY_START", "2026-04-18")
 REPLAY_PARALLEL = env_int("REPLAY_PARALLEL", 4)                     # concurrent hour downloads (~2-4 MB/s each)
+REPLAY_ASSEMBLE = env_bool("REPLAY_ASSEMBLE", True)                  # 0: download and parse only (no assembly / corpus_meta / mature rounds)
 REPLAY_DIR = CORPUS_DIR / "replay"
 CORPUS_PULL_BEFORE = env_str("CORPUS_PULL_BEFORE", REPLAY_START)     # swap-api puller only handles graduations before the replay archive begins
 

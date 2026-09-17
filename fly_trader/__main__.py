@@ -105,6 +105,19 @@ def _cmd_build_corpus_features(args):
     corpus_features.main()
 
 
+def _cmd_refetch_pool_ids(args):
+    from .ingest import replay_pull
+    print(f"{replay_pull.refetch_missing_pool_id()} archive hours marked for re-download (run the replay worker or fly-trader replay-pull)")
+
+
+def _cmd_fit_wallet_skill(args):
+    from .logging_setup import setup
+    from .train import wallet_skill
+    setup("train")
+    out = wallet_skill.fit(days=args.days)
+    print(json.dumps({k: out.get(k) for k in ("h", "L", "selection", "evaluation", "baseline", "beats_baseline", "candidates", "stopped")}, indent=1, default=str))
+
+
 def _cmd_train_selector(args):
     from .logging_setup import setup
     from .train import selector
@@ -169,6 +182,9 @@ def build_parser() -> argparse.ArgumentParser:
     w = sub.add_parser("wallet"); w.add_argument("action", choices=["new", "show"]); w.set_defaults(fn=_cmd_wallet)
     d = sub.add_parser("discover"); d.add_argument("--once", action="store_true"); d.set_defaults(fn=_cmd_discover)
     sub.add_parser("replay-pull").set_defaults(fn=_cmd_replay_pull)
+    sub.add_parser("refetch-pool-ids", help="mark archive hours without pool_id for re-download").set_defaults(fn=_cmd_refetch_pool_ids)
+    fw = sub.add_parser("fit-wallet-skill", help="fit the wallet-skill tables' hold and lookback by the selector's objective (one-off, many hours, resumable)")
+    fw.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)"); fw.set_defaults(fn=_cmd_fit_wallet_skill)
     sub.add_parser("pumpstream").set_defaults(fn=_cmd_pumpstream)
     sub.add_parser("build-corpus-features").set_defaults(fn=_cmd_build_corpus_features)
     sub.add_parser("assemble-replay").set_defaults(fn=_cmd_assemble_replay)

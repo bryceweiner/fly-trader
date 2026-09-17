@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import glob
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 
 import numpy as np
@@ -23,7 +23,8 @@ import pyarrow.parquet as pq
 from .. import config
 from ..market.features import FEATURE_VERSION, FEATURES
 from .corpus_features import _epoch_s
-from .corpus_meta import FEATURE_COLS as META_COLS, load_features
+from .corpus_meta import CURVE_COLS, FEATURE_COLS as META_COLS, load_features
+from .flow import FLOW_COLS, MARKET_COLS, SKILL_COLS
 from .mature import part_current
 
 EXTRA_COLS = ["traders_15m", "traders_1h", "n_trades_1m", "hod_s", "hod_c", "age_known", "meta_known"]
@@ -37,8 +38,16 @@ DROPPED_COLS = frozenset(["logsigners_15m", "logsigners_1h", "hawkes", "log_sinc
                           "organic_score", "log_holders", "log_liq_usd", "top_holders_pct", "dev_balance_pct", "is_sus", "is_verified",
                           "net_buyers_1h", "holder_change_1h", "price_change_24h", "token2022",
                           "rvol_5m", "rvol_15m", "rvol_1h", "rvol_3h",
-                          "prior_launches", "prior_grads", "prior_known", "prior_rug_share", "prior_moon_share"])
-X_COLS = [c for c in FEATURES + EXTRA_COLS + META_COLS if c not in DROPPED_COLS]
+                          "prior_launches", "prior_grads", "prior_moon_share"])
+# Input groups of the strategy stack (2026-09-15), each kept only if the walk-forward objective says so (train/selector.py):
+# rug — graduation-time curve facts, the creator's rug history and insider selling; flow — wallet flow and market volume;
+# skill — buying by skilled wallets. LEGACY_COLS are the 37 inputs of the single-strategy selector.
+GROUPS = {"rug": [*CURVE_COLS, "curve_known", "prior_rug_share", "prior_known", "insider_sell_share_1m", "log_insider_sell_15m"],
+          "flow": ["top_sell_share_1m", "buyers_ret", "buyers_slope", "org_imb_5m", "org_imb_15m", "wash_share_15m", "log_org_vol_15m", *MARKET_COLS],
+          "skill": list(SKILL_COLS)}
+_GROUPED = {c for g in GROUPS.values() for c in g}
+LEGACY_COLS = [c for c in FEATURES + EXTRA_COLS + META_COLS if c not in DROPPED_COLS and c not in _GROUPED]
+X_COLS = LEGACY_COLS + [c for g in GROUPS.values() for c in g]
 # Hold and gates fitted to the market at real costs (2026-09-15 sweep over 149 days: holds 10–240 min × age × pool ×
 # 15-min volume × buy line, walk-forward): a 120-minute hold with pools ≥ 10 SOL and ≥ 5 SOL traded in 15 minutes (and
 # tokens ≥ 6 h past graduation, train/selector.MIN_AGE_H) made money in every month and on 46–49 of 64 days in each
@@ -58,10 +67,17 @@ class DecisionSet:
     mint: np.ndarray       # [N] str
     cols: list[str]
     horizon_s: float
+    fwd_h: dict = field(default_factory=dict)    # hold (min) → [N] float32 net return (next-open fill) over that hold; NaN past the data
 
     @property
     def days(self) -> list[date]:
         return sorted(set(self.day.tolist()))
+
+    def subset(self, mask: np.ndarray) -> "DecisionSet":
+        """The rows of ``mask`` (e.g. the days before a bootstrap), labels for every hold included."""
+        m = np.asarray(mask, dtype=bool)
+        return DecisionSet(X=self.X[m], y=self.y[m], fwd=self.fwd[m], fwd_pess=self.fwd_pess[m], day=self.day[m], ts=self.ts[m], mint=self.mint[m],
+                           cols=list(self.cols), horizon_s=self.horizon_s, fwd_h={h: v[m] for h, v in self.fwd_h.items()})
 
     def mask_days(self, lo: date | None = None, hi: date | None = None) -> np.ndarray:
         m = np.ones(len(self.y), bool)
@@ -72,7 +88,8 @@ class DecisionSet:
         return m
 
 
-def build(days: int | None = 45, horizon_min: int = HOLD_MIN, fee: float | None = None, label_thr: float = 0.03, feature_dir=None) -> DecisionSet:
+def build(days: int | None = 45, horizon_min: int = HOLD_MIN, fee: float | None = None, label_thr: float = 0.03, feature_dir=None, holds=None) -> DecisionSet:
+    """``holds``: extra holds (minutes) whose labels are computed in the same pass (``DecisionSet.fwd_h``)."""
     root = feature_dir or (config.CORPUS_DIR / "features_mature")
     files = sorted(glob.glob(str(root / "*" / "part.parquet")))
     if days:
@@ -82,8 +99,13 @@ def build(days: int | None = 45, horizon_min: int = HOLD_MIN, fee: float | None 
     stale = [f for f in files if not part_current(f)]
     if stale:
         raise RuntimeError(f"{len(stale)} feature part(s) were built with another feature or aggregation version (e.g. {stale[0]}); run build-mature")
-    need = ["mint", "ts", "open", "close", "resq", "age_h", "traders_15m", "traders_1h", "n_trades_1m"] + FEATURES
-    df = pd.concat([pq.read_table(f, columns=need).to_pandas() for f in files], ignore_index=True).sort_values(["mint", "ts"]).reset_index(drop=True)
+    need = ["mint", "ts", "open", "close", "resq", "age_h", "traders_15m", "traders_1h", "n_trades_1m"] + FEATURES + FLOW_COLS + SKILL_COLS + MARKET_COLS
+    optional = set(FLOW_COLS + SKILL_COLS + MARKET_COLS)      # parts that predate the wallet-flow columns (tests' synthetic parts) read as 0
+    df = pd.concat([pq.read_table(f, columns=[c for c in need if c not in optional or c in pq.read_schema(f).names]).to_pandas() for f in files],
+                   ignore_index=True).sort_values(["mint", "ts"]).reset_index(drop=True)
+    for c in optional:
+        if c not in df:
+            df[c] = 0.0
     # a mint whose series breaks scale (secondary pool in another quote, impossible reserve) is ineligible FROM THAT MINUTE ON —
     # never before it, so no decision row is judged with the token's future (rows before a dump keep their labels)
     jump = (df["close"] / df.groupby("mint")["close"].shift(1)).fillna(1.0)
@@ -95,6 +117,7 @@ def build(days: int | None = 45, horizon_min: int = HOLD_MIN, fee: float | None 
     ts = _epoch_s(df["ts"]); cl = df["close"].to_numpy(); op = df["open"].to_numpy()
     mints = df["mint"].to_numpy(); starts = np.r_[0, np.flatnonzero(mints[1:] != mints[:-1]) + 1, len(mints)]
     fwd = np.full(len(df), np.nan); fwdp = np.full(len(df), np.nan)
+    hold_list = sorted({int(h) for h in (holds or [])}); fh = {h: np.full(len(df), np.nan) for h in hold_list}
     ec = np.clip(df["exit_cost_0p1"].to_numpy(dtype=float), 0.0, 1.0) if fee is None else None   # one-side cost fraction per minute
     for s, e in zip(starts[:-1], starts[1:]):
         t = ts[s:e]; j = np.searchsorted(t, t + H, side="right") - 1 + s
@@ -111,6 +134,13 @@ def build(days: int | None = 45, horizon_min: int = HOLD_MIN, fee: float | None 
             nxt_ok = np.r_[np.diff(t) <= 120.0, False]
             idx = np.flatnonzero(nxt_ok); entry[idx] = op[s + idx + 1]
         fwdp[s:e] = exit_px / entry * keep - 1
+        for hm in hold_list:                         # the same label for another hold: exit at the last close at or before t + hold
+            jh = np.searchsorted(t, t + hm * 60.0, side="right") - 1 + s
+            kh = (1 - ec[s:e]) * (1 - ec[jh]) if fee is None else 1 - fee
+            v = cl[jh] / entry * kh - 1
+            if e - s > 2:
+                v[spike[jh - s]] = np.nan
+            fh[hm][s:e] = v
     hod = df["ts"].dt.hour + df["ts"].dt.minute / 60.0
     df["hod_s"], df["hod_c"] = np.sin(2 * np.pi * hod / 24), np.cos(2 * np.pi * hod / 24)
     df["age_known"] = df["age_h"].notna().astype(np.float32)
@@ -118,10 +148,13 @@ def build(days: int | None = 45, horizon_min: int = HOLD_MIN, fee: float | None 
     last_ts = df["ts"].max()
     elig = (np.isfinite(df["resq"]) & (df["resq"] >= MIN_RESQ_SOL) & (df["logvol_15m"] >= math.log1p(MIN_VOL_15M_SOL))
             & np.isfinite(fwd) & (df["ts"] < last_ts - pd.Timedelta(minutes=horizon_min + 5))).to_numpy() & ~broken
+    for hm in hold_list:                             # no label where that hold runs past the data
+        fh[hm][(df["ts"] >= last_ts - pd.Timedelta(minutes=hm + 5)).to_numpy()] = np.nan
     df = df[elig].reset_index(drop=True); fwd = fwd[elig]; fwdp = fwdp[elig]; ts = ts[elig]
     X = df[X_COLS].astype(np.float32).replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy()
     return DecisionSet(X=X, y=(fwd > label_thr).astype(np.int8), fwd=fwd.astype(np.float32), fwd_pess=fwdp.astype(np.float32),
-                       day=df["ts"].dt.date.to_numpy(), ts=ts, mint=df["mint"].to_numpy(), cols=list(X_COLS), horizon_s=H)
+                       day=df["ts"].dt.date.to_numpy(), ts=ts, mint=df["mint"].to_numpy(), cols=list(X_COLS), horizon_s=H,
+                       fwd_h={hm: fh[hm][elig].astype(np.float32) for hm in hold_list})
 
 
 def taken_idx(ts: np.ndarray, mint: np.ndarray, horizon_s: float, idx: np.ndarray) -> np.ndarray:
@@ -133,11 +166,13 @@ def taken_idx(ts: np.ndarray, mint: np.ndarray, horizon_s: float, idx: np.ndarra
         return idx
     idx = idx[np.lexsort((ts[idx], mint[idx]))]
     t = np.asarray(ts[idx], dtype=np.float64); m = mint[idx]
+    hv = np.asarray(horizon_s, dtype=np.float64)       # a scalar, or one hold per row of ``ts`` (each position exits after its own)
+    hs = np.full(len(idx), float(hv)) if hv.ndim == 0 else hv[idx]
     first = np.r_[True, m[1:] != m[:-1]]; gid = np.cumsum(first) - 1; starts = np.flatnonzero(first)
     ends = np.r_[starts[1:], len(idx)]
-    span = float(t.max() - t.min()) + horizon_s + 1.0
+    span = float(t.max() - t.min()) + float(hs.max()) + 1.0
     key = gid * span + (t - t.min())                  # sorted: (token, time) in one exact float64 key
-    nxt = np.searchsorted(key, key + horizon_s, side="left")
+    nxt = np.searchsorted(key, key + hs, side="left")
     has_next = nxt < ends[gid]
     out = []; frontier = starts
     while len(frontier):
@@ -146,30 +181,22 @@ def taken_idx(ts: np.ndarray, mint: np.ndarray, horizon_s: float, idx: np.ndarra
     return idx[np.sort(np.concatenate(out))]
 
 
-def taken_rows(ds: DecisionSet, pick: np.ndarray) -> np.ndarray:
-    """Row indices of the trades a picker takes (the same rule as ``trades_from_picks``)."""
-    return taken_idx(ds.ts, ds.mint, ds.horizon_s, np.flatnonzero(pick))
+def taken_rows(ds: DecisionSet, pick: np.ndarray, hold_s=None) -> np.ndarray:
+    """Row indices of the trades a picker takes (the same rule as ``trades_from_picks``); ``hold_s``: per-row holds."""
+    return taken_idx(ds.ts, ds.mint, ds.horizon_s if hold_s is None else hold_s, np.flatnonzero(pick))
 
 
-def trades_from_picks(ds: DecisionSet, pick: np.ndarray, returns: np.ndarray | None = None, with_days: bool = False):
-    """Net returns of the trades a picker would take: one position per token, re-entry only after the hold.
-    With ``with_days`` also returns the entry day of each trade (so per-day tables respect holds across midnight)."""
+def trades_from_picks(ds: DecisionSet, pick: np.ndarray, returns: np.ndarray | None = None, with_days: bool = False, hold_s=None):
+    """Net returns of the trades a picker would take: one position per token, re-entry only after the hold (``hold_s``:
+    per-row holds, each position exits after its own). With ``with_days`` also returns the entry day of each trade (so
+    per-day tables respect holds across midnight)."""
     r_all = ds.fwd_pess if returns is None else returns
-    idx = np.flatnonzero(pick)
-    if len(idx) == 0:
-        return (np.array([], dtype=np.float32), np.array([], dtype=object)) if with_days else np.array([], dtype=np.float32)
-    order = np.lexsort((ds.ts[idx], ds.mint[idx])); idx = idx[order]
-    out = []; days = []; last_mint = None; last_t = -1e18
-    for i in idx:
-        if ds.mint[i] != last_mint:
-            last_mint = ds.mint[i]; last_t = -1e18
-        if ds.ts[i] >= last_t + ds.horizon_s:
-            out.append(r_all[i]); days.append(ds.day[i]); last_t = ds.ts[i]
-    r = np.asarray(out, dtype=np.float32)
-    return (r, np.asarray(days, dtype=object)) if with_days else r
+    tr = taken_idx(ds.ts, ds.mint, ds.horizon_s if hold_s is None else hold_s, np.flatnonzero(pick))
+    r = np.asarray(r_all[tr], dtype=np.float32)
+    return (r, np.asarray(ds.day[tr], dtype=object)) if with_days else r
 
 
-def random_trades(ds: DecisionSet, rows: np.ndarray, n_picks: int, seeds: int = 20) -> np.ndarray:
+def random_trades(ds: DecisionSet, rows: np.ndarray, n_picks: int, seeds: int = 20, hold_s=None, returns: np.ndarray | None = None) -> np.ndarray:
     """The no-skill baseline: ``n_picks`` random minutes among ``rows`` (the model's pick count on the same eligible
     minutes), traded with the same hold rule, fills and costs; ``seeds`` draws pooled."""
     idx = np.flatnonzero(rows)
@@ -178,7 +205,7 @@ def random_trades(ds: DecisionSet, rows: np.ndarray, n_picks: int, seeds: int = 
     out = []
     for s in range(seeds):
         pick = np.zeros(len(ds.y), bool); pick[np.random.default_rng(s).choice(idx, min(n_picks, len(idx)), replace=False)] = True
-        out.append(trades_from_picks(ds, pick))
+        out.append(trades_from_picks(ds, pick, returns=returns, hold_s=hold_s))
     return np.concatenate(out)
 
 
@@ -206,9 +233,9 @@ def summarize(r: np.ndarray) -> dict:
     return {"n": int(len(r)), "mean": float(r.mean()), "median": float(np.median(r)), "win": float((r > 0).mean()), "pf": (g / l) if l > 0 else None}   # None: no losing trade (JSON has no inf)
 
 
-def evaluate(ds: DecisionSet, scores: np.ndarray, test: np.ndarray, threshold: float, label: str = "") -> dict:
-    """Trades on rows of ``test`` whose score ≥ threshold; metrics per day and pooled."""
-    pick = test & (scores >= threshold); r, rdays = trades_from_picks(ds, pick, with_days=True)
+def evaluate(ds: DecisionSet, scores: np.ndarray, test: np.ndarray, threshold, label: str = "", hold_s=None, returns: np.ndarray | None = None) -> dict:
+    """Trades on rows of ``test`` whose score ≥ threshold (a scalar or per-row lines); metrics per day and pooled."""
+    pick = test & (scores >= threshold); r, rdays = trades_from_picks(ds, pick, returns=returns, with_days=True, hold_s=hold_s)
     per_day = {}
     for d in sorted(set(ds.day[test].tolist())):
         per_day[str(d)] = summarize(r[rdays == d])

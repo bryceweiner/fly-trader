@@ -48,8 +48,13 @@ SELECTOR_DIR = config.BRAIN_DIR / "selectors"
 # the data and model definitions a selector was trained on (the input columns by hash, so dropping or adding one retires
 # old models); a model from other definitions is never loaded or shown. The fly has its own (train/fly_selector.FLY_VERSION),
 # so a change to the fly never retires a selector.
-DATA_VERSION = {"agg": AGG_VERSION, "features": FEATURE_VERSION, "costs": "real-fees-1", "selector": "ev-hold120-1",
-                "cols": hashlib.sha1(",".join(X_COLS).encode()).hexdigest()[:8]}
+def _skill_version() -> str:
+    from .wallet_skill import skill_version
+    return skill_version()
+
+
+DATA_VERSION = {"agg": AGG_VERSION, "features": FEATURE_VERSION, "costs": "real-fees-1", "selector": "multi-1",
+                "cols": hashlib.sha1(",".join(X_COLS).encode()).hexdigest()[:8], "skill": _skill_version(), "meta": "rug-1"}
 WARMUP_DAYS, BLOCK_DAYS = 21, 7      # walk-forward: the first 21 days only train; every later day is tested, refit every 7 days
 MIN_AGE_H = 6.0                      # trade only tokens at least this long past graduation (unknown age = graduated before the archive); fitted, see decisions.HOLD_MIN
 MIN_EV = 0.01                        # the buy line of a model before its walk-forward chose one
@@ -97,10 +102,22 @@ class SelectorModel:
     trained_through: str
     metrics: dict = field(default_factory=dict)
     sizing: list = field(default_factory=list)  # agent/sizing.py table from the backtest's out-of-sample trades
+    stack: dict = field(default_factory=dict)   # train/strategies.final_models: strategies, veto, combination rule (empty: single ev model)
 
     def score(self, X: np.ndarray) -> np.ndarray:
         """Predicted net return over the hold."""
         return self.gbm.predict(self.scaler.transform(X))
+
+    def decide(self, X: np.ndarray, cols: list[str], t_start: float) -> dict:
+        """Per row: the strategy that trades it, score, hold, line, sizing table, allowed or the filter's reason
+        (train/strategies.decide); a model without a stack decides with its single ev model."""
+        from . import strategies
+        st = getattr(self, "stack", None) or {}
+        if st.get("strategies"):
+            return strategies.decide(st, X, cols, t_start)
+        idx = [cols.index(c) for c in self.cols]; sc = self.score(np.atleast_2d(X)[:, idx]); n = len(sc)
+        return {"strategy": np.full(n, "ev", dtype=object), "score": sc, "hold_s": np.full(n, self.horizon_min * 60.0), "threshold": np.full(n, self.threshold),
+                "tables": [self.sizing] * n, "allow": np.ones(n, bool), "reason": np.full(n, "trade", dtype=object)}
 
     def universe(self, X: np.ndarray) -> np.ndarray:
         return in_universe(X, self.cols)
@@ -237,7 +254,47 @@ def load_latest() -> SelectorModel | None:
 
 
 def main(days: int | None = None, horizon_min: int = HOLD_MIN, stop_event: threading.Event | None = None) -> dict:
-    """``days``: None = every day of the corpus (the default; a number keeps only the most recent days)."""
+    """The strategy stack (train/strategies.py) fitted, judged and saved; ``days``: None = the whole corpus."""
+    from . import strategies
+    from ..ops.reset import reset_training_stats
+    reset_training_stats("selector", reason="selector training")
+    prog.set_stop_event(stop_event); prog.clear()
+    prog.update("selector: building decision points", 0, 1, force=True)
+    t0 = time.time(); ds = build(days=days, horizon_min=horizon_min, holds=strategies.HOLDS_MIN)
+    log.info("decision points: %d rows, %d days, universe mean %+.2f%% (%.0fs)", len(ds.y), len(ds.days), ds.fwd_pess.mean() * 100, time.time() - t0)
+    stack = strategies.fit_stack(ds, stop_event)
+    for c in stack.components:
+        log.info("component %-28s %s — %s", c["name"], "PASSED" if c["passed"] else "dropped", c["reason"])
+        record_event("info", "selector", f"component {c['name']}: {'passed' if c['passed'] else 'dropped'}", c)
+    if stop_event is not None and stop_event.is_set():
+        return {"stopped": True}
+    prog.update("selector: fitting the deployable models on every day", 0, 1, force=True)
+    models = strategies.final_models(ds, stack) if stack.fits else {"strategies": {}}
+    ev = (models["strategies"] or {}).get("ev") or next(iter((models["strategies"] or {}).values()), None)
+    if ev is None:
+        final = fit(ds, np.ones(len(ds.y), bool), seed=99)
+    else:
+        final = SelectorModel(gbm=ev["gbm"], scaler=ev["scaler"], cols=ev["cols"], threshold=ev["line"], horizon_min=ev["hold_min"], trained_through=str(ds.days[-1]),
+                              sizing=ev["sizing"])
+    final.stack = models
+    final.metrics = {"walk_forward": {**stack.evaluation, "days": None}, "selection": stack.selection, "random_baseline": {"mean": stack.evaluation.get("random_mean")},
+                     "components": stack.components, "strategies": {k: {x: v[x] for x in ("line", "hold_min", "thr", "high", "hours", "regimes", "sizing", "selection", "evaluation")}
+                                                                    for k, v in models["strategies"].items()},
+                     "groups": stack.groups, "combine": stack.combine, "veto": {k: v for k, v in (stack.veto or {}).items() if k not in ("p",)} or None,
+                     "fallback": stack.fallback, "line": final.threshold, "costs": "real fees (pool fee by market cap, Jupiter 10 bps, network fee) + impact",
+                     "data": DATA_VERSION, "deployable": stack.deployable, "deploy_reason": stack.reason, "sizing": final.sizing,
+                     "model": {"kind": "stack", "min_age_h": MIN_AGE_H, "min_resq_sol": MIN_RESQ_SOL, "min_vol_15m_sol": MIN_VOL_15M_SOL},
+                     "rows": int(len(ds.y)), "days": len(ds.days), "first_day": str(ds.days[0]), "last_day": str(ds.days[-1])}
+    path, sid = save(final)
+    record_event("info", "selector", f"selector saved (snapshot {sid})", {"path": str(path), "deployable": stack.deployable, "reason": stack.reason,
+                                                                         "fallback": stack.fallback, **stack.evaluation})
+    prog.update("selector: saved", 1, 1, force=True, snapshot_id=sid, deployable=stack.deployable, deploy_reason=stack.reason)
+    log.info("selector saved: %s (snapshot %d) — %s: %s", path, sid, "put to work" if stack.deployable else "NOT put to work", stack.reason)
+    return {"snapshot_id": sid, "deployable": stack.deployable, "deploy_reason": stack.reason, "line": final.threshold, "components": stack.components}
+
+
+def main_single(days: int | None = None, horizon_min: int = HOLD_MIN, stop_event: threading.Event | None = None) -> dict:
+    """The single-strategy selector (before 2026-09-15); kept for comparison runs. ``days``: None = the whole corpus."""
     from ..ops.reset import reset_training_stats
     reset_training_stats("selector", reason="selector training")
     prog.set_stop_event(stop_event); prog.clear()

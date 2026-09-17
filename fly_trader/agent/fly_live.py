@@ -61,16 +61,16 @@ class LiveMirror:
         snap = snapshot_balances(self.broker.rpc, self.broker.pubkey); sol_free = snap.lamports / config.LAMPORTS_PER_SOL
         n_exit = n_dead = 0
         for p in ledger.open_positions(conn, BOOK):
-            held = (m1 - p["opened_at"]).total_seconds()
-            if held < self.H or p["mint"] in inflight:
+            held = (m1 - p["opened_at"]).total_seconds(); H = float(p.get("hold_s") or self.H)          # each position's own hold
+            if held < H or p["mint"] in inflight:
                 continue
-            if held >= self.H + DEAD_BAG_S:
+            if held >= H + DEAD_BAG_S:
                 did = self._decision(conn, ctx, run_id, beat_id, p, f"dead-bag: unsold {held / 3600:.1f} h after entry", True)
                 ledger.close_position(conn, position_id=int(p["id"]), exit_price=0.0, proceeds_sol=0.0, fees_sol=0.0, decision_id=did, forced_kind="dead_bag", ts=m1)
                 record_event("warning", "fly_live", f"dead-bag: {p['mint']} could not be sold; written off, its tokens are swept hourly", {"position": int(p["id"]), "cost_sol": float(p["cost_sol"])})
                 n_dead += 1
                 continue
-            overdue = held >= self.H + OVERDUE_S
+            overdue = held >= H + OVERDUE_S
             did = self._decision(conn, ctx, run_id, beat_id, p, f"held {held / 60:.0f} min" + (" (retrying)" if overdue else ""), False)
             n_exit += bool(self.worker.submit(ExecRequest(decision_id=did, mint=p["mint"], pool=p["pool"], side="sell", amount_in=int(p["qty"]),
                                                           slippage_bps=config.SLIPPAGE_FORCED_BPS if overdue else config.SLIPPAGE_EXIT_BPS,
@@ -82,7 +82,7 @@ class LiveMirror:
         for e in entries:
             if e["mint"] in held_mints:
                 skipped.append((e["mint"], "held")); continue
-            size, why = sizing.size_position(e["score"], line, table or [], bankroll, cash, e["info"]["resq"])
+            size, why = sizing.size_position(e["score"], e.get("threshold", line), e.get("table") or table or [], bankroll, cash, e["info"]["resq"])
             if blocked or size <= 0:
                 skipped.append((e["mint"], blocked or why)); continue
             if self.worker.submit(ExecRequest(decision_id=e["decision_id"], mint=e["mint"], pool=e["info"]["pool"], side="buy", amount_in=int(size * config.LAMPORTS_PER_SOL),

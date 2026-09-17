@@ -37,7 +37,7 @@ class PaperBroker:
 
     def buy(self, conn, *, decision_id: int | None, mint: str, pool: str | None, size_sol: float, price: float | None,
             res_quote_sol: float | None, mcap_sol: float | None, decimals: int, program_label: str | None, pool_fee: float | None = None,
-            ts: datetime | None = None) -> PaperFill:
+            ts: datetime | None = None, hold_s: float | None = None, strategy: str | None = None) -> PaperFill:
         """Fill at ``price`` pushed up by the constant-product impact, paying the real fees (market/exit_cost.py): the pool
         fee the stream reports (``pool_fee``) or the schedule's rate for ``mcap_sol``, Jupiter's platform fee, the network fee."""
         ts = ts or datetime.now(timezone.utc)
@@ -57,7 +57,7 @@ class PaperBroker:
             return PaperFill(False, None, None, price, 0.0, 0, 0.0, "zero quantity")
         fee_sol = size_sol * fee_frac
         pid = ledger.open_position(conn, book=self.book, mint=mint, pool=pool, qty_raw=qty_raw, cost_sol=size_sol,
-                                   entry_price=eff_price, decision_id=decision_id, fees_sol=fee_sol, ts=ts)
+                                   entry_price=eff_price, decision_id=decision_id, fees_sol=fee_sol, ts=ts, hold_s=hold_s, strategy=strategy)
         fid = ledger.record_fill(conn, order_id=None, book=self.book, mint=mint, side="buy", token_delta=qty_raw,
                                  sol_delta_lamports=-int(size_sol * config.LAMPORTS_PER_SOL), price_sol=eff_price,
                                  fee_lamports=int(fee_sol * config.LAMPORTS_PER_SOL), verified_by="model", ts=ts)

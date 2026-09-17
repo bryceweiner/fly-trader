@@ -36,6 +36,7 @@ from ..market.exit_cost import PUMP_SUPPLY
 from ..market.features import FEATURES, FIDX, TokenMeta, TokenState
 from ..train.corpus_meta import FEATURE_COLS as META_COLS
 from ..train.decisions import MIN_RESQ_SOL, MIN_VOL_15M_SOL, X_COLS
+from ..train.flow import FlowWindow, MarketWindow
 from ..train.mature import MASKED
 from ..train.selector import in_universe
 
@@ -48,13 +49,14 @@ MODEL_CHECK_S = 600          # how often books reload newer models and new books
 
 
 class MintState:
-    __slots__ = ("st", "meta", "hist", "decimals", "pool", "program_label", "graduated_at", "meta_row", "prev_close", "broken")
+    __slots__ = ("st", "meta", "hist", "decimals", "pool", "program_label", "graduated_at", "meta_row", "prev_close", "broken", "flow")
 
     def __init__(self, mint: str, decimals: int, pool: str | None, program_label: str | None, graduated_at: float | None, meta_row: dict | None):
         self.st = TokenState(mint); self.meta = TokenMeta(mint=mint, program_label=program_label or "Pump.fun Amm", graduated_at=graduated_at)
         self.hist: deque = deque(maxlen=200)       # (t_end, n_trades, n_traders) for the trailing hour
         self.decimals, self.pool, self.program_label, self.graduated_at, self.meta_row = decimals, pool, program_label, graduated_at, meta_row
         self.prev_close: float | None = None; self.broken = False
+        self.flow = FlowWindow()                    # wallet flow inputs (train/flow.py, as mature.build_day)
 
 
 @dataclass
@@ -92,6 +94,7 @@ class MinuteEngine:
         self.books = list(books or []); self.live = live
         self.states: dict[str, MintState] = {}
         self.meta_cache: dict[str, dict] = {}; self.last_sweep = time.time(); self.last_minute: float | None = None
+        self.market = MarketWindow()                 # mkt_vol_1h over every traded mint (as mature._market_windows)
 
     def has_book(self, name: str) -> bool:
         return any(b.name == name for b in self.books)
@@ -135,10 +138,13 @@ class MinuteEngine:
     # ---- one minute ----
     def _aggregate(self, conn, m0: datetime, m1: datetime) -> dict[str, dict]:
         """PumpAPI minutes: every SOL-quoted PumpSwap pump.fun token, the same fields as the archive."""
-        rows = conn.execute("SELECT mint, pool_id, open, high, low, close, buy_sol, sell_sol, n_buys, n_sells, n_traders, resq_sol, fee_rate FROM pump_minutes WHERE ts = %s", (m0,)).fetchall()
+        rows = conn.execute("SELECT mint, pool_id, open, high, low, close, buy_sol, sell_sol, n_buys, n_sells, n_traders, resq_sol, fee_rate, "
+                            "n_buyers, wash_sol, wash_buy_sol, top_sell_sol, insider_sell_sol, skill_buy FROM pump_minutes WHERE ts = %s", (m0,)).fetchall()
         return {r["mint"]: {"open": r["open"], "high": r["high"], "low": r["low"], "close": r["close"], "buy": r["buy_sol"] or 0.0, "sell": r["sell_sol"] or 0.0,
                             "nb": r["n_buys"] or 0, "ns": r["n_sells"] or 0, "n_traders": int(r["n_traders"] or 0), "resq": r["resq_sol"],
-                            "pool": r["pool_id"], "program_label": "Pump.fun Amm", "fee_rate": r["fee_rate"]} for r in rows if r["close"]}
+                            "pool": r["pool_id"], "program_label": "Pump.fun Amm", "fee_rate": r["fee_rate"],
+                            "n_buyers": r["n_buyers"], "wash_sol": r["wash_sol"], "wash_buy_sol": r["wash_buy_sol"], "top_sell_sol": r["top_sell_sol"],
+                            "insider_sell_sol": r["insider_sell_sol"], "skill_buy": r["skill_buy"]} for r in rows if r["close"]}
 
     def _features(self, conn, mint: str, a: dict, t_end: float) -> tuple[np.ndarray, dict]:
         """The full feature vector (``X_COLS``) of a mint for the minute ending ``t_end``, and what trading needs."""
@@ -152,6 +158,7 @@ class MinuteEngine:
         if a["sell"] > 0 or a["buy"] <= 0:
             st.append(t_end - 1e-3, price, a["sell"], False, None, resq)
         s.hist.append((t_end, float(a["nb"] + a["ns"]), float(a["n_traders"])))
+        s.flow.append(t_end, a["buy"], a["sell"], a.get("n_buyers"), a.get("wash_sol"), a.get("wash_buy_sol"), a.get("top_sell_sol"), a.get("insider_sell_sol"), a.get("skill_buy"))
         f, _mask = st.features(t_end, s.meta)
         ht = np.array([h[0] for h in s.hist]); hn = np.array([h[1] for h in s.hist]); htr = np.array([h[2] for h in s.hist])
         for k, w in (("1m", 60), ("5m", 300), ("15m", 900), ("1h", 3600)):
@@ -164,13 +171,14 @@ class MinuteEngine:
         meta = s.meta_row or {}
         extra = {"traders_15m": float(htr[ht > t_end - 900].sum()), "traders_1h": float(htr[ht > t_end - 3600].sum()), "n_trades_1m": float(a["nb"] + a["ns"]),
                  "hod_s": math.sin(2 * math.pi * hod / 24), "hod_c": math.cos(2 * math.pi * hod / 24), "age_known": 1.0 if s.graduated_at is not None else 0.0,
-                 "meta_known": 1.0 if meta.get("ttg_min") is not None else 0.0}
+                 "meta_known": 1.0 if meta.get("ttg_min") is not None else 0.0, **s.flow.features(t_end), "mkt_vol_1h": self.market.value(t_end)}
         by_name = {**{n: float(f[i]) for i, n in enumerate(FEATURES)}, **extra,
                    **{c: float(meta.get(c)) if meta.get(c) is not None else 0.0 for c in META_COLS}}
         x = np.nan_to_num(np.asarray([by_name.get(c, 0.0) for c in X_COLS], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         info = {"price": price, "open": float(a["open"]) if a.get("open") else price, "resq": resq, "logvol_15m": f[FIDX["logvol_15m"]],
                 "ec": float(f[FIDX["exit_cost_0p1"]]), "age_h": (t_end - s.graduated_at) / 3600 if s.graduated_at else None,
-                "mcap": price * s.meta.supply, "fee_rate": a.get("fee_rate"), "decimals": s.decimals, "pool": s.pool, "program_label": s.program_label, "broken": s.broken}
+                "mcap": price * s.meta.supply, "fee_rate": a.get("fee_rate"), "decimals": s.decimals, "pool": s.pool, "program_label": s.program_label, "broken": s.broken,
+                "skill_missing": a.get("skill_buy") is None, "curve_known": bool(meta.get("curve_known"))}
         return x, info
 
     @staticmethod
@@ -194,6 +202,7 @@ class MinuteEngine:
 
     def _minute_rows(self, conn, agg: dict, m1_epoch: float) -> tuple[np.ndarray, list, list, dict]:
         xs, infos, mints, bars = [], [], [], {}
+        self.market.add(m1_epoch, sum(float(a["buy"]) + float(a["sell"]) for a in agg.values()))
         for mint, a in agg.items():
             x, info = self._features(conn, mint, a, m1_epoch)
             bars[mint] = (m1_epoch - 60.0, info["open"], info["price"], info["ec"])
@@ -209,6 +218,7 @@ class MinuteEngine:
                 t1 = m1_epoch - 60 * k
                 agg = self._aggregate(conn, datetime.fromtimestamp(t1 - 60, timezone.utc), datetime.fromtimestamp(t1, timezone.utc))
                 bars = {}
+                self.market.add(t1, sum(float(a["buy"]) + float(a["sell"]) for a in agg.values()))
                 for mint, a in agg.items():
                     _x, info = self._features(conn, mint, a, t1); n += 1
                     bars[mint] = (t1 - 60.0, info["open"], info["price"], info["ec"])

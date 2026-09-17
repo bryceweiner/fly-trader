@@ -85,13 +85,35 @@ class SelectorBook:
     def open_mints(self, conn) -> set[str]:
         return {p["mint"] for p in ledger.open_positions(conn, BOOK)}
 
+    def _decide(self, ctx) -> dict | None:
+        """The strategy stack's per-row decision (train/strategies.decide), with the live fail-closed rules: rows whose
+        inputs training had but live lacks are blocked — the skill table of the day missing while skill inputs are used, a
+        token graduated inside the archive whose curve facts are not known yet while rug inputs are used."""
+        if not (getattr(self.model, "stack", None) or {}).get("strategies") or not len(ctx.mints):
+            return None
+        d = self.model.decide(ctx.X, X_COLS, ctx.t_start)
+        groups = set((getattr(self.model, "metrics", None) or {}).get("groups") or [])
+        for k, i in enumerate(ctx.infos):
+            if not d["allow"][k]:
+                continue
+            if "skill" in groups and i.get("skill_missing"):
+                d["allow"][k] = False; d["reason"][k] = "fail closed: no wallet-skill table for today"
+            elif "rug" in groups and i.get("age_h") is not None and not i.get("curve_known"):
+                d["allow"][k] = False; d["reason"][k] = "fail closed: curve facts not known yet"
+        return d
+
     def on_minute(self, ctx) -> dict:
         conn = ctx.conn
-        scores = self.model.score(ctx.X[:, self.idx]) if len(ctx.mints) else np.array([])
+        d = self._decide(ctx)
+        if d is not None:
+            scores = np.where(np.isfinite(d["score"]), d["score"], -1.0); thr = d["threshold"]
+        else:
+            scores = self.model.score(ctx.X[:, self.idx]) if len(ctx.mints) else np.array([]); thr = self.model.threshold
         summary = {"minute": ctx.m1.isoformat(), "mints_traded": len(ctx.agg), "eligible": len(ctx.mints),
-                   "picks": int((scores >= self.model.threshold).sum()) if len(scores) else 0,
+                   "picks": int((scores >= thr).sum()) if len(scores) else 0,
                    "score_p99": float(np.percentile(scores, 99)) if len(scores) else None, "score_max": float(scores.max()) if len(scores) else None,
-                   "threshold": self.model.threshold, "snapshot": self.snapshot_id}
+                   "threshold": self.model.threshold, "snapshot": self.snapshot_id,
+                   "strategies": sorted(((getattr(self.model, "stack", None) or {}).get("strategies") or {"ev": None}).keys())}
         if not ctx.trade:
             return summary
         if not ctx.fresh:
@@ -100,9 +122,10 @@ class SelectorBook:
             return status
         handed = handover.state(conn) is not None and ctx.engine.has_book("fly")
         self.beat_no += 1
+        extra = {} if d is None else {"holds": d["hold_s"], "strategies": d["strategy"], "allow": d["allow"], "reasons": d["reason"], "tables": d["tables"]}
         st = paper_trading.trade_minute(ctx, book=BOOK, run_id=self.run_id, beat_no=self.beat_no, broker=self.broker, kind=KIND, mints=ctx.mints, infos=ctx.infos,
-                                        scores=scores, threshold=self.model.threshold, table=getattr(self.model, "sizing", None), horizon_s=self.horizon_s,
-                                        block="handed over to the fly" if handed else None)
+                                        scores=scores, threshold=thr, table=getattr(self.model, "sizing", None), horizon_s=self.horizon_s,
+                                        block="handed over to the fly" if handed else None, **extra)
         if handed and st["open"] == 0:
             self.done = True
             record_event("info", "selector", "selector retired: the fly holds the seat and the book is flat", {"run_id": self.run_id})

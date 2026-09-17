@@ -107,6 +107,21 @@ def parse_hour(path: Path) -> tuple[pa.Table, pa.Table, int]:
     return pa.table(T, schema=TRADE_SCHEMA), pa.table(E, schema=EVENT_SCHEMA), n
 
 
+def refetch_missing_pool_id() -> int:
+    """Hours whose trades file predates the ``pool_id`` column (written 2026-08-20..09-13 by an older parser) are marked
+    ``refetch``: ``plan_hours`` downloads them again and ``parse_hour`` writes the column, so the archive applies the live
+    stream's blocked-pool filter and dominant-pool choice (train/mature.py). Returns the number of hours marked."""
+    hours = []
+    for f in sorted(config.REPLAY_DIR.glob("*/*_trades.parquet")):
+        if "pool_id" not in pq.read_schema(f).names:
+            d = datetime.fromisoformat(f.parent.name)
+            hours.append(datetime(d.year, d.month, d.day, int(f.name[:2]), tzinfo=timezone.utc))
+    if hours:
+        with transaction() as conn:
+            conn.cursor().executemany(HOUR_SQL, [(h, "refetch", "trades file lacks pool_id") for h in hours])
+    return len(hours)
+
+
 def plan_hours(now: datetime | None = None) -> list[datetime]:
     now = now or datetime.now(timezone.utc)   # callers pass the same ``now`` they seed the re-plan bound with
     start = datetime.fromisoformat(config.REPLAY_START).replace(tzinfo=timezone.utc)
@@ -249,8 +264,9 @@ def main(stop_event: threading.Event | None = None) -> None:
                     except queue.Full:
                         continue
 
-    from ..train import replay_assemble
-    assembler = threading.Thread(target=replay_assemble.assemble_loop, args=(stop,), name="replay-assemble", daemon=True); assembler.start()
+    if config.REPLAY_ASSEMBLE:                   # REPLAY_ASSEMBLE=0: a download-only run (e.g. refetch-pool-ids) leaves the builds alone
+        from ..train import replay_assemble
+        assembler = threading.Thread(target=replay_assemble.assemble_loop, args=(stop,), name="replay-assemble", daemon=True); assembler.start()
     threads = [threading.Thread(target=downloader, name=f"replay-dl-{i}", daemon=True) for i in range(config.REPLAY_PARALLEL)]
     for t in threads:
         t.start()

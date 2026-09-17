@@ -1,5 +1,6 @@
 """Model & training: which model trades and how it tested against random picks, the automatic retraining pipeline (the
 selector every 7 days until the fly holds its seat; the fly bootstrapped once), the plastic fly, and every saved model."""
+import json
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -47,6 +48,48 @@ def sizing_panel(meta: dict) -> None:
                    f"at a fixed {config.MAX_POSITION_SOL:g} SOL → {f.get('final_sol', 0):.2f} SOL (worst drawdown {f.get('max_drawdown', 0):.0%}).")
 
 
+def _best(b: dict | None) -> str:
+    """The most profitable setting a component tried, whether or not it cleared the bars — why a dropped one was dropped."""
+    if not b:
+        return "—"
+    win = f"{b['win'] * 100:.0f}% winners" if b.get("win") is not None else "—"
+    pf = f"PF {b['pf']:.2f}" if b.get("pf") is not None else "PF ∞"
+    return f"{win} · {pf} · {b.get('n', 0)} trades · total {b.get('total', 0):+.1f}"
+
+
+def stack_panel(meta: dict) -> None:
+    """The selector's strategy stack: every component tried (kept or dropped, and why) and the strategies it trades."""
+    comps = meta.get("components") or []
+    if not comps:
+        return
+    st.markdown("**Components**")
+    if meta.get("fallback"):
+        st.warning("No setting reached 65 % winning trades on both halves: this model trades the most profitable system that passes profit factor 1.3 and the deploy rule instead.",
+                   icon=":material/warning:")
+
+    def half(x: dict | None, k: str):
+        return None if not x or x.get(k) is None else float(x[k])
+    st.dataframe(pd.DataFrame([{"component": c["name"], "kept": c["passed"], "why": c["reason"],
+                                "winning (selection)": (half(c.get("selection"), "win") or 0) * 100 if half(c.get("selection"), "win") is not None else None,
+                                "winning (evaluation)": (half(c.get("evaluation"), "win") or 0) * 100 if half(c.get("evaluation"), "win") is not None else None,
+                                "profit factor (evaluation)": half(c.get("evaluation"), "pf"), "total (evaluation)": half(c.get("evaluation"), "total"),
+                                "trades (evaluation)": half(c.get("evaluation"), "n"), "settings tried": c.get("trials"), "best reached": _best(c.get("best_seen")),
+                                "parameters": json.dumps(c.get("params") or {}, default=str)}
+                               for c in comps]), hide_index=True,
+                 column_config={"winning (selection)": st.column_config.NumberColumn(format="%.0f%%"), "winning (evaluation)": st.column_config.NumberColumn(format="%.0f%%"),
+                                "profit factor (evaluation)": st.column_config.NumberColumn(format="%.2f"), "total (evaluation)": st.column_config.NumberColumn(format="%+.2f",
+                                help="Sum of the net returns of the evaluation half's trades (1.00 = one position's cost)."),
+                                "best reached": st.column_config.TextColumn(help="The most profitable setting this component tried on the selection half, whether or not it cleared the bars.")})
+    strat = meta.get("strategies") or {}
+    if strat:
+        st.markdown("**Strategies**")
+        st.dataframe(pd.DataFrame([{"strategy": k, "hold (min)": v.get("hold_min"), "buy line": (v.get("line") or 0) * 100, "trigger": json.dumps(v.get("thr") or {}, default=str),
+                                    "trades (evaluation)": half(v.get("evaluation"), "n"), "winning (evaluation)": (half(v.get("evaluation"), "win") or 0) * 100 if half(v.get("evaluation"), "win") is not None else None,
+                                    "profit factor (evaluation)": half(v.get("evaluation"), "pf")} for k, v in strat.items()]), hide_index=True,
+                     column_config={"buy line": st.column_config.NumberColumn(format="%+.2f%%"), "winning (evaluation)": st.column_config.NumberColumn(format="%.0f%%"),
+                                    "profit factor (evaluation)": st.column_config.NumberColumn(format="%.2f")})
+
+
 @st.fragment(run_every="10s")
 def loaded() -> None:
     s = system_state(); m, latest = s["model"], s["latest"]
@@ -74,6 +117,7 @@ def loaded() -> None:
                 st.metric("Profitable test days", f"{wf.get('days_positive', '—')} of {wf.get('days', '—')}", help="Test days whose average trade made money after costs.")
             st.caption(backtest_line(meta))
             sizing_panel(meta)
+            stack_panel(meta)
         elif not latest:
             st.info("No model has been trained on the current data yet, so nothing is trading. The automatic retraining below runs as soon as the data is ready.",
                     icon=":material/info:")

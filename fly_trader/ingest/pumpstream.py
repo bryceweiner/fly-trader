@@ -42,7 +42,8 @@ from .. import config
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..logging_setup import setup
-from ..train.corpus_meta import blocked_pool_ids, creator_history
+from ..train.corpus_meta import CURVE_COLS, blocked_pool_ids, creator_history, curve_facts
+from ..train.flow import minute_wallet_cols
 
 log = logging.getLogger(__name__)
 WSOL = "So11111111111111111111111111111111111111112"
@@ -60,11 +61,12 @@ def _txt(v):
 
 
 class Minute:
-    __slots__ = ("open", "high", "low", "close", "buy", "sell", "nb", "ns", "traders", "resq", "pool_id", "fee_rate")
+    __slots__ = ("open", "high", "low", "close", "buy", "sell", "nb", "ns", "traders", "wallets", "resq", "pool_id", "fee_rate")
 
     def __init__(self, pool_id: str | None = None):
         self.open = None; self.high = -math.inf; self.low = math.inf; self.close = None; self.buy = 0.0; self.sell = 0.0
         self.nb = 0; self.ns = 0; self.traders = set(); self.resq = None; self.pool_id = pool_id; self.fee_rate = None   # the pool fee charged (poolFeeRate)
+        self.wallets: dict[str, list[float]] = {}                  # trader → [bought SOL, sold SOL] (train/flow.py)
 
 
 class Aggregator:
@@ -73,10 +75,13 @@ class Aggregator:
         self.ref: dict[str, deque] = {}; self.ref_day: int | None = None                                  # trailing legs per mint, reset each UTC day
         self.max_event_s = 0.0; self.last_event_wall = 0.0                # newest event time; wall clock of the last trade received
         self.creates: dict[str, dict] = {}                                 # mint → create facts (24 h)
+        self.curve: dict[str, dict] = {}                                   # mint → bonding-curve wallets since its create (corpus_meta.curve_facts)
         self.pending_creates: list[tuple[str, dict]] = []                 # creates not yet written to pump_events
         self.blocked: set[str] = set()                                     # pool ids of directly created (custom) PumpSwap pools
         self.pending_pools: list[tuple] = []                               # custom pools not yet written to pump_pools
         self.flushed_through: datetime | None = None                       # start of the newest complete minute written
+        self.insiders: dict[str, frozenset] = {}                           # mint → creator/bundle/early wallets (token_insiders)
+        self.skill: dict | None = None; self.skill_day: str | None = None  # wallet → skill decile for the current UTC day (train/wallet_skill.py)
         self.stats = {"events": 0, "trades": 0, "dropped_band": 0, "dropped_late": 0, "dropped_custom_pool": 0, "flushed_minutes": 0, "flushed_rows": 0, "creates": 0, "migrates": 0,
                       "custom_pools": 0, "blocked_pools": 0, "reconnects": 0, "outcomes_filled": 0, "started_at": datetime.now(timezone.utc).isoformat()}
 
@@ -95,6 +100,9 @@ class Aggregator:
                 self.pending_pools.append((pid, mint, e.get("poolCreatedBy"), datetime.fromtimestamp(ts / 1000, timezone.utc) if ts is not None else None))
             return
         if ts is None or not mint:
+            return
+        if a in ("buy", "sell") and pool == "pump":
+            self._curve(e)
             return
         if a in ("buy", "sell"):
             if pool != "pump-amm" or e.get("quoteMint") != WSOL or not str(mint).endswith("pump"):
@@ -140,6 +148,7 @@ class Aggregator:
                 trader = b.get("trader") or e.get("txSigner")          # as replay_pull writes the archive's trader column
                 if trader:
                     row.traders.add(trader)
+                    row.wallets.setdefault(trader, [0.0, 0.0])[0 if b.get("action") == "buy" else 1] += sol
             row.resq = float(q)
             if e.get("poolFeeRate") is not None:
                 row.fee_rate = float(e["poolFeeRate"])
@@ -148,14 +157,32 @@ class Aggregator:
             c = {"ts": ts, "creator": e.get("txSigner"), "dev_sol": e.get("quoteAmount"), "dev_tokens": e.get("initialBuy"), "supply": e.get("supply"),
                  "mayhem": e.get("mayhemMode"), "name": _txt(e.get("name")), "symbol": _txt(e.get("symbol")), "uri": _txt(e.get("uri")), "sig": e.get("signature")}
             self.creates[mint] = c; self.pending_creates.append((mint, c))
+            self.curve[mint] = {"slot": int(e.get("block") or 0), "creator": e.get("txSigner"), "supply": e.get("supply"), "initial_buy": e.get("initialBuy"), "ts": ts, "wallets": {}}
             self.stats["creates"] += 1
             if len(self.creates) > 200_000:
                 cutoff = ts - 86_400_000
                 self.creates = {k: v for k, v in self.creates.items() if v["ts"] >= cutoff}
+                self.curve = {k: v for k, v in self.curve.items() if v["ts"] >= cutoff}
         elif a == "migrate" and pool == "pump-amm":
             self.stats["migrates"] += 1
             self.write_creates()                    # the creator's own earlier creates must be visible to the history query
             self._graduation(e)
+
+    def _curve(self, e: dict) -> None:
+        """A bonding-curve buy/sell of a token created while the stream ran: per wallet its first buy slot and tokens bought/sold."""
+        st = self.curve.get(e.get("mint"))
+        if st is None:
+            return                                   # created before this process started: the archive fills its facts (fail closed until then)
+        slot = int(e.get("block") or 0)
+        for b in e.get("breakdown") or [{"action": e.get("action"), "trader": e.get("txSigner"), "tokenAmount": e.get("tokenAmount")}]:
+            w = b.get("trader") or e.get("txSigner")
+            if not w:
+                continue
+            rec = st["wallets"].setdefault(w, [None, 0.0, 0.0]); tok = float(b.get("tokenAmount") or 0.0)
+            if (b.get("action") or e.get("action")) == "buy":
+                rec[1] += tok; rec[0] = slot if rec[0] is None else min(rec[0], slot)
+            else:
+                rec[2] += tok
 
     def write_creates(self) -> int:
         """Persist creates as they arrive (keyed by signature); on failure they stay queued for the next attempt."""
@@ -224,6 +251,14 @@ class Aggregator:
                               h["prior_launches"], h["prior_grads"], h["prior_known"], h["prior_rug_share"], h["prior_moon_share"]))
                 conn.execute("INSERT INTO corpus_tokens (mint, graduated_at, grad_slot, source, status) VALUES (%s,%s,%s,'stream','pending') ON CONFLICT (mint) DO NOTHING",
                              (mint, g, int(e.get("block") or 0)))
+                st = self.curve.pop(mint, None)
+                if st is not None:                           # the token's whole curve life was seen: the archive's definition (curve_facts)
+                    facts, insiders = curve_facts(st["slot"], st["creator"], st["supply"], st["initial_buy"], st["wallets"])
+                    conn.execute("UPDATE corpus_meta SET " + ", ".join(f"{c} = COALESCE({c}, %s)" for c in CURVE_COLS) + ", curve_known = COALESCE(curve_known, true) WHERE mint = %s",
+                                 (*[facts[c] for c in CURVE_COLS], mint))
+                    conn.cursor().executemany("INSERT INTO token_insiders (mint, wallet, kind) VALUES (%s,%s,%s) ON CONFLICT (mint, wallet) DO NOTHING",
+                                              [(mint, w, k) for w, k in insiders])
+                    self.insiders[mint] = frozenset(w for w, _ in insiders)
         except Exception:
             log.exception("graduation upsert failed for %s", mint)
 
@@ -239,14 +274,18 @@ class Aggregator:
                 r = self.row(m, mint)
                 if r is None or r.close is None:
                     continue
-                rows.append((mint, ts, r.pool_id, r.open, r.high, r.low, r.close, r.buy, r.sell, r.nb, r.ns, len(r.traders), r.resq, r.fee_rate))
+                wc = minute_wallet_cols(r.wallets, self.insiders.get(mint, frozenset()), self.skill)
+                rows.append((mint, ts, r.pool_id, r.open, r.high, r.low, r.close, r.buy, r.sell, r.nb, r.ns, len(r.traders), r.resq, r.fee_rate,
+                             wc["n_buyers"], wc["wash_sol"], wc["wash_buy_sol"], wc["top_sell_sol"], wc["insider_sell_sol"], wc["skill_buy"]))
         if rows:
             with transaction() as conn:
-                conn.cursor().executemany("INSERT INTO pump_minutes (mint, ts, pool_id, open, high, low, close, buy_sol, sell_sol, n_buys, n_sells, n_traders, resq_sol, fee_rate) "
-                                          "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (mint, ts) DO UPDATE SET close = EXCLUDED.close, high = greatest(pump_minutes.high, EXCLUDED.high), "
+                conn.cursor().executemany("INSERT INTO pump_minutes (mint, ts, pool_id, open, high, low, close, buy_sol, sell_sol, n_buys, n_sells, n_traders, resq_sol, fee_rate, "
+                                          "n_buyers, wash_sol, wash_buy_sol, top_sell_sol, insider_sell_sol, skill_buy) "
+                                          "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (mint, ts) DO UPDATE SET close = EXCLUDED.close, high = greatest(pump_minutes.high, EXCLUDED.high), "
                                           "low = least(pump_minutes.low, EXCLUDED.low), buy_sol = pump_minutes.buy_sol + EXCLUDED.buy_sol, sell_sol = pump_minutes.sell_sol + EXCLUDED.sell_sol, "
                                           "n_buys = pump_minutes.n_buys + EXCLUDED.n_buys, n_sells = pump_minutes.n_sells + EXCLUDED.n_sells, n_traders = greatest(pump_minutes.n_traders, EXCLUDED.n_traders), "
-                                          "resq_sol = EXCLUDED.resq_sol, fee_rate = COALESCE(EXCLUDED.fee_rate, pump_minutes.fee_rate)", rows)
+                                          "resq_sol = EXCLUDED.resq_sol, fee_rate = COALESCE(EXCLUDED.fee_rate, pump_minutes.fee_rate), n_buyers = EXCLUDED.n_buyers, wash_sol = EXCLUDED.wash_sol, "
+                                          "wash_buy_sol = EXCLUDED.wash_buy_sol, top_sell_sol = EXCLUDED.top_sell_sol, insider_sell_sol = EXCLUDED.insider_sell_sol, skill_buy = EXCLUDED.skill_buy", rows)
         for m in done:
             self.minutes.pop(m, None)
         self.stats["flushed_minutes"] += len(done); self.stats["flushed_rows"] += len(rows)
@@ -323,6 +362,40 @@ def _logged(name: str, fn, *args):
         return 0
 
 
+def _load_insiders(agg: Aggregator) -> None:
+    """Insider wallets (creator, bundle, early buyers: token_insiders) of every mint traded today not loaded yet; a token's
+    set is fixed at its graduation, so loaded sets are kept."""
+    todo = [m for m in agg.ref if m not in agg.insiders]
+    if not todo:
+        return
+    try:
+        with transaction() as conn:
+            rows = conn.execute("SELECT mint, wallet FROM token_insiders WHERE mint = ANY(%s)", (todo,)).fetchall()
+    except Exception:
+        log.exception("insider load failed; retried in 1 min")
+        return
+    got: dict[str, set] = {}
+    for r in rows:
+        got.setdefault(r["mint"], set()).add(r["wallet"])
+    for m in todo:
+        agg.insiders[m] = frozenset(got.get(m, ()))
+
+
+def load_skill(agg: Aggregator, now: float | None = None) -> None:
+    """The wallet-skill table of the current UTC day (the file training joins for that day), once per day."""
+    from ..train.mature import SKILL_DIR
+    day = datetime.fromtimestamp(now or time.time(), timezone.utc).date().isoformat()
+    if agg.skill_day == day and agg.skill is not None:
+        return
+    f = SKILL_DIR / f"{day}.parquet"
+    if not f.exists():
+        agg.skill = None; agg.skill_day = day
+        return
+    t = pq.read_table(f, columns=["wallet", "bucket"])
+    agg.skill = dict(zip(t["wallet"].to_pylist(), t["bucket"].to_pylist())); agg.skill_day = day
+    log.info("wallet skill table for %s loaded: %d wallets", day, len(agg.skill))
+
+
 def _load_blocked(agg: Aggregator) -> None:
     """Union the custom pools in ``pump_pools`` (stream rows and the archive backfill) into the blocked set."""
     try:
@@ -334,7 +407,11 @@ def _load_blocked(agg: Aggregator) -> None:
 
 async def _run(stop: threading.Event | None, agg: Aggregator) -> None:
     ctx = ssl.create_default_context(cafile=certifi.where()); backoff = 1.0
-    _load_blocked(agg); last_pools = time.time()
+    _load_blocked(agg); last_pools = time.time(); last_ins = 0.0
+    try:
+        load_skill(agg)
+    except Exception:
+        log.exception("wallet skill load failed; retried in 5 min")
     last_status = last_flush = last_outcomes = 0.0; last_archive = time.time() - 3000; last_msg = 0.0; rate_n = 0; rate_t = time.time()
     bg: dict[str, asyncio.Task | None] = {"archive": None, "outcomes": None}
     while not (stop is not None and stop.is_set()):
@@ -362,6 +439,12 @@ async def _run(stop: threading.Event | None, agg: Aggregator) -> None:
                         last_flush = now
                     if now - last_pools >= 300:
                         _load_blocked(agg); last_pools = now
+                        try:
+                            load_skill(agg, now)
+                        except Exception:
+                            log.exception("wallet skill load failed; retried in 5 min")
+                    if now - last_ins >= 60:
+                        _load_insiders(agg); last_ins = now
                     if now - last_status >= 5.0:
                         agg.write_creates(); agg.write_pools()
                         _status(agg, {"events_per_s": rate_n / max(now - rate_t, 1e-9), "pending_minutes": len(agg.minutes), "lag_s": now - last_msg, "connected": True,

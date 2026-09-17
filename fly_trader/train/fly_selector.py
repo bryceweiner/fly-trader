@@ -41,13 +41,15 @@ import torch.nn as nn
 import torch.nn.functional as Fn
 
 from .. import config
+from ..agent import sizing
 from ..brain.connectome import AFFERENT_POPS, EFFERENT_POP, Connectome, SubConnectome
+from ..brain.plastic import assign_channels
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from . import fly_calibrate
 from . import progress as prog
 from . import selector
-from .decisions import HOLD_MIN, DecisionSet, build, rank_corr
+from .decisions import HOLD_MIN, DecisionSet, build, rank_corr, taken_idx
 from .scaling import RobustScaler
 
 log = logging.getLogger(__name__)
@@ -67,7 +69,7 @@ DIAG_ROWS = 50_000
 GATES = {"mbon_share_min": 0.10, "mbon_saturated_max": 0.20, "slope_min": 0.6, "slope_max": 1.4}
 TEACHER_NOTE = "selector fit on the fly's training days, same configuration"
 # the definitions a fly was trained on (the selector's, as its teacher, + the fly's network and plasticity design)
-FLY_VERSION = {**selector.DATA_VERSION, "fly": "flynet-2-mb", "plastic": "mb3f-1"}
+FLY_VERSION = {**selector.DATA_VERSION, "fly": "flynet-3-ch", "plastic": "mb4-ch"}
 
 
 def _inv_softplus(x: torch.Tensor) -> torch.Tensor:
@@ -78,7 +80,8 @@ class FlyNet(nn.Module):
     """Scorer on the connectome: features → afferent neurons → K steps along the synapses and the KC→MBON block →
     normalised descending neurons → decoder, + signed readout of the normalised MBONs → predicted net return (× ``SCALE``)."""
 
-    def __init__(self, graph, obs_dim: int, k_steps: int = K_STEPS, leak: float = LEAK, hidden: int = HIDDEN, kc_active: float = KC_ACTIVE, device=None):
+    def __init__(self, graph, obs_dim: int, k_steps: int = K_STEPS, leak: float = LEAK, hidden: int = HIDDEN, kc_active: float = KC_ACTIVE, device=None,
+                 n_strategies: int = 1):
         super().__init__()
         dev = torch.device(device) if device else graph.device
         self.N, self.k_steps, self.leak, self.obs_dim, self.hidden, self.kc_active = graph.N, k_steps, leak, obs_dim, hidden, kc_active
@@ -106,8 +109,19 @@ class FlyNet(nn.Module):
         self.eff_norm = nn.BatchNorm1d(n_eff).to(dev)
         self.mb_norm = nn.BatchNorm1d(self.n_mbon, affine=False).to(dev)
         self.dec = nn.Sequential(nn.Linear(n_eff, hidden), nn.GELU(), nn.Linear(hidden, hidden), nn.GELU()).to(dev)
-        self.head = nn.Linear(hidden, 1).to(dev)
+        # one head per strategy over the shared decoder; strategy s reads its own dopamine channel (mushroom-body
+        # compartments, brain/plastic.assign_channels) and the compartments no strategy claims
+        self.n_strategies = int(n_strategies)
+        self.heads = nn.ModuleList([nn.Linear(hidden, 1) for _ in range(self.n_strategies)]).to(dev)
+        comp = getattr(graph, "mbon_compartment", None)
+        learn, read = assign_channels(comp if comp is not None else None, graph.W_KM0.float().sum(0).numpy(), c_sign.numpy(), self.n_strategies)
+        self.register_buffer("learn", torch.as_tensor(learn).to(dev)); self.register_buffer("read", torch.as_tensor(read).to(dev))
         self.dev = dev
+
+    @property
+    def head(self) -> nn.Linear:
+        """The first strategy's head (the only one with one strategy)."""
+        return self.heads[0]
 
     @property
     def c(self) -> torch.Tensor:
@@ -142,19 +156,31 @@ class FlyNet(nn.Module):
             h = self._kwta(torch.tanh(pre_act))
         return h, k, u
 
-    def forward_parts(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """(descending-neuron output [B] × SCALE, MBON pre-activation at the last step [B, n_MBON], KC code [B, n_KC])."""
+    def forward_parts_all(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(every strategy head's decoder output [B, S] × SCALE, MBON pre-activation at the last step [B, n_MBON], KC code [B, n_KC])."""
         h, k, u = self._propagate(x)
-        y_dn = self.head(self.dec(self.eff_norm(h.index_select(0, self.eff_rows).T))).squeeze(-1)
-        return y_dn, u.T, k.T
+        z = self.dec(self.eff_norm(h.index_select(0, self.eff_rows).T))
+        return torch.cat([hd(z) for hd in self.heads], dim=1), u.T, k.T
 
-    def readout(self, y_dn: torch.Tensor, u0: torch.Tensor, k: torch.Tensor, D: torch.Tensor | None = None) -> torch.Tensor:
-        """Prediction × SCALE from the parts; ``D`` [n_KC, n_MBON] is a plastic change of the KC→MBON weights at the last step."""
+    def forward_parts(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(the first head's decoder output [B] × SCALE, MBON pre-activation at the last step [B, n_MBON], KC code [B, n_KC])."""
+        y, u, k = self.forward_parts_all(x)
+        return y[:, 0], u, k
+
+    def readout(self, y_dn: torch.Tensor, u0: torch.Tensor, k: torch.Tensor, D: torch.Tensor | None = None, s: int = 0) -> torch.Tensor:
+        """Strategy ``s``'s prediction × SCALE from the parts; ``D`` [n_KC, n_MBON] is a plastic change of the KC→MBON
+        weights at the last step; the strategy reads its own channel's MBONs and the unclaimed ones."""
         u = u0 if D is None else u0 + self.gain[self.mb0:self.mb1] * (k @ (D * self.mask))
-        return y_dn + self.mb_norm(torch.tanh(u)) @ self.c
+        return y_dn + (self.mb_norm(torch.tanh(u)) * self.read[s].float()) @ self.c
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.readout(*self.forward_parts(x))
+
+    def forward_all(self, x: torch.Tensor) -> torch.Tensor:
+        """Every strategy's prediction × SCALE [B, S]."""
+        y, u, k = self.forward_parts_all(x)
+        z = self.mb_norm(torch.tanh(u))
+        return y + (z[:, None, :] * self.read.float()[None]) @ self.c
 
     def mbon_stats(self) -> tuple[torch.Tensor, torch.Tensor]:
         """The frozen MBON normalisation (mean, standard deviation) the readout uses in eval mode."""
@@ -166,30 +192,74 @@ class FlyNet(nn.Module):
 
 
 class FlyModel:
-    """A trained fly as a trading model: the interface of ``selector.SelectorModel`` (score, universe, threshold, sizing)
-    plus ``parts`` for the plasticity rule. ``threshold`` and ``sizing`` are the fly's own calibration."""
+    """A trained fly as a trading model: one value per strategy of the selector's stack (``rules``: its fitted trigger,
+    high window and hold), each on its own dopamine channel, with the fly's own line and sizing per strategy. The
+    single-strategy interface of ``selector.SelectorModel`` (score, threshold, sizing, universe) is the first strategy's."""
 
-    def __init__(self, net: FlyNet, scaler: RobustScaler, cols: list[str], horizon_min: int, threshold: float | None = None, sizing: list | None = None):
+    def __init__(self, net: FlyNet, scaler: RobustScaler, cols: list[str], horizon_min: int, threshold: float | None = None, sizing: list | None = None,
+                 rules: dict | None = None, lines: dict | None = None, sizings: dict | None = None, combine: str = "score"):
         self.net, self.scaler, self.cols, self.horizon_min = net, scaler, list(cols), horizon_min
-        self.threshold = threshold if threshold is not None else selector.MIN_EV
-        self.sizing = list(sizing or [])
+        self.rules = dict(rules or {"ev": {"thr": {}, "high": None, "hold_min": int(horizon_min)}})
+        self.strategies = list(self.rules)
+        base = threshold if threshold is not None else selector.MIN_EV
+        self.lines = {k: float((lines or {}).get(k, base)) for k in self.strategies}
+        self.sizings = {k: list((sizings or {}).get(k, sizing or [])) for k in self.strategies}
+        self.combine = combine
+
+    @property
+    def threshold(self) -> float:
+        return self.lines[self.strategies[0]]
+
+    @threshold.setter
+    def threshold(self, v: float) -> None:
+        self.lines[self.strategies[0]] = float(v)
+
+    @property
+    def sizing(self) -> list:
+        return self.sizings[self.strategies[0]]
+
+    @sizing.setter
+    def sizing(self, v: list) -> None:
+        self.sizings[self.strategies[0]] = list(v or [])
+
+    def hold_s(self, s: int) -> float:
+        return float(self.rules[self.strategies[s]]["hold_min"]) * 60.0
 
     def _x(self, X: np.ndarray) -> torch.Tensor:
         return torch.tensor(self.scaler.transform(X), device=self.net.dev)
 
     @torch.no_grad()
-    def score(self, X: np.ndarray, batch: int = 2048) -> np.ndarray:
-        """Predicted net return over the hold (the frozen fly)."""
-        self.net.eval(); out = np.empty(len(X), np.float64)
+    def score_all(self, X: np.ndarray, batch: int = 2048) -> np.ndarray:
+        """[B, S] every strategy's predicted net return over its hold (the frozen fly)."""
+        self.net.eval(); out = np.empty((len(X), len(self.strategies)), np.float64)
         for i in range(0, len(X), batch):
-            out[i:i + batch] = (self.net(self._x(X[i:i + batch])) / SCALE).float().cpu().numpy()
+            out[i:i + batch] = (self.net.forward_all(self._x(X[i:i + batch])) / SCALE).float().cpu().numpy()
         return out
+
+    def score(self, X: np.ndarray, batch: int = 2048) -> np.ndarray:
+        """The first strategy's predicted net return over its hold (the frozen fly)."""
+        return self.score_all(X, batch)[:, 0]
 
     @torch.no_grad()
     def parts(self, X: np.ndarray) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``FlyNet.forward_parts`` on raw feature rows (one batch; eval mode)."""
         self.net.eval()
         return self.net.forward_parts(self._x(X))
+
+    @torch.no_grad()
+    def parts_all(self, X: np.ndarray) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``FlyNet.forward_parts_all``: every head's decoder output [B, S], MBON pre-activation, KC code."""
+        self.net.eval()
+        return self.net.forward_parts_all(self._x(X))
+
+    def triggers(self, X: np.ndarray, cols: list[str]) -> np.ndarray:
+        """[B, S] where each strategy's fitted trigger (the selector's) fires — its candidates."""
+        from . import strategies
+        X = np.atleast_2d(X); out = np.zeros((len(X), len(self.strategies)), bool)
+        for j, name in enumerate(self.strategies):
+            r = self.rules[name]
+            out[:, j] = (strategies.base_mask(name, X, cols, r.get("high")) & strategies.trigger_mask(name, r.get("thr") or {}, X, cols)) if name in strategies.STRATEGIES else True
+        return out
 
     def universe(self, X: np.ndarray) -> np.ndarray:
         return selector.in_universe(X, self.cols)
@@ -223,18 +293,62 @@ def recalibrate(net: FlyNet, X: np.ndarray, scaler: RobustScaler, batch: int = B
     net.eval()
 
 
-def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, batch: int = BATCH, stop: threading.Event | None = None,
-              seed: int = 0, graph=None, device=None) -> tuple[FlyModel | None, dict]:
-    """Distil ``teacher`` (anything with ``score`` and ``scaler``) into a FlyNet over the training rows ``rows`` (mask)."""
-    torch.manual_seed(seed); rng = np.random.default_rng(seed); dev = torch.device(device) if device else _device()
-    net = FlyNet(graph if graph is not None else _graph(), obs_dim=len(ds.cols), device=dev)
-    idx = np.flatnonzero(rows); tgt = np.empty(len(idx), np.float32)
+class StackTeacher:
+    """The selector's strategy stack (train/strategies.final_models) as the fly's teacher: per strategy, on its candidates,
+    the net return it predicts where the stack would trade, and one typical score-spread (MAD) below that strategy's
+    line where a filter (win filter, gates, dump veto) blocks it — so the fly learns the final decision, not the raw score."""
+
+    def __init__(self, models: dict, scaler: RobustScaler, cols: list[str]):
+        self.models, self.scaler, self.cols = models, scaler, list(cols)
+        self.strategies = list(models.get("strategies") or {})
+        self.rules = {k: {"thr": dict(v["thr"]), "high": v["high"], "hold_min": int(v["hold_min"])} for k, v in models["strategies"].items()}
+        self.lines = {k: float(v["line"]) for k, v in models["strategies"].items()}
+        self.threshold = self.lines[self.strategies[0]] if self.strategies else selector.MIN_EV
+        self.combine = models.get("combine", "score"); self.eps: dict = {}
+
+    def targets(self, X: np.ndarray, ts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(targets [B, S] with NaN off each strategy's candidates, allowed [B, S])."""
+        from . import strategies
+        per = strategies.decide_all(self.models, X, self.cols, ts); T = np.full((len(X), len(self.strategies)), np.nan); A = np.zeros_like(T, dtype=bool)
+        for j, k in enumerate(self.strategies):
+            d = per[k]; sc = d["score"]; trig = d["trig"]
+            if k not in self.eps:
+                al = sc[d["allow"] & np.isfinite(sc)]
+                self.eps[k] = float(np.median(np.abs(al - np.median(al)))) if len(al) else 0.0
+            T[trig, j] = np.where(d["allow"][trig], sc[trig], np.minimum(sc[trig], self.lines[k] - self.eps[k])); A[:, j] = d["allow"]
+        return T, A
+
+
+def _teacher_targets(teacher, ds: DecisionSet, idx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """[n, S] targets (NaN: not a candidate of that strategy) and loss weights for the rows ``idx``."""
+    if isinstance(teacher, StackTeacher):
+        T = np.full((len(idx), len(teacher.strategies)), np.nan, np.float32); W = np.ones_like(T)
+        for i in range(0, len(idx), 200_000):
+            t, a = teacher.targets(ds.X[idx[i:i + 200_000]], ds.ts[idx[i:i + 200_000]])
+            T[i:i + 200_000] = t; W[i:i + 200_000] = np.where(a, TOP_WEIGHT, 1.0)
+        return np.clip(T, -1.0, 1.0), W
+    tgt = np.empty(len(idx), np.float32)
     for i in range(0, len(idx), 500_000):
         tgt[i:i + 500_000] = teacher.score(ds.X[idx[i:i + 500_000]])
-    tgt = np.clip(tgt, -1.0, 1.0); wts = np.where(tgt >= np.quantile(tgt, 0.99), TOP_WEIGHT, 1.0).astype(np.float32)
-    use = distil_rows(idx, tgt, rng)
+    tgt = np.clip(tgt, -1.0, 1.0)
+    return tgt[:, None], np.where(tgt >= np.quantile(tgt, 0.99), TOP_WEIGHT, 1.0).astype(np.float32)[:, None]
+
+
+def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, batch: int = BATCH, stop: threading.Event | None = None,
+              seed: int = 0, graph=None, device=None) -> tuple[FlyModel | None, dict]:
+    """Distil ``teacher`` (a StackTeacher, or anything with ``score`` and ``scaler``) into a FlyNet over the training rows
+    ``rows`` (mask): one head per strategy, each learning its strategy's targets on that strategy's candidates."""
+    torch.manual_seed(seed); rng = np.random.default_rng(seed); dev = torch.device(device) if device else _device()
+    n_s = len(teacher.strategies) if isinstance(teacher, StackTeacher) else 1
+    net = FlyNet(graph if graph is not None else _graph(), obs_dim=len(ds.cols), device=dev, n_strategies=n_s)
+    idx = np.flatnonzero(rows); T, W = _teacher_targets(teacher, ds, idx)
+    keep = np.isfinite(T).any(1); idx, T, W = idx[keep], T[keep], W[keep]
+    if not len(idx):
+        return None, {"stopped": False, "reason": "no teacher candidates"}
+    use = distil_rows(idx, np.nanmax(np.where(np.isfinite(T), T, -np.inf), axis=1), rng)
     with torch.no_grad():
-        net.head.bias.fill_(float(tgt.mean()) * SCALE); net.head.weight.mul_(0.1)
+        for j, hd in enumerate(net.heads):
+            col = T[:, j]; hd.bias.fill_(float(np.nanmean(col)) * SCALE if np.isfinite(col).any() else 0.0); hd.weight.mul_(0.1)
     opt = torch.optim.Adam(net.param_groups(LR_GRAPH, LR_HEAD)); n_b = max(1, len(use) // batch); total = max(1, epochs * n_b); hist = []; t0 = time.time()
     for ep in range(epochs):
         perm = use[rng.permutation(len(use))]; tot = 0.0; net.train()
@@ -243,8 +357,9 @@ def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, 
                 return None, {"epochs": hist, "stopped": True}
             sel = perm[b * batch:(b + 1) * batch]
             x = torch.tensor(teacher.scaler.transform(ds.X[idx[sel]]), device=dev)
-            t = torch.tensor(tgt[sel] * SCALE, device=dev); w = torch.tensor(wts[sel], device=dev)
-            loss = (w * (net(x) - t) ** 2).sum() / w.sum()
+            t = torch.tensor(np.nan_to_num(T[sel]) * SCALE, device=dev); m = torch.tensor(np.isfinite(T[sel]), device=dev).float()
+            w = torch.tensor(W[sel], device=dev) * m
+            loss = (w * (net.forward_all(x) - t) ** 2).sum() / w.sum().clamp(min=1e-9)
             opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0); opt.step(); tot += loss.item()
             if b % 200 == 0:
                 done = ep * n_b + b + 1; el = time.time() - t0
@@ -254,8 +369,11 @@ def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, 
         log.info("fly epoch %d: weighted mse %.4f over %d rows (%.0fs)", ep, tot / n_b, min(len(use), n_b * batch), time.time() - t0)
     rec = idx[rng.choice(len(idx), min(RECAL_ROWS, len(idx)), replace=False)]
     recalibrate(net, ds.X[np.sort(rec)], teacher.scaler, batch)
-    return FlyModel(net, teacher.scaler, ds.cols, int(ds.horizon_s // 60)), {"epochs": hist, "stopped": False, "rows": int(len(use)),
-                                                                              "training_rows": int(len(idx)), "top_weight": TOP_WEIGHT}
+    if isinstance(teacher, StackTeacher):
+        fly = FlyModel(net, teacher.scaler, ds.cols, int(teacher.rules[teacher.strategies[0]]["hold_min"]), rules=teacher.rules, combine=teacher.combine)
+    else:
+        fly = FlyModel(net, teacher.scaler, ds.cols, int(ds.horizon_s // 60))
+    return fly, {"epochs": hist, "stopped": False, "rows": int(len(use)), "training_rows": int(len(idx)), "top_weight": TOP_WEIGHT, "strategies": fly.strategies}
 
 
 @torch.no_grad()
@@ -289,34 +407,88 @@ def gate_check(diag: dict) -> tuple[bool, list[str]]:
     return not why, why
 
 
+def _stack_teacher(ds: DecisionSet, train: np.ndarray, stop=None):
+    """The selector's strategy stack fitted on the training days only (an honest teacher for the calibration week)."""
+    from . import strategies
+    sub = ds.subset(train)
+    stack = strategies.fit_stack(sub, stop)
+    if not stack.fits:
+        return None, stack
+    return StackTeacher(strategies.final_models(sub, stack), RobustScaler.fit(sub.X, seed=7), ds.cols), stack
+
+
+def fly_decide(fly: FlyModel, X: np.ndarray, cols: list[str], values: np.ndarray | None = None) -> dict:
+    """The fly's own per-row decision: among the strategies whose trigger fires and whose value clears the fly's line,
+    the one with the larger sizing-band Kelly fraction or margin (the teacher's combination rule)."""
+    V = fly.score_all(X) if values is None else values; trig = fly.triggers(X, cols); n = len(X)
+    strat = np.full(n, None, dtype=object); score = np.full(n, -1.0); hold = np.zeros(n); thr = np.full(n, np.inf); tables = [[] for _ in range(n)]
+    key = np.full(n, -np.inf)
+    for j, name in enumerate(fly.strategies):
+        v = V[:, j]; line = fly.lines[name]; ok = trig[:, j] & (v >= line)
+        kv = (np.array([((sizing.band_for(fly.sizings[name], m) or {}).get("kelly") or 0.0) for m in v - line]) + 1e-9 * v
+              if fly.combine == "kelly" and fly.sizings[name] else v - line)
+        take = ok & (kv > key)
+        key = np.where(take, kv, key)
+        for i in np.flatnonzero(take):
+            strat[i] = name; score[i] = v[i]; hold[i] = fly.rules[name]["hold_min"] * 60.0; thr[i] = line; tables[i] = fly.sizings[name]
+    return {"strategy": strat, "score": score, "hold_s": hold, "threshold": thr, "tables": tables}
+
+
 def bootstrap(ds: DecisionSet, S: date, epochs: int = EPOCHS, stop: threading.Event | None = None, seed: int = 0, graph=None,
-              device=None) -> tuple[FlyModel | None, dict]:
-    """The one time the selector teaches: a fly ready to trade from day ``S`` on, with its own line and sizing."""
+              device=None, teacher=None) -> tuple[FlyModel | None, dict]:
+    """The one time the selector teaches: a fly ready to trade from day ``S`` on, with its own line and sizing per strategy.
+    ``teacher``: default the selector's strategy stack fitted on the days before ``S − 8`` (a set without the stack's inputs
+    or per-hold labels — synthetic tests — gets the single-model selector)."""
+    from .decisions import LEGACY_COLS
     train_end = S - timedelta(days=CALIB_DAYS + PURGE_DAYS)
     train = ds.day < train_end; uni = selector.in_universe(ds.X, ds.cols)
     if not train.any():
         raise RuntimeError(f"no training days before {train_end}")
-    prog.update("fly: fitting its teacher (the selector, same configuration)", 0, 1, force=True)
-    teacher = selector.fit(ds, train, seed=7)
+    stack_info = None
+    if teacher is None:
+        prog.update("fly: fitting its teacher (the selector's strategy stack, training days only)", 0, 1, force=True)
+        if ds.fwd_h and set(LEGACY_COLS) <= set(ds.cols):
+            teacher, stack = _stack_teacher(ds, train, stop)
+            stack_info = {"components": stack.components, "deployable": stack.deployable, "reason": stack.reason}
+            if teacher is None:
+                return None, {"S": str(S), "gates_ok": False, "gate_failures": ["the teacher stack has no strategy on the training days"], "teacher_stack": stack_info}
+        else:
+            teacher = selector.fit(ds, train, seed=7)
     fly, fit_info = train_fly(ds, train & uni, teacher, epochs=epochs, stop=stop, seed=seed, graph=graph, device=device)
     if fly is None:
-        return None, {"stopped": True}
+        return None, {"stopped": True, **fit_info}
     s_epoch = datetime(S.year, S.month, S.day, tzinfo=timezone.utc).timestamp()
-    calib = (ds.day >= S - timedelta(days=CALIB_DAYS)) & (ds.day < S) & uni & (ds.ts + ds.horizon_s + 60.0 <= s_epoch)   # labels known at S
-    ci = np.flatnonzero(calib)
-    prog.update("fly: calibrating its own buy line", 0, 1, force=True)
-    sc = fly.score(ds.X[ci]) if len(ci) else np.array([])
-    cal = fly_calibrate.calibrate(ds.ts[ci], ds.mint[ci], ds.horizon_s, sc, ds.fwd_pess[ci])
-    fly.threshold, fly.sizing = cal.line, cal.sizing
+    week = (ds.day >= S - timedelta(days=CALIB_DAYS)) & (ds.day < S) & uni
+    prog.update("fly: calibrating its own buy lines", 0, 1, force=True)
+    wi = np.flatnonzero(week); V = fly.score_all(ds.X[wi]) if len(wi) else np.zeros((0, len(fly.strategies))); trig = fly.triggers(ds.X[wi], ds.cols)
+    per = {}
+    for j, name in enumerate(fly.strategies):
+        H = fly.rules[name]["hold_min"]; y = ds.fwd_h.get(H, ds.fwd_pess)
+        known = trig[:, j] & (ds.ts[wi] + H * 60.0 + 60.0 <= s_epoch)        # labels known at S
+        ci = wi[known]
+        cal = fly_calibrate.calibrate(ds.ts[ci], ds.mint[ci], H * 60.0, V[known, j], y[ci])
+        fly.lines[name], fly.sizings[name] = cal.line, cal.sizing
+        per[name] = {"line": cal.line, "trades": cal.trades, "mean": cal.mean, "total": cal.total, "hold_min": H}
+    d = fly_decide(fly, ds.X[wi], ds.cols, V) if len(wi) else {"strategy": np.array([], dtype=object), "hold_s": np.array([])}
+    picked = np.array([x is not None for x in d["strategy"]], bool)
+    ret = np.array([ds.fwd_h.get(fly.rules[x]["hold_min"], ds.fwd_pess)[i] if x is not None else np.nan for i, x in zip(wi, d["strategy"])])
+    known = picked & (ds.ts[wi] + d["hold_s"] + 60.0 <= s_epoch)
+    tr = taken_idx(ds.ts[wi], ds.mint[wi], d["hold_s"], np.flatnonzero(known)); r = ret[tr]
+    comb = {"trades": int(len(r)), "mean": float(np.mean(r)) if len(r) else None, "total": float(np.sum(r)) if len(r) else 0.0, "per_strategy": per}
+    ci = np.flatnonzero(week & (ds.ts + ds.horizon_s + 60.0 <= s_epoch))
     di = ci if len(ci) <= DIAG_ROWS else np.sort(np.random.default_rng(seed).choice(ci, DIAG_ROWS, replace=False))
-    diag = diagnose(fly, ds.X[di], teacher.score(ds.X[di])) if len(di) else {"mbon_share": 0.0, "mbon_saturated": 1.0, "kc_active": 0.0, "rows": 0}
+    t_sc = teacher.score(ds.X[di]) if hasattr(teacher, "score") else (teacher.targets(ds.X[di], ds.ts[di])[0][:, 0] if len(di) else None)
+    if t_sc is not None and len(di):
+        ok_t = np.isfinite(t_sc); di, t_sc = di[ok_t], t_sc[ok_t]
+    diag = diagnose(fly, ds.X[di], t_sc) if len(di) else {"mbon_share": 0.0, "mbon_saturated": 1.0, "kc_active": 0.0, "rows": 0}
     ok, why = gate_check(diag)
     info = {"S": str(S), "train_through": str(train_end - timedelta(days=1)), "calibration_days": [str(S - timedelta(days=CALIB_DAYS)), str(S - timedelta(days=1))],
-            "line": cal.line, "sizing": cal.sizing, "calibration": {"trades": cal.trades, "mean": cal.mean, "total": cal.total, "lines": cal.lines},
-            "diagnostics": diag, "gates_ok": ok, "gate_failures": why, "fit": fit_info, "teacher": TEACHER_NOTE, "teacher_line": teacher.threshold}
-    log.info("fly bootstrap for %s: line %+.2f%% (%d calibration trades, mean %s) | MBON share %.1f%% saturated %.0f%% KC active %.1f%% slope %s | gates %s",
-             S, cal.line * 100, cal.trades, f"{cal.mean * 100:+.2f}%" if cal.mean is not None else "-", diag["mbon_share"] * 100, diag["mbon_saturated"] * 100,
-             diag["kc_active"] * 100, f"{diag.get('slope'):.2f}" if diag.get("slope") is not None else "-", "ok" if ok else "; ".join(why))
+            "line": fly.threshold, "sizing": fly.sizing, "lines": fly.lines, "calibration": comb, "strategies": fly.strategies, "rules": fly.rules,
+            "diagnostics": diag, "gates_ok": ok, "gate_failures": why, "fit": fit_info, "teacher": TEACHER_NOTE, "teacher_line": getattr(teacher, "threshold", None),
+            "teacher_stack": stack_info}
+    log.info("fly bootstrap for %s: strategies %s, lines %s | calibration %d trades, mean %s | MBON share %.1f%% saturated %.0f%% | gates %s",
+             S, fly.strategies, {k: round(v, 4) for k, v in fly.lines.items()}, comb["trades"], f"{comb['mean'] * 100:+.2f}%" if comb["mean"] is not None else "-",
+             diag["mbon_share"] * 100, diag["mbon_saturated"] * 100, "ok" if ok else "; ".join(why))
     return fly, info
 
 
@@ -329,8 +501,9 @@ def save(fly: FlyModel, metrics: dict, run_id: str | None = None) -> tuple[Path,
     path = root / f"fly_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.pt"
     n = fly.net
     torch.save({"state_dict": n.state_dict(), "scaler": fly.scaler.state(), "cols": fly.cols, "threshold": fly.threshold, "sizing": fly.sizing,
-                "horizon_min": fly.horizon_min, "config": {"k_steps": n.k_steps, "leak": n.leak, "hidden": n.hidden, "obs_dim": n.obs_dim,
-                                                           "kc_active": n.kc_active, "scale": SCALE}, "metrics": metrics}, path)
+                "horizon_min": fly.horizon_min, "rules": fly.rules, "lines": fly.lines, "sizings": fly.sizings, "combine": fly.combine,
+                "config": {"k_steps": n.k_steps, "leak": n.leak, "hidden": n.hidden, "obs_dim": n.obs_dim, "kc_active": n.kc_active, "scale": SCALE,
+                           "n_strategies": n.n_strategies}, "metrics": metrics}, path)
     sha = hashlib.sha256(path.read_bytes()).hexdigest()
     with transaction() as conn:
         row = conn.execute("INSERT INTO brain_snapshots (run_id, path, sha256, kind, note) VALUES (%s,%s,%s,'fly_selector',%s) RETURNING id",
@@ -341,11 +514,12 @@ def save(fly: FlyModel, metrics: dict, run_id: str | None = None) -> tuple[Path,
 def load(path: str | Path, graph=None, device=None) -> FlyModel:
     d = torch.load(path, map_location="cpu", weights_only=False); c = d["config"]
     net = FlyNet(graph if graph is not None else _graph(), obs_dim=c["obs_dim"], k_steps=c["k_steps"], leak=c["leak"], hidden=c["hidden"],
-                 kc_active=c["kc_active"], device=device or _device())
+                 kc_active=c["kc_active"], device=device or _device(), n_strategies=c.get("n_strategies", 1))
     net.load_state_dict(d["state_dict"]); net.eval()
     for bn in (net.eff_norm, net.mb_norm):
         bn.momentum = None
-    return FlyModel(net, RobustScaler.from_state(d["scaler"]), d["cols"], d["horizon_min"], d["threshold"], d.get("sizing"))
+    return FlyModel(net, RobustScaler.from_state(d["scaler"]), d["cols"], d["horizon_min"], d["threshold"], d.get("sizing"), rules=d.get("rules"),
+                    lines=d.get("lines"), sizings=d.get("sizings"), combine=d.get("combine", "score"))
 
 
 def latest_current(conn) -> dict | None:
@@ -393,11 +567,12 @@ def main(days: int | None = None, epochs: int = EPOCHS, stop_event: threading.Ev
     reset_training_stats("fly_selector", reason="fly bootstrap")
     prog.set_stop_event(stop_event); prog.clear()
     prog.update("fly: building decision points", 0, 1, force=True)
-    ds = build(days=days, horizon_min=HOLD_MIN); S = ds.days[-1] + timedelta(days=1)
+    from .strategies import HOLDS_MIN
+    ds = build(days=days, horizon_min=HOLD_MIN, holds=HOLDS_MIN); S = ds.days[-1] + timedelta(days=1)
     fly, info = bootstrap(ds, S, epochs=epochs, stop=stop_event)
     if fly is None:
         return {"stopped": True}
-    record_event("info", "fly_selector", "fly bootstrap", {k: info[k] for k in ("S", "line", "calibration", "diagnostics", "gates_ok", "gate_failures")})
+    record_event("info", "fly_selector", "fly bootstrap", {k: info.get(k) for k in ("S", "lines", "calibration", "diagnostics", "gates_ok", "gate_failures")})
     path, sid = save(fly, info)
     prog.update("fly: done", 1, 1, force=True, snapshot_id=sid, line=info["line"], gates_ok=info["gates_ok"], diagnostics=info["diagnostics"])
     return {**info, "snapshot_id": sid, "path": str(path)}

@@ -80,12 +80,13 @@ def size_position(score: float, threshold: float, table: list[dict] | None, bank
     return float(size), why + f" → {size:.3f} SOL"
 
 
-def simulate_bankroll(ts: np.ndarray, horizon_s: float, margins: np.ndarray, returns: np.ndarray, table: list[dict] | None,
-                      start_sol: float | None = None, res_quote: np.ndarray | None = None) -> dict:
+def simulate_bankroll(ts: np.ndarray, horizon_s, margins: np.ndarray, returns: np.ndarray, table: list[dict] | None,
+                      start_sol: float | None = None, res_quote: np.ndarray | None = None, tables: list | None = None) -> dict:
     """Replay out-of-sample trades in entry order with the sizing rule (positions overlap for ``horizon_s``; cash, the
     reserve and — given ``res_quote``, each trade's pool quote reserve — the pool-depth cap are enforced, as live).
     Returns the final bankroll, its multiple and the worst drawdown."""
     start = float(start_sol or config.CAPITAL_SOL or 1.0); cash = start; open_: list[tuple[float, float, float]] = []   # (exit_ts, cost, return)
+    hv = np.asarray(horizon_s, dtype=np.float64); hold = np.full(len(ts), float(hv)) if hv.ndim == 0 else hv    # per-trade holds allowed
     peak = start; mdd = 0.0; n = 0
     for i in np.argsort(ts, kind="stable"):
         t = float(ts[i])
@@ -97,9 +98,9 @@ def simulate_bankroll(ts: np.ndarray, horizon_s: float, margins: np.ndarray, ret
                 still.append(x)
         open_ = still
         bankroll = cash + sum(x[1] for x in open_)
-        size, _ = size_position(float(margins[i]), 0.0, table, bankroll, cash, float(res_quote[i]) if res_quote is not None else None)
+        size, _ = size_position(float(margins[i]), 0.0, tables[i] if tables is not None else table, bankroll, cash, float(res_quote[i]) if res_quote is not None else None)
         if size > 0:
-            cash -= size; open_.append((t + horizon_s, size, float(returns[i]))); n += 1
+            cash -= size; open_.append((t + float(hold[i]), size, float(returns[i]))); n += 1
         w = cash + sum(x[1] for x in open_); peak = max(peak, w); mdd = max(mdd, 1 - w / peak if peak > 0 else 0.0)
     final = cash + sum(x[1] * (1 + x[2]) for x in open_)
     return {"start_sol": start, "final_sol": final, "multiple": final / start if start > 0 else None, "max_drawdown": mdd, "trades": n}

@@ -20,9 +20,11 @@ log = logging.getLogger(__name__)
 
 def open_positions(conn, book: str) -> list[dict]:
     rows = conn.execute(
-        """SELECT p.*, t.decimals, t.graduated_at, wp.program_label
+        """SELECT p.*, t.decimals, t.graduated_at, wp.program_label,
+                  COALESCE(p.hold_s, (d.detail->>'hold_s')::float) AS hold_s, COALESCE(p.strategy, d.detail->>'strategy') AS strategy
            FROM positions p LEFT JOIN tokens t ON t.mint = p.mint
            LEFT JOIN watch_pools wp ON wp.pool = p.pool
+           LEFT JOIN decisions d ON d.id = p.entry_decision_id
            WHERE p.book = %s AND p.status = 'open' ORDER BY p.opened_at""",
         (book,),
     ).fetchall()
@@ -54,7 +56,8 @@ def record_fill(conn, *, order_id: int | None, book: str, mint: str, side: str, 
 
 
 def open_position(conn, *, book: str, mint: str, pool: str | None, qty_raw: int, cost_sol: float,
-                  entry_price: float, decision_id: int | None, fees_sol: float, ts: datetime | None = None) -> int:
+                  entry_price: float, decision_id: int | None, fees_sol: float, ts: datetime | None = None,
+                  hold_s: float | None = None, strategy: str | None = None) -> int:
     ts = ts or datetime.now(timezone.utc)
     existing = conn.execute("SELECT id, qty, cost_sol, entry_price FROM positions WHERE book=%s AND mint=%s AND status='open'",
                             (book, mint)).fetchone()
@@ -67,9 +70,9 @@ def open_position(conn, *, book: str, mint: str, pool: str | None, qty_raw: int,
         return int(existing["id"])
     row = conn.execute(
         """INSERT INTO positions (book, mint, pool, opened_at, entry_decision_id, qty, cost_sol, entry_price, peak_price,
-             last_mark_price, last_mark_ts, fees_sol, status, last_swap_ts)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open',%s) RETURNING id""",
-        (book, mint, pool, ts, decision_id, qty_raw, cost_sol, entry_price, entry_price, entry_price, ts, fees_sol, ts),
+             last_mark_price, last_mark_ts, fees_sol, status, last_swap_ts, hold_s, strategy)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open',%s,%s,%s) RETURNING id""",
+        (book, mint, pool, ts, decision_id, qty_raw, cost_sol, entry_price, entry_price, entry_price, ts, fees_sol, ts, hold_s, strategy),
     ).fetchone()
     return int(row["id"])
 

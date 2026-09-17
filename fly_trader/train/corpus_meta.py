@@ -35,7 +35,43 @@ from .. import config
 from ..db.connection import transaction
 
 log = logging.getLogger(__name__)
-FEATURE_COLS = ["ttg_min", "dev_sol", "dev_share", "mayhem", "rq0", "prior_launches", "prior_grads", "prior_known", "prior_rug_share", "prior_moon_share"]
+CURVE_COLS = ["bundle_share", "dev_hold_share", "dev_sold_frac", "grad_hhi"]
+FEATURE_COLS = ["ttg_min", "dev_sol", "dev_share", "mayhem", "rq0", "prior_launches", "prior_grads", "prior_known", "prior_rug_share", "prior_moon_share",
+                *CURVE_COLS, "curve_known"]
+
+
+def curve_facts(create_slot: int | None, creator: str | None, supply: float | None, initial_buy: float | None, wallets: dict) -> tuple[dict, list[tuple[str, str]]]:
+    """Graduation-time rug facts from a token's bonding-curve trading, one definition for the archive (``update_curve_facts``)
+    and the live stream (``ingest/pumpstream.py``). ``wallets``: wallet → [first buy slot or None, tokens bought, tokens sold]
+    over the curve legs up to the migration. The creator's first buy rides on the create event (``initial_buy``, not a
+    trade leg — measured 2026-09-15: a creator leg in the create slot occurs only when the create carried no initial buy).
+    - bundle_share: tokens held at migration by non-creator wallets whose first buy is in the create slot (same block as
+      the creation: bought together with it) / supply;
+    - dev_hold_share: the creator's held tokens (initial buy + curve buys − sells) / supply;
+    - dev_sold_frac: the creator's sold tokens / its bought tokens (initial buy included);
+    - grad_hhi: Herfindahl concentration of holdings at migration (Σ of squared shares of all positive holdings).
+    Returns (facts, insider wallets [(wallet, kind)]: the creator and bundle wallets)."""
+    sup = float(supply) if supply else 0.0; ib = float(initial_buy or 0.0)
+    held, bundle, insiders = [], 0.0, []
+    dev_b, dev_s = ib, 0.0
+    for w, (first, bought, sold) in wallets.items():
+        net = float(bought) - float(sold)
+        if w == creator:
+            dev_b += float(bought); dev_s += float(sold)
+            continue
+        if net > 0:
+            held.append(net)
+        if first is not None and create_slot is not None and int(first) == int(create_slot):
+            bundle += max(net, 0.0); insiders.append((w, "bundle"))
+    dev_net = dev_b - dev_s
+    if creator:
+        insiders.insert(0, (creator, "creator"))
+        if dev_net > 0:
+            held.append(dev_net)
+    tot = sum(held)
+    facts = {"bundle_share": bundle / sup if sup > 0 else None, "dev_hold_share": max(dev_net, 0.0) / sup if sup > 0 else None,
+             "dev_sold_frac": dev_s / dev_b if dev_b > 0 else 0.0, "grad_hhi": sum((h / tot) ** 2 for h in held) if tot > 0 else None}
+    return facts, insiders
 
 
 def _outcomes(rows: list[dict]) -> list[tuple]:
@@ -111,9 +147,65 @@ def rebuild(outcome_batch: int = 20000) -> int:
             "INSERT INTO corpus_meta (" + ",".join(cols) + ") VALUES (" + ",".join(["%s"] * len(cols)) + ") ON CONFLICT (mint) DO UPDATE SET " +
             ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c != "mint") + ", updated_at = now()", rows)
     n_cr = _backfill_creates(creates)
-    log.info("corpus_meta rebuilt: %d graduated tokens (%d with creator, %d with outcomes), %d archive creates added to pump_events, %d custom pools to pump_pools, in %.0fs",
-             len(meta), int(meta["creator"].notna().sum()), int(meta["own_dd60"].notna().sum()), n_cr, n_pp, time.time() - t0)
+    n_curve = update_curve_facts()
+    log.info("corpus_meta rebuilt: %d graduated tokens (%d with creator, %d with outcomes), %d archive creates added to pump_events, %d custom pools to pump_pools, "
+             "curve facts for %d, in %.0fs", len(meta), int(meta["creator"].notna().sum()), int(meta["own_dd60"].notna().sum()), n_cr, n_pp, n_curve, time.time() - t0)
     return len(meta)
+
+
+def update_curve_facts() -> int:
+    """Curve facts and insiders (``curve_facts``) for graduated tokens whose whole curve life (create hour .. graduation
+    hour) is in the archive and that have none yet; the archive's values replace the stream's (COALESCEd at graduation)."""
+    from datetime import timedelta
+    with transaction() as conn:
+        todo = conn.execute("SELECT mint, create_ts, graduated_at, creator, supply, dev_tokens FROM corpus_meta "
+                            "WHERE curve_known IS NOT TRUE AND create_ts IS NOT NULL AND graduated_at IS NOT NULL").fetchall()
+        done = {r["hour"].astimezone(__import__("datetime").timezone.utc) for r in conn.execute("SELECT hour FROM replay_hours WHERE status IN ('done','missing')").fetchall()}
+    ready = []
+    for r in todo:
+        h = r["create_ts"].replace(minute=0, second=0, microsecond=0); g = r["graduated_at"]
+        ok = True
+        while h <= g:
+            if h not in done:
+                ok = False; break
+            h += timedelta(hours=1)
+        if ok:
+            ready.append(r)
+    if not ready:
+        return 0
+    days = sorted({(r["create_ts"] + timedelta(hours=k)).date() for r in ready for k in range(0, int((r["graduated_at"] - r["create_ts"]).total_seconds() // 3600) + 2)})
+    trade_files = [str(f) for d in days for f in sorted((config.REPLAY_DIR / d.isoformat()).glob("*_trades.parquet"))]
+    event_files = [str(f) for d in days for f in sorted((config.REPLAY_DIR / d.isoformat()).glob("*_events.parquet"))]
+    if not trade_files:
+        return 0
+    import pyarrow as pa
+    con = duckdb.connect()
+    con.register("todo", pa.table({"mint": pa.array([r["mint"] for r in ready], pa.string()),
+                                   "g": pa.array([r["graduated_at"] for r in ready], pa.timestamp("us", tz="UTC"))}))
+    slots = dict(con.execute("SELECT e.mint, arg_min(e.slot, e.ts) FROM read_parquet(?, union_by_name = true) e JOIN todo USING (mint) "
+                             "WHERE e.action = 'create' AND e.pool = 'pump' GROUP BY e.mint", [event_files]).fetchall()) if event_files else {}
+    legs = con.execute("""SELECT t.mint, t.trader, min(t.slot) FILTER (WHERE t.side = 1) AS first_buy,
+                                 coalesce(sum(t.tokens) FILTER (WHERE t.side = 1), 0) AS bought, coalesce(sum(t.tokens) FILTER (WHERE t.side = -1), 0) AS sold
+                          FROM read_parquet(?, union_by_name = true) t JOIN todo d ON d.mint = t.mint
+                          WHERE t.pool = 'pump' AND t.ts <= d.g AND t.trader IS NOT NULL GROUP BY t.mint, t.trader""", [trade_files]).df()
+    con.close()
+    by_mint = {m: g for m, g in legs.groupby("mint")} if len(legs) else {}
+    upd, ins = [], []
+    for r in ready:
+        g = by_mint.get(r["mint"])
+        wallets = {} if g is None else {w: [None if pd.isna(f) else int(f), float(b), float(s_)] for w, f, b, s_ in zip(g["trader"], g["first_buy"], g["bought"], g["sold"])}
+        facts, insiders = curve_facts(slots.get(r["mint"]), r["creator"], r["supply"], r["dev_tokens"], wallets)
+        upd.append((*[_pg(facts[c]) for c in CURVE_COLS], r["mint"])); ins.extend((r["mint"], w, k) for w, k in insiders)
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.executemany("UPDATE corpus_meta SET " + ", ".join(f"{c} = %s" for c in CURVE_COLS) + ", curve_known = true, updated_at = now() WHERE mint = %s", upd)
+            cur.execute("CREATE TEMP TABLE _ti (mint text, wallet text, kind text) ON COMMIT DROP")
+            with cur.copy("COPY _ti FROM STDIN") as cp:
+                for rec in ins:
+                    cp.write_row(rec)
+            cur.execute("INSERT INTO token_insiders (mint, wallet, kind) SELECT DISTINCT ON (mint, wallet) mint, wallet, kind FROM _ti ON CONFLICT (mint, wallet) DO NOTHING")
+    log.info("curve facts: %d tokens, %d insider wallets", len(upd), len(ins))
+    return len(upd)
 
 
 def _pg(x):
@@ -241,6 +333,7 @@ def load_features() -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["mint"] + FEATURE_COLS)
     df["mayhem"] = df["mayhem"].map({True: 1.0, False: 0.0})
+    df["curve_known"] = df["curve_known"].map({True: 1.0, False: 0.0})
     return df
 
 
