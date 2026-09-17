@@ -3,8 +3,8 @@
 
 const CONFIG = {
   GITHUB_URL: "https://github.com/bryceweiner/fly-trader",
-  X_URL: "",            // X community link, e.g. "https://x.com/i/communities/..."; empty = placeholder
-  FLY_CA: "",           // $FLY contract address once launched; empty = TBA
+  X_URL: "https://x.com/i/communities/2038854012578173030",
+  FLY_CA: "0x2fC7f9E2911f20b2C4660d2AEf808aa91bDdb3D3",
   VENUE_URL: "https://ponsfamily.com/coin/", // CA is appended
 };
 
