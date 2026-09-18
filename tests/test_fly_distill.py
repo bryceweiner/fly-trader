@@ -145,3 +145,13 @@ def test_robust_scaler_tames_fat_tails_and_keeps_order():
     assert np.abs(Z).max() < 25                                                          # a 1e6 outlier no longer swamps the units
     assert (np.diff(Z[:, 1]) > 0).all()                                                  # monotone: tree splits are unchanged
     assert np.allclose(RobustScaler.from_state(sc.state()).transform(X), Z)
+
+
+def test_the_scaler_never_touches_the_callers_array():
+    """transform() copies; only transform_into() writes, and the walk-forwards hand it arrays they own."""
+    X = np.random.default_rng(0).normal(size=(64, 5)).astype(np.float32); before = X.copy()
+    sc = RobustScaler.fit(X)
+    Z = sc.transform(X)
+    assert np.array_equal(X, before) and not np.shares_memory(Z, X)
+    Y = X.copy()
+    assert sc.transform_into(Y) is Y and np.allclose(Y, Z)

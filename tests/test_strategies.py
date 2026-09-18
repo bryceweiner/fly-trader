@@ -1,6 +1,7 @@
 """The strategy stack: every fit records the best setting it reached even when none clears the bars; the objective (win rate, profit factor, trade count; weekly totals recorded, not required) orders settings with
 admissible ones first; a filter must beat random removal; on a planted edge the stack finds an admissible ev strategy,
 records every component with a reason, and the live decision reproduces the fitted rule."""
+import threading
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -8,6 +9,12 @@ import pytest
 
 from fly_trader.train import strategies as S
 from fly_trader.train.decisions import X_COLS, DecisionSet
+
+
+@pytest.fixture(autouse=True)
+def _cache_in_tmp(tmp_path, monkeypatch):
+    """The walk-forward cache belongs to the corpus: no test may write into it."""
+    monkeypatch.setattr(S, "CACHE_DIR", tmp_path / "stack_cache")
 
 
 def _ds(days=42, per_day=600, seed=0):
@@ -93,3 +100,46 @@ def test_empty_inputs_are_skipped_and_groups_are_judged_at_one_hold(monkeypatch)
     n_inputs = sum(1 for c in st.components if c["name"].startswith("inputs:") and c["trials"])
     assert all(h == (S.EV_HOLD,) for _, h in calls[:1 + n_inputs])            # the baseline and every group trial: one hold
     assert any(h is None for _, h in calls[1 + n_inputs:])                    # the strategies themselves scan the whole grid
+
+
+def test_walk_forward_scores_are_cached_and_never_partial():
+    """A killed fit must resume from disk, and a fit that was interrupted must leave nothing behind to resume from."""
+    ds = _ds(days=20, per_day=40); calls = []
+
+    def compute():
+        calls.append(1); return np.arange(len(ds.y), dtype=np.float32)
+    v1 = S._cached(ds, ["a"], "ev|hold120", None, compute)
+    v2 = S._cached(ds, ["a"], "ev|hold120", None, compute)
+    assert len(calls) == 1 and np.array_equal(v1, v2)                       # the second fit reuses the file
+    ev = threading.Event(); ev.set()
+    S._cached(ds, ["a"], "ev|hold30", ev, compute)
+    assert len(calls) == 2 and not S._cache_path(ds, ["a"], "ev|hold30").exists()      # interrupted: nothing written
+    assert S._cache_path(ds, ["a"], "ev|hold120") != S._cache_path(ds, ["b"], "ev|hold120")   # the inputs are part of the key
+
+
+def test_random_removal_scores_each_book_with_its_own_holds():
+    """The filtered book carries no hold for a row the filter removed. Passing those zeros for the unfiltered book made
+    taken_idx re-enter the same minute forever (three training runs died this way) and scored the dropped trades as 0."""
+    ds = _ds(days=30, per_day=60)
+    before = np.zeros(len(ds.y), bool); before[:400] = True
+    after = before.copy(); after[200:400] = False
+    hold_after = np.where(after, 1800.0, 0.0); ret_after = np.where(after, ds.fwd_pess, np.nan)
+    hold_before = np.where(before, 1800.0, 0.0); ret_before = np.where(before, ds.fwd_pess, np.nan)
+    with pytest.raises(ValueError, match="hold of zero"):
+        S.beats_random_removal(ds, before, after, hold_after, ret_after, ds.day[0])
+    ok, info = S.beats_random_removal(ds, before, after, hold_after, ret_after, ds.day[0],
+                                      hold_before=hold_before, returns_before=ret_before)
+    assert isinstance(ok, bool) and info["removed"] > 0
+    wrong = S.beats_random_removal(ds, before, after, hold_after, ret_after, ds.day[0],          # what the old call effectively did:
+                                   hold_before=hold_before, returns_before=np.nan_to_num(ret_after))[1]   # removed trades scored as zero
+    assert info["random_total"] != pytest.approx(wrong["random_total"], abs=1e-9)
+    assert info["filtered_total"] == pytest.approx(float(np.nansum(ret_after[S.taken_idx(ds.ts, ds.mint, hold_after, np.flatnonzero(after))])), abs=1e-6)
+
+
+def test_cache_keys_separate_fits_whose_inputs_share_column_names():
+    """The wallet-skill candidates all use the same column names but different values: without a tag they would reuse
+    each other's walk-forward scores and every candidate would look identical."""
+    ds = _ds(days=20, per_day=40); cols = ["imb_5m", "ret_1m"]
+    a = S._cache_path(ds, cols, "ev|hold120|h20-L7")
+    b = S._cache_path(ds, cols, "ev|hold120|h30-L7")
+    assert a != b and S._cache_path(ds, cols, "ev|hold120|h20-L7") == a

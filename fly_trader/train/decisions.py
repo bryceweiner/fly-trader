@@ -168,6 +168,8 @@ def taken_idx(ts: np.ndarray, mint: np.ndarray, horizon_s: float, idx: np.ndarra
     t = np.asarray(ts[idx], dtype=np.float64); m = mint[idx]
     hv = np.asarray(horizon_s, dtype=np.float64)       # a scalar, or one hold per row of ``ts`` (each position exits after its own)
     hs = np.full(len(idx), float(hv)) if hv.ndim == 0 else hv[idx]
+    if not (hs > 0).all():         # a zero hold lets a token re-enter at the same minute: the frontier below would never advance
+        raise ValueError(f"{int((hs <= 0).sum())} of {len(hs)} picked rows have a hold of zero or less; a position must be held for a positive time")
     first = np.r_[True, m[1:] != m[:-1]]; gid = np.cumsum(first) - 1; starts = np.flatnonzero(first)
     ends = np.r_[starts[1:], len(idx)]
     span = float(t.max() - t.min()) + float(hs.max()) + 1.0

@@ -27,7 +27,16 @@ class RobustScaler:
         return cls(med, np.where(iqr > 1e-12, iqr, np.where(sd > 1e-12, sd, 1.0)))
 
     def transform(self, X: np.ndarray) -> np.ndarray:
-        return np.arcsinh((np.asarray(X, dtype=np.float32) - self.center) / self.scale).astype(np.float32)
+        """A scaled copy of ``X``, never touching it. One allocation: the arithmetic then runs in place, so a walk-forward
+        block of tens of millions of rows costs one array instead of four (subtract, divide, asinh and cast each used to
+        allocate their own)."""
+        return self.transform_into(np.array(X, dtype=np.float32, order="C"))
+
+    def transform_into(self, Z: np.ndarray) -> np.ndarray:
+        """Scale ``Z`` in place and return it. Only for an array the caller owns — a block copy from fancy indexing, never
+        a view of the corpus, which this would corrupt."""
+        Z -= self.center; Z /= self.scale; np.arcsinh(Z, out=Z)
+        return Z
 
     def state(self) -> dict:
         return {"center": self.center.tolist(), "scale": self.scale.tolist()}

@@ -255,7 +255,7 @@ def fit(days: int | None = None, stop=None) -> dict:
     if state.get("key") != key:
         state = {"key": key, "candidates": {}}
     if "baseline" not in state:
-        b = strategies.fit_strategy(ds, "ev", list(LEGACY_COLS), uni, sel, day0, stop)
+        b = strategies.fit_strategy(ds, "ev", list(LEGACY_COLS), uni, sel, day0, stop, holds=(strategies.EV_HOLD,))
         if stop is not None and stop.is_set():
             return {"stopped": True}
         state["baseline"] = b.selection if b else None; _write_fit(state)
@@ -266,7 +266,7 @@ def fit(days: int | None = None, stop=None) -> dict:
             continue
         prog.update("wallet skill: fitting (hold, lookback)", i, len(grid), force=True, candidate=name)
         ds.X[:, sk] = candidate_skill_cols(ds, h, L, stop=stop)
-        f = strategies.fit_strategy(ds, "ev", cols, uni, sel, day0, stop)
+        f = strategies.fit_strategy(ds, "ev", cols, uni, sel, day0, stop, holds=(strategies.EV_HOLD,), cache_tag=f"|{name}")
         if stop is not None and stop.is_set():
             return {"stopped": True, "candidates": len(state["candidates"])}
         state["candidates"][name] = {"h": h, "L": L, "selection": f.selection if f else None, "trials": f.trials if f else 0,
@@ -284,7 +284,7 @@ def fit(days: int | None = None, stop=None) -> dict:
     if best is None:
         raise RuntimeError("no (hold, lookback) gave the ev strategy a setting that passes the objective on the selection half")
     ds.X[:, sk] = candidate_skill_cols(ds, best["h"], best["L"], stop=stop)
-    f = strategies.fit_strategy(ds, "ev", cols, uni, sel, day0, stop)
+    f = strategies.fit_strategy(ds, "ev", cols, uni, sel, day0, stop, holds=(strategies.EV_HOLD,), cache_tag=f"|h{best['h']}-L{best['L']}")
     evs = strategies.score_pick(ds, f.pick(ds, ev, uni), f.hold_min * 60.0, ds.fwd_h.get(f.hold_min, ds.fwd_pess), day0) if f else strategies.Score()
     rec = {"h": best["h"], "L": best["L"], "selection": best["selection"], "evaluation": evs.dict(), "baseline": state.get("baseline"),
            "beats_baseline": bool(strategies.better(score(best["selection"]), score(state.get("baseline")))), "candidates": len(state["candidates"]),

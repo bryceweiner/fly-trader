@@ -26,15 +26,18 @@ sizing band) or the higher score wins — whichever rule made more on the select
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from datetime import timedelta
 
 import numpy as np
 from scipy.stats import binom
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 
+from .. import config
 from ..agent import sizing
 from . import progress as prog
 from .decisions import GROUPS, LEGACY_COLS, DecisionSet, taken_idx
@@ -53,6 +56,14 @@ QUANTILES = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.975, 0.99, 0.9
 LOSS_QUANTILES = (0.05, 0.10, 0.20, 0.30)
 RANDOM_SEEDS = 20
 PASSES = 2
+PREDICT_CHUNK = 2_000_000       # rows scored at once out of sample: the block's own copy stays small
+CACHE_DIR = config.CORPUS_DIR / "stack_cache"
+
+
+def _rss_gb() -> float:
+    """The process's resident size now (ru_maxrss is a high-water mark and hides a climb)."""
+    import psutil
+    return psutil.Process().memory_info().rss / 2**30
 
 
 def _gbm_params():
@@ -121,10 +132,15 @@ def passes(s: Score, fallback: bool) -> bool:
     return s.admissible or (fallback and s.base_ok)
 
 
-def beats_random_removal(ds: DecisionSet, pick_before: np.ndarray, pick_after: np.ndarray, hold_s, returns, day0) -> tuple[bool, dict]:
-    """A filter must beat dropping the same number of trades at random from the unfiltered trades."""
-    t0 = taken_idx(ds.ts, ds.mint, hold_s, np.flatnonzero(pick_before)); t1 = taken_idx(ds.ts, ds.mint, hold_s, np.flatnonzero(pick_after))
-    r0 = np.nan_to_num(np.asarray(returns[t0], dtype=np.float64)); after = float(np.nansum(returns[t1]))
+def beats_random_removal(ds: DecisionSet, pick_before: np.ndarray, pick_after: np.ndarray, hold_s, returns, day0,
+                         hold_before=None, returns_before=None) -> tuple[bool, dict]:
+    """A filter must beat dropping the same number of trades at random from the unfiltered trades. Each book is scored
+    with its own holds and returns: the filtered book's arrays hold nothing for a row the filter removed — a zero there
+    would let a token re-enter within its own hold, and its return would count as zero profit rather than what it made."""
+    hb = hold_s if hold_before is None else hold_before
+    rb = returns if returns_before is None else returns_before
+    t0 = taken_idx(ds.ts, ds.mint, hb, np.flatnonzero(pick_before)); t1 = taken_idx(ds.ts, ds.mint, hold_s, np.flatnonzero(pick_after))
+    r0 = np.nan_to_num(np.asarray(rb[t0], dtype=np.float64)); after = float(np.nansum(returns[t1]))
     k = max(0, len(t0) - len(t1))
     if k == 0 or len(t0) == 0:
         return after >= float(r0.sum()), {"filtered_total": after, "random_total": float(r0.sum()), "removed": 0}
@@ -133,6 +149,36 @@ def beats_random_removal(ds: DecisionSet, pick_before: np.ndarray, pick_after: n
 
 
 # ---------------------------------------------------------------- walk-forward primitives
+def _cache_path(ds: DecisionSet, cols: list[str], tag: str) -> "Path":
+    from .selector import DATA_VERSION
+    k = repr((str(ds.days[0]), str(ds.days[-1]), int(len(ds.y)), float(ds.horizon_s), list(cols), tag,
+              DATA_VERSION.get("agg"), DATA_VERSION.get("features"), OBJECTIVE))
+    return CACHE_DIR / f"{hashlib.sha256(k.encode()).hexdigest()[:20]}.npy"
+
+
+def _cached(ds: DecisionSet, cols: list[str], tag: str, stop, compute):
+    """One strategy-hold walk-forward is ~1.5 h of the fit; keep its out-of-sample scores on disk, keyed by the corpus,
+    the inputs and the hold, so a fit that is interrupted resumes in minutes instead of starting again. A run that was
+    stopped part-way is never written."""
+    f = _cache_path(ds, cols, tag)
+    if f.exists():
+        try:
+            v = np.load(f)
+            if len(v) == len(ds.y):
+                log.info("walk-forward %s: reusing cached scores", tag)
+                return v
+            log.warning("cached walk-forward %s has %d rows, not %d; recomputing", tag, len(v), len(ds.y))
+        except (OSError, ValueError):
+            log.warning("cached walk-forward %s unreadable; recomputing", tag)
+    v = compute()
+    if stop is not None and stop.is_set():
+        return v                                                  # partial: not worth keeping
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_suffix(".tmp.npy"); np.save(tmp, v); tmp.replace(f)
+    return v
+
+
+
 def wf_blocks(days: list) -> list[list]:
     from .selector import BLOCK_DAYS, WARMUP_DAYS
     return [days[k:k + BLOCK_DAYS] for k in range(WARMUP_DAYS, len(days), BLOCK_DAYS)]
@@ -159,8 +205,13 @@ def wf_regress(ds: DecisionSet, rows: np.ndarray, y: np.ndarray, cols: np.ndarra
         tr = np.flatnonzero(fin & (ds.day < (min(blk) - timedelta(days=1)))); te = np.flatnonzero(rows & np.isin(ds.day, blk))
         if len(tr) < 10 * _gbm_params()["min_samples_leaf"] or len(te) == 0:
             continue
-        m, sc = fit_regressor(ds.X[np.ix_(tr, cols)], y[tr], seed=k)
-        out[te] = m.predict(sc.transform(ds.X[np.ix_(te, cols)]))
+        Xtr = ds.X[np.ix_(tr, cols)]                                  # this block's own copy: scaled in place, freed before the next
+        sc = RobustScaler.fit(Xtr, seed=k)
+        m = HistGradientBoostingRegressor(**_gbm_params(), random_state=k); m.fit(sc.transform_into(Xtr), np.clip(y[tr], -1.0, 1.0))
+        del Xtr
+        for i in range(0, len(te), PREDICT_CHUNK):
+            ci = te[i:i + PREDICT_CHUNK]
+            out[ci] = m.predict(sc.transform_into(ds.X[np.ix_(ci, cols)]))
         prog.update(f"selector: {label} walk-forward", k + 1, len(blocks), force=True)
     return out
 
@@ -174,10 +225,16 @@ def wf_classify(ds: DecisionSet, rows: np.ndarray, feats, y: np.ndarray, n_class
         tr = np.flatnonzero(rows & (ds.day < (min(blk) - timedelta(days=1)))); te = np.flatnonzero(rows & np.isin(ds.day, blk))
         if len(tr) < 10 * _gbm_params()["min_samples_leaf"] or len(te) == 0 or len(np.unique(y[tr])) < 2:
             continue
-        m, sc = fit_classifier(feats(tr), y[tr], seed=k)
-        p = m.predict_proba(sc.transform(feats(te)))
-        full = np.zeros((len(te), n_classes), np.float32); full[:, m.classes_.astype(int)] = p
-        out[te] = full
+        Xtr = np.asarray(feats(tr), dtype=np.float32)                 # as above: one block-sized array at a time
+        log.info("classifier block %d: train %d rows (%.2f GB), score %d rows", k, len(tr), Xtr.nbytes / 2**30, len(te))
+        sc = RobustScaler.fit(Xtr, seed=k)
+        m = HistGradientBoostingClassifier(**_gbm_params(), random_state=k); m.fit(sc.transform_into(Xtr), y[tr])
+        del Xtr
+        for i in range(0, len(te), PREDICT_CHUNK):
+            ci = te[i:i + PREDICT_CHUNK]
+            pr = m.predict_proba(sc.transform_into(np.asarray(feats(ci), dtype=np.float32)))
+            full = np.zeros((len(ci), n_classes), np.float32); full[:, m.classes_.astype(int)] = pr
+            out[ci] = full
     return out
 
 
@@ -253,11 +310,14 @@ class StrategyFit:
         return p
 
 
-def fit_strategy(ds: DecisionSet, name: str, cols: list[str], uni: np.ndarray, sel: np.ndarray, day0, stop=None, holds=None) -> StrategyFit | None:
+def fit_strategy(ds: DecisionSet, name: str, cols: list[str], uni: np.ndarray, sel: np.ndarray, day0, stop=None, holds=None,
+                 cache_tag: str = "") -> StrategyFit | None:
     """Coordinate ascent over (hold, line, trigger thresholds, high window) on the selection half; each hold's OOS scores
     come from its own walk-forward (models fit on the strategy's candidates, label = net return over that hold).
     ``holds``: fit these holds instead of the strategy's whole grid — one walk-forward per hold is the expensive part, so
-    the input-group comparison runs at a single hold and only the strategies themselves scan the grid."""
+    the input-group comparison runs at a single hold and only the strategies themselves scan the grid. ``cache_tag``
+    distinguishes fits whose inputs share their column names but hold different values (the wallet-skill candidates), which
+    would otherwise collide in the walk-forward cache."""
     spec = STRATEGIES[name]; X, c = ds.X, ds.cols; ci = np.asarray([c.index(x) for x in cols])
     oos = {}
     loose = uni & np.zeros(len(ds.y), bool)
@@ -267,7 +327,7 @@ def fit_strategy(ds: DecisionSet, name: str, cols: list[str], uni: np.ndarray, s
         y = ds.fwd_h[H] if H in ds.fwd_h else (ds.fwd_pess if H * 60 == ds.horizon_s else None)
         if y is None:
             continue
-        oos[H] = wf_regress(ds, loose, y, ci, stop, label=f"{name} {H} min")
+        oos[H] = _cached(ds, cols, f"{name}|hold{H}{cache_tag}", stop, lambda H=H, y=y: wf_regress(ds, loose, y, ci, stop, label=f"{name} {H} min"))
     if not oos:
         return None
     ret = lambda H: ds.fwd_h[H] if H in ds.fwd_h else ds.fwd_pess
@@ -314,12 +374,18 @@ def fit_meta(ds: DecisionSet, s: StrategyFit, uni: np.ndarray, sel: np.ndarray, 
     half's candidates) jointly with the line."""
     X, c = ds.X, ds.cols; ci = np.asarray([c.index(x) for x in s.cols]); y_r = ds.fwd_h.get(s.hold_min, ds.fwd_pess)
     rows = uni & base_mask(s.name, X, c, s.high) & trigger_mask(s.name, s.thr, X, c) & np.isfinite(s.oos) & (s.oos >= 0) & np.isfinite(y_r)
+    log.info("meta-label %s: %d candidate rows of %d, %d inputs, hold %d min", s.name, int(rows.sum()), len(ds.y), len(ci) + 1, s.hold_min)
     feats = lambda idx: np.c_[X[np.ix_(idx, ci)], s.oos[idx]]
     p = wf_classify(ds, rows, feats, (y_r > 0).astype(np.int8), 2, stop)[:, 1]
+    log.info("meta-label %s: classifiers done, %.1f GB resident; choosing the line and cut-off", s.name, _rss_gb())
     best = None; best_p = None; trials = 0; seen = None
-    for line in [s.line] + quantile_grid(s.oos[sel & rows]):
-        for cut in quantile_grid(p[sel & rows]):
+    lines = [s.line] + quantile_grid(s.oos[sel & rows]); cuts = quantile_grid(p[sel & rows])
+    log.info("meta-label %s: %d lines x %d cut-offs to try", s.name, len(lines), len(cuts))
+    for line in lines:
+        for cut in cuts:
             trials += 1
+            if trials % 25 == 0:
+                log.info("meta-label %s: trial %d/%d, %.1f GB resident", s.name, trials, len(lines) * len(cuts), _rss_gb())
             pk = sel & rows & (s.oos >= line) & (p >= cut)
             sc = score_pick(ds, pk, s.hold_min * 60.0, y_r, day0)
             if sc.n > 0 and (seen is None or sc.total > seen.total):
@@ -414,8 +480,13 @@ class Stack:
 
 
 def _comp(name, passed, reason, sel=None, ev=None, params=None, trials=0, best=None) -> dict:
-    return {"name": name, "passed": bool(passed), "reason": reason, "selection": sel, "evaluation": ev, "params": params or {}, "trials": int(trials),
-            "best_seen": best}
+    """One component's verdict. Logged as it is decided: the stack spends hours per component, and a run that dies must
+    leave behind what it had already settled."""
+    c = {"name": name, "passed": bool(passed), "reason": reason, "selection": sel, "evaluation": ev, "params": params or {}, "trials": int(trials),
+         "best_seen": best}
+    log.info("component %s: %s (%s) | selection %s | evaluation %s | best reached %s | %d settings tried",
+             name, "kept" if c["passed"] else "dropped", reason, sel, ev, best, c["trials"])
+    return c
 
 
 def fit_stack(ds: DecisionSet, stop: threading.Event | None = None) -> Stack:
@@ -467,6 +538,7 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None) -> Stack:
     # 2. strategies
     fits = []
     for name in STRATEGIES:
+        log.info("fitting strategy %s over holds %s", name, STRATEGIES[name]["holds"])
         f = fit_strategy(ds, name, cols, uni, sel, day0, stop)         # the full hold grid: the group step above fitted one hold only
         if f is None or not f.selection:
             comps.append(_comp(f"strategy: {name}", False, (f.reason if f else "no candidates") or "no admissible setting", trials=f.trials if f else 0,
@@ -501,12 +573,19 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None) -> Stack:
         p, cut, info = fit_meta(ds, f, uni, sel, day0, stop)
         if cut is None:
             comps.append(_comp(f"meta-label: {f.name}", False, "no cut-off cleared the bars on the selection half", trials=info["trials"], best=info.get("best_seen"))); continue
+        log.info("meta-label %s: scoring the book before the filter (%.1f GB)", f.name, _rss_gb())
         before_s = score_pick(ds, *system_pick(ds, fits, sel, uni, combine, tables)[:3], day0)
         old = (f.meta_p, f.meta_cut, f.line); f.meta_p, f.meta_cut = p, cut; f.line = info["line"] if info["line"] is not None else f.line
+        log.info("meta-label %s: scoring the book after the filter (%.1f GB)", f.name, _rss_gb())
         after_sel = score_pick(ds, *system_pick(ds, fits, sel, uni, combine, tables)[:3], day0)
+        log.info("meta-label %s: evaluation half, unfiltered book (%.1f GB)", f.name, _rss_gb())
         pk0, hd0, rt0, _ = system_pick(ds, [*(g for g in fits if g is not f), _without_meta(f, old)], ev, uni, combine, tables)
+        log.info("meta-label %s: evaluation half, filtered book (%.1f GB)", f.name, _rss_gb())
         pk1, hd1, rt1, _ = system_pick(ds, fits, ev, uni, combine, tables)
-        ev_s = score_pick(ds, pk1, hd1, rt1, day0); rnd_ok, rnd = beats_random_removal(ds, pk0, pk1, hd1, rt1, day0)
+        log.info("meta-label %s: scoring the evaluation half (%.1f GB)", f.name, _rss_gb())
+        ev_s = score_pick(ds, pk1, hd1, rt1, day0)
+        log.info("meta-label %s: random-removal test (%.1f GB)", f.name, _rss_gb())
+        rnd_ok, rnd = beats_random_removal(ds, pk0, pk1, hd1, rt1, day0, hold_before=hd0, returns_before=rt0)
         ok = better(after_sel, before_s) and passes(ev_s, fallback=not after_sel.admissible) and rnd_ok
         comps.append(_comp(f"meta-label: {f.name}", ok, "improves the book on the selection half, passes on the evaluation half and beats random removal" if ok
                            else "rejected (selection, evaluation or random-removal test)", after_sel.dict(), {**ev_s.dict(), "random_removal": rnd}, {"cut": cut, "line": f.line},
@@ -540,7 +619,7 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None) -> Stack:
         f.hours, f.regimes = gates[f.name]["hours"], gates[f.name]["regimes"]
     pk2, hd2, rt2, _ = system_pick(ds, fits, tested, uni, combine, tables); pk2 &= keep
     after_sel = score_pick(ds, pk2 & sel, hd2, rt2, day0); ev_s = score_pick(ds, pk2 & ev, hd2, rt2, day0)
-    rnd_ok, rnd = beats_random_removal(ds, pk & ev, pk2 & ev, hd2, rt2, day0)
+    rnd_ok, rnd = beats_random_removal(ds, pk & ev, pk2 & ev, hd2, rt2, day0, hold_before=hd, returns_before=rt)
     any_gate = any(g["hours"] or g["regimes"] for g in gates.values())
     ok = any_gate and better(after_sel, before_sel) and passes(ev_s, fallback=not after_sel.admissible) and rnd_ok
     comps.append(_comp("hour and market gates", ok, "no hour or decile lost money with enough trades" if not any_gate else
