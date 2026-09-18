@@ -7,6 +7,7 @@ DATABASE_URL at fly_trader_test).
 from __future__ import annotations
 
 import os
+import time
 from contextlib import contextmanager
 
 import psycopg
@@ -38,7 +39,15 @@ def _refuse_production_under_pytest(url: str) -> None:
 def connect(url: str | None = None, *, autocommit: bool = False) -> psycopg.Connection:
     url = url or database_url()
     _refuse_production_under_pytest(url)
-    return psycopg.connect(url, autocommit=autocommit, row_factory=dict_row, options="-c timezone=UTC")
+    last: Exception | None = None
+    for attempt in range(3):          # a busy machine can refuse one connection; a long training run must not die for it
+        try:
+            return psycopg.connect(url, autocommit=autocommit, row_factory=dict_row, options="-c timezone=UTC", connect_timeout=10)
+        except psycopg.OperationalError as e:
+            last = e
+            if attempt < 2:
+                time.sleep(0.5 * 2 ** attempt)
+    raise last
 
 
 @contextmanager

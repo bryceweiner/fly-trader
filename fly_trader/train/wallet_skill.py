@@ -177,13 +177,28 @@ def daily() -> int:
     return n
 
 
-def _day_skill(d: date, h: int, L: int, day_dir: Path | None = None):
+def _lookups() -> tuple[list[str], dict]:
+    """The blocked pools and token insiders, read once: a fit aggregates 149 days per candidate, and reconnecting for each
+    one cost thousands of connections and lost a 20-hour run to a connection timeout."""
+    from ..db.connection import transaction
+    from .corpus_meta import blocked_pool_ids
+    with transaction() as conn:
+        blocked = blocked_pool_ids(conn)
+        ins: dict = {}
+        for r in conn.execute("SELECT mint, wallet FROM token_insiders").fetchall():
+            ins.setdefault(r["mint"], []).append(r["wallet"])
+    log.info("wallet skill: %d blocked pools, insiders for %d tokens (read once)", len(blocked), len(ins))
+    return blocked, ins
+
+
+def _day_skill(d: date, h: int, L: int, day_dir: Path | None = None, lookups=None):
     """(mint, minute start s, skill_buy [n, N_SKILL]) of day D's aggregate rows as the archive builds them under candidate
     (h, L)'s table (``mature.aggregate_table``: the aggregation's own SQL); None without usable hour files."""
     files = mature._hour_files(d)
     if not files or mature._lacks_pool_id(files):
         return None
-    tab = mature.aggregate_table(files, skill_table(d, h, L, day_dir))
+    blocked, insiders = lookups if lookups is not None else (None, None)
+    tab = mature.aggregate_table(files, skill_table(d, h, L, day_dir), blocked=blocked, insiders=insiders)
     sb = np.zeros((tab.num_rows, flow.N_SKILL))
     col = tab["skill_buy"].combine_chunks()
     if col.null_count < len(col):
@@ -198,13 +213,14 @@ def candidate_skill_cols(ds, h: int, L: int, day_dir: Path | None = None, stop=N
     15-minute window (``flow.skill_features``)."""
     from . import progress as prog
     out = np.zeros((len(ds.y), len(flow.SKILL_COLS)), np.float32)
+    lookups = _lookups()
     groups = pd.Series(np.arange(len(ds.y))).groupby(ds.day).indices
     days = sorted(groups); prev_d, prev = None, None
     for i, d in enumerate(days):
         if stop is not None and stop.is_set():
             break
-        before = prev if prev_d == d - timedelta(days=1) else _day_skill(d - timedelta(days=1), h, L, day_dir)
-        cur = _day_skill(d, h, L, day_dir); prev_d, prev = d, cur
+        before = prev if prev_d == d - timedelta(days=1) else _day_skill(d - timedelta(days=1), h, L, day_dir, lookups)
+        cur = _day_skill(d, h, L, day_dir, lookups); prev_d, prev = d, cur
         if cur is None:
             continue
         parts = [x for x in (before, cur) if x is not None]

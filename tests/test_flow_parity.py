@@ -123,3 +123,20 @@ def test_candidate_skill_inputs_equal_the_archive_build(world, monkeypatch):
         f = fw.features(ts[i] + 60.0)
         assert got[i] == pytest.approx([f[c] for c in flow.SKILL_COLS], abs=1e-6)
     assert got[:, flow.SKILL_COLS.index("skill_known_15m")].max() > 0              # the candidate table was used
+
+
+def test_passed_in_lookups_match_the_database(world):
+    """The skill fit reads the blocked pools and insiders once and hands them to every day instead of reconnecting for
+    each; the rows must be identical to the ones the database path builds."""
+    from fly_trader.db.connection import transaction
+    from fly_trader.train.corpus_meta import blocked_pool_ids
+    d = date(2026, 9, 3); files = mature._hour_files(d)
+    from_db = mature.aggregate_table(files, mature.skill_table_for(d))
+    with transaction() as conn:
+        blocked = blocked_pool_ids(conn)
+        ins: dict = {}
+        for r in conn.execute("SELECT mint, wallet FROM token_insiders").fetchall():
+            ins.setdefault(r["mint"], []).append(r["wallet"])
+    passed_in = mature.aggregate_table(files, mature.skill_table_for(d), blocked=blocked, insiders=ins)
+    assert from_db.to_pylist() == passed_in.to_pylist()
+    assert any(r["insider_sell_sol"] > 0 for r in passed_in.to_pylist())      # the insider join really fired

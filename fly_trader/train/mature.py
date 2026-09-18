@@ -200,15 +200,19 @@ def days_ready() -> list[date]:
     return out
 
 
-def aggregate_table(files: list[str], skill) -> pa.Table:
+def aggregate_table(files: list[str], skill, blocked: list[str] | None = None, insiders: dict | None = None) -> pa.Table:
     """A day's minute aggregates from its hour files, with ``skill`` (wallet → decile table, or None) as the day's skill
-    table — ``aggregate_day``'s SQL, also used to rebuild the skill inputs under a candidate table (train/wallet_skill.fit)."""
+    table — ``aggregate_day``'s SQL, also used to rebuild the skill inputs under a candidate table (train/wallet_skill.fit).
+    ``blocked`` (pool ids) and ``insiders`` (mint -> wallets) are read from Postgres when not given; a caller that aggregates
+    many days hands them in once, rather than opening two connections per day."""
     con = duckdb.connect()
     cols = [c[0] for c in con.execute("SELECT * FROM read_parquet(?, union_by_name = true) LIMIT 0", [files]).description]
     quote_filter = "AND (quote_mint IS NULL OR quote_mint = 'So11111111111111111111111111111111111111112')" if "quote_mint" in cols else ""
     pool_sel = "pool_id" if "pool_id" in cols else "NULL AS pool_id"
-    with transaction() as conn:
-        con.register("blocked", pa.table({"pool_id": pa.array(blocked_pool_ids(conn), pa.string())}))
+    if blocked is None:
+        with transaction() as conn:
+            blocked = blocked_pool_ids(conn)
+    con.register("blocked", pa.table({"pool_id": pa.array(blocked, pa.string())}))
     pool_filter = "AND (pool_id IS NULL OR pool_id NOT IN (SELECT pool_id FROM blocked))" if "pool_id" in cols else ""
     # causal filters only (nothing later in the day decides which earlier trades exist); the live stream applies the same:
     # no directly created pool, reserve band, a leg within 50x of the median of the mint's previous 200 legs, and per (mint, minute) the pool with the most legs
@@ -234,9 +238,13 @@ def aggregate_table(files: list[str], skill) -> pa.Table:
                       sum(CASE WHEN side = 1 THEN sol ELSE 0 END) AS b, sum(CASE WHEN side = -1 THEN sol ELSE 0 END) AS s
                     FROM clean WHERE trader IS NOT NULL GROUP BY ALL""")
     mints = [r[0] for r in con.execute("SELECT DISTINCT mint FROM w").fetchall()]
-    with transaction() as conn:
-        ins = conn.execute("SELECT mint, wallet FROM token_insiders WHERE mint = ANY(%s)", (mints,)).fetchall() if mints else []
-    con.register("ins", pa.table({"mint": pa.array([r["mint"] for r in ins], pa.string()), "wallet": pa.array([r["wallet"] for r in ins], pa.string())}))
+    if insiders is None:
+        with transaction() as conn:
+            rows = conn.execute("SELECT mint, wallet FROM token_insiders WHERE mint = ANY(%s)", (mints,)).fetchall() if mints else []
+        ins = [(r["mint"], r["wallet"]) for r in rows]
+    else:
+        ins = [(m, w) for m in mints for w in insiders.get(m, ())]
+    con.register("ins", pa.table({"mint": pa.array([m for m, _ in ins], pa.string()), "wallet": pa.array([w for _, w in ins], pa.string())}))
     con.register("skill", skill if skill is not None else pa.table({"wallet": pa.array([], pa.string()), "bucket": pa.array([], pa.int8())}))
     sk_expr = ("[" + ", ".join(f"sum(CASE WHEN coalesce(k.bucket, {UNKNOWN}) = {q} THEN w.b ELSE 0 END)" for q in range(N_SKILL)) + "]") if skill is not None else "NULL::DOUBLE[]"
     con.execute(f"""CREATE TEMP TABLE wc AS SELECT w.mint, w.mb AS ts, count(*) FILTER (WHERE w.b > 0) AS n_buyers,
