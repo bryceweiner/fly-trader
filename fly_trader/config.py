@@ -74,6 +74,10 @@ GAS_RESERVE_SOL = env_float("GAS_RESERVE_SOL", 0.30)
 KELLY_FRACTION = env_float("KELLY_FRACTION", 0.25)                 # quarter Kelly: the band estimates are noisy
 MAX_POSITION_FRACTION = env_float("MAX_POSITION_FRACTION", 0.10)   # of the deployable bankroll (wealth minus the gas reserve)
 MAX_POOL_SHARE = env_float("MAX_POOL_SHARE", 0.02)                 # of the pool's quote reserve (bounds price impact)
+# The training label charges what an exit really costs at the size the book takes. market/features.py prices
+# exit_cost_0p1 for a fixed 0.1 SOL, but positions are Kelly-sized up to MAX_POSITION_FRACTION of the bankroll, and
+# impact = value/(value + reserves) grows with size. 0 = the sizing rule's own ceiling (train/decisions.py).
+LABEL_SIZE_SOL = env_float("LABEL_SIZE_SOL", 0.0)
 MIN_POSITION_SOL = env_float("MIN_POSITION_SOL", 0.02)             # smaller sizes are skipped
 KILL_SWITCH_DRAWDOWN = env_float("KILL_SWITCH_DRAWDOWN", 0.30)
 CIRCUIT_THRESHOLD = env_int("CIRCUIT_THRESHOLD", 3)

@@ -62,3 +62,21 @@ def test_trades_and_random_with_per_row_holds(tmp_path):
     assert len(r) == len(taken_idx(ds.ts, ds.mint, hold, np.flatnonzero(pick))) and len(r) > len(decisions.trades_from_picks(ds, pick))
     ev = decisions.evaluate(ds, np.where(pick, 1.0, np.nan), pick, 0.5, hold_s=hold, returns=ds.fwd_h[10])
     assert ev["pooled"]["n"] == len(r)
+
+
+def test_the_label_is_costed_at_the_size_the_book_trades():
+    """exit_cost_0p1 is priced for 0.1 SOL; positions are Kelly-sized well above that and impact grows with size, so the
+    label must reprice both sides or every backtest return is optimistic."""
+    import pandas as pd
+    from fly_trader import config
+    from fly_trader.market.exit_cost import exit_cost_fraction
+    from fly_trader.train.decisions import _label_exit_cost
+    resq = np.array([25.0, 150.0, 2000.0])
+    ec01 = np.array([exit_cost_fraction(0.1, r, 5e5, None) for r in resq])
+    got = _label_exit_cost(pd.DataFrame({"exit_cost_0p1": ec01, "resq": resq}))
+    size = config.LABEL_SIZE_SOL or config.MAX_POSITION_FRACTION * config.CAPITAL_SOL
+    want = [exit_cost_fraction(min(size, config.MAX_POOL_SHARE * r), r, 5e5, None) for r in resq]
+    assert got == pytest.approx(want, abs=2e-4)          # matches the live cost model at the traded size
+    assert (got > ec01).all()                            # and is strictly dearer than the 0.1 SOL assumption
+    blind = _label_exit_cost(pd.DataFrame({"exit_cost_0p1": [0.01], "resq": [float("nan")]}))
+    assert blind[0] == 1.0                               # unknown liquidity: assume the position cannot be exited

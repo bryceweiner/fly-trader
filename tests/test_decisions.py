@@ -66,7 +66,10 @@ def test_model_costs_on_both_sides_and_random_baseline(tmp_path):
         r = _row("C", t0 + timedelta(minutes=k), 1.0); r["exit_cost_0p1"] = 0.01 if k < 10 else 0.02; rows.append(r)
     ds = decisions.build(days=None, feature_dir=_part(tmp_path, rows), horizon_min=30)   # default: the paper broker's cost model
     i0 = np.flatnonzero(ds.ts == t0.timestamp())[0]
-    assert ds.fwd[i0] == pytest.approx(0.99 * 0.98 - 1, abs=1e-6)          # entry cost at the signal minute, exit cost at the exit minute
+    from fly_trader.market.exit_cost import cost_at_size                    # costs are charged at the size the book trades
+    e_in, e_out = cost_at_size(0.01, 100.0), cost_at_size(0.02, 100.0)
+    assert e_in > 0.01 and e_out > 0.02                                     # dearer than the stored 0.1 SOL figure
+    assert ds.fwd[i0] == pytest.approx((1 - e_in) * (1 - e_out) - 1, abs=1e-6)   # entry cost at the signal minute, exit cost at the exit minute
     rr = decisions.random_trades(ds, np.ones(len(ds.y), bool), 3, seeds=2)
     assert len(rr) >= 2 and (rr < 0).all()                                  # a flat market loses exactly the costs
     assert len(decisions.random_trades(ds, np.ones(len(ds.y), bool), 0)) == 0

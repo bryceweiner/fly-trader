@@ -40,13 +40,14 @@ def connect(url: str | None = None, *, autocommit: bool = False) -> psycopg.Conn
     url = url or database_url()
     _refuse_production_under_pytest(url)
     last: Exception | None = None
-    for attempt in range(3):          # a busy machine can refuse one connection; a long training run must not die for it
+    for attempt in range(3):          # a busy machine can refuse one connection; a long training run must not die for it,
+        # but an unreachable database must still report in seconds, not half a minute: three short attempts, ~10 s in all
         try:
-            return psycopg.connect(url, autocommit=autocommit, row_factory=dict_row, options="-c timezone=UTC", connect_timeout=10)
+            return psycopg.connect(url, autocommit=autocommit, row_factory=dict_row, options="-c timezone=UTC", connect_timeout=3)
         except psycopg.OperationalError as e:
             last = e
             if attempt < 2:
-                time.sleep(0.5 * 2 ** attempt)
+                time.sleep(0.25 * 2 ** attempt)
     raise last
 
 

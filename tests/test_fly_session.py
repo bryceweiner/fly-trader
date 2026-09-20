@@ -37,7 +37,9 @@ def test_resolver_equals_the_training_label(tmp_path):
     df, root = _part(tmp_path)
     ds = decisions.build(days=None, horizon_min=10, feature_dir=root)
     assert len(ds.y) > 100
-    bars = {m: [(t.timestamp(), o, c, e) for t, o, c, e in zip(g["ts"], g["open"], g["close"], g["exit_cost_0p1"])]
+    from fly_trader.market.exit_cost import cost_at_size          # the engine reprices before it hands a bar to the fly
+    bars = {m: [(t.timestamp(), o, c, cost_at_size(e, rq)) for t, o, c, e, rq in
+                zip(g["ts"], g["open"], g["close"], g["exit_cost_0p1"], g["resq"])]
             for m, g in df.sort_values("ts").groupby("mint")}
     got = np.array([resolve_label(bars[m], t, ds.horizon_s) for m, t in zip(ds.mint, ds.ts)], dtype=np.float64)
     assert np.allclose(got, ds.fwd_pess, rtol=1e-5, atol=1e-6)

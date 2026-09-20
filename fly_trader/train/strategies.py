@@ -57,6 +57,10 @@ LOSS_QUANTILES = (0.05, 0.10, 0.20, 0.30)
 RANDOM_SEEDS = 20
 PASSES = 2
 PREDICT_CHUNK = 2_000_000       # rows scored at once out of sample: the block's own copy stays small
+# The last three weeks are never fitted on: no strategy, filter, gate or input group may see them. The finished book is
+# scored on them exactly once, for the record — never to decide anything, or they would stop being a holdout. At the
+# book's observed rate (~48 trades a day) that is ~1,000 trades, an order of magnitude above MIN_LINE_TRADES.
+HOLDOUT_DAYS = 21
 CACHE_DIR = config.CORPUS_DIR / "stack_cache"
 
 
@@ -152,7 +156,7 @@ def beats_random_removal(ds: DecisionSet, pick_before: np.ndarray, pick_after: n
 def _cache_path(ds: DecisionSet, cols: list[str], tag: str) -> "Path":
     from .selector import DATA_VERSION
     k = repr((str(ds.days[0]), str(ds.days[-1]), int(len(ds.y)), float(ds.horizon_s), list(cols), tag,
-              DATA_VERSION.get("agg"), DATA_VERSION.get("features"), OBJECTIVE))
+              DATA_VERSION.get("agg"), DATA_VERSION.get("features"), DATA_VERSION.get("costs"), OBJECTIVE))
     return CACHE_DIR / f"{hashlib.sha256(k.encode()).hexdigest()[:20]}.npy"
 
 
@@ -442,26 +446,6 @@ def fit_veto(ds: DecisionSet, pick: np.ndarray, hold: np.ndarray, ret: np.ndarra
             "best_seen": seen.dict() if seen else None}
 
 
-def fit_gates(ds: DecisionSet, pick: np.ndarray, hold: np.ndarray, ret: np.ndarray, who: np.ndarray, fits: list[StrategyFit], sel: np.ndarray, day0) -> dict:
-    """Per strategy: UTC hours and market-volume deciles whose selection-half trades (≥ the minimum count) lost money (PF < 1)."""
-    out = {}; tr = taken_idx(ds.ts, ds.mint, hold, np.flatnonzero(sel & pick)); hr = ((ds.ts // 3600) % 24).astype(int)
-    mv = _col(ds.cols, ds.X, "mkt_vol_1h") if "mkt_vol_1h" in ds.cols else None
-    edges = np.quantile(mv[tr], np.linspace(0, 1, 11)) if mv is not None and len(tr) else None
-    for k, f in enumerate(fits):
-        t = tr[who[tr] == k]; r = ret[t]; hours, regimes = [], []
-        for h in range(24):
-            rr = r[hr[t] == h]
-            if len(rr) >= _min_trades() and rr[rr > 0].sum() < -rr[rr <= 0].sum():
-                hours.append(h)
-        if edges is not None:
-            for lo, hi in zip(edges[:-1], edges[1:]):
-                rr = r[(mv[t] >= lo) & (mv[t] < hi)]
-                if len(rr) >= _min_trades() and rr[rr > 0].sum() < -rr[rr <= 0].sum():
-                    regimes.append((float(lo), float(hi)))
-        out[f.name] = {"hours": hours, "regimes": regimes}
-    return out
-
-
 # ---------------------------------------------------------------- the whole stack
 @dataclass
 class Stack:
@@ -477,6 +461,7 @@ class Stack:
     fallback: bool
     reason: str
     tables: dict = field(default_factory=dict)
+    holdout_days: list = field(default_factory=list)    # withheld from every fit; scored once afterwards by score_holdout
 
 
 def _comp(name, passed, reason, sel=None, ev=None, params=None, trials=0, best=None) -> dict:
@@ -493,11 +478,15 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None) -> Stack:
     """Every component in order, each on top of the accepted ones; see the module docstring."""
     from .selector import deploy_decision, in_universe
     uni = in_universe(ds.X, ds.cols)
-    tdays = sorted({d for blk in wf_blocks(ds.days) for d in blk})
+    holdout_days = list(ds.days[-HOLDOUT_DAYS:]) if HOLDOUT_DAYS and len(ds.days) > HOLDOUT_DAYS + 4 else []
+    fit_days = [d for d in ds.days if d not in set(holdout_days)]
+    tdays = sorted({d for blk in wf_blocks(fit_days) for d in blk})
     if len(tdays) < 4:
         raise RuntimeError("too few walk-forward days for the strategy stack")
     half = tdays[len(tdays) // 2]; day0 = tdays[0]
     tested = np.isin(ds.day, tdays); sel = tested & (ds.day < half); ev = tested & (ds.day >= half)
+    log.info("fitting on %d days (%s..%s); holdout of %d days (%s..%s) is never fitted on", len(tdays), tdays[0], tdays[-1],
+             len(holdout_days), holdout_days[0] if holdout_days else "-", holdout_days[-1] if holdout_days else "-")
     comps = []
     # 1. input groups, judged on the ev strategy: all groups at once; if that is rejected, each group on its own, accumulating
     best = fit_strategy(ds, "ev", LEGACY_COLS, uni, sel, day0, stop, holds=(EV_HOLD,))
@@ -609,24 +598,10 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None) -> Stack:
         comps.append(_comp("dump veto", False, "too few candidate trades to fit it"))
     else:
         comps.append(_comp("dump veto", False, "no dump level and cut-off cleared the bars on the selection half", trials=v["trials"], best=v.get("best_seen")))
-    # 6. gates
+    # (hour and market-volume gates were removed on 2026-09-20: fitted on the selection half they blocked 8 of 24 hours
+    # and 2 volume deciles, cutting the book from ~27 trades a day to under 1 on days nothing was fitted on. Strategies
+    # still carry empty ``hours``/``regimes`` so models saved with gates keep working.)
     keep = ~(veto["p"] >= veto["cut"]) if veto else np.ones(len(ds.y), bool)
-    pk, hd, rt, who = system_pick(ds, fits, tested, uni, combine, tables); pk &= keep
-    gates = fit_gates(ds, pk, hd, rt, who, fits, sel, day0)
-    before_sel = score_pick(ds, pk & sel, hd, rt, day0)
-    saved = [(f.hours, f.regimes) for f in fits]
-    for f in fits:
-        f.hours, f.regimes = gates[f.name]["hours"], gates[f.name]["regimes"]
-    pk2, hd2, rt2, _ = system_pick(ds, fits, tested, uni, combine, tables); pk2 &= keep
-    after_sel = score_pick(ds, pk2 & sel, hd2, rt2, day0); ev_s = score_pick(ds, pk2 & ev, hd2, rt2, day0)
-    rnd_ok, rnd = beats_random_removal(ds, pk & ev, pk2 & ev, hd2, rt2, day0, hold_before=hd, returns_before=rt)
-    any_gate = any(g["hours"] or g["regimes"] for g in gates.values())
-    ok = any_gate and better(after_sel, before_sel) and passes(ev_s, fallback=not after_sel.admissible) and rnd_ok
-    comps.append(_comp("hour and market gates", ok, "no hour or decile lost money with enough trades" if not any_gate else
-                       ("improves the book, passes on the evaluation half and beats random removal" if ok else "rejected"), after_sel.dict(), {**ev_s.dict(), "random_removal": rnd}, gates))
-    if not ok:
-        for f, (h, r) in zip(fits, saved):
-            f.hours, f.regimes = h, r
     # the whole book
     pk, hd, rt, _ = system_pick(ds, fits, tested, uni, combine, tables); pk &= keep
     s_sel = score_pick(ds, pk & sel, hd, rt, day0); s_ev = score_pick(ds, pk & ev, hd, rt, day0)
@@ -638,7 +613,8 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None) -> Stack:
     fb = (not strict) and s_sel.base_ok and s_ev.base_ok
     deployable = dep and (strict or fb)
     reason = (why + ("; meets ≥65 % winners and PF ≥1.3 on both halves" if strict else "; profit fallback (below 65 % winners)" if fb else "; fails the stack's bars"))
-    return Stack(groups, cols, fits, combine, veto, comps, s_sel.dict(), {**s_ev.dict(), "random_mean": rnd.get("mean")}, deployable, fb and deployable, reason, tables)
+    return Stack(groups, cols, fits, combine, veto, comps, s_sel.dict(), {**s_ev.dict(), "random_mean": rnd.get("mean")}, deployable, fb and deployable, reason, tables,
+                 holdout_days=holdout_days)
 
 
 def _without_meta(f: StrategyFit, old) -> StrategyFit:
@@ -647,22 +623,54 @@ def _without_meta(f: StrategyFit, old) -> StrategyFit:
     return g
 
 
+def score_holdout(ds: DecisionSet, models: dict, days: list) -> dict:
+    """The deployed decision (``decide``: strategies, win filters, dump veto and gates as they would trade) scored on the
+    days ``fit_stack`` withheld from every fit. It decides nothing — recorded and reported only. Feeding it back into any
+    choice would make it a second evaluation half rather than a holdout."""
+    from .decisions import random_trades, summarize
+    from .selector import in_universe
+    if not days or not (models.get("strategies") or {}):
+        return {}
+    eligible = np.isin(ds.day, days) & in_universe(ds.X, ds.cols)
+    rows = np.flatnonzero(eligible)
+    out = {"days": [str(days[0]), str(days[-1])], "rows": int(len(rows))}
+    if not len(rows):
+        return out
+    d = decide(models, ds.X[rows], ds.cols, ds.ts[rows])
+    take = d["allow"]
+    if not take.any():
+        return {**out, "n": 0}
+    idx = rows[take]; holds = d["hold_s"][take]
+    hold_full = np.zeros(len(ds.y)); hold_full[idx] = holds
+    ret_full = np.full(len(ds.y), np.nan, np.float32)
+    for hm in {int(h // 60) for h in holds}:
+        r = idx[(holds // 60).astype(int) == hm]
+        ret_full[r] = ds.fwd_h.get(hm, ds.fwd_pess)[r]
+    tr = taken_idx(ds.ts, ds.mint, hold_full, idx)
+    s = score_trades(ds, tr, ret_full, days[0])
+    rnd = summarize(random_trades(ds, eligible, max(1, len(tr))))
+    return {**out, **s.dict(), "random_mean": rnd.get("mean")}
+
+
 # ---------------------------------------------------------------- deployment: final models and live decisions
-def final_models(ds: DecisionSet, stack: Stack) -> dict:
+def final_models(ds: DecisionSet, stack: Stack, exclude_days: list | None = None) -> dict:
     """Every accepted component refit on all days (the walk-forward only chose their settings): per strategy its GBM over
-    its candidates and hold, its win classifier on all its out-of-sample candidates; the veto on all candidate trades."""
+    its candidates and hold, its win classifier on all its out-of-sample candidates; the veto on all candidate trades.
+    ``exclude_days``: leave those days out of every fit, so the result can be scored on days it has never seen. Deployment
+    refits on everything; only the holdout measurement excludes, or it would be scoring itself in sample."""
     from .selector import in_universe
     uni = in_universe(ds.X, ds.cols); out = {"strategies": {}, "veto": None, "combine": stack.combine}
+    keep = ~np.isin(ds.day, exclude_days) if exclude_days else np.ones(len(ds.y), bool)
     for f in stack.fits:
         ci = np.asarray([ds.cols.index(x) for x in f.cols]); y = ds.fwd_h.get(f.hold_min, ds.fwd_pess)
         loose = np.zeros(len(ds.y), bool)
         for high in STRATEGIES[f.name]["highs"]:
             loose |= uni & base_mask(f.name, ds.X, ds.cols, high)
-        rows = np.flatnonzero(loose & np.isfinite(y))
+        rows = np.flatnonzero(loose & np.isfinite(y) & keep)
         gbm, scaler = fit_regressor(ds.X[np.ix_(rows, ci)], y[rows], seed=99)
         meta = None
         if f.meta_cut is not None:
-            mr = np.flatnonzero(uni & base_mask(f.name, ds.X, ds.cols, f.high) & trigger_mask(f.name, f.thr, ds.X, ds.cols) & np.isfinite(f.oos) & (f.oos >= 0) & np.isfinite(y))
+            mr = np.flatnonzero(uni & base_mask(f.name, ds.X, ds.cols, f.high) & trigger_mask(f.name, f.thr, ds.X, ds.cols) & np.isfinite(f.oos) & (f.oos >= 0) & np.isfinite(y) & keep)
             mc, ms = fit_classifier(np.c_[ds.X[np.ix_(mr, ci)], f.oos[mr]], (y[mr] > 0).astype(np.int8), seed=99)
             meta = {"model": mc, "scaler": ms, "cut": f.meta_cut}
         out["strategies"][f.name] = {"gbm": gbm, "scaler": scaler, "cols": list(f.cols), "line": f.line, "hold_min": f.hold_min, "thr": dict(f.thr), "high": f.high,
@@ -670,7 +678,7 @@ def final_models(ds: DecisionSet, stack: Stack) -> dict:
                                      "selection": f.selection, "evaluation": f.evaluation}
     if stack.veto is not None:
         pk, hd, rt, _ = system_pick(ds, stack.fits, np.ones(len(ds.y), bool), uni, stack.combine, stack.tables)
-        rows = np.flatnonzero(pk & np.isfinite(rt)); ci = np.asarray([ds.cols.index(x) for x in stack.cols])
+        rows = np.flatnonzero(pk & np.isfinite(rt) & keep); ci = np.asarray([ds.cols.index(x) for x in stack.cols])
         y = np.searchsorted(stack.veto["levels"], rt[rows], side="left").astype(np.int8)
         vm, vs = fit_classifier(ds.X[np.ix_(rows, ci)], y, seed=99)
         out["veto"] = {"model": vm, "scaler": vs, "cols": list(stack.cols), "k": stack.veto["level_index"], "cut": stack.veto["cut"], "dump": stack.veto["dump"]}

@@ -64,3 +64,24 @@ def exit_cost_fraction(value_sol: float, res_quote_sol: float | None, mcap_sol: 
     if value_sol <= 0:
         return 0.0
     return min(1.0, fee_fraction(value_sol, mcap_sol, pool_fee) + impact_fraction(value_sol, res_quote_sol, program_label))
+
+
+def cost_at_size(ec_0p1, res_quote_sol, size_sol: float | None = None):
+    """``exit_cost_0p1`` (priced for a fixed 0.1 SOL in market/features.py) repriced for the size the book actually
+    trades, as a fraction of one side.
+
+    Positions are Kelly-sized up to ``MAX_POSITION_FRACTION`` of the bankroll and impact is ``value/(value+reserves)``,
+    so the stored feature understates a real exit. The fee part (pool, platform, network) is recovered from the stored
+    value and only impact recomputed, so a feature part never has to be rebuilt. ``size_sol`` defaults to the sizing
+    rule's own ceiling and is capped by ``MAX_POOL_SHARE`` of the pool, exactly as agent/sizing.py caps a live buy.
+    Unknown liquidity costs 1.0: a position that cannot be exited. Takes scalars or arrays."""
+    ec = np.clip(np.asarray(ec_0p1, dtype=float), 0.0, 1.0)
+    r = np.asarray(res_quote_sol, dtype=float)
+    ok = np.isfinite(r) & (r > 0)
+    want = size_sol if size_sol is not None else (config.LABEL_SIZE_SOL or config.MAX_POSITION_FRACTION * config.CAPITAL_SOL)
+    sz = np.maximum(np.minimum(want, config.MAX_POOL_SHARE * np.where(ok, r, 0.0)), 1e-9)
+    tx = TX_FEE_LAMPORTS / config.LAMPORTS_PER_SOL
+    fees01 = np.clip(ec - np.where(ok, 0.1 / (0.1 + r), 1.0), 0.0, 1.0)      # the stored value minus its own impact term
+    fees = np.clip(fees01 - tx / 0.1 + tx / sz, 0.0, 1.0)                    # the network fee is per trade, not per SOL
+    out = np.where(ok, np.clip(fees + np.where(ok, sz / (sz + r), 1.0), 0.0, 1.0), 1.0)
+    return float(out) if np.ndim(ec_0p1) == 0 else out

@@ -33,6 +33,7 @@ import numpy as np
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..market.exit_cost import PUMP_SUPPLY
+from ..market.exit_cost import cost_at_size
 from ..market.features import FEATURES, FIDX, TokenMeta, TokenState
 from ..train.corpus_meta import FEATURE_COLS as META_COLS
 from ..train.decisions import MIN_RESQ_SOL, MIN_VOL_15M_SOL, X_COLS
@@ -176,7 +177,8 @@ class MinuteEngine:
                    **{c: float(meta.get(c)) if meta.get(c) is not None else 0.0 for c in META_COLS}}
         x = np.nan_to_num(np.asarray([by_name.get(c, 0.0) for c in X_COLS], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         info = {"price": price, "open": float(a["open"]) if a.get("open") else price, "resq": resq, "logvol_15m": f[FIDX["logvol_15m"]],
-                "ec": float(f[FIDX["exit_cost_0p1"]]), "age_h": (t_end - s.graduated_at) / 3600 if s.graduated_at else None,
+                # "ec" is the training label's own cost model (market/exit_cost.cost_at_size), at the size the book trades
+                "ec": float(cost_at_size(f[FIDX["exit_cost_0p1"]], resq)), "age_h": (t_end - s.graduated_at) / 3600 if s.graduated_at else None,
                 "mcap": price * s.meta.supply, "fee_rate": a.get("fee_rate"), "decimals": s.decimals, "pool": s.pool, "program_label": s.program_label, "broken": s.broken,
                 "skill_missing": a.get("skill_buy") is None, "curve_known": bool(meta.get("curve_known"))}
         return x, info

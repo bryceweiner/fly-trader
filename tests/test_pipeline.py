@@ -68,6 +68,7 @@ def test_build_complete_needs_every_feature_day(tmp_path, monkeypatch):
     monkeypatch.setattr(mature, "MATURE_DIR", tmp_path / "mature"); monkeypatch.setattr(mature, "MATURE_FEAT_DIR", tmp_path / "feat")
     from fly_trader import config
     monkeypatch.setattr(config, "REPLAY_DIR", tmp_path / "replay")          # the real archive's pool_id gap must not leak in
+    monkeypatch.setattr(mature, "SKILL_DIR", tmp_path / "skill")            # nor the frozen wallet-skill tables: this test is about missing parts
     monkeypatch.setattr(mature, "days_ready", lambda: [])
     t = pa.table({"mint": ["A"], "close": [1.0]})
     for d in ("2026-09-01", "2026-09-02"):

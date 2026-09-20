@@ -53,7 +53,7 @@ def _skill_version() -> str:
     return skill_version()
 
 
-DATA_VERSION = {"agg": AGG_VERSION, "features": FEATURE_VERSION, "costs": "real-fees-1", "selector": "multi-1",
+DATA_VERSION = {"agg": AGG_VERSION, "features": FEATURE_VERSION, "costs": "real-fees-sized-1", "selector": "multi-1",
                 "cols": hashlib.sha1(",".join(X_COLS).encode()).hexdigest()[:8], "skill": _skill_version(), "meta": "rug-1"}
 WARMUP_DAYS, BLOCK_DAYS = 21, 7      # walk-forward: the first 21 days only train; every later day is tested, refit every 7 days
 MIN_AGE_H = 6.0                      # trade only tokens at least this long past graduation (unknown age = graduated before the archive); fitted, see decisions.HOLD_MIN
@@ -247,6 +247,13 @@ def latest_current(conn) -> dict | None:
     return None
 
 
+def load_snapshot(snapshot_id: int) -> SelectorModel | None:
+    """One named selector snapshot, whatever has been deployed since (agent/selector_session.py's pin)."""
+    with transaction() as conn:
+        row = conn.execute("SELECT path FROM brain_snapshots WHERE id = %s AND kind = 'selector'", (snapshot_id,)).fetchone()
+    return joblib.load(row["path"]) if row and Path(row["path"]).exists() else None
+
+
 def load_latest() -> SelectorModel | None:
     with transaction() as conn:
         r = latest_current(conn)
@@ -270,6 +277,17 @@ def main(days: int | None = None, horizon_min: int = HOLD_MIN, stop_event: threa
         return {"stopped": True}
     prog.update("selector: fitting the deployable models on every day", 0, 1, force=True)
     models = strategies.final_models(ds, stack) if stack.fits else {"strategies": {}}
+    # scored with models refit without the holdout: the deployed ones above have seen those days and would score themselves
+    holdout = strategies.score_holdout(ds, strategies.final_models(ds, stack, exclude_days=stack.holdout_days), stack.holdout_days) if stack.holdout_days else {}
+    if holdout.get("n"):
+        log.info("holdout %s..%s (no fit ever saw these days): %d trades, %s winners, PF %s, %s per trade vs random %s",
+                 holdout["days"][0], holdout["days"][1], holdout["n"],
+                 f"{holdout['win'] * 100:.1f}%" if holdout.get("win") is not None else "-",
+                 f"{holdout['pf']:.2f}" if holdout.get("pf") is not None else "-",
+                 f"{holdout['mean'] * 100:+.2f}%" if holdout.get("mean") is not None else "-",
+                 f"{(holdout.get('random_mean') or 0) * 100:+.2f}%")
+    elif stack.holdout_days:
+        log.info("holdout %s: the book took no trades there", holdout.get("days"))
     ev = (models["strategies"] or {}).get("ev") or next(iter((models["strategies"] or {}).values()), None)
     if ev is None:
         final = fit(ds, np.ones(len(ds.y), bool), seed=99)
@@ -281,7 +299,7 @@ def main(days: int | None = None, horizon_min: int = HOLD_MIN, stop_event: threa
                      "components": stack.components, "strategies": {k: {x: v[x] for x in ("line", "hold_min", "thr", "high", "hours", "regimes", "sizing", "selection", "evaluation")}
                                                                     for k, v in models["strategies"].items()},
                      "groups": stack.groups, "combine": stack.combine, "veto": {k: v for k, v in (stack.veto or {}).items() if k not in ("p",)} or None,
-                     "fallback": stack.fallback, "line": final.threshold, "costs": "real fees (pool fee by market cap, Jupiter 10 bps, network fee) + impact",
+                     "fallback": stack.fallback, "holdout": holdout, "line": final.threshold, "costs": "real fees (pool fee by market cap, Jupiter 10 bps, network fee) + impact",
                      "data": DATA_VERSION, "deployable": stack.deployable, "deploy_reason": stack.reason, "sizing": final.sizing,
                      "model": {"kind": "stack", "min_age_h": MIN_AGE_H, "min_resq_sol": MIN_RESQ_SOL, "min_vol_15m_sol": MIN_VOL_15M_SOL},
                      "rows": int(len(ds.y)), "days": len(ds.days), "first_day": str(ds.days[0]), "last_day": str(ds.days[-1])}

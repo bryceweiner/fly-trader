@@ -88,6 +88,14 @@ class DecisionSet:
         return m
 
 
+def _label_exit_cost(df) -> np.ndarray:
+    """One side's real cost per row, at the size the book trades (market/exit_cost.cost_at_size). The live engine puts
+    the same value in every bar it hands the fly (agent/minute_engine.py), so what the fly learns from and what it was
+    trained on are one cost model."""
+    from ..market.exit_cost import cost_at_size
+    return cost_at_size(df["exit_cost_0p1"].to_numpy(dtype=float), df["resq"].to_numpy(dtype=float))
+
+
 def build(days: int | None = 45, horizon_min: int = HOLD_MIN, fee: float | None = None, label_thr: float = 0.03, feature_dir=None, holds=None) -> DecisionSet:
     """``holds``: extra holds (minutes) whose labels are computed in the same pass (``DecisionSet.fwd_h``)."""
     root = feature_dir or (config.CORPUS_DIR / "features_mature")
@@ -118,7 +126,7 @@ def build(days: int | None = 45, horizon_min: int = HOLD_MIN, fee: float | None 
     mints = df["mint"].to_numpy(); starts = np.r_[0, np.flatnonzero(mints[1:] != mints[:-1]) + 1, len(mints)]
     fwd = np.full(len(df), np.nan); fwdp = np.full(len(df), np.nan)
     hold_list = sorted({int(h) for h in (holds or [])}); fh = {h: np.full(len(df), np.nan) for h in hold_list}
-    ec = np.clip(df["exit_cost_0p1"].to_numpy(dtype=float), 0.0, 1.0) if fee is None else None   # one-side cost fraction per minute
+    ec = _label_exit_cost(df) if fee is None else None                 # one-side cost fraction per minute, at the size the book trades
     for s, e in zip(starts[:-1], starts[1:]):
         t = ts[s:e]; j = np.searchsorted(t, t + H, side="right") - 1 + s
         exit_px = cl[j]

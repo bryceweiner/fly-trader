@@ -38,12 +38,25 @@ def _columns(model) -> np.ndarray:
     return np.asarray([X_COLS.index(c) for c in model.cols], dtype=int)
 
 
+def pinned_snapshot() -> int | None:
+    """The selector snapshot the operator has pinned, or None. A pin freezes the book on one model: a forward test that
+    silently swapped models mid-run could not say which one earned the result."""
+    with transaction() as conn:
+        r = conn.execute("SELECT value FROM ui_settings WHERE key = 'pinned_selector_snapshot'").fetchone()
+    if not r:
+        return None
+    v = r["value"]
+    v = v.get("id") if isinstance(v, dict) else json.loads(v or "{}").get("id")
+    return int(v) if v is not None else None
+
+
 class SelectorBook:
     name = "selector"
 
     def __init__(self):
         from ..train import selector as sel
-        self.model = sel.load_latest()
+        pin = pinned_snapshot()
+        self.model = sel.load_snapshot(pin) if pin is not None else sel.load_latest()
         if self.model is None:
             raise NoModel("no model has qualified to trade yet (trained on the current data, with a backtest that made money after costs and beat random picks)")
         self.idx = _columns(self.model)
@@ -51,16 +64,20 @@ class SelectorBook:
         self.broker = PaperBroker(BOOK); self.done = False
         self.run_id = str(uuid.uuid4()); self.beat_no = 0
         with transaction() as conn:
-            self.snapshot_id = sel.latest_current(conn)["id"]                  # the snapshot load_latest returned
+            self.snapshot_id = pin if pin is not None else sel.latest_current(conn)["id"]   # the snapshot actually loaded
             conn.execute("INSERT INTO runs (run_id, kind, config, brain_snapshot_id, status) VALUES (%s,%s,%s,%s,'running')",
                          (self.run_id, KIND, json.dumps({"threshold": self.model.threshold, "horizon_min": self.model.horizon_min, "book": BOOK}, default=str), self.snapshot_id))
         record_event("info", "selector", "selector session started", {"run_id": self.run_id, "snapshot": self.snapshot_id, "threshold": self.model.threshold, "horizon_min": self.model.horizon_min})
         log.info("selector session: snapshot %d threshold %.4f horizon %d min", self.snapshot_id, self.model.threshold, self.model.horizon_min)
 
     def maybe_reload(self) -> bool:
-        """Switch to a newer deployable model without a restart (the paper book and open positions carry on)."""
+        """Switch to a newer deployable model without a restart (the paper book and open positions carry on). While a
+        snapshot is pinned (``ui_settings['pinned_selector_snapshot']``) the book stays on it, so a forward test measures
+        one model instead of a blend of every retrain that lands during it."""
         import joblib
         from ..train import selector as sel
+        if pinned_snapshot() is not None:
+            return False
         with transaction() as conn:
             r = sel.latest_current(conn)
         if not r or r["id"] == self.snapshot_id:

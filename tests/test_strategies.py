@@ -62,7 +62,8 @@ def test_stack_finds_the_planted_edge_and_decides_like_it(monkeypatch):
     ds = _ds(days=100, per_day=400)                                   # enough weeks per half for the walk-forward
     st = S.fit_stack(ds)
     names = [c["name"] for c in st.components]
-    assert "strategy: ev" in names and "dump veto" in names and "hour and market gates" in names and any(n.startswith("meta-label") for n in names)
+    assert "strategy: ev" in names and "dump veto" in names and any(n.startswith("meta-label") for n in names)
+    assert not any("gates" in n for n in names)                       # removed 2026-09-20: they did not survive the holdout
     ev = next(c for c in st.components if c["name"] == "strategy: ev")
     assert ev["passed"] and ev["selection"]["win"] >= S.WIN_MIN and ev["evaluation"]["win"] >= S.WIN_MIN
     assert st.deployable and not st.fallback
@@ -92,6 +93,7 @@ def test_empty_inputs_are_skipped_and_groups_are_judged_at_one_hold(monkeypatch)
     monkeypatch.setattr(S, "GROUPS", {"empty": ["age_known"], "market": ["mkt_vol_1h"]})     # age_known never varies here
     import fly_trader.train.strategies as mod
     monkeypatch.setattr(mod, "LEGACY_COLS", ["imb_5m", "ret_1m", "log_age_h"])
+    monkeypatch.setattr(S, "HOLDOUT_DAYS", 0)          # this test is about the group trials, not the holdout: keep its full day budget
     calls = []; real = S.fit_strategy
     monkeypatch.setattr(S, "fit_strategy", lambda *a, **k: (calls.append((a[1], k.get("holds"))), real(*a, **k))[1])
     st = S.fit_stack(_ds(days=100, per_day=150))
@@ -143,3 +145,30 @@ def test_cache_keys_separate_fits_whose_inputs_share_column_names():
     a = S._cache_path(ds, cols, "ev|hold120|h20-L7")
     b = S._cache_path(ds, cols, "ev|hold120|h30-L7")
     assert a != b and S._cache_path(ds, cols, "ev|hold120|h20-L7") == a
+
+
+def test_the_holdout_is_never_fitted_on_and_is_scored_once(monkeypatch):
+    """The last HOLDOUT_DAYS days must not reach any fit; the finished book is scored on them exactly once, for the
+    record. Anything that fitted against them would make the number worthless."""
+    monkeypatch.setattr(S, "STRATEGIES", {"ev": {**S.STRATEGIES["ev"], "holds": (30, 120)}})
+    monkeypatch.setattr(S, "GROUPS", {})
+    import fly_trader.train.strategies as mod
+    monkeypatch.setattr(mod, "LEGACY_COLS", ["imb_5m", "ret_1m", "age_known", "log_age_h"])
+    monkeypatch.setattr(S, "HOLDOUT_DAYS", 10)
+    ds = _ds(days=100, per_day=150)
+    seen = []
+    real = S.score_pick
+    monkeypatch.setattr(S, "score_pick", lambda d_, pick, *a, **k: (seen.append(set(d_.day[pick])), real(d_, pick, *a, **k))[1])
+    st = S.fit_stack(ds)
+    hold = set(ds.days[-10:])
+    assert not [i for i, days in enumerate(seen) if days & hold], "no fit may score the holdout"
+    assert st.holdout_days == list(ds.days[-10:])
+    fitted = []
+    real_fr = S.fit_regressor
+    monkeypatch.setattr(S, "fit_regressor", lambda X, y, seed: (fitted.append(len(X)), real_fr(X, y, seed))[1])
+    S.final_models(ds, st)                                                 # deployment: every day
+    S.final_models(ds, st, exclude_days=st.holdout_days)                   # measurement: the holdout left out
+    assert fitted[-1] < fitted[0], "excluding the holdout must reduce the training rows"
+    monkeypatch.undo()
+    h = S.score_holdout(ds, S.final_models(ds, st, exclude_days=st.holdout_days), st.holdout_days)
+    assert h["n"] > 0 and h["days"] == [str(ds.days[-10]), str(ds.days[-1])] and h.get("random_mean") is not None
