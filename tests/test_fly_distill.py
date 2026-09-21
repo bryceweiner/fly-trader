@@ -129,6 +129,47 @@ def test_bootstrap_gives_the_fly_its_own_line_from_labels_known_before_S():
     assert set(info["diagnostics"]) >= {"mbon_share", "mbon_saturated", "kc_active", "slope"} and isinstance(info["gates_ok"], bool)
 
 
+def test_the_fly_is_taught_by_the_selector_the_book_trades(monkeypatch):
+    """Until 2026-09-21 the bootstrap refit its own stack and distilled that. Selection is unstable enough that the
+    refit was a different trading system (deployed ev at 0.046 over 120 min vs a refit capitulation at 0.010 over 240),
+    so the fly was never a copy of the selector it was judged against."""
+    import contextlib
+
+    from fly_trader.agent import selector_session
+    ds = _market_ds(); train = ds.day < ds.days[-3]
+    ev = {"cols": ["f0", "f1"], "line": 0.046, "hold_min": 120, "thr": {}, "high": None}
+    monkeypatch.setattr(selector_session, "pinned_snapshot", lambda: 60)
+    monkeypatch.setattr(fly_selector.selector, "load_snapshot", lambda i: SimpleNamespace(stack={"strategies": {"ev": ev}, "combine": "score"}))
+    t, note, sid = fly_selector.deployed_teacher(ds, train)
+    assert sid == 60 and "#60" in note and t.strategies == ["ev"] and t.rules["ev"]["hold_min"] == 120 and t.lines["ev"] == 0.046
+
+    monkeypatch.setattr(fly_selector, "transaction", lambda: contextlib.nullcontext(None))
+    monkeypatch.setattr(selector_session, "pinned_snapshot", lambda: None)
+    monkeypatch.setattr(fly_selector.selector, "latest_current", lambda conn: None)
+    assert fly_selector.deployed_teacher(ds, train) == (None, fly_selector.TEACHER_NOTE, None)      # says so rather than pretending
+
+    monkeypatch.setattr(selector_session, "pinned_snapshot", lambda: 61)
+    monkeypatch.setattr(fly_selector.selector, "load_snapshot", lambda i: SimpleNamespace(stack={"strategies": {"ev": {**ev, "cols": ["f0", "nope"]}}}))
+    t2, note2, sid2 = fly_selector.deployed_teacher(ds, train)
+    assert t2 is None and sid2 is None and "nope" in note2                                          # never distil inputs the corpus lacks
+
+
+def test_training_stops_when_an_epoch_buys_less_than_its_own_noise(monkeypatch):
+    """One epoch left a per-row error of ~3.9 % net return against a 4.6 % line, so the ordering near the line was
+    mostly noise. The count is now the data's to choose: passes end when the held-out error stops moving by more than
+    its standard error, and the epoch that generalised best is the one kept."""
+    monkeypatch.setattr(fly_selector, "VAL_MIN_ROWS", 100); monkeypatch.setattr(fly_selector, "VAL_ROWS", 500)
+    torch.manual_seed(0)
+    ds = _ds(); t = Teacher(ds)
+    fly, info = fly_selector.train_fly(ds, np.ones(len(ds.y), bool), t, epochs=12, batch=500, graph=_graph(), device="cpu")
+    assert info["val_rows"] == 500 and info["epoch_cap"] == 12 and fly_selector.MIN_EPOCHS <= info["epochs_run"] <= 12
+    assert all("val_mse" in e and "val_se" in e for e in info["epochs"])
+    assert info["val_mse"] == min(e["val_mse"] for e in info["epochs"])                             # the best epoch, not the last
+    assert (info["early_stop"] is None) == (info["epochs_run"] == 12)
+    small, si = fly_selector.train_fly(ds, np.ones(len(ds.y), bool), t, epochs=0, graph=_graph(), device="cpu")
+    assert si["val_rows"] == 0 and si["early_stop"] is None and si["epochs_run"] == 0              # nothing to hold out, nothing to stop
+
+
 def test_rank_corr_matches_spearman_with_ties():
     rng = np.random.default_rng(1)
     a = rng.integers(0, 20, 500).astype(float); b = a + rng.normal(scale=5, size=500); b[::7] = b[0]

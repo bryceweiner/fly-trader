@@ -7,7 +7,7 @@ activity ``m`` and, 120 minutes later, its realized net return ``r``:
 
     δ   = clip(clip(r, ±1) − ŷ, ±DELTA_CLIP)                  dopamine: the prediction error (ŷ recomputed with the current D)
     g_j = c_j γ_j (1 − m_j²) / (σ_j · scale)                   how MBON j moves the prediction (∂ŷ/∂D_ij = k_i g_j, exact)
-    ΔD  = (α/ν) · M ⊙ Σ_rows w δ k gᵀ                          w = TOP_WEIGHT on minutes scored at/above the line, else 1
+    ΔD  = (α/ν) · M ⊙ Σ_rows w δ k gᵀ                          w = 1 on minutes scored at/above the line, else 0
 
 which is gradient descent on the weighted squared prediction error: reward (δ > 0) depresses KC→avoid-MBON synapses
 (c < 0) and potentiates KC→approach ones; punishment the reverse. ``ν`` (the median squared norm of one row's update,
@@ -27,7 +27,7 @@ from __future__ import annotations
 import bisect
 import itertools
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -132,8 +132,15 @@ def assign_channels(comp: np.ndarray, km_mass: np.ndarray, c_sign: np.ndarray, n
 
 
 def row_weights(scores: torch.Tensor, lines: torch.Tensor) -> torch.Tensor:
-    """[C, B]: ``TOP_WEIGHT`` where a configuration scored the row at or above its own line, else 1."""
-    return torch.where(scores >= lines[:, None], TOP_WEIGHT, 1.0)
+    """[C, B]: 1 where a configuration scored the row at or above its own line, else 0 — it learns from the outcome of
+    its own decisions and nothing else.
+
+    Until 2026-09-21 every candidate row was tagged, weighting the ones above the line 10x. Candidates are overwhelmingly
+    losers (4.58M of them averaged -5.70% over the 2026-07-27 replay while the rows actually traded averaged +6.30%), so
+    even at 10x the losing population outweighed the tradeable rows by more than 100:1 and dragged every prediction
+    toward the candidate mean. Learning then made the fly worse than the same network frozen (PF 1.012 vs 1.098). A row
+    below the line is not a decision, so it carries no weight."""
+    return torch.where(scores >= lines[:, None], 1.0, 0.0)
 
 
 class PlasticBank:

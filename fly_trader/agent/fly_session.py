@@ -10,7 +10,7 @@ learning rate and forgetting of its mushroom body (``brain/plastic.py``). Each m
 3. calibration: at the first minute of each UTC day, the line and sizing of the plastic fly and of its frozen shadow
    (the bootstrap, D = 0) from their scores of the minutes resolved in the last seven days (``train/fly_calibrate.py``);
 4. scoring: eligible minutes are scored by the plastic fly and its shadow, stored (``fly_scored``: pending rows keep the
-   feature vector, so tags survive restarts) and tagged; minutes at or above the line weigh ``TOP_WEIGHT`` ×;
+   feature vector, so tags survive restarts) and tagged; only minutes at or above the line teach it (brain/plastic.py);
 5. trading (fresh stream, trade minutes): the race rules (``agent/paper_trading.py``) at the plastic line and sizing.
 
 Hourly: learning statistics (``fly_updates``), a snapshot of the plastic state (kind 'fly_plastic'; hourly for 7 days,
@@ -192,7 +192,7 @@ class FlyBook:
         for (t, name), rs in sorted(groups.items()):
             j = self.names.index(name)
             Y, u0, k = self.fly.parts_all(np.asarray([r["x"] for r in rs], dtype=np.float32))
-            w = torch.where(torch.tensor([float(r["score"]) >= float(r["line"]) for r in rs]), plastic.TOP_WEIGHT, 1.0)[None]
+            w = plastic.row_weights(torch.tensor([[float(r["score"]) for r in rs]]), torch.tensor([float(rs[0]["line"])]))
             self.pending.push([(t, r["mint"], name) for r in rs], np.full(len(rs), t), t + self.holds[name] + LABEL_LAG_S, Y[:, j], u0, k, w, s=j)
             for r in rs:
                 self.watch[r["mint"]] = self.watch.get(r["mint"], 0) + 1

@@ -16,9 +16,12 @@ last step and the KC code that drove it; ``readout`` completes the prediction wi
 weights at that last step (``D`` = None is the frozen fly). The descending neurons at the last step are computed from
 the previous step, so ``D`` reaches the output only through the MBON readout.
 
-Bootstrap (``bootstrap``, the one time the selector teaches): the selector is fit on the days before ``S − 8`` (one
-purge day before the calibration week), the fly imitates it on the tradable minutes of those days (the teacher's top
-``DISTIL_TOP`` plus a random ``DISTIL_SAMPLE``; squared error weighted ``TOP_WEIGHT`` × on the teacher's top 1 %), both
+Bootstrap (``bootstrap``, the one time the selector teaches): the teacher is the selector the live book trades
+(``deployed_teacher``); only when none is deployed is a stack refit on the days before ``S − 8`` (one purge day before
+the calibration week), which is also what the replay uses, since there the refit is the honest out-of-sample teacher.
+The fly imitates it on the tradable minutes of those days (the teacher's top ``DISTIL_TOP`` plus a random
+``DISTIL_SAMPLE``; squared error weighted ``TOP_WEIGHT`` × on the teacher's top 1 %; passes stop when a held-out
+slice stops improving by more than its own standard error, so the epoch count comes from the data), both
 normalisations are recomputed over ``RECAL_ROWS`` training rows and frozen, and the fly's own buy line and sizing bands
 are calibrated (``train/fly_calibrate.py``) on its scores for the seven days before ``S`` whose labels were known by
 then — never the selector's line. Reports: the MBONs' share of the score variance, MBON saturation, the slope and rank
@@ -59,17 +62,19 @@ K_STEPS, LEAK, HIDDEN = 4, 0.5, 128
 KC_ACTIVE = 0.10             # share of Kenyon cells left active at every step
 KM_INIT_SCALE = 0.006        # KC→MBON weight per synapse: ~22 active KC inputs × ~8 synapses ≈ 1, MBONs unsaturated
 C_INIT = 0.1                 # MBON readout coefficient at start (SCALE units per standard deviation of an MBON)
-EPOCHS, BATCH = 1, 512
+EPOCHS, BATCH = 8, 512       # EPOCHS only caps the runtime; early stopping below picks the count the data supports
 TOP_WEIGHT = 10.0            # loss weight of the teacher's top 1 % of training minutes
 DISTIL_TOP, DISTIL_SAMPLE = 0.05, 3_000_000
 RECAL_ROWS = 200_000
+VAL_ROWS, VAL_MIN_ROWS = 200_000, 100_000   # distillation rows held out to judge the fit; a smaller slice is too noisy to stop on
+MIN_EPOCHS = 2               # never stop on one epoch: it has nothing to be compared against
 LR_GRAPH, LR_HEAD = 1e-4, 1e-3
 PURGE_DAYS, CALIB_DAYS = 1, 7
 DIAG_ROWS = 50_000
 GATES = {"mbon_share_min": 0.10, "mbon_saturated_max": 0.20, "slope_min": 0.6, "slope_max": 1.4}
-TEACHER_NOTE = "selector fit on the fly's training days, same configuration"
+TEACHER_NOTE = "a stack refit on the fly's training days (no deployed selector to copy)"
 # the definitions a fly was trained on (the selector's, as its teacher, + the fly's network and plasticity design)
-FLY_VERSION = {**selector.DATA_VERSION, "fly": "flynet-3-ch", "plastic": "mb4-ch"}
+FLY_VERSION = {**selector.DATA_VERSION, "fly": "flynet-3-ch", "plastic": "mb4-ch", "teacher": "deployed-1"}
 
 
 def _inv_softplus(x: torch.Tensor) -> torch.Tensor:
@@ -334,6 +339,25 @@ def _teacher_targets(teacher, ds: DecisionSet, idx: np.ndarray) -> tuple[np.ndar
     return tgt[:, None], np.where(tgt >= np.quantile(tgt, 0.99), TOP_WEIGHT, 1.0).astype(np.float32)[:, None]
 
 
+@torch.no_grad()
+def _val_mse(net: FlyNet, scaler: RobustScaler, ds: DecisionSet, idx: np.ndarray, T: np.ndarray, W: np.ndarray, val: np.ndarray,
+             dev: torch.device, batch: int) -> tuple[float, float]:
+    """Weighted squared error on distillation rows held out of training, and the standard error of that mean. An epoch
+    that buys less than the noise in this estimate has stopped teaching the fly anything, which is where training ends:
+    the count comes from the data instead of being chosen. Until 2026-09-21 the bootstrap ran exactly one epoch, leaving
+    a per-row error of ~3.9 % net return against a 4.6 % buy line — the ordering near the line was mostly noise."""
+    net.eval(); parts = []
+    for i in range(0, len(val), batch):
+        sl = val[i:i + batch]
+        x = torch.tensor(scaler.transform(ds.X[idx[sl]]), device=dev)
+        t = torch.tensor(np.nan_to_num(T[sl]) * SCALE, device=dev); m = torch.tensor(np.isfinite(T[sl]), device=dev).float()
+        w = torch.tensor(W[sl], device=dev) * m
+        parts.append(((w * (net.forward_all(x) - t) ** 2).sum(1) / w.sum(1).clamp(min=1e-9)).cpu())
+    net.train()
+    e = torch.cat(parts).double() if parts else torch.zeros(1, dtype=torch.float64)
+    return float(e.mean()), float(e.std() / max(len(e) ** 0.5, 1.0))
+
+
 def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, batch: int = BATCH, stop: threading.Event | None = None,
               seed: int = 0, graph=None, device=None) -> tuple[FlyModel | None, dict]:
     """Distil ``teacher`` (a StackTeacher, or anything with ``score`` and ``scaler``) into a FlyNet over the training rows
@@ -346,10 +370,14 @@ def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, 
     if not len(idx):
         return None, {"stopped": False, "reason": "no teacher candidates"}
     use = distil_rows(idx, np.nanmax(np.where(np.isfinite(T), T, -np.inf), axis=1), rng)
+    val = np.empty(0, use.dtype)
+    if epochs > 1 and len(use) // 10 >= VAL_MIN_ROWS:      # a smaller slice cannot tell a real improvement from noise
+        n_v = min(VAL_ROWS, len(use) // 10); p0 = rng.permutation(len(use)); val, use = np.sort(use[p0[:n_v]]), np.sort(use[p0[n_v:]])
     with torch.no_grad():
         for j, hd in enumerate(net.heads):
             col = T[:, j]; hd.bias.fill_(float(np.nanmean(col)) * SCALE if np.isfinite(col).any() else 0.0); hd.weight.mul_(0.1)
     opt = torch.optim.Adam(net.param_groups(LR_GRAPH, LR_HEAD)); n_b = max(1, len(use) // batch); total = max(1, epochs * n_b); hist = []; t0 = time.time()
+    best = best_v = prev_v = early = None
     for ep in range(epochs):
         perm = use[rng.permutation(len(use))]; tot = 0.0; net.train()
         for b in range(n_b):
@@ -367,13 +395,31 @@ def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, 
                             eta_s=(total - done) * el / done)
         hist.append({"epoch": ep, "mse": tot / n_b, "secs": time.time() - t0, "rows": min(len(use), n_b * batch)})
         log.info("fly epoch %d: weighted mse %.4f over %d rows (%.0fs)", ep, tot / n_b, min(len(use), n_b * batch), time.time() - t0)
+        if not len(val):
+            continue
+        vm, vse = _val_mse(net, teacher.scaler, ds, idx, T, W, val, dev, batch)
+        hist[-1]["val_mse"], hist[-1]["val_se"] = vm, vse
+        log.info("fly epoch %d: held-out weighted mse %.4f +/- %.4f over %d rows", ep, vm, vse, len(val))
+        if best_v is None or vm < best_v:
+            best_v, best = vm, {k: v.detach().clone() for k, v in net.state_dict().items()}
+        gain = None if prev_v is None else prev_v - vm
+        stop_now = ep + 1 >= MIN_EPOCHS and gain is not None and gain <= vse
+        prev_v = vm
+        if stop_now:
+            early = f"epoch {ep} moved the held-out error by {gain:+.4f}, inside its standard error {vse:.4f}"
+            log.info("fly: stopping early - %s", early)
+            break
+    if best is not None:
+        net.load_state_dict(best)                          # the epoch that generalised best, not merely the last one
     rec = idx[rng.choice(len(idx), min(RECAL_ROWS, len(idx)), replace=False)]
     recalibrate(net, ds.X[np.sort(rec)], teacher.scaler, batch)
     if isinstance(teacher, StackTeacher):
         fly = FlyModel(net, teacher.scaler, ds.cols, int(teacher.rules[teacher.strategies[0]]["hold_min"]), rules=teacher.rules, combine=teacher.combine)
     else:
         fly = FlyModel(net, teacher.scaler, ds.cols, int(ds.horizon_s // 60))
-    return fly, {"epochs": hist, "stopped": False, "rows": int(len(use)), "training_rows": int(len(idx)), "top_weight": TOP_WEIGHT, "strategies": fly.strategies}
+    return fly, {"epochs": hist, "stopped": False, "rows": int(len(use)), "training_rows": int(len(idx)), "top_weight": TOP_WEIGHT,
+                 "strategies": fly.strategies, "epochs_run": len(hist), "epoch_cap": int(epochs), "val_rows": int(len(val)),
+                 "val_mse": best_v, "early_stop": early}
 
 
 @torch.no_grad()
@@ -411,10 +457,42 @@ def _stack_teacher(ds: DecisionSet, train: np.ndarray, stop=None):
     """The selector's strategy stack fitted on the training days only (an honest teacher for the calibration week)."""
     from . import strategies
     sub = ds.subset(train)
-    stack = strategies.fit_stack(sub, stop)
+    stack = strategies.fit_stack(sub, stop, holdout_days_n=0)   # already only days before S - 8; the replay is its out-of-sample proof
     if not stack.fits:
         return None, stack
     return StackTeacher(strategies.final_models(sub, stack), RobustScaler.fit(sub.X, seed=7), ds.cols), stack
+
+
+def deployed_teacher(ds: DecisionSet, train: np.ndarray) -> tuple[StackTeacher | None, str, int | None]:
+    """The selector the live book actually trades, wrapped as the fly's teacher, with the reason and the snapshot id.
+
+    Until 2026-09-21 the bootstrap always refit its own stack on the days before ``S − 8`` and distilled that instead.
+    Component selection is unstable enough that the refit was a different trading system: the deployed stack (#60, fit
+    through 2026-09-18) traded ``ev`` at line 0.046 over 120 minutes, while the fly's own teacher (through 2026-09-11)
+    traded ``capitulation`` at 0.010 over 240 — five of eight components flipped by one extra week of corpus. The fly
+    was never a copy of the selector it was being judged against. None (with the reason) falls back to that refit.
+
+    The deployed selector is fit on the whole corpus, the fly's calibration week included, so that week is not
+    out-of-sample for the teacher; the fly's own line is still calibrated on realised labels, never on the teacher's."""
+    from ..agent.selector_session import pinned_snapshot
+    sid = pinned_snapshot()
+    if sid is None:
+        with transaction() as conn:
+            r = selector.latest_current(conn)
+        sid = int(r["id"]) if r else None
+    if sid is None:
+        return None, TEACHER_NOTE, None
+    m = selector.load_snapshot(sid)
+    if m is None:
+        return None, f"selector #{sid} could not be loaded; {TEACHER_NOTE}", None
+    st = getattr(m, "stack", None) or {}
+    if not st.get("strategies"):
+        return None, f"selector #{sid} has no strategy stack; {TEACHER_NOTE}", None
+    missing = sorted({c for v in st["strategies"].values() for c in v["cols"]} - set(ds.cols))
+    if missing:
+        return None, f"selector #{sid} wants columns the corpus lacks ({', '.join(missing[:4])}); {TEACHER_NOTE}", None
+    names = ", ".join(f"{k} (line {v['line']:.4f}, {v['hold_min']} min)" for k, v in st["strategies"].items())
+    return StackTeacher(st, RobustScaler.fit(ds.X[np.flatnonzero(train)], seed=7), list(ds.cols)), f"deployed selector #{sid}: {names}", sid
 
 
 def fly_decide(fly: FlyModel, X: np.ndarray, cols: list[str], values: np.ndarray | None = None) -> dict:
@@ -435,10 +513,12 @@ def fly_decide(fly: FlyModel, X: np.ndarray, cols: list[str], values: np.ndarray
 
 
 def bootstrap(ds: DecisionSet, S: date, epochs: int = EPOCHS, stop: threading.Event | None = None, seed: int = 0, graph=None,
-              device=None, teacher=None) -> tuple[FlyModel | None, dict]:
+              device=None, teacher=None, teacher_note: str | None = None) -> tuple[FlyModel | None, dict]:
     """The one time the selector teaches: a fly ready to trade from day ``S`` on, with its own line and sizing per strategy.
-    ``teacher``: default the selector's strategy stack fitted on the days before ``S − 8`` (a set without the stack's inputs
-    or per-hold labels — synthetic tests — gets the single-model selector)."""
+    ``teacher``: the live path passes the deployed selector (``deployed_teacher``); left None, the stack is refit on the
+    days before ``S − 8`` — which is what the replay wants, since there the refit is the honest out-of-sample teacher (a
+    set without the stack's inputs or per-hold labels — synthetic tests — gets the single-model selector).
+    ``teacher_note`` records in the snapshot which selector taught this fly."""
     from .decisions import LEGACY_COLS
     train_end = S - timedelta(days=CALIB_DAYS + PURGE_DAYS)
     train = ds.day < train_end; uni = selector.in_universe(ds.X, ds.cols)
@@ -484,7 +564,7 @@ def bootstrap(ds: DecisionSet, S: date, epochs: int = EPOCHS, stop: threading.Ev
     ok, why = gate_check(diag)
     info = {"S": str(S), "train_through": str(train_end - timedelta(days=1)), "calibration_days": [str(S - timedelta(days=CALIB_DAYS)), str(S - timedelta(days=1))],
             "line": fly.threshold, "sizing": fly.sizing, "lines": fly.lines, "calibration": comb, "strategies": fly.strategies, "rules": fly.rules,
-            "diagnostics": diag, "gates_ok": ok, "gate_failures": why, "fit": fit_info, "teacher": TEACHER_NOTE, "teacher_line": getattr(teacher, "threshold", None),
+            "diagnostics": diag, "gates_ok": ok, "gate_failures": why, "fit": fit_info, "teacher": teacher_note or TEACHER_NOTE, "teacher_line": getattr(teacher, "threshold", None),
             "teacher_stack": stack_info}
     log.info("fly bootstrap for %s: strategies %s, lines %s | calibration %d trades, mean %s | MBON share %.1f%% saturated %.0f%% | gates %s",
              S, fly.strategies, {k: round(v, 4) for k, v in fly.lines.items()}, comb["trades"], f"{comb['mean'] * 100:+.2f}%" if comb["mean"] is not None else "-",
@@ -561,18 +641,22 @@ def latest_deployable(conn) -> dict | None:
     return None
 
 
-def main(days: int | None = None, epochs: int = EPOCHS, stop_event: threading.Event | None = None) -> dict:
-    """Bootstrap a fly to trade from tomorrow on: taught on every corpus day but the last eight, calibrated on the last seven."""
+def main(days: int | None = None, epochs: int | None = None, stop_event: threading.Event | None = None) -> dict:
+    """Bootstrap a fly to trade from tomorrow on: taught by the selector the live book trades, on every corpus day but
+    the last eight, calibrated on the last seven. ``epochs``: a cap; None leaves the count to the held-out slice."""
     from ..ops.reset import reset_training_stats
     reset_training_stats("fly_selector", reason="fly bootstrap")
     prog.set_stop_event(stop_event); prog.clear()
     prog.update("fly: building decision points", 0, 1, force=True)
     from .strategies import HOLDS_MIN
     ds = build(days=days, horizon_min=HOLD_MIN, holds=HOLDS_MIN); S = ds.days[-1] + timedelta(days=1)
-    fly, info = bootstrap(ds, S, epochs=epochs, stop=stop_event)
+    teacher, note, taught_by = deployed_teacher(ds, ds.day < S - timedelta(days=CALIB_DAYS + PURGE_DAYS))
+    log.info("fly bootstrap teacher: %s", note)
+    fly, info = bootstrap(ds, S, epochs=EPOCHS if epochs is None else epochs, stop=stop_event, teacher=teacher, teacher_note=note)
     if fly is None:
         return {"stopped": True}
-    record_event("info", "fly_selector", "fly bootstrap", {k: info.get(k) for k in ("S", "lines", "calibration", "diagnostics", "gates_ok", "gate_failures")})
+    info["teacher_snapshot"] = taught_by
+    record_event("info", "fly_selector", "fly bootstrap", {k: info.get(k) for k in ("S", "lines", "calibration", "diagnostics", "gates_ok", "gate_failures", "teacher")})
     path, sid = save(fly, info)
     prog.update("fly: done", 1, 1, force=True, snapshot_id=sid, line=info["line"], gates_ok=info["gates_ok"], diagnostics=info["diagnostics"])
     return {**info, "snapshot_id": sid, "path": str(path)}

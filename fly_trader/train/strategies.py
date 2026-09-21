@@ -474,11 +474,15 @@ def _comp(name, passed, reason, sel=None, ev=None, params=None, trials=0, best=N
     return c
 
 
-def fit_stack(ds: DecisionSet, stop: threading.Event | None = None) -> Stack:
-    """Every component in order, each on top of the accepted ones; see the module docstring."""
+def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days_n: int | None = None) -> Stack:
+    """Every component in order, each on top of the accepted ones; see the module docstring. ``holdout_days_n``: how many
+    of the last days to withhold from every fit (default ``HOLDOUT_DAYS``). A caller whose ``ds`` is already restricted to
+    days before some later date -- the fly's bootstrap teacher (train/fly_selector.py) -- passes 0: its out-of-sample
+    proof is the replay that follows, and withholding again would only cost it its most recent three weeks."""
     from .selector import deploy_decision, in_universe
     uni = in_universe(ds.X, ds.cols)
-    holdout_days = list(ds.days[-HOLDOUT_DAYS:]) if HOLDOUT_DAYS and len(ds.days) > HOLDOUT_DAYS + 4 else []
+    n_hold = HOLDOUT_DAYS if holdout_days_n is None else int(holdout_days_n)
+    holdout_days = list(ds.days[-n_hold:]) if n_hold and len(ds.days) > n_hold + 4 else []
     fit_days = [d for d in ds.days if d not in set(holdout_days)]
     tdays = sorted({d for blk in wf_blocks(fit_days) for d in blk})
     if len(tdays) < 4:

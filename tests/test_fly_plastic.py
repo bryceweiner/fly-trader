@@ -115,4 +115,6 @@ def test_pending_tags_return_as_pushed_and_only_when_due(net):
     assert torch.allclose(t.k, k[:4]) and torch.allclose(t.u0, u0[:4]) and tuple(t.w.shape) == (2, 4)
     t2 = q.pop_due(1e9)
     assert len(t2) == 6 and len(q) == 0 and float(t2.w[0, 0]) == 10.0
-    assert plastic.row_weights(torch.tensor([[0.1, 0.3]]), torch.tensor([0.2])).tolist() == [[1.0, plastic.TOP_WEIGHT]]
+    assert plastic.row_weights(torch.tensor([[0.1, 0.3]]), torch.tensor([0.2])).tolist() == [[0.0, 1.0]]   # below the line teaches nothing
+    two = plastic.row_weights(torch.tensor([[0.1, 0.3], [0.1, 0.3]]), torch.tensor([0.2, 0.5]))
+    assert two.tolist() == [[0.0, 1.0], [0.0, 0.0]]              # each configuration judges against its own line

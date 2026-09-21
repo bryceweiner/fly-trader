@@ -11,8 +11,9 @@
       realized net return over that strategy's hold teaches only that strategy's channel (``brain/plastic.py``);
    b. at each UTC day boundary each (configuration, strategy) recalibrates its line and sizing
       (``train/fly_calibrate.py``) on its own scores of the minutes resolved in the last seven days;
-   c. each strategy's candidate rows (the selector's trigger) are scored and tagged; a row at/above the line counts
-      ``TOP_WEIGHT`` ×;
+   c. each strategy's candidate rows (the selector's trigger) are scored; only the rows a configuration would have
+      traded (at or above its own line) teach it -- the candidate set is overwhelmingly losers and learning from it
+      dragged every prediction toward that mean (brain/plastic.row_weights);
    d. every hour the rollback checks (``train/fly_governance.py``) are evaluated per strategy and counted, not acted on.
 3. Each strategy's configuration is the one with the most total net profit on its own trades of the first half of the
    replay days (≥ 100 trades; plastic configurations only). Channels are disjoint, so the combination is exact. The
@@ -27,7 +28,7 @@ import logging
 import math
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import numpy as np
 import torch
@@ -97,6 +98,7 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
     day_done = _day_start(ts_o[live_from]) if live_from < n else None
     next_gov = (ts_o[live_from] + HOUR_S) if live_from < n else None
     gov_counts = {(c, s): {"shadow": 0, "ic": 0, "drift": 0, "any": 0, "checks": 0} for c in range(C) for s in range(NS)}
+    learn: dict = {}                     # per UTC day, per configuration: what the mushroom body actually did
     nu_set = False; g = 0; n_updates = 0
     fly.net.eval()
     while g < len(starts):
@@ -115,7 +117,7 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
                 tags = pending.pop_due(now, device=bank.dev)
                 if tags is not None:
                     r = torch.tensor([float(labels[s_][row]) for row, s_ in tags.keys], dtype=torch.float32)
-                    bank.update(tags, r, now); n_updates += len(tags)
+                    _learn_add(learn, now, bank.update(tags, r, now)); n_updates += len(tags)
                 if day_done is not None and _day_start(now) > day_done:
                     day_done = _day_start(now)
                     _recalibrate(ds, order, ts_o, scores, lines, sizings, now, lags, holds_min, line_log)
@@ -132,12 +134,45 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
                 scores[:, s_, s0 + loc] = sc.float().cpu().numpy()
                 if s0 >= live_from:
                     w = plastic.row_weights(sc, torch.tensor(lines[:, s_], dtype=sc.dtype, device=sc.device))
-                    pending.push([(int(order[s0 + j]), s_) for j in loc], ts_o[s0 + loc], now + lags[s_], Y[li, s_], u0[li], k[li], w, s=s_)
+                    keep = np.flatnonzero((w > 0).any(0).cpu().numpy())      # a row no configuration would trade teaches none of them
+                    if len(keep):
+                        kl = loc[keep]; ki = torch.as_tensor(lo + kl, device=Y.device)
+                        pending.push([(int(order[s0 + j]), s_) for j in kl], ts_o[s0 + kl], now + lags[s_],
+                                     Y[ki, s_], u0[ki], k[ki], w[:, torch.as_tensor(keep, device=w.device)], s=s_)
         if g == 0 or (g1 // 50) != (g // 50):
             prog.update("fly replay: learning from the market", int(b), n, day=str(datetime.fromtimestamp(float(ts_o[b - 1]), timezone.utc).date()),
                         updates=n_updates, pending=len(pending), drift=[round(float(x), 4) for x in bank.drift()], eta_s=(n - b) * (time.time() - t0) / max(b, 1))
         g = g1
-    return _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_counts, boot, S, save_verdict, time.time() - t0, fly, names, holds_min, lines)
+    return _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_counts, boot, S, save_verdict, time.time() - t0, fly, names, holds_min, lines, learn)
+
+
+def _learn_add(learn: dict, now: float, st: dict) -> None:
+    """Accumulate one update's statistics per UTC day, per configuration. A replay that leaves no record of its own
+    learning cannot say why learning helped or hurt — which is how a degrading fly went unexplained for two runs."""
+    if not st or not st.get("n"):
+        return
+    n = int(st["n"]); d = datetime.fromtimestamp(now, timezone.utc).date()
+    e = learn.setdefault(d, {"n": 0, "delta": None, "abs": None, "step": None, "capped": None, "drift": None})
+    e["n"] += n
+    for key, src, scale in (("delta", "mean_delta", n), ("abs", "mean_abs_delta", n), ("step", "step", 1)):
+        v = [float(x) * scale for x in st[src]]
+        e[key] = v if e[key] is None else [a + b for a, b in zip(e[key], v)]
+    cap = [int(bool(x)) for x in st["capped"]]
+    e["capped"] = cap if e["capped"] is None else [a + b for a, b in zip(e["capped"], cap)]
+    e["drift"] = [float(x) for x in st["drift"]]
+
+
+def _learning_series(learn: dict) -> list:
+    """The per-day series for the verdict: mean delta (how wrong it was), step size, and drift from the bootstrap."""
+    out = []
+    for d in sorted(learn):
+        e = learn[d]; n = max(e["n"], 1)
+        out.append({"day": str(d), "n": e["n"],
+                    "mean_delta": [round(x / n, 6) for x in (e["delta"] or [])],
+                    "mean_abs_delta": [round(x / n, 6) for x in (e["abs"] or [])],
+                    "step": [round(x, 8) for x in (e["step"] or [])],
+                    "capped": e["capped"] or [], "drift": [round(x, 5) for x in (e["drift"] or [])]})
+    return out
 
 
 def _window(ts_o: np.ndarray, now: float, lag: float, span_s: float) -> tuple[int, int]:
@@ -203,13 +238,15 @@ def _book(ds, order, ts_o, scores, line_log, choice: list[int], boot_lines: list
     N = len(ds.y); key = np.full(N, -np.inf); pick = np.zeros(N, bool); hold = np.zeros(N); ret = np.full(N, np.nan, np.float32)
     for s_, c in enumerate(choice):
         Sf, Lf = _arm(ds, order, ts_o, scores[c, s_], line_log, (c, s_), boot_lines[s_], mask_pos)
-        ok = Sf >= Lf; m = np.where(ok, Sf - Lf, -np.inf); take = ok & (m > key)
+        lab = _labels(ds, holds_min[s_])
+        ok = (Sf >= Lf) & np.isfinite(lab)          # a row whose hold runs past the corpus has no label: not a trade
+        m = np.where(ok, Sf - Lf, -np.inf); take = ok & (m > key)
         key = np.where(take, m, key); pick |= ok
-        hold = np.where(take, holds_min[s_] * 60.0, hold); ret = np.where(take, _labels(ds, holds_min[s_]), ret)
+        hold = np.where(take, holds_min[s_] * 60.0, hold); ret = np.where(take, lab, ret)
     return pick, hold, ret
 
 
-def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_counts, boot, S, save_verdict, secs, fly, names, holds_min, lines) -> dict:
+def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_counts, boot, S, save_verdict, secs, fly, names, holds_min, lines, learn=None) -> dict:
     days_r = sorted(set(ds.day[order[live_from:]].tolist()))
     sel_days, ev_days = days_r[: len(days_r) // 2], days_r[len(days_r) // 2:]
     day_o = ds.day[order]
@@ -240,7 +277,7 @@ def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_co
     out = {"S": str(S), "selection_days": [str(sel_days[0]), str(sel_days[-1])] if sel_days else None, "evaluation_days": [str(ev_days[0]), str(ev_days[-1])] if ev_days else None,
            "strategies": names, "per_strategy": per_strategy, "configs": per_strategy[names[0]]["configs"],
            "bootstrap": {k: boot.get(k) for k in ("lines", "calibration", "diagnostics", "gates_ok", "gate_failures")}, "data": fly_selector.FLY_VERSION,
-           "secs": secs, "finished_at": datetime.now(timezone.utc).isoformat()}
+           "secs": secs, "finished_at": datetime.now(timezone.utc).isoformat(), "learning": _learning_series(learn or {})}
     ev0, rnd0 = judge([0] * len(names))
     out["frozen"] = {**ev0["pooled"], "random": rnd0}
     if not any(v["plastic"] for v in per_strategy.values()):
@@ -252,13 +289,29 @@ def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_co
                    alpha=per_strategy[names[0]]["alpha"], half_life_days=per_strategy[names[0]]["half_life_days"],
                    plastic_beats_frozen=bool((ev["pooled"]["mean"] or -1) > (ev0["pooled"]["mean"] or -1)))
     log.info("fly replay from %s: %s — %s | frozen %s", S, "PASSED" if out.get("passed") else "FAILED", out.get("reason"), out["frozen"])
+    log.info("fly replay verdict: %s", {k: out.get(k) for k in ("passed", "reason", "evaluation", "frozen", "random")})
     if save_verdict:
         record_event("info" if out.get("passed") else "warning", "fly_replay", "fly replay " + ("passed" if out.get("passed") else "failed"),
                      {k: out.get(k) for k in ("S", "passed", "reason", "evaluation", "random", "frozen", "plastic_beats_frozen")} |
                      {"per_strategy": {k: {x: v[x] for x in ("alpha", "half_life_days", "hold_min", "plastic")} for k, v in per_strategy.items()}})
-        with transaction() as conn:
-            conn.execute("INSERT INTO ui_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-                         (KEY, json.dumps(out, default=str)))
+        try:        # NaN is valid Python and invalid JSON: never let the store discard a finished replay
+            with transaction() as conn:
+                conn.execute("INSERT INTO ui_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+                             (KEY, json.dumps(prog._finite(out), default=str)))
+        except Exception:
+            log.exception("could not store the replay verdict; it is in the log above and the fly cannot be armed until it is stored")
+        try:        # the chosen configuration's learning, where the console already looks for it
+            c0 = choice[0] if choice else 0
+            with transaction() as conn:
+                for rec in out["learning"]:
+                    d = date.fromisoformat(rec["day"]); pick = lambda k: (rec[k][c0] if len(rec.get(k) or []) > c0 else None)
+                    conn.execute("INSERT INTO fly_updates (hour, n, mean_delta, mean_abs_delta, step, capped, drift, ic, detail) "
+                                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (hour) DO NOTHING",
+                                 (datetime(d.year, d.month, d.day, tzinfo=timezone.utc), rec["n"], pick("mean_delta"), pick("mean_abs_delta"),
+                                  pick("step"), pick("capped"), pick("drift"), None,
+                                  json.dumps({"source": "replay", "config": c0, "per_config_drift": rec["drift"]}, default=str)))
+        except Exception:
+            log.exception("could not store the replay's learning statistics (the verdict is stored)")
     prog.update("fly replay: done", 1, 1, force=True, passed=out.get("passed"), reason=out.get("reason"))
     return out
 

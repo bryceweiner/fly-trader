@@ -36,6 +36,8 @@ def test_replay_learns_only_from_known_labels_and_judges_with_the_deploy_rule(mo
     out = fly_replay.run(ds=ds, fly=fly, boot=boot, start_day=9, configs=[(0.0, math.inf), (1e-3, 3.0)], save_verdict=False)
     assert sum(seen) > 0 and out["configs"][0]["alpha"] == 0.0 and len(out["configs"]) == 2
     assert isinstance(out["passed"], bool) and "reason" in out and out["data"] == fly_selector.FLY_VERSION
+    assert out["learning"] and sum(d["n"] for d in out["learning"]) > 0          # the replay records what its learning did
+    assert all(len(d["drift"]) == len(out["configs"]) for d in out["learning"])   # per configuration, every day
     if out.get("chosen"):
         assert out["chosen"]["alpha"] > 0                                                   # the frozen fly is a comparison, never the pick
 
@@ -62,3 +64,20 @@ def test_rollback_checks():
     assert gov.drift_check(0.6) and not gov.drift_check(0.4)
     out = gov.check((bad, good), (s, -s), 0.7)
     assert out["triggers"] == ["shadow", "ic", "drift"]
+
+
+def test_unresolved_rows_are_not_trades_and_a_nan_verdict_still_stores():
+    """A 240-minute hold has no label at the end of the corpus (decisions.build leaves NaN). Counting those rows put
+    n=3195 mean=NaN in a finished replay's own judgement and then lost five hours of work to a JSON error."""
+    import json
+    import numpy as np
+    from fly_trader.train import progress as prog
+    ds = _market_ds(days=14, per_day=400)
+    lab = ds.fwd_pess.copy(); lab[-200:] = np.nan                       # the tail has no resolved label
+    ds.fwd_h = {30: lab}
+    order = np.argsort(ds.ts, kind="stable"); ts_o = ds.ts[order]
+    scores = np.full((1, 1, len(order)), 1.0, np.float32)
+    pick, hold, ret = fly_replay._book(ds, order, ts_o, scores, {}, [0], [0.0], [30], np.ones(len(order), bool))
+    assert pick.any() and np.isfinite(ret[pick]).all()                  # every taken row has a known outcome
+    assert not pick[np.flatnonzero(~np.isfinite(lab))].any()            # and the unresolved tail was not taken
+    assert json.loads(json.dumps(prog._finite({"frozen": {"n": 3195, "mean": float("nan")}})))["frozen"]["mean"] is None

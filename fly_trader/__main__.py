@@ -136,7 +136,7 @@ def _cmd_fly_replay(args):
     from .logging_setup import setup
     from .train import fly_replay
     setup("train")
-    out = fly_replay.main(days=args.days, start_day=args.start_day)
+    out = fly_replay.main(days=args.days, start_day=args.start_day if args.start_day is not None else fly_replay.DEFAULT_START)
     print(json.dumps({k: out.get(k) for k in ("S", "passed", "reason", "alpha", "half_life_days", "evaluation", "random", "frozen", "plastic_beats_frozen")}, indent=1, default=str))
 
 
@@ -194,11 +194,13 @@ def build_parser() -> argparse.ArgumentParser:
     ts_ = sub.add_parser("train-selector"); ts_.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
     ts_.set_defaults(fn=_cmd_train_selector)
     tf_ = sub.add_parser("train-fly-selector"); tf_.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
-    tf_.add_argument("--epochs", type=int, default=1, help="full passes over the distillation rows")
+    tf_.add_argument("--epochs", type=int, default=None, help="cap on full passes over the distillation rows (default: until the fit stops improving)")
     tf_.set_defaults(fn=_cmd_train_fly_selector)
     fr = sub.add_parser("fly-replay", help="bootstrap the fly once, let it learn over the corpus, judge it (the gate before it trades)")
     fr.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
-    fr.add_argument("--start-day", type=int, default=30, help="day index of the bootstrap (the selector teaches on the days before it)")
+    fr.add_argument("--start-day", type=int, default=None,
+                    help="day index of the bootstrap (the selector teaches on the days before it); default: train/fly_replay.DEFAULT_START, "
+                         "the earliest day that leaves the teacher's walk-forward enough days in each half")
     fr.set_defaults(fn=_cmd_fly_replay)
     bc = sub.add_parser("backtest-corpus"); bc.add_argument("--max-tokens", type=int, default=None); bc.add_argument("--days", type=int, default=None)
     bc.add_argument("--fees", default="0.003,0.0055"); bc.add_argument("--only", default=None); bc.add_argument("--universe", default="graduation", choices=["graduation", "mature"]); bc.set_defaults(fn=_cmd_backtest_corpus)

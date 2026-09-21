@@ -1,6 +1,6 @@
 """Per-strategy holds: labels for several holds computed at once equal single-hold builds, and the one-position-per-token
 rule with per-row holds equals the scalar rule when holds are equal and respects each position's own exit otherwise."""
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -80,3 +80,21 @@ def test_the_label_is_costed_at_the_size_the_book_trades():
     assert (got > ec01).all()                            # and is strictly dearer than the 0.1 SOL assumption
     blind = _label_exit_cost(pd.DataFrame({"exit_cost_0p1": [0.01], "resq": [float("nan")]}))
     assert blind[0] == 1.0                               # unknown liquidity: assume the position cannot be exited
+
+
+def test_subset_keeps_days_rows_and_every_hold():
+    """The fly's teacher is built with DecisionSet.subset; if it dropped days or per-hold labels the bootstrap would fit
+    on a silently smaller corpus than intended."""
+    from fly_trader.train.decisions import X_COLS, DecisionSet
+    n = 600
+    days = np.array([date(2026, 7, 1) + timedelta(days=int(i // 100)) for i in range(n)], dtype=object)
+    ds = DecisionSet(X=np.zeros((n, len(X_COLS)), np.float32), y=np.zeros(n, np.int8), fwd=np.arange(n, dtype=np.float32),
+                     fwd_pess=np.arange(n, dtype=np.float32), day=days, ts=np.arange(n, dtype=float) * 60.0,
+                     mint=np.array([f"m{i}" for i in range(n)]), cols=list(X_COLS), horizon_s=1800.0,
+                     fwd_h={h: np.arange(n, dtype=np.float32) + h for h in (10, 120)})
+    m = ds.day < date(2026, 7, 4)
+    sub = ds.subset(m)
+    assert len(sub.y) == int(m.sum()) and sub.days == sorted(set(days[m].tolist()))
+    assert sorted(sub.fwd_h) == [10, 120] and all(len(v) == len(sub.y) for v in sub.fwd_h.values())
+    assert sub.fwd_h[120][0] == pytest.approx(ds.fwd_h[120][np.flatnonzero(m)[0]])   # labels follow their rows
+    assert sub.cols == ds.cols and sub.horizon_s == ds.horizon_s
