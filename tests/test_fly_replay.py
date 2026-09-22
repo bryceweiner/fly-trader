@@ -81,3 +81,26 @@ def test_unresolved_rows_are_not_trades_and_a_nan_verdict_still_stores():
     assert pick.any() and np.isfinite(ret[pick]).all()                  # every taken row has a known outcome
     assert not pick[np.flatnonzero(~np.isfinite(lab))].any()            # and the unresolved tail was not taken
     assert json.loads(json.dumps(prog._finite({"frozen": {"n": 3195, "mean": float("nan")}})))["frozen"]["mean"] is None
+
+
+def test_every_configuration_shares_the_frozen_flys_line(monkeypatch):
+    """Per-configuration lines let the frozen arm take 4,216 selection-half trades to the chosen arm's 2,609 with the
+    weights no more than 5 % apart: the arms traded different slices because of their lines, not their weights. One line,
+    calibrated on the frozen fly, leaves the weights as the only difference between arms."""
+    from types import SimpleNamespace
+    calls = []
+
+    def fake_cal(ts, mint, hold_s, sc, y, prev_line=None, prev_sizing=None):
+        calls.append(len(sc)); return SimpleNamespace(line=float(np.mean(sc)), sizing=[{"lo": 0.0, "kelly": 0.1}])
+    monkeypatch.setattr(fly_replay.fly_calibrate, "calibrate", fake_cal)
+    n, C, NS = 200, 3, 2
+    ts = np.arange(n, dtype=np.float64) * 60.0
+    ds = SimpleNamespace(ts=ts, mint=np.array([f"m{i % 7}" for i in range(n)]), fwd_h={}, fwd_pess=np.zeros(n, np.float32))
+    scores = np.random.default_rng(0).normal(size=(C, NS, n))               # every configuration scores differently
+    lines = np.full((C, NS), 0.02); sizings = [[[] for _ in range(NS)] for _ in range(C)]; line_log = {}
+    fly_replay._recalibrate(ds, np.arange(n), ts, scores, lines, sizings, float(ts[-1]) + 61.0, [60.0, 60.0], [10, 30], line_log)
+    assert calls == [n, n]                                                   # once per strategy, on every resolved row
+    for s in range(NS):
+        assert lines[0, s] == pytest.approx(np.mean(scores[0, s]))           # the frozen configuration's scores
+        assert (lines[:, s] == lines[0, s]).all() and all(line_log[(c, s)][-1] == (float(ts[-1]) + 61.0, lines[0, s]) for c in range(C))
+        assert all(sizings[c][s] == sizings[0][s] for c in range(C))

@@ -9,8 +9,9 @@
    α = 0 is the frozen fly) — exactly what the live fly does each minute:
    a. tags whose labels are known (scored at ``t`` with ``t + the strategy's hold + 60 s`` ≤ now) are captured: the
       realized net return over that strategy's hold teaches only that strategy's channel (``brain/plastic.py``);
-   b. at each UTC day boundary each (configuration, strategy) recalibrates its line and sizing
-      (``train/fly_calibrate.py``) on its own scores of the minutes resolved in the last seven days;
+   b. at each UTC day boundary each strategy's line and sizing are recalibrated (``train/fly_calibrate.py``) on the
+      frozen fly's scores of the minutes resolved in the last seven days and shared by every configuration, so the
+      arms differ only in their weights (per-configuration lines once traded different slices: ``_recalibrate``);
    c. each strategy's candidate rows (the selector's trigger) are scored; only the rows a configuration would have
       traded (at or above its own line) teach it -- the candidate set is overwhelmingly losers and learning from it
       dragged every prediction toward that mean (brain/plastic.row_weights);
@@ -191,15 +192,21 @@ def _line_at(line_log: dict, key, ts: np.ndarray, default: float) -> np.ndarray:
 
 
 def _recalibrate(ds, order, ts_o, scores, lines, sizings, now, lags, holds_min, line_log) -> None:
+    """One line and sizing per strategy, calibrated on the frozen fly's scores and shared by every configuration.
+
+    Until 2026-09-22 each configuration calibrated its own. With the plastic and frozen weights no more than 5 % apart,
+    the frozen arm still took 4,216 selection-half trades to the chosen arm's 2,609: the arms traded different slices
+    because of their lines, so "plastic beats frozen" measured line calibration, not plasticity. A shared line leaves
+    the weights as the only difference between arms, which is the question the replay exists to answer."""
     for s_, (lag, H) in enumerate(zip(lags, holds_min)):
         a, b = _window(ts_o, now, lag, fly_calibrate.WINDOW_DAYS * DAY_S)
         rows = order[a:b]; y = _labels(ds, H)[rows]
+        sc = scores[0, s_, a:b]; has = np.isfinite(sc)
+        cal = fly_calibrate.calibrate(ds.ts[rows[has]], ds.mint[rows[has]], H * 60.0, sc[has], y[has], prev_line=float(lines[0, s_]), prev_sizing=sizings[0][s_])
         for c in range(lines.shape[0]):
             key = (c, s_)
             if key not in line_log:
                 line_log[key] = [(-math.inf, float(lines[c, s_]))]
-            sc = scores[c, s_, a:b]; has = np.isfinite(sc)
-            cal = fly_calibrate.calibrate(ds.ts[rows[has]], ds.mint[rows[has]], H * 60.0, sc[has], y[has], prev_line=float(lines[c, s_]), prev_sizing=sizings[c][s_])
             lines[c, s_] = cal.line; sizings[c][s_] = cal.sizing
             line_log[key].append((now, float(cal.line)))
 
