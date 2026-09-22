@@ -36,12 +36,13 @@ import numpy as np
 import torch
 
 from .. import config
-from ..brain import plastic
+from ..brain import activity, plastic
+from ..brain.connectome import current_connectome_path
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..execution import ledger
 from ..execution.broker_paper import PaperBroker
-from ..ops.reset import fly_state_dir
+from ..ops.reset import activity_dir, fly_state_dir
 from ..train import fly_calibrate, fly_governance as gov, fly_selector
 from ..train.decisions import X_COLS
 from . import handover, paper_trading
@@ -129,6 +130,11 @@ class FlyBook:
     def _load_bootstrap(self, boot: dict) -> None:
         self.boot_id = int(boot["id"])
         self.fly = fly_selector.load(boot["path"])
+        try:
+            self.connectome_name = current_connectome_path().name       # stamped on the activity files the console draws
+        except Exception:
+            self.connectome_name = ""
+        self.capture_ok = True
         self.idx = np.asarray([X_COLS.index(c) for c in self.fly.cols], dtype=int)
         self.names = list(self.fly.strategies); self.holds = {k: float(self.fly.rules[k]["hold_min"]) * 60.0 for k in self.names}
         self.H = max(self.holds.values())
@@ -331,7 +337,8 @@ class FlyBook:
         if not n:
             return {"decision": empty, "picks": 0}
         X = ctx.X[:, self.idx]
-        Y, u0, k = self.fly.parts_all(X); trig = self.fly.triggers(ctx.X, X_COLS)
+        Y, u0, k, H = self.fly.parts_all_h(X); trig = self.fly.triggers(ctx.X, X_COLS)
+        self._capture(H, trig, ctx.t_start); del H
         if not self.nu_set:
             self.bank.estimate_nu(Y[:, 0], u0, k); self.nu_set = True
         t = ctx.t_start; ts = datetime.fromtimestamp(t, timezone.utc); rows = []
@@ -361,6 +368,19 @@ class FlyBook:
         self.fly.lines = dict(self.lines["plastic"]); self.fly.sizings = {k: list(v) for k, v in self.sizing["plastic"].items()}
         d = fly_selector.fly_decide(self.fly, ctx.X, X_COLS, np.where(np.isfinite(V), V, -np.inf))
         return {"decision": d, "picks": int(sum(1 for x in d["strategy"] if x is not None))}
+
+    def _capture(self, H: torch.Tensor, trig: np.ndarray, t: float) -> None:
+        """The console's brain view: this minute's mean activity over the rows some strategy's trigger fired on (every
+        row when none did), one file per minute (brain/activity.py). Never allowed to interrupt scoring."""
+        if not self.capture_ok:
+            return
+        try:
+            sel = np.flatnonzero(trig.any(1)); n_c = int(len(sel))
+            m = (H.index_select(0, torch.as_tensor(sel, device=H.device)) if n_c else H).mean(0)
+            activity.write(activity_dir(), t, activity.quantise(m), n_rows=int(len(trig)), n_cand=n_c, connectome=self.connectome_name)
+        except Exception:
+            self.capture_ok = False
+            log.exception("brain activity capture disabled for this session")
 
     # ---- daily and hourly ----
     def _resolved(self, conn, since_resolved: float, cols: str, name: str) -> list[dict]:
@@ -418,6 +438,7 @@ class FlyBook:
             if c["triggers"] and now >= self.checks_paused_until.get(name, 0.0) and not self.learning_frozen:
                 self._rollback(conn, now, c, sid, name=name)
         self._prune(conn, now)
+        activity.prune(activity_dir(), now - activity.KEEP_S)
         self._handover_check(conn, now)
 
     def _snapshot(self, conn, now: float, good: bool, checks: dict) -> int:

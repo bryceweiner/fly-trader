@@ -215,7 +215,9 @@ def run_console(port: int = 8501) -> None:
     app = str(config.REPO_ROOT / "fly_trader" / "ui" / "app.py")
     from streamlit.web import bootstrap
     flag_options = {"server.port": port, "server.headless": True, "browser.gatherUsageStats": False,
-                    "server.fileWatcherType": "none", "logger.level": "warning"}
+                    "server.fileWatcherType": "none", "logger.level": "warning",
+                    "server.enableStaticServing": True}       # ui/static/brain: the 3D view's neuron geometry, fetched once
+
     bootstrap.load_config_options(flag_options)      # the CLI does this before run(); without it port/headless/watcher flags are ignored
     try:
         bootstrap.run(app, False, [], flag_options)

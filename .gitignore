@@ -3,7 +3,10 @@
 data/
 logs/
 dist/
-models/wallet_skill/*.parquet   # ~300 MB: on Hugging Face, fetched by docker/entrypoint.sh
+# the wallet-skill table (~300 MB) lives on Hugging Face; docker/entrypoint.sh fetches it
+models/wallet_skill/*.parquet
+# generated neuron geometry for the console's 3D view (brain/geometry.py); the distribution ships it under models/geometry
+fly_trader/ui/static/brain/
 __pycache__/
 *.pyc
 .pytest_cache/

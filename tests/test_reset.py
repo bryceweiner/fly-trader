@@ -71,6 +71,7 @@ def test_runner_reset_keeps_the_race_books_and_the_fly_and_reset_fly_clears_only
     monkeypatch.setattr(config, "PG_ARCHIVE_DIR", tmp_path / "arch")
     monkeypatch.setattr(config, "BRAIN_DIR", tmp_path / "brain")
     (tmp_path / "brain" / "plastic").mkdir(parents=True); (tmp_path / "brain" / "plastic" / "state.pt").write_bytes(b"x")
+    (tmp_path / "brain" / "activity").mkdir(); (tmp_path / "brain" / "activity" / "20260901T0000.npz").write_bytes(b"x")   # the console's brain view
     with transaction() as conn:
         runs = _race_fixture(conn)
     reset_training_state(reason="test")
@@ -84,8 +85,9 @@ def test_runner_reset_keeps_the_race_books_and_the_fly_and_reset_fly_clears_only
         assert _n(conn, "SELECT count(*) AS n FROM fly_scored WHERE mint = 'RACE_F'") == 1
         assert _n(conn, "SELECT count(*) AS n FROM brain_snapshots WHERE path IN ('p1','p2')") == 2
         assert _n(conn, "SELECT count(*) AS n FROM brain_snapshots WHERE path = 'p3'") == 0
-    assert (tmp_path / "brain" / "plastic" / "state.pt").exists()
+    assert (tmp_path / "brain" / "plastic" / "state.pt").exists() and (tmp_path / "brain" / "activity" / "20260901T0000.npz").exists()
     reset_fly(reason="test")
+    assert not (tmp_path / "brain" / "activity").exists() and list((tmp_path / "arch").glob("reset_fly_*/activity/20260901T0000.npz"))
     with transaction() as conn:
         assert _n(conn, "SELECT count(*) AS n FROM positions WHERE mint = 'RACE_F'") == 0
         assert _n(conn, "SELECT count(*) AS n FROM positions WHERE mint = 'RACE_S'") == 1                    # the selector's book stays

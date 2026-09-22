@@ -161,11 +161,15 @@ class FlyNet(nn.Module):
             h = self._kwta(torch.tanh(pre_act))
         return h, k, u
 
-    def forward_parts_all(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """(every strategy head's decoder output [B, S] × SCALE, MBON pre-activation at the last step [B, n_MBON], KC code [B, n_KC])."""
+    def forward_parts_all_h(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``forward_parts_all`` plus every neuron's activity after the last step [B, N] (the console's brain view)."""
         h, k, u = self._propagate(x)
         z = self.dec(self.eff_norm(h.index_select(0, self.eff_rows).T))
-        return torch.cat([hd(z) for hd in self.heads], dim=1), u.T, k.T
+        return torch.cat([hd(z) for hd in self.heads], dim=1), u.T, k.T, h.T
+
+    def forward_parts_all(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(every strategy head's decoder output [B, S] × SCALE, MBON pre-activation at the last step [B, n_MBON], KC code [B, n_KC])."""
+        return self.forward_parts_all_h(x)[:3]
 
     def forward_parts(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """(the first head's decoder output [B] × SCALE, MBON pre-activation at the last step [B, n_MBON], KC code [B, n_KC])."""
@@ -256,6 +260,12 @@ class FlyModel:
         """``FlyNet.forward_parts_all``: every head's decoder output [B, S], MBON pre-activation, KC code."""
         self.net.eval()
         return self.net.forward_parts_all(self._x(X))
+
+    @torch.no_grad()
+    def parts_all_h(self, X: np.ndarray) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``parts_all`` plus the activity of every neuron [B, N] (one batch; ``score_all`` is the batched path)."""
+        self.net.eval()
+        return self.net.forward_parts_all_h(self._x(X))
 
     def triggers(self, X: np.ndarray, cols: list[str]) -> np.ndarray:
         """[B, S] where each strategy's fitted trigger (the selector's) fires — its candidates."""
