@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>fly-trader — a fruit fly connectome that trades Robinhood Chain memecoins</title>
+  <meta name="description" content="fly-trader runs the complete FlyWire fruit-fly connectome — 139,255 neurons, 2.7 million connections — as a trained trading policy on pump.fun graduates. Open source, experimental, no promises.">
+  <link rel="canonical" href="https://fly-trader.app/">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="fly-trader">
+  <meta property="og:description" content="A fruit fly is learning to trade. 139,255 real neurons, real synapses, real markets. Open source and experimental.">
+  <meta property="og:url" content="https://fly-trader.app/">
+  <meta property="og:image" content="https://fly-trader.app/assets/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="theme-color" content="#0b0a10">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="nav">
+  <div class="shell nav-inner">
+    <a class="logo" href="#home" aria-label="fly-trader home">fly<span>trader</span></a>
+    <ul class="nav-links">
+      <li><a href="#home">Home</a></li>
+      <li><a href="#about">About</a></li>
+      <li><a href="#fly">$FLY</a></li>
+      <li><a href="#get-started">Get Started</a></li>
+    </ul>
+    <div class="nav-right">
+      <a class="icon-link" data-link="github" href="https://github.com/bryceweiner/fly-trader" target="_blank" rel="noopener" aria-label="GitHub repository">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.1.79-.25.79-.56v-2.17c-3.2.7-3.87-1.37-3.87-1.37-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.76 2.69 1.25 3.35.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.41-2.69 5.38-5.25 5.67.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>
+      </a>
+      <a class="icon-link" data-link="x" href="#" target="_blank" rel="noopener" aria-label="X community">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.24 2.25h3.31l-7.23 8.26 8.5 11.24h-6.66l-5.21-6.82-5.97 6.82H1.67l7.73-8.84L1.25 2.25h6.83l4.71 6.23 5.45-6.23zm-1.16 17.52h1.83L7.08 4.13H5.12l11.96 15.64z"/></svg>
+      </a>
+      <button class="burger" type="button" aria-label="Open menu" aria-expanded="false" aria-controls="mobile-menu">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      </button>
+    </div>
+  </div>
+  <nav class="mobile-menu" id="mobile-menu" hidden>
+    <ul>
+      <li><a href="#home">Home</a></li>
+      <li><a href="#about">About</a></li>
+      <li><a href="#fly">$FLY</a></li>
+      <li><a href="#get-started">Get Started</a></li>
+      <li><a data-link="github" href="https://github.com/bryceweiner/fly-trader" target="_blank" rel="noopener">GitHub</a></li>
+      <li><a data-link="x" href="#" target="_blank" rel="noopener">X community</a></li>
+    </ul>
+  </nav>
+</header>
+
+<main>
+
+<!-- ============ HERO ============ -->
+<section class="hero" id="home">
+  <div class="hero-media" aria-hidden="true">
+    <video autoplay muted loop playsinline preload="metadata" poster="assets/fafb.png">
+      <source src="assets/hero.av1.mp4" type='video/mp4; codecs="av01.0.08M.08"'>
+      <source src="assets/hero.h264.mp4" type='video/mp4; codecs="avc1.640028"'>
+    </video>
+    <picture class="hero-poster">
+      <source srcset="assets/fafb.webp" type="image/webp">
+      <img src="assets/fafb.png" alt="" width="768" height="600">
+    </picture>
+  </div>
+  <div class="hero-scrim" aria-hidden="true"></div>
+
+  <div class="shell">
+    <div class="hero-content">
+      <div class="chip"><span class="dot" aria-hidden="true"></span>Experimental · Robinhood Chain mainnet</div>
+
+      <h1 class="display hero-title headline" id="headline" aria-live="polite">
+        <span class="passage is-active">
+          <span class="line">A Fruit Fly</span>
+          <span class="line accent">Is Learning</span>
+          <span class="line">To Trade.</span>
+        </span>
+        <span class="passage">
+          <span class="line">139,255 Neurons.</span>
+          <span class="line accent">Real Synapses.</span>
+          <span class="line">Real Markets.</span>
+        </span>
+        <span class="passage">
+          <span class="line">Open Source.</span>
+          <span class="line accent">Open Brain.</span>
+          <span class="line">No Stopping.</span>
+        </span>
+      </h1>
+
+      <p class="tagline">The complete adult <em>Drosophila</em> connectome, wired to a memecoin tape and trained on the money.</p>
+
+      <div class="btn-row hard-shadow">
+        <a class="btn primary" href="#get-started">Get Started</a>
+        <a class="btn" href="#about">About the Fly</a>
+        <a class="btn violet" href="#fly">$FLY</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ ABOUT ============ -->
+<section class="section" id="about">
+  <div class="shell">
+    <div class="section-head">
+      <span class="micro accent">01 · About</span>
+      <h2 class="section-title">One brain, 128 tokens, one second at a time</h2>
+      <p class="lede">fly-trader does not use a neural network shaped like a brain. It uses the brain: the synapse-level wiring diagram of an adult fruit fly, run as a recurrent policy whose only trainable freedom is how strongly each real synapse fires.</p>
+    </div>
+
+    <!-- The brain -->
+    <div class="sub">
+      <h3 class="sub-title">The brain</h3>
+      <div class="prose">
+        <p>The wiring comes from <strong>FlyWire FAFB v783</strong>, the first complete synaptic connectome of an adult animal brain (Dorkenwald et al., 2024; annotations from Schlegel et al., 2024). Every neuron is present. Every connection between them is a real, electron-microscopy-reconstructed synapse. Neurotransmitter signs follow Shiu et al. (2024): GABA and glutamate inhibit, everything else excites. The build reproduces the MIT-licensed <em>flybrain</em> export edge for edge.</p>
+      </div>
+      <div class="stat-grid">
+        <div class="stat"><span class="micro">Neurons</span><div class="value">139,255</div><p class="note">Whole brain, both hemispheres, optic lobes included</p></div>
+        <div class="stat"><span class="micro">Connections</span><div class="value">2.70 M</div><p class="note">Distinct pre→post pairs; ≈33.9 M individual synapses</p></div>
+        <div class="stat"><span class="micro">Kenyon cells</span><div class="value violet">5,177</div><p class="note">Sparse odor code of the mushroom body</p></div>
+        <div class="stat"><span class="micro">Output neurons (MBONs)</span><div class="value violet">96</div><p class="note">Approach and avoid readouts of the mushroom body</p></div>
+        <div class="stat"><span class="micro">Dopaminergic neurons</span><div class="value">323</div><p class="note">307 PAM (reward) · 16 PPL1 (punishment)</p></div>
+        <div class="stat"><span class="micro">Olfactory glomeruli</span><div class="value">48</div><p class="note">Antennal-lobe channels the encoder writes into</p></div>
+        <div class="stat"><span class="micro">Named populations</span><div class="value lime">26</div><p class="note">Sensory, mushroom body, central complex, descending</p></div>
+        <div class="stat"><span class="micro">Source</span><div class="value lime">FAFB v783</div><p class="note">FlyWire consortium, Nature 2024</p></div>
+      </div>
+    </div>
+
+    <!-- How it works -->
+    <div class="sub">
+      <h3 class="sub-title">How it works</h3>
+      <div class="split">
+        <div class="prose">
+          <p><strong>Sensing.</strong> Every second the system watches up to 128 recently graduated pump.fun tokens at once. For each one it computes a 45-dimensional market observation: returns and realized volatility over one minute to three hours, buy/sell imbalance, volume, trade counts, unique signers, burstiness, liquidity, drawdown, exit cost, and holder statistics. A small learned encoder writes that observation into the fly's afferent neurons, the populations that in a living fly carry smell, taste, touch, and temperature.</p>
+          <p><strong>Propagation.</strong> Activity then flows through the connectome exactly as the wiring allows: a neuron can only influence the neurons it actually synapses onto. The sign of every synapse is fixed by its neurotransmitter (Dale's law) and the topology never changes. What training adjusts is the magnitude of each connection, plus a gain and bias per neuron. This follows the FlyGM approach (arXiv 2602.17997) in which a whole connectome is trained end to end as a graph model and outperforms both size-matched multilayer perceptrons and random graphs of the same density.</p>
+          <p><strong>Acting.</strong> A decoder reads the 1,303 descending neurons, the fly's motor output, and produces a target exposure between 0 and 1 for each token. Exposure is a fraction of the maximum position size; the runner buys, resizes, or sells to match it, and a trade only fires when the target moves by at least a quarter of a position.</p>
+          <p><strong>Learning.</strong> Training runs in three stages: a rule-based expert generates demonstrations, the connectome is warm-started by imitation with DAgger correction, then recurrent proximal policy optimisation (PPO) refines it against net profit and loss after Jupiter fees, pool fees, and constant-product price impact. Gradients flow back through time and through every synapse of the graph.</p>
+        </div>
+        <div>
+          <div class="panel hard-shadow-violet">
+            <span class="micro">Trained graph · central brain</span>
+            <div class="kv" style="border:0;background:transparent;gap:12px">
+              <div style="padding:0;background:transparent"><span class="micro">Neurons</span><div class="v accent">41,756</div></div>
+              <div style="padding:0;background:transparent"><span class="micro">Edges</span><div class="v accent">1,040,700</div></div>
+              <div style="padding:0;background:transparent"><span class="micro">Trainable parameters</span><div class="v">1.31 M</div></div>
+              <div style="padding:0;background:transparent"><span class="micro">Message-passing steps</span><div class="v">4 per beat</div></div>
+              <div style="padding:0;background:transparent"><span class="micro">Beat</span><div class="v">1 s · 128 slots</div></div>
+              <div style="padding:0;background:transparent"><span class="micro">Compute</span><div class="v">Apple M-series GPU</div></div>
+            </div>
+            <p class="mt-24" style="margin-bottom:0">The optic lobes (97,499 neurons) are excluded from the trained policy; the market has no photoreceptors to speak to them. The full 139,255-neuron graph is retained for the spiking mode.</p>
+          </div>
+          <div class="panel mt-24">
+            <span class="micro">Also in the code · spiking mode</span>
+            <p>An earlier design runs the full brain as leaky integrate-and-fire neurons with dopamine-gated three-factor plasticity confined to the Kenyon-cell → MBON synapses, the site of associative learning in the real fly. It remains available behind a flag and is retained for research, but the trained policy is the default.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Training data -->
+    <div class="sub">
+      <h3 class="sub-title">Training data</h3>
+      <div class="prose">
+        <p>The fly learns from the post-graduation life of pump.fun tokens on Robinhood Chain: candles and per-trade rows pulled from pump.fun's own swap API, an hourly historical replay archive, and a live tape of every swap on watched pools streamed through Helius. Token metadata and holder statistics come from Jupiter. All of it is stored in Postgres and Parquet and every decision is replayable from journaled inputs.</p>
+      </div>
+      <div class="stat-grid">
+        <div class="stat"><span class="micro">Market features</span><div class="value">45</div><p class="note">Per token per beat, over 1 m · 5 m · 15 m · 1 h · 3 h windows</p></div>
+        <div class="stat"><span class="micro">Graduated tokens in corpus</span><div class="value">14,922</div><p class="note">1-minute candles for the first 12 h, 5-minute to 7 days; 31 GB</p></div>
+        <div class="stat"><span class="micro">Corpus feature rows</span><div class="value violet">2.7 M</div><p class="note">One row per traded minute per token</p></div>
+        <div class="stat"><span class="micro">Historical trade rows</span><div class="value violet">405 M</div><p class="note">Replay archive, every pump.fun trade, hour by hour</p></div>
+        <div class="stat"><span class="micro">Live swaps captured</span><div class="value">1.49 M</div><p class="note">Helius websocket tape on watched pools</p></div>
+        <div class="stat"><span class="micro">Slot observations</span><div class="value">472 k</div><p class="note">Behind the measured eligibility gates</p></div>
+        <div class="stat"><span class="micro">Graduations per hour</span><div class="value lime">≈36</div><p class="note">Measured rate of new pump.fun migrations</p></div>
+        <div class="stat"><span class="micro">Sources</span><div class="value lime" style="font-size:1rem;line-height:1.4">pump.fun · PumpAPI · Helius · Jupiter</div></div>
+      </div>
+    </div>
+
+    <!-- Strategies -->
+    <div class="sub">
+      <h3 class="sub-title">What we taught the fly</h3>
+      <div class="prose">
+        <p>A connectome does not come with a trading strategy. The expert that demonstrates one for it is deliberately simple and every threshold in it was measured on the fly's own data before it was allowed to teach.</p>
+      </div>
+      <div class="cards three mt-24">
+        <div class="card">
+          <span class="num">UNIVERSE</span>
+          <h4>Graduated pump.fun tokens only</h4>
+          <ul>
+            <li>Mint and freeze authority must be disabled</li>
+            <li>At least 1 SOL of swap volume in the last 3 hours</li>
+            <li>Watched for up to 7 days after graduation</li>
+            <li>Everything else (liquidity, age, holders) is sensory input, never a filter</li>
+          </ul>
+        </div>
+        <div class="card">
+          <span class="num">ELIGIBILITY</span>
+          <h4>Measured on 472 k observations</h4>
+          <ul>
+            <li>At least 6 hours since graduation: younger tokens averaged −0.7 % forward return</li>
+            <li>Buy imbalance ≥ 0.2 over both 5 and 15 minutes</li>
+            <li>Within 5 % of the one-hour high, and rising</li>
+            <li>Each condition independently raised the 5- and 15-minute forward return</li>
+          </ul>
+        </div>
+        <div class="card">
+          <span class="num">EXPERT STRATEGIES</span>
+          <h4>Four demonstrations, walk-forward tested</h4>
+          <ul>
+            <li>Breakout with volume confirmation</li>
+            <li>Participation flow from per-trade rows</li>
+            <li>Quality survivor and graduation survivor</li>
+            <li>Exit grid: trailing 5–20 %, hard stop 3–8 %, max hold 30–120 min</li>
+          </ul>
+        </div>
+        <div class="card">
+          <span class="num">INNATE VALENCE</span>
+          <h4>What smells good before learning</h4>
+          <ul>
+            <li>Rank score over short-horizon momentum and buy/sell flow</li>
+            <li>Penalty on bot-inflated volume: a low organic score smells bad</li>
+            <li>Backtest: top-versus-bottom decile spread of +0.75 % over 5 minutes</li>
+          </ul>
+        </div>
+        <div class="card">
+          <span class="num">REFLEXES</span>
+          <h4>Exits the fly cannot unlearn</h4>
+          <ul>
+            <li>Bitter: exit at −2 % unrealized</li>
+            <li>Turned: was up 1 % or more, now flat or below</li>
+            <li>Satiety: a gain held long enough is taken, if it clears the round-trip fee</li>
+            <li>Hard stop at −50 %; dead-bag sweep after 3 hours without a swap</li>
+          </ul>
+        </div>
+        <div class="card">
+          <span class="num">RISK RAILS</span>
+          <h4>Capital protection outside the brain</h4>
+          <ul>
+            <li>0.1 SOL maximum per position, valence-proportional sizing</li>
+            <li>10 SOL rolling 24-hour notional cap</li>
+            <li>Kill switch at −30 % from peak wealth blocks new entries</li>
+            <li>Gas reserve, circuit breaker on failed executions, stale-feed halt</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="sub">
+      <div class="notice">
+        <span class="micro">Status · 2026-09</span>
+        <p>fly-trader is an experiment. The policy is still in training and its out-of-sample results are unproven; no performance is claimed here or anywhere else. Live trading is default-deny. Paper books run first, every observation, decision, and fill is written to Postgres, and the whole history is replayable. Read the code before you trust it, and never fund it with money you cannot lose.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ $FLY ============ -->
+<section class="section" id="fly">
+  <div class="shell">
+    <div class="section-head">
+      <span class="micro accent">02 · Token</span>
+      <h2 class="section-title">$FLY</h2>
+      <p class="lede">A Robinhood Chain token launching on ponsfamily.com alongside the software. It exists to gather the community around the experiment. It has no utility today.</p>
+    </div>
+
+    <div class="token-grid">
+      <div>
+        <div class="kv hard-shadow-violet">
+          <div><span class="micro">Ticker</span><div class="v accent">$FLY</div></div>
+          <div><span class="micro">Total supply</span><div class="v">1,000,000,000</div></div>
+          <div><span class="micro">Chain</span><div class="v">Robinhood Chain</div></div>
+          <div><span class="micro">Venue</span><div class="v">ponsfamily.com</div></div>
+          <div class="wide">
+            <span class="micro">Contract address</span>
+            <div class="ca-row">
+              <code id="fly-ca">TBA</code>
+              <button class="btn" type="button" id="copy-ca" aria-disabled="true">Copy</button>
+            </div>
+          </div>
+        </div>
+        <div class="btn-row mt-24">
+          <a class="btn violet" id="buy-fly" href="#" target="_blank" rel="noopener" aria-disabled="true">Buy on ponsfamily.com</a>
+          <a class="btn" data-link="x" href="#" target="_blank" rel="noopener">Join the X community</a>
+        </div>
+        <p class="micro mt-24">Contract address and buy link are published here and on the X community at launch. Anything elsewhere is not us.</p>
+      </div>
+
+      <div>
+        <div class="panel">
+          <span class="micro">Utility</span>
+          <p class="coming-soon">Coming soon!</p>
+          <p>Ties between $FLY and the fly-trader software are forthcoming and will be announced on this page and in the X community. Until they are announced, the token does nothing and confers nothing.</p>
+        </div>
+        <div class="notice danger mt-24">
+          <span class="micro">Disclaimer</span>
+          <p>$FLY is a memecoin. It is not an offer or solicitation to buy securities, and nothing on this site is investment, financial, legal, or tax advice. There is no expectation of profit from the efforts of others; the token may lose all of its value. It confers no ownership, revenue, governance, or other rights, and no utility is promised. Do your own research, understand the risks of ponsfamily.com and Robinhood Chain tokens, and comply with the law where you live. Only spend what you can afford to lose.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ GET STARTED ============ -->
+<section class="section" id="get-started">
+  <div class="shell">
+    <div class="section-head">
+      <span class="micro accent">03 · Get Started</span>
+      <h2 class="section-title">Run your own fly</h2>
+      <p class="lede">The whole system is open source under the MIT license: connectome build, data ingest, training, the trading runner, and the operator console. It runs on a single Mac.</p>
+      <div class="btn-row hard-shadow">
+        <a class="btn primary" data-link="github" href="https://github.com/bryceweiner/fly-trader" target="_blank" rel="noopener">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.1.79-.25.79-.56v-2.17c-3.2.7-3.87-1.37-3.87-1.37-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.76 2.69 1.25 3.35.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.41-2.69 5.38-5.25 5.67.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>
+          View on GitHub
+        </a>
+        <a class="btn" data-link="readme" href="https://github.com/bryceweiner/fly-trader#readme" target="_blank" rel="noopener">Read the README</a>
+      </div>
+    </div>
+
+    <div class="sub">
+      <h3 class="sub-title">You will need</h3>
+      <ul class="req-list">
+        <li><strong>A Mac with Apple Silicon</strong><span>The brain runs on the Metal GPU through PyTorch. M-series with 32 GB or more is comfortable.</span></li>
+        <li><strong>Python 3.13 and uv</strong><span>uv installs everything else. No other runtime is required.</span></li>
+        <li><strong>PostgreSQL</strong><span>Local database for the tape, decisions, fills, and brain snapshots. Homebrew's works.</span></li>
+        <li><strong>A Helius API key</strong><span>Streams swaps and resolves transactions. The free developer tier is enough to watch.</span></li>
+        <li><strong>A Robinhood Chain wallet (optional)</strong><span>Only for live trading. The bot creates its own; you fund it with what you are willing to lose.</span></li>
+        <li><strong>Patience</strong><span>The connectome build downloads about 100 MB of FlyWire data and the first training run takes hours.</span></li>
+      </ul>
+    </div>
+
+    <div class="sub">
+      <h3 class="sub-title">Steps</h3>
+      <ol class="steps">
+        <li>
+          <div>
+            <h4>Clone and install</h4>
+            <pre>git clone https://github.com/bryceweiner/fly-trader.git
+cd fly-trader
+uv sync</pre>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h4>Configure</h4>
+            <p>Copy the template and paste your Helius key. Leave <code>LIVE_ENABLED=0</code>; paper books run by default.</p>
+            <pre>cp .env.example .env</pre>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h4>Create the database</h4>
+            <pre>createdb fly_trader
+uv run fly-trader init-db</pre>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h4>Build the brain</h4>
+            <p>Downloads the FlyWire export, checks it against the published neuron and edge counts, and writes the connectome artifact.</p>
+            <pre>uv run fly-trader build-connectome</pre>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h4>Open the console</h4>
+            <p>One Streamlit app starts and supervises every worker: discovery, capture, training, and the trading runner. Nothing runs outside it.</p>
+            <pre>uv run fly-trader ui</pre>
+            <p>Then open <code>http://localhost:8501</code>, start the discover and capture workers, and let the tape fill for a few hours before training.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h4>Train, then trade on paper</h4>
+            <p>Build a dataset from the captured tape and train the policy from the Training tab or the command line. Promote the checkpoint you like. Watch the paper books before you consider anything else.</p>
+            <pre>uv run fly-trader build-dataset
+uv run fly-trader train-policy</pre>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h4>Go live only if you mean it</h4>
+            <p>Create the bot wallet, fund it modestly, set <code>LIVE_ENABLED=1</code> with your capital caps, and run the swap smoke test first. Every cap in the About section is enforced in code, and the kill switch is yours.</p>
+            <pre>uv run fly-trader wallet new
+uv run fly-trader swap-smoke --sol 0.01</pre>
+          </div>
+        </li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="footer">
+  <div class="shell">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <a class="logo" href="#home">fly<span>trader</span></a>
+        <p>A fruit-fly connectome trading Robinhood Chain memecoins. Open source, experimental, and honest about both.</p>
+      </div>
+      <div>
+        <h5 class="micro">Project</h5>
+        <ul>
+          <li><a href="#about">About</a></li>
+          <li><a href="#fly">$FLY</a></li>
+          <li><a href="#get-started">Get Started</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5 class="micro">Community</h5>
+        <ul>
+          <li><a data-link="github" href="https://github.com/bryceweiner/fly-trader" target="_blank" rel="noopener">GitHub</a></li>
+          <li><a data-link="x" href="#" target="_blank" rel="noopener">X community</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5 class="micro">Legal</h5>
+        <ul>
+          <li><a href="terms.html">Terms of Service</a></li>
+          <li><a href="privacy.html">Privacy Policy</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© <span id="year">2026</span> fly-trader · MIT licensed · <a href="https://ponsfamily.com" target="_blank" rel="noopener">ponsfamily.com</a></span>
+      <span>Not financial advice · <a href="https://flywire.ai" target="_blank" rel="noopener">Connectome: FlyWire</a></span>
+    </div>
+  </div>
+</footer>
+
+<script src="site.js"></script>
+</body>
+</html>
