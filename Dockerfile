@@ -12,9 +12,11 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 WORKDIR /app
 COPY . .
 # CPU-only torch first (the default Linux wheel pulls CUDA, ~3 GB); the project's own pin is then already satisfied.
+# Editable install: the package IS /app/fly_trader, so config.REPO_ROOT is /app -- the mounted .env the wallet writes
+# to, the console's static directory, config/. A plain install ran a copy under site-packages and looked there instead.
 RUN uv venv /app/.venv \
     && uv pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.12" \
-    && uv pip install . \
+    && uv pip install -e . \
     && chmod +x /app/docker/entrypoint.sh
 
 EXPOSE 8501
