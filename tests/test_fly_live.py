@@ -96,3 +96,56 @@ def test_blocked_entries_and_the_gap_pause(db_conn, clean):
                              table=[{"lo": 0.0, "kelly": 0.4, "n": 1, "mean": 0.1, "win": 1}],
                              entries=[{"mint": "LIVE_B", "decision_id": d, "score": 0.05, "info": {"resq": 1000.0, "pool": "PB", "decimals": 6}}])
     assert out2["entered"] == 0 and out2["blocked"] == "paused" and not [r for r in w.submitted if r.side == "buy"]
+
+
+def test_a_tripped_kill_switch_liquidates_when_asked_and_only_then(db_conn, clean, monkeypatch):
+    """The kill switch blocked entries and kept holding. With KILL_SWITCH_LIQUIDATE every open live position is sold at the
+    forced slippage the minute it trips, retried while it stays on; a position already in flight is left to the worker."""
+    w = _Worker(); mirror = fly_live.LiveMirror(7200.0, broker=SimpleNamespace(rpc=_Rpc(5 * config.LAMPORTS_PER_SOL), pubkey="PK"), worker=w)
+    m1 = datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc)
+    with transaction() as conn:
+        for mint, age in (("LIVE_K1", 600), ("LIVE_K2", 7200 + 60)):                    # one young, one due for its scheduled exit
+            conn.execute("INSERT INTO positions (book, mint, pool, opened_at, qty, cost_sol, entry_price, status) VALUES ('live', %s, 'P', %s, 1000000, 0.2, 0.0000002, 'open')",
+                         (mint, m1 - timedelta(seconds=age)))
+        beat = conn.execute("INSERT INTO beats (beat_no) VALUES (1) RETURNING id").fetchone()["id"]
+        conn.execute("INSERT INTO wealth_marks (beat_id, book, ts, sol_free, positions_value, exit_cost, wealth, peak, drawdown, exposure, n_open) "
+                     "VALUES (%s, 'live', %s, 100, 0, 0, 100, 100, 0, 0, 0)", (beat + 500000, m1 - timedelta(minutes=5)))   # a peak far above today's 5 SOL
+        monkeypatch.setattr(config, "KILL_SWITCH_LIQUIDATE", False)
+        out = mirror.minute(_ctx(conn, m1), run_id=str(uuid.uuid4()), beat_id=beat, line=0.01, table=[], entries=[])
+        killed = conn.execute("SELECT kill_switch FROM circuit_state WHERE id = 1").fetchone()["kill_switch"]
+    assert killed and out["liquidated"] == 0 and [r.mint for r in w.submitted] == ["LIVE_K2"]      # default: halt only, the scheduled exit alone
+    w2 = _Worker(); mirror.worker = w2
+    with transaction() as conn:
+        monkeypatch.setattr(config, "KILL_SWITCH_LIQUIDATE", True)
+        out = mirror.minute(_ctx(conn, m1 + timedelta(minutes=1)), run_id=str(uuid.uuid4()), beat_id=beat + 1, line=0.01, table=[], entries=[])
+        reasons = {r["mint"]: r["reason"] for r in conn.execute("SELECT mint, reason FROM decisions WHERE mint LIKE 'LIVE_K%%' AND kind = 'fly_exit'").fetchall()}
+    sells = {r.mint: r for r in w2.submitted}
+    assert out["liquidated"] == 1 and set(sells) == {"LIVE_K1", "LIVE_K2"}
+    assert sells["LIVE_K1"].slippage_bps == config.SLIPPAGE_FORCED_BPS and reasons["LIVE_K1"] == "kill switch: liquidating"
+    assert sells["LIVE_K2"].slippage_bps == config.SLIPPAGE_EXIT_BPS                                  # the scheduled exit went first; not re-submitted
+
+
+def test_the_handover_gate_reads_its_thresholds_from_config(db_conn, monkeypatch):
+    """HANDOVER_DAYS=0 counts the whole race (a zero-length window would count nothing), HANDOVER_MIN_TRADES is the trade
+    count, and HANDOVER_BEAT_SELECTOR=0 drops the race against the paper selector."""
+    from fly_trader.agent import fly_session, handover
+    now = datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc); race = now - timedelta(days=2)
+    stub = SimpleNamespace(race_started_at=race.timestamp(), boot_id=62)
+    with transaction() as conn:
+        conn.execute("DELETE FROM ui_settings WHERE key = %s", (handover.KEY,)); conn.execute("DELETE FROM positions WHERE mint LIKE 'HAND_%%'")
+        for i in range(20):
+            conn.execute("INSERT INTO positions (book, mint, qty, cost_sol, realized_sol, status, closed_at) VALUES (%s, %s, 0, 0.1, -0.01, 'closed', %s)",
+                         (fly_session.BOOK, f"HAND_{i}", race + timedelta(hours=i)))                   # 20 losing trades: no selector to beat
+        try:
+            monkeypatch.setattr(config, "HANDOVER_DAYS", 14); monkeypatch.setattr(config, "HANDOVER_MIN_TRADES", 20); monkeypatch.setattr(config, "HANDOVER_BEAT_SELECTOR", True)
+            fly_session.FlyBook._handover_check(stub, conn, now.timestamp())
+            assert handover.state(conn) is None                                                     # two days into a 14-day race
+            monkeypatch.setattr(config, "HANDOVER_DAYS", 0)
+            fly_session.FlyBook._handover_check(stub, conn, now.timestamp())
+            assert handover.state(conn) is None                                                     # loses to a flat selector
+            monkeypatch.setattr(config, "HANDOVER_BEAT_SELECTOR", False)
+            fly_session.FlyBook._handover_check(stub, conn, now.timestamp())
+            st = handover.state(conn)
+            assert st and st["fly_trades"] == 20 and st["days"] == 0 and st["beat_selector"] is False
+        finally:
+            conn.execute("DELETE FROM ui_settings WHERE key = %s", (handover.KEY,)); conn.execute("DELETE FROM positions WHERE mint LIKE 'HAND_%%'")

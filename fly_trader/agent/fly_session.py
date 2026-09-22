@@ -35,6 +35,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .. import config
 from ..brain import plastic
 from ..db.apilog import record_event
 from ..db.connection import transaction
@@ -52,7 +53,6 @@ NEXT_OPEN_S = 120.0          # entry at the next traded minute's open when it co
 JUMP = 50.0
 LABEL_LAG_S = 60.0
 ROLLBACK_PAUSE_S, ROLLBACK_LIMIT, ROLLBACK_WINDOW_S, ROLLBACK_MIN_AGE_S = 86400.0, 3, 7 * 86400.0, 86400.0
-HANDOVER_DAYS, HANDOVER_MIN_TRADES = 14, 30
 SNAP_HOURLY_DAYS, SCORED_KEEP_DAYS = 7, 35
 COMMAND_KEY = "fly_command"
 
@@ -440,7 +440,7 @@ class FlyBook:
         if cmd == "pause":
             self.learning_frozen = True; record_event("info", "fly", "learning paused by the operator")
         elif cmd == "resume":
-            self.learning_frozen = False; self.rollbacks = []; record_event("info", "fly", "learning resumed by the operator")
+            self.learning_frozen = False; self.rollbacks = {}; record_event("info", "fly", "learning resumed by the operator")
         elif cmd == "rollback":
             for j, name in enumerate(self.names):
                 self._rollback(conn, now, {"triggers": ["operator"], "drift": self._drift(j)}, None, count=False, name=name)
@@ -492,14 +492,19 @@ class FlyBook:
         conn.execute("DELETE FROM fly_scored WHERE state <> 'pending' AND ts < %s", (datetime.fromtimestamp(now - SCORED_KEEP_DAYS * 86400.0, timezone.utc),))
 
     def _handover_check(self, conn, now: float) -> None:
-        if handover.state(conn) is not None or self.race_started_at is None or now - self.race_started_at < HANDOVER_DAYS * 86400.0:
+        """The fly takes the selector's seat once it has raced ``config.HANDOVER_DAYS`` (0: no minimum, the window is the
+        whole race), closed ``config.HANDOVER_MIN_TRADES`` paper trades and, when ``config.HANDOVER_BEAT_SELECTOR``,
+        realized at least the paper selector's P&L over that window."""
+        days = config.HANDOVER_DAYS
+        if handover.state(conn) is not None or self.race_started_at is None or now - self.race_started_at < days * 86400.0:
             return
-        since = datetime.fromtimestamp(now - HANDOVER_DAYS * 86400.0, timezone.utc)
+        since = datetime.fromtimestamp(self.race_started_at if days <= 0 else now - days * 86400.0, timezone.utc)
         pnl = {b: conn.execute("SELECT COALESCE(sum(realized_sol), 0) AS s, count(*) AS n FROM positions WHERE book = %s AND status = 'closed' AND closed_at >= %s",
                                (b, since)).fetchone() for b in (BOOK, "paper_selector")}
         fly_pnl, sel_pnl, n = float(pnl[BOOK]["s"]), float(pnl["paper_selector"]["s"]), int(pnl[BOOK]["n"])
-        if n >= HANDOVER_MIN_TRADES and fly_pnl >= sel_pnl:
+        if n >= config.HANDOVER_MIN_TRADES and (fly_pnl >= sel_pnl or not config.HANDOVER_BEAT_SELECTOR):
             detail = {"at": datetime.fromtimestamp(now, timezone.utc).isoformat(), "fly_pnl_sol": fly_pnl, "selector_pnl_sol": sel_pnl, "fly_trades": n,
-                      "selector_trades": int(pnl["paper_selector"]["n"]), "days": HANDOVER_DAYS, "bootstrap": self.boot_id}
+                      "selector_trades": int(pnl["paper_selector"]["n"]), "days": days, "beat_selector": config.HANDOVER_BEAT_SELECTOR, "bootstrap": self.boot_id}
             handover.record(conn, detail)
-            record_event("info", "handover", f"the fly takes the selector's seat: {fly_pnl:+.3f} SOL vs {sel_pnl:+.3f} SOL over {HANDOVER_DAYS} days", detail)
+            record_event("info", "handover", f"the fly takes the selector's seat: {fly_pnl:+.3f} SOL vs {sel_pnl:+.3f} SOL over {n} trades"
+                         + (f" in {days} days" if days > 0 else ""), detail)

@@ -9,7 +9,8 @@ signing is allowed (LIVE_ENABLED=1 and the live prerequisites, chain/cluster_gua
 - entries: every paper entry of this minute is mirrored with the same score, line and certainty bands, sized from the
   wallet (SOL balance + open live positions at cost as the bankroll, the SOL balance as cash; the gas reserve is never
   spent — agent/sizing.py), one position per token, unless the kill switch, the circuit breaker or paused entries block;
-- wealth: wallet SOL + open positions net of exit cost → ``wealth_marks`` (book 'live'); the kill switch on its own peak;
+- wealth: wallet SOL + open positions net of exit cost → ``wealth_marks`` (book 'live'); the kill switch on its own peak,
+  and with ``KILL_SWITCH_LIQUIDATE`` every open position is sold at the forced slippage while it stays on;
 - gap: over the last ``GAP_TRADES`` closed live trades, the mean return per trade trailing the paper mirror's same
   decisions by more than ``GAP_MAX`` pauses entries and raises an alert. Learning is unaffected: it learns from market
   labels, not fills.
@@ -101,12 +102,30 @@ class LiveMirror:
         conn.execute("INSERT INTO wealth_marks (beat_id, book, ts, sol_free, positions_value, exit_cost, wealth, peak, drawdown, exposure, n_open) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                      "ON CONFLICT (beat_id, book) DO NOTHING",
                      (beat_id, BOOK, m1, sol_free, gross_v - exit_cost, exit_cost, wealth, peak, (1.0 - wealth / peak) if peak > 0 else 0.0, exposure, len(opens)))
-        rails.check_drawdown(conn, wealth, peak)
+        killed = rails.check_drawdown(conn, wealth, peak)
+        n_liq = self.liquidate(conn, ctx, run_id, beat_id) if killed and config.KILL_SWITCH_LIQUIDATE else 0
         gap = self.gap(conn)
         if ctx.m1_epoch - self.last_sweep >= SWEEP_S:
             self.last_sweep = ctx.m1_epoch; self.sweep(conn, snap, inflight, m1)
         return {"stage": "trading live", "wallet_sol": sol_free, "wealth": wealth, "entered": n_enter, "exited": n_exit, "dead_bags": n_dead, "in_flight": len(inflight),
-                "blocked": blocked, "skipped": skipped[:10], "gap": gap, "failed_orders": sum(1 for r in drained if not r.ok)}
+                "blocked": blocked, "skipped": skipped[:10], "gap": gap, "failed_orders": sum(1 for r in drained if not r.ok), "liquidated": n_liq}
+
+    def liquidate(self, conn, ctx, run_id: str, beat_id: int) -> int:
+        """Sell every open live position at the forced slippage while the kill switch is on (``KILL_SWITCH_LIQUIDATE``):
+        a book that has lost ``KILL_SWITCH_DRAWDOWN`` of its peak stops holding, not only entering. Called every trade
+        minute the switch stays on, so a sell that fails is retried until the book is flat; positions already in flight
+        (this minute's scheduled exits included) are left to the worker."""
+        n = 0; inflight = self.worker.pending()
+        for p in ledger.open_positions(conn, BOOK):
+            if p["mint"] in inflight:
+                continue
+            did = self._decision(conn, ctx, run_id, beat_id, p, "kill switch: liquidating", True)
+            n += bool(self.worker.submit(ExecRequest(decision_id=did, mint=p["mint"], pool=p["pool"], side="sell", amount_in=int(p["qty"]),
+                                                     slippage_bps=config.SLIPPAGE_FORCED_BPS, max_slippage_bps=config.SLIPPAGE_FORCED_BPS,
+                                                     decimals=int(p.get("decimals") or 6), position_id=int(p["id"]))))
+        if n:
+            record_event("error", "fly_live", f"kill switch: liquidating {n} open live position(s)", {"positions": n})
+        return n
 
     def gap(self, conn) -> dict:
         """Live vs its paper mirror on the same decisions; pauses entries when live trails by more than ``GAP_MAX`` per trade."""

@@ -47,9 +47,15 @@ def main(stop_event=None) -> None:
 def _main(stop_event=None) -> None:
     live = False
     if config.LIVE_ENABLED:
-        from ..chain.cluster_guard import assert_signing_allowed
-        assert_signing_allowed()
-        live = True
+        from ..chain.cluster_guard import SigningRefused, assert_signing_allowed
+        try:
+            assert_signing_allowed(); live = True
+        except SigningRefused as e:
+            if config.SOLANA_CLUSTER != "mainnet-beta":
+                raise                                                   # a wrong cluster is a configuration error, never a wait
+            live = True                                                 # the per-minute gate (fly_session._live) keeps it in paper until the wallet is ready
+            log.error("LIVE_ENABLED=1 but %s -- trading paper only until that is fixed", e)
+            record_event("error", "runner", "live trading requested but not possible yet: holding in paper", {"why": str(e)})
     if config.RESET_ON_START:                      # a fresh runner never carries over a previous run's books or stats
         from ..ops.reset import reset_training_state
         reset_training_state(reason="runner start")

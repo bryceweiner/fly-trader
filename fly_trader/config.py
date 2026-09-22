@@ -80,6 +80,7 @@ MAX_POOL_SHARE = env_float("MAX_POOL_SHARE", 0.02)                 # of the pool
 LABEL_SIZE_SOL = env_float("LABEL_SIZE_SOL", 0.0)
 MIN_POSITION_SOL = env_float("MIN_POSITION_SOL", 0.02)             # smaller sizes are skipped
 KILL_SWITCH_DRAWDOWN = env_float("KILL_SWITCH_DRAWDOWN", 0.30)
+KILL_SWITCH_LIQUIDATE = env_bool("KILL_SWITCH_LIQUIDATE", False)   # a tripped kill switch also sells every open live position (agent/fly_live.py)
 CIRCUIT_THRESHOLD = env_int("CIRCUIT_THRESHOLD", 3)
 EXECUTABILITY_MAX_IMPACT = env_float("EXECUTABILITY_MAX_IMPACT", 0.30)
 SLIPPAGE_ENTRY_BPS = env_int("SLIPPAGE_ENTRY_BPS", 150)
@@ -110,6 +111,11 @@ LAMBDA_IMPACT_DLMM = env_float("LAMBDA_IMPACT_DLMM", 0.02)
 
 # ---- training lifecycle ----
 RESET_ON_START = env_bool("RESET_ON_START", True)  # wipe the paper book and its stats when the runner starts
+
+# ---- the fly's handover (agent/fly_session.py): when its paper race earns it the live seat ----
+HANDOVER_DAYS = env_int("HANDOVER_DAYS", 14)                        # days of racing first; 0 = as soon as the trades are in
+HANDOVER_MIN_TRADES = env_int("HANDOVER_MIN_TRADES", 30)            # closed paper_fly trades required
+HANDOVER_BEAT_SELECTOR = env_bool("HANDOVER_BEAT_SELECTOR", True)   # and realized P&L at least the paper selector's over the window
 
 
 def helius_http_url() -> str:
