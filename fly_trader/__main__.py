@@ -125,17 +125,25 @@ def _cmd_train_selector(args):
     selector.main(days=args.days)
 
 
+def _use_device(args) -> None:
+    """--device overrides DEVICE from the environment for this command (brain/device.py resolves it)."""
+    if getattr(args, "device", None):
+        from . import config
+        from .brain import device
+        config.DEVICE = args.device; device.reset()
+
+
 def _cmd_train_fly_selector(args):
     from .logging_setup import setup
     from .train import fly_selector
-    setup("train")
+    setup("train"); _use_device(args)
     fly_selector.main(days=args.days, epochs=args.epochs)
 
 
 def _cmd_fly_replay(args):
     from .logging_setup import setup
     from .train import fly_replay
-    setup("train")
+    setup("train"); _use_device(args)
     out = fly_replay.main(days=args.days, start_day=args.start_day if args.start_day is not None else fly_replay.DEFAULT_START)
     print(json.dumps({k: out.get(k) for k in ("S", "passed", "reason", "alpha", "half_life_days", "evaluation", "random", "frozen", "plastic_beats_frozen")}, indent=1, default=str))
 
@@ -195,9 +203,11 @@ def build_parser() -> argparse.ArgumentParser:
     ts_.set_defaults(fn=_cmd_train_selector)
     tf_ = sub.add_parser("train-fly-selector"); tf_.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
     tf_.add_argument("--epochs", type=int, default=None, help="cap on full passes over the distillation rows (default: until the fit stops improving)")
+    tf_.add_argument("--device", default=None, help="auto | cpu | cuda | cuda:N | mps (default: DEVICE from .env, auto)")
     tf_.set_defaults(fn=_cmd_train_fly_selector)
     fr = sub.add_parser("fly-replay", help="bootstrap the fly once, let it learn over the corpus, judge it (the gate before it trades)")
     fr.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
+    fr.add_argument("--device", default=None, help="auto | cpu | cuda | cuda:N | mps (default: DEVICE from .env, auto)")
     fr.add_argument("--start-day", type=int, default=None,
                     help="day index of the bootstrap (the selector teaches on the days before it); default: train/fly_replay.DEFAULT_START, "
                          "the earliest day that leaves the teacher's walk-forward enough days in each half")

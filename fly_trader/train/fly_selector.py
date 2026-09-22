@@ -45,6 +45,7 @@ import torch.nn.functional as Fn
 
 from .. import config
 from ..agent import sizing
+from ..brain import device as brain_device
 from ..brain.connectome import AFFERENT_POPS, EFFERENT_POP, Connectome, SubConnectome
 from ..brain.plastic import assign_channels
 from ..db.apilog import record_event
@@ -132,6 +133,11 @@ class FlyNet(nn.Module):
     def c(self) -> torch.Tensor:
         """MBON readout coefficients: approach +, avoid −, the others free."""
         return torch.where(self.c_sign != 0, self.c_sign * Fn.softplus(self.rho), self.c_free)
+
+    def batch_rows(self, ceiling: int = 2048, training: bool = False) -> int:
+        """Rows one batch may hold on this device: the free memory over the graph's measured per-row cost
+        (brain/device.rows_for), never above ``ceiling``."""
+        return brain_device.rows_for(int(self.pre.numel()), self.N, self.dev, ceiling=ceiling, training=training)
 
     def w_km(self) -> torch.Tensor:
         """The KC→MBON weights as a dense [n_KC, n_MBON] matrix (0 where the connectome has no synapse)."""
@@ -238,9 +244,10 @@ class FlyModel:
         return torch.tensor(self.scaler.transform(X), device=self.net.dev)
 
     @torch.no_grad()
-    def score_all(self, X: np.ndarray, batch: int = 2048) -> np.ndarray:
-        """[B, S] every strategy's predicted net return over its hold (the frozen fly)."""
-        self.net.eval(); out = np.empty((len(X), len(self.strategies)), np.float64)
+    def score_all(self, X: np.ndarray, batch: int | None = None) -> np.ndarray:
+        """[B, S] every strategy's predicted net return over its hold (the frozen fly). ``batch`` defaults to what the
+        device's memory affords (``FlyNet.batch_rows``)."""
+        self.net.eval(); batch = batch or self.net.batch_rows(); out = np.empty((len(X), len(self.strategies)), np.float64)
         for i in range(0, len(X), batch):
             out[i:i + batch] = (self.net.forward_all(self._x(X[i:i + batch])) / SCALE).float().cpu().numpy()
         return out
@@ -258,14 +265,17 @@ class FlyModel:
     @torch.no_grad()
     def parts_all(self, X: np.ndarray) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``FlyNet.forward_parts_all``: every head's decoder output [B, S], MBON pre-activation, KC code."""
-        self.net.eval()
-        return self.net.forward_parts_all(self._x(X))
+        return self.parts_all_h(X)[:3]
 
     @torch.no_grad()
     def parts_all_h(self, X: np.ndarray) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``parts_all`` plus the activity of every neuron [B, N] (one batch; ``score_all`` is the batched path)."""
-        self.net.eval()
-        return self.net.forward_parts_all_h(self._x(X))
+        """``parts_all`` plus the activity of every neuron [B, N], in as many batches as the device's memory asks for
+        (``FlyNet.batch_rows``): a busy minute must not exceed a small card."""
+        self.net.eval(); b = self.net.batch_rows()
+        if len(X) <= b:
+            return self.net.forward_parts_all_h(self._x(X))
+        parts = [self.net.forward_parts_all_h(self._x(X[i:i + b])) for i in range(0, len(X), b)]
+        return tuple(torch.cat([p[j] for p in parts]) for j in range(4))
 
     def triggers(self, X: np.ndarray, cols: list[str]) -> np.ndarray:
         """[B, S] where each strategy's fitted trigger (the selector's) fires — its candidates."""
@@ -281,7 +291,8 @@ class FlyModel:
 
 
 def _device() -> torch.device:
-    return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    """config.DEVICE resolved (brain/device.py): CUDA, MPS or CPU — the same answer the connectome gets."""
+    return brain_device.resolve()
 
 
 def _graph():
@@ -372,7 +383,7 @@ def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, 
               seed: int = 0, graph=None, device=None) -> tuple[FlyModel | None, dict]:
     """Distil ``teacher`` (a StackTeacher, or anything with ``score`` and ``scaler``) into a FlyNet over the training rows
     ``rows`` (mask): one head per strategy, each learning its strategy's targets on that strategy's candidates."""
-    torch.manual_seed(seed); rng = np.random.default_rng(seed); dev = torch.device(device) if device else _device()
+    brain_device.seed_all(seed); rng = np.random.default_rng(seed); dev = torch.device(device) if device else _device()
     n_s = len(teacher.strategies) if isinstance(teacher, StackTeacher) else 1
     net = FlyNet(graph if graph is not None else _graph(), obs_dim=len(ds.cols), device=dev, n_strategies=n_s)
     idx = np.flatnonzero(rows); T, W = _teacher_targets(teacher, ds, idx)
@@ -386,6 +397,7 @@ def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, 
     with torch.no_grad():
         for j, hd in enumerate(net.heads):
             col = T[:, j]; hd.bias.fill_(float(np.nanmean(col)) * SCALE if np.isfinite(col).any() else 0.0); hd.weight.mul_(0.1)
+    batch = min(batch, net.batch_rows(ceiling=batch, training=True))      # a training step keeps every propagation step: ~4x a forward pass
     opt = torch.optim.Adam(net.param_groups(LR_GRAPH, LR_HEAD)); n_b = max(1, len(use) // batch); total = max(1, epochs * n_b); hist = []; t0 = time.time()
     best = best_v = prev_v = early = None
     for ep in range(epochs):
@@ -421,6 +433,7 @@ def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, 
             break
     if best is not None:
         net.load_state_dict(best)                          # the epoch that generalised best, not merely the last one
+    opt = None; brain_device.empty_cache(dev)                          # the optimiser's state and the autograd workspace go back to the device
     rec = idx[rng.choice(len(idx), min(RECAL_ROWS, len(idx)), replace=False)]
     recalibrate(net, ds.X[np.sort(rec)], teacher.scaler, batch)
     if isinstance(teacher, StackTeacher):
@@ -433,10 +446,10 @@ def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, 
 
 
 @torch.no_grad()
-def diagnose(fly: FlyModel, X: np.ndarray, teacher_scores: np.ndarray | None = None, batch: int = 2048) -> dict:
+def diagnose(fly: FlyModel, X: np.ndarray, teacher_scores: np.ndarray | None = None, batch: int | None = None) -> dict:
     """How much of the score runs through the mushroom body, how saturated the MBONs are, how sparse the KC code is,
     and (given the teacher's scores) how the fly's scores line up with them."""
-    net = fly.net; net.eval(); mb, tot, sat, act = [], [], [], []
+    net = fly.net; net.eval(); batch = batch or net.batch_rows(); mb, tot, sat, act = [], [], [], []
     for i in range(0, len(X), batch):
         y_dn, u0, k = fly.parts(X[i:i + batch])
         m = net.mb_norm(torch.tanh(u0)) @ net.c

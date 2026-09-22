@@ -196,7 +196,8 @@ def status_strip() -> None:
         fly = s["fly"]
         if fly.get("stage") and fly.get("stage") != "not trading":
             st.badge(f"Fly learning · drift {float(fly.get('drift') or 0):.1%}" if not fly.get("learning_frozen") else "Fly: learning frozen", icon=":material/neurology:",
-                     color="violet" if not fly.get("learning_frozen") else "orange", help=f"Plastic fly: buy line {pct(fly.get('line'))}, {fly.get('pending', 0)} labels pending.")
+                     color="violet" if not fly.get("learning_frozen") else "orange",
+                     help=f"Plastic fly on {fly.get('device') or '?'}: buy line {pct(fly.get('line'))}, {fly.get('pending', 0)} labels pending.")
         else:
             st.badge("Fly not trading", icon=":material/neurology:", color="gray", help=fly.get("detail") or "The trading engine is stopped.")
         if s["handover"]:

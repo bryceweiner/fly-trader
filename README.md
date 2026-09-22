@@ -31,7 +31,11 @@ Jupiter Tokens v2 ─────▶ token stats (history for future inputs)
 
 ## Requirements
 
-- macOS on Apple Silicon (the fly trains on the Metal GPU via PyTorch MPS; 64 GB+ recommended for the full archive)
+- Any of: **macOS on Apple Silicon** (the fly runs on the Metal GPU via PyTorch MPS), **Linux or Windows with an NVIDIA
+  GPU** (CUDA), or **any 64-bit CPU**. The fly's forward pass is a memory-bound scatter over a million synapses, so a
+  16-thread CPU scores as fast as the Apple GPU (~1,700 rows/s measured) and trains at about 0.8× its speed. Memory
+  matters more than compute: batch sizes are derived from free memory (`fly_trader/brain/device.py`), so an 8 GB GPU
+  works, in smaller batches; 64 GB of RAM is recommended for training on the full archive, 16 GB for trading.
 - Python 3.13 and [uv](https://docs.astral.sh/uv/)
 - PostgreSQL 15+ (`brew install postgresql@17`)
 - A Jupiter API key (token stats); a Helius API key and a funded wallet only for live execution
@@ -41,7 +45,7 @@ Jupiter Tokens v2 ─────▶ token stats (history for future inputs)
 ```bash
 git clone https://github.com/bryceweiner/fly-trader.git
 cd fly-trader
-uv sync
+uv sync                       # macOS: the Apple-GPU torch from PyPI. Elsewhere choose one: --extra cpu | --extra cu126 | --extra cu130
 cp .env.example .env          # paste your keys; leave LIVE_ENABLED=0
 createdb fly_trader
 uv run fly-trader init-db
@@ -82,7 +86,8 @@ Every knob is an environment variable read by `fly_trader/config.py`; `.env.exam
 | `KELLY_FRACTION` | `0.25` | share of the growth-optimal bet per score band |
 | `MAX_POSITION_FRACTION` / `MAX_POOL_SHARE` | `0.10` / `0.02` | largest position: of the bankroll / of the pool's SOL reserve |
 | `KILL_SWITCH_DRAWDOWN` | `0.30` | drawdown from peak that blocks new entries |
-| `DEVICE` | `mps` | torch device for the fly |
+| `DEVICE` | `auto` | where the fly runs: `auto` (CUDA if present, else MPS, else CPU), `cpu`, `cuda`, `cuda:1`, `mps`; a missing backend falls back to the CPU with a warning |
+| `DEVICE_MEMORY_GB` | measured | caps the memory batch sizes are derived from (a shared GPU, a container limit) |
 | `LIVE_ENABLED` | `0` | signing on mainnet |
 
 ## CLI reference

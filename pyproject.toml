@@ -26,6 +26,37 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-cov"]
+# Which torch: plain `uv sync` takes PyPI's wheel (Apple Silicon: MPS; Linux: the CUDA build, ~3 GB). Pick one extra
+# to be explicit: `uv sync --extra cpu` (any machine, no GPU), `--extra cu126` or `--extra cu130` (NVIDIA; the CUDA
+# runtime ships in the wheel, only the driver must be installed). cu128 stopped at torch 2.11 and does not satisfy the pin.
+cpu = ["torch>=2.12"]
+cu126 = ["torch>=2.12; sys_platform != 'darwin'"]   # no CUDA on macOS: there the extra is a no-op and PyPI's wheel stays
+cu130 = ["torch>=2.12; sys_platform != 'darwin'"]
+
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "cu126" }, { extra = "cu130" }]]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu126", extra = "cu126", marker = "sys_platform != 'darwin'" },
+  { index = "pytorch-cu130", extra = "cu130", marker = "sys_platform != 'darwin'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [project.scripts]
 fly-trader = "fly_trader.__main__:main"

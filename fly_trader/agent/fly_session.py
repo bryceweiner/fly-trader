@@ -36,7 +36,7 @@ import numpy as np
 import torch
 
 from .. import config
-from ..brain import activity, plastic
+from ..brain import activity, device as brain_device, plastic
 from ..brain.connectome import current_connectome_path
 from ..db.apilog import record_event
 from ..db.connection import transaction
@@ -124,7 +124,8 @@ class FlyBook:
             self._restore_tags(conn)
         record_event("info", "fly", "fly session started", {"run_id": self.run_id, "bootstrap": self.boot_id, "channels": self.cfg, "lines": self.lines["plastic"],
                                                             "pending": len(self.pending), "learning_frozen": self.learning_frozen})
-        log.info("fly session: bootstrap %d, channels %s, lines %s, %d pending tags", self.boot_id, self.cfg, self.lines["plastic"], len(self.pending))
+        log.info("fly session: bootstrap %d on %s, channels %s, lines %s, %d pending tags", self.boot_id, brain_device.describe(self.fly.net.dev), self.cfg,
+                 self.lines["plastic"], len(self.pending))
 
     # ---- model and state ----
     def _load_bootstrap(self, boot: dict) -> None:
@@ -246,7 +247,8 @@ class FlyBook:
         out = {"minute": ctx.m1.isoformat(), "eligible": len(ctx.mints), "picks": scored["picks"], "lines": self.lines["plastic"], "frozen_lines": self.lines["frozen"],
                "line": self.lines["plastic"][self.names[0]], "frozen_line": self.lines["frozen"][self.names[0]],
                "drift": max(drift.values()) if drift else 0.0, "drift_by_strategy": drift, "pending": len(self.pending), "learned": learned,
-               "learning_frozen": self.learning_frozen, "channels": self.cfg, "holds_min": {k: v / 60.0 for k, v in self.holds.items()}, "bootstrap": self.boot_id}
+               "learning_frozen": self.learning_frozen, "channels": self.cfg, "holds_min": {k: v / 60.0 for k, v in self.holds.items()}, "bootstrap": self.boot_id,
+               "device": str(self.fly.net.dev)}
         if ctx.trade and ctx.fresh:
             if self.race_started_at is None:
                 self.race_started_at = ctx.m1_epoch

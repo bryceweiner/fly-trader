@@ -102,7 +102,7 @@ LAMPORTS_PER_SOL = 1_000_000_000
 STATS_REFRESH_S = env_float("STATS_REFRESH_S", 600.0)
 
 # ---- connectome (the fly) ----
-DEVICE = env_str("DEVICE", "mps")
+DEVICE = env_str("DEVICE", "auto")          # auto (CUDA, else MPS, else CPU) | cpu | cuda | cuda:N | mps  — brain/device.py
 NT_SIGN_MODE = env_str("NT_SIGN_MODE", "shiu")  # shiu | flybrain
 CELL_TYPES_SOURCE = env_str("CELL_TYPES_SOURCE", "annotations")  # annotations | flybrain
 

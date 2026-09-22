@@ -5,7 +5,6 @@ populations by ``SubConnectome``.
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -22,19 +21,10 @@ EFFERENT_POP = "DESCENDING"                                                     
 
 
 def resolve_device(name: str | None = None) -> torch.device:
-    """config.DEVICE with automatic fallback to CPU when MPS (or CUDA) is unavailable."""
-    name = (name or config.DEVICE or "cpu").lower()
-    if name.startswith("mps"):
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        print("[connectome] MPS unavailable; falling back to cpu", file=sys.stderr)
-        return torch.device("cpu")
-    if name.startswith("cuda"):
-        if torch.cuda.is_available():
-            return torch.device(name)
-        print("[connectome] CUDA unavailable; falling back to cpu", file=sys.stderr)
-        return torch.device("cpu")
-    return torch.device("cpu")
+    """config.DEVICE (or ``name``) as a device — CPU, CUDA or MPS, with fallback to the CPU — through ``brain/device.py``,
+    the one resolver every network shares."""
+    from .device import resolve
+    return resolve(name)
 
 
 def current_connectome_path() -> Path:

@@ -34,7 +34,7 @@ from datetime import date, datetime, timezone
 import numpy as np
 import torch
 
-from ..brain import plastic
+from ..brain import device as brain_device, plastic
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from . import fly_calibrate, fly_governance as gov, fly_selector, selector
@@ -89,6 +89,8 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
     ts_o = ds.ts[order]; n = len(order)
     live_from = int(np.searchsorted(ts_o, S_epoch, side="left"))                      # rows before it: history only (calibration seed)
     bank = plastic.PlasticBank(fly.net, configs, fly_selector.SCALE, learn=fly.net.learn.cpu().numpy(), read=fly.net.read.cpu().numpy())
+    brain_device.empty_cache(bank.dev); chunk = fly.net.batch_rows(ceiling=CHUNK)   # the bootstrap's workspace goes back; rows per batch from the device's memory
+    log.info("fly replay on %s: %d rows per batch", brain_device.describe(bank.dev), chunk)
     C = bank.C
     scores = np.full((C, NS, n), np.nan, np.float32)
     lines = np.array([[fly.lines[k] for k in names]] * C, dtype=np.float64); sizings = [[list(fly.sizings[k]) for k in names] for _ in range(C)]
@@ -106,7 +108,7 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
         if stop is not None and stop.is_set():
             return {"stopped": True}
         g1 = g; rows_in = 0
-        while g1 < len(starts) and rows_in < CHUNK:
+        while g1 < len(starts) and rows_in < chunk:
             rows_in += ends[g1] - starts[g1]; g1 += 1
         a, b = starts[g], ends[g1 - 1]
         Y, u0, k = fly.parts_all(ds.X[order[a:b]]); trig = fly.triggers(ds.X[order[a:b]], ds.cols)
