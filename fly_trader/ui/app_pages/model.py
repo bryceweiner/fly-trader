@@ -251,6 +251,7 @@ def plastic_fly() -> None:
                 st.metric("Picks vs shadow (3 d)", pct(sh.get("mean_plastic")), delta=f"shadow {pct(sh.get('mean_frozen'))}", delta_color="off",
                           help="Average realized return of its picks vs the frozen bootstrap's picks; rolled back when it trails by more than one standard error.")
                 st.metric("Learning", "frozen" if frozen else "on")
+                st.metric("Device", fly.get("device") or "—", help="Where the fly runs: DEVICE in .env (auto: CUDA, else Apple MPS, else CPU).")
             upd = q("SELECT hour, n, mean_abs_delta, drift, ic FROM fly_updates ORDER BY hour DESC LIMIT 72")
             if upd:
                 st.line_chart(pd.DataFrame(upd), x="hour", y=["drift", "ic"], x_label="", height=200)
