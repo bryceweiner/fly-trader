@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env", override=False)
 
-SECRET_ENV_NAMES = ("HELIUS_API_KEY", "JUPITER_API_KEY", "BOT_PRIVATE_KEY")
+SECRET_ENV_NAMES = ("HELIUS_API_KEY", "JUPITER_API_KEY", "BOT_PRIVATE_KEY", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH")
 
 
 def utcnow() -> datetime:
@@ -163,6 +163,53 @@ def live_prerequisites_missing() -> list[str]:
         missing.append("JUPITER_API_KEY")
     if not HELIUS_API_KEY:
         missing.append("HELIUS_API_KEY")
+    return missing
+
+# ---- Kalshi prediction markets (fly_trader/kalshi; the same key names as better_bot, whose client is vendored) ----
+KALSHI_API_KEY_ID = env_str("KALSHI_API_KEY_ID")
+KALSHI_PRIVATE_KEY_PATH = env_str("KALSHI_PRIVATE_KEY_PATH")
+KALSHI_API_BASE_URL = env_str("KALSHI_API_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2")
+KALSHI_WS_URL = env_str("KALSHI_WS_URL", "wss://api.elections.kalshi.com/trade-api/ws/v2")
+KALSHI_SUBACCOUNT = env_int("KALSHI_SUBACCOUNT", 0)                # 0 = the primary account: only a dedicated subaccount may trade live
+KALSHI_FEE_FACTOR = env_float("KALSHI_FEE_FACTOR", 0.07)            # taker fee per contract = factor x multiplier x P(1-P)
+KALSHI_MAKER_FEE_FACTOR = env_float("KALSHI_MAKER_FEE_FACTOR", 0.0175)
+KALSHI_CAPITAL_USD = env_float("KALSHI_CAPITAL_USD", 100.0)         # the cap both Kalshi arms share (paper start; live never sizes above it)
+KALSHI_CASH_FLOOR_USD = env_float("KALSHI_CASH_FLOOR_USD", 5.0)     # the gas reserve's analogue: never spent
+KALSHI_MIN_PAYOUT_CENTS = env_int("KALSHI_MIN_PAYOUT_CENTS", 25)    # a fill whose winning profit is below this is skipped
+KALSHI_LIVE_ENABLED = env_bool("KALSHI_LIVE_ENABLED", False)
+KALSHI_TAKER_LIVE = env_bool("KALSHI_TAKER_LIVE", True)
+KALSHI_MAKER_LIVE = env_bool("KALSHI_MAKER_LIVE", True)
+KALSHI_KILL_SWITCH_DRAWDOWN = env_float("KALSHI_KILL_SWITCH_DRAWDOWN", 0.30)
+KALSHI_MAX_SLATE_FRACTION = env_float("KALSHI_MAX_SLATE_FRACTION", 0.50)   # of the cap deployed at once across every open position
+KALSHI_MAX_DAYS_TO_CLOSE = env_float("KALSHI_MAX_DAYS_TO_CLOSE", 10.0)     # the evidence base (Whelan 2026) covers the last 10 days
+KALSHI_MIN_MINUTES_TO_CLOSE = env_float("KALSHI_MIN_MINUTES_TO_CLOSE", 5.0)
+KALSHI_MAX_SPREAD_CENTS = env_int("KALSHI_MAX_SPREAD_CENTS", 10)
+KALSHI_MIN_OPEN_INTEREST = env_float("KALSHI_MIN_OPEN_INTEREST", 100.0)
+KALSHI_MIN_VOLUME_24H = env_float("KALSHI_MIN_VOLUME_24H", 50.0)
+KALSHI_MAKER_QUIET_MIN = env_float("KALSHI_MAKER_QUIET_MIN", 30.0)         # no resting orders this close to the market's close
+KALSHI_MAKER_TTL_H = env_float("KALSHI_MAKER_TTL_H", 6.0)
+KALSHI_MAKER_MAX_RESTING = env_int("KALSHI_MAKER_MAX_RESTING", 40)
+KALSHI_HISTORY_START = env_str("KALSHI_HISTORY_START", "2025-01-01")
+KALSHI_DATASET_DIR = env_str("KALSHI_DATASET_DIR")                        # jon-becker/prediction-market-analysis checkout (data/kalshi/{markets,trades})
+KALSHI_MINUTES_KEEP_DAYS = env_int("KALSHI_MINUTES_KEEP_DAYS", 7)
+KALSHI_MIN_MARKET_VOLUME = env_float("KALSHI_MIN_MARKET_VOLUME", 1000.0)   # contracts over a market's life: below it the corpus skips the market (6.8 M settled since 2025 are mostly dead ladders)
+KALSHI_MARKETS_PER_DAY = env_int("KALSHI_MARKETS_PER_DAY", 150)           # the corpus keeps at most this many settled markets per close day (the most traded); ~1.3 s of API per market
+KALSHI_DIR = DATA_DIR / "kalshi"
+KALSHI_RPS = env_float("KALSHI_RPS", 12.0)                                 # REST pacing under the Basic tier (200 read tokens/s, 10 per call)
+
+
+def kalshi_live_prerequisites_missing() -> list[str]:
+    missing = []
+    if not KALSHI_LIVE_ENABLED:
+        missing.append("KALSHI_LIVE_ENABLED=1")
+    if not KALSHI_API_KEY_ID:
+        missing.append("KALSHI_API_KEY_ID")
+    if not KALSHI_PRIVATE_KEY_PATH or not Path(KALSHI_PRIVATE_KEY_PATH).expanduser().exists():
+        missing.append("KALSHI_PRIVATE_KEY_PATH (readable PEM file)")
+    if KALSHI_SUBACCOUNT <= 0:
+        missing.append("KALSHI_SUBACCOUNT (a dedicated subaccount, never the primary)")
+    if KALSHI_CAPITAL_USD <= 0:
+        missing.append("KALSHI_CAPITAL_USD")
     return missing
 
 # ---- historical corpus (every pump.fun graduation, pulled from the migration wallet + pump.fun's swap-api) ----

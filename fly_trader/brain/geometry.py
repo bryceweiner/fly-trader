@@ -25,6 +25,8 @@ EXCLUDE = ("VISUAL",)
 POS_COLS = ["pos_x", "pos_y", "pos_z"]
 SOMA_COLS = ["soma_x", "soma_y", "soma_z"]
 BIN, META = "geometry.bin", "geometry.json"
+FULL_BIN, FULL_META = "geometry_full.bin", "geometry_full.json"         # every neuron: the scene both flies are drawn into (ui/brain3d)
+FLY_EXCLUDES = {"memecoin": EXCLUDE, "kalshi": None}                     # None: brain/connectome.VISUAL_SUB (the memecoin afferents), resolved lazily
 
 
 def keep_mask(pop_ranges: dict, n: int, exclude: tuple[str, ...] = EXCLUDE) -> np.ndarray:
@@ -60,10 +62,11 @@ def read_meta(out_dir: Path) -> dict | None:
 
 
 def build_geometry(out_dir: Path, connectome_path: str | Path | None = None, annotations: str | Path | None = None,
-                   exclude: tuple[str, ...] = EXCLUDE) -> dict:
+                   exclude: tuple[str, ...] = EXCLUDE, names: tuple[str, str] = (BIN, META)) -> dict:
     """Write (once per connectome) and return the geometry metadata. Soma centroid where known, else the neuron's
-    annotation point, else its population's centroid (a handful of neurons); scaled to micrometres and centred."""
-    out_dir = Path(out_dir); jpath, bpath = out_dir / META, out_dir / BIN
+    annotation point, else its population's centroid (a handful of neurons); scaled to micrometres and centred.
+    ``exclude=()`` with ``names=(FULL_BIN, FULL_META)`` is the whole brain (``build_full_geometry``)."""
+    out_dir = Path(out_dir); bpath, jpath = out_dir / names[0], out_dir / names[1]
     path = Path(connectome_path) if connectome_path else current_connectome_path()
     with np.load(path, allow_pickle=False) as z:
         sha = str(z["content_sha256"]); n = int(z["N"]); pop_ranges = {k: tuple(v) for k, v in json.loads(str(z["pop_ranges"])).items()}
@@ -97,3 +100,39 @@ def build_geometry(out_dir: Path, connectome_path: str | Path | None = None, ann
     out_dir.mkdir(parents=True, exist_ok=True)
     _atomic(bpath, np.ascontiguousarray(xyz).tobytes()); _atomic(jpath, json.dumps(meta).encode())
     return meta
+
+
+def fly_index(pop_ranges: dict, n: int, exclude: tuple[str, ...]) -> np.ndarray:
+    """int32 map from a fly's sub-graph index to the full-graph index (the rows ``SubConnectome`` keeps, in order)."""
+    return np.flatnonzero(keep_mask(pop_ranges, n, exclude)).astype(np.int32)
+
+
+def build_full_geometry(out_dir: Path, connectome_path: str | Path | None = None, annotations: str | Path | None = None) -> dict:
+    """The whole brain's geometry plus, per fly, the index map from its sub-graph into it (``index_<fly>.bin``): the
+    scene the console draws both flies into. ``geometry_full.json`` carries ``flies`` = {name: {"exclude", "n", "index"}}."""
+    from .connectome import VISUAL_SUB
+    out_dir = Path(out_dir); jpath = out_dir / FULL_META
+    meta = read_meta_named(out_dir, FULL_META)
+    path = Path(connectome_path) if connectome_path else current_connectome_path()
+    with np.load(path, allow_pickle=False) as z:
+        sha = str(z["content_sha256"]); n = int(z["N"]); pop_ranges = {k: tuple(v) for k, v in json.loads(str(z["pop_ranges"])).items()}
+    if meta and meta.get("connectome_sha256") == sha and meta.get("version") == VERSION and meta.get("flies") and (out_dir / FULL_BIN).exists() \
+            and all((out_dir / f["index"]).exists() for f in meta["flies"].values()):
+        return meta
+    meta = build_geometry(out_dir, path, annotations, exclude=(), names=(FULL_BIN, FULL_META))
+    flies = {}
+    for name, exc in FLY_EXCLUDES.items():
+        exc = tuple(exc) if exc is not None else tuple(VISUAL_SUB)
+        idx = fly_index(pop_ranges, n, exc); fname = f"index_{name}.bin"
+        _atomic(out_dir / fname, np.ascontiguousarray(idx).tobytes())
+        flies[name] = {"exclude": list(exc), "n": int(len(idx)), "index": fname}
+    meta = {**meta, "flies": flies}
+    _atomic(jpath, json.dumps(meta).encode())
+    return meta
+
+
+def read_meta_named(out_dir: Path, name: str) -> dict | None:
+    try:
+        return json.loads((Path(out_dir) / name).read_text())
+    except (FileNotFoundError, ValueError):
+        return None

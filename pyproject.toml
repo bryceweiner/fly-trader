@@ -22,6 +22,9 @@ dependencies = [
   "streamlit>=1.40",
   "altair",
   "psutil",
+  "kalshi-python-async>=3.10,<3.11",
+  "cryptography",
+  "aiohttp",
 ]
 
 [project.optional-dependencies]

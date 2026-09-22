@@ -28,14 +28,16 @@ from ..db.connection import transaction
 
 log = logging.getLogger(__name__)
 
-PRESERVED_BOOKS = ("live", "paper_selector", "paper_fly")
-RACE_RUN_KINDS = ("selector", "fly")
-MODEL_KINDS = ("selector", "fly_selector", "fly_plastic")
+PRESERVED_BOOKS = ("live", "paper_selector", "paper_fly", "paper_kalshi_taker", "paper_kalshi_maker", "live_kalshi_taker", "live_kalshi_maker")
+RACE_RUN_KINDS = ("selector", "fly", "kalshi_fly")
+MODEL_KINDS = ("selector", "fly_selector", "fly_plastic", "kalshi_selector", "kalshi_fly_selector", "kalshi_fly_plastic")
 FLY_BOOK, FLY_RUN_KIND = "paper_fly", "fly"
 FLY_TABLES = ["fly_scored", "fly_calibrations", "fly_updates", "fly_rollbacks"]
 BOOK_TABLES = ["positions", "orders", "fills"]
 TRAINING_EVENTS = {"selector": "(source = 'selector' AND (message LIKE 'walk-forward%' OR message LIKE 'selector saved%'))",   # per regimen: a fly
-                   "fly_selector": "source = 'fly_selector'"}                                               # run keeps the selector's
+                   "fly_selector": "source = 'fly_selector'",                                                # run keeps the selector's
+                   "kalshi_selector": "(source = 'kalshi_selector' AND (message LIKE 'walk-forward%' OR message LIKE 'selector saved%'))",
+                   "kalshi_fly_selector": "source = 'kalshi_fly_selector'"}
 
 
 def _sql_list(xs) -> str:
@@ -97,6 +99,47 @@ def reset_training_state(reason: str = "runner start", archive: bool = True) -> 
 
 def fly_state_dir() -> Path:
     return config.BRAIN_DIR / "plastic"
+
+
+def kalshi_fly_state_dir() -> Path:
+    return config.BRAIN_DIR / "plastic_kalshi"
+
+
+def kalshi_activity_dir() -> Path:
+    return config.BRAIN_DIR / "activity_kalshi"
+
+
+KALSHI_BOOKS = ("paper_kalshi_taker", "paper_kalshi_maker")
+KALSHI_FLY_TABLES = ["kalshi_fly_scored", "kalshi_fly_calibrations", "kalshi_fly_updates", "kalshi_fly_rollbacks"]
+KALSHI_BOOK_TABLES = ["kalshi_positions", "kalshi_orders", "kalshi_fills"]
+
+
+def reset_kalshi_fly(reason: str = "operator", archive: bool = True) -> dict:
+    """The visual (Kalshi) fly starts again from its bootstrap: its paper books, sessions, learned state, activity and
+    statistics are archived and cleared. The live Kalshi books and the bootstrap snapshots are kept."""
+    out_dir = config.PG_ARCHIVE_DIR / f"reset_kalshi_fly_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    runs = "SELECT run_id FROM runs WHERE kind = 'kalshi_fly'"
+    books = _sql_list(KALSHI_BOOKS)
+    plan = [("decisions", f"WHERE run_id IN ({runs}) AND (detail->>'book') IN {books}"),
+            ("beats", f"WHERE run_id IN ({runs})"),
+            ("wealth_marks", f"WHERE book IN {books}"),
+            *[(t, f"WHERE book IN {books}") for t in KALSHI_BOOK_TABLES],
+            ("brain_snapshots", "WHERE kind = 'kalshi_fly_plastic'"),
+            ("runs", "WHERE kind = 'kalshi_fly'"),
+            *[(t, "") for t in KALSHI_FLY_TABLES]]
+    with transaction() as conn:
+        counts = _wipe(conn, plan, out_dir if archive else None)
+        conn.execute("DELETE FROM book_state WHERE book = ANY(%s)", (list(KALSHI_BOOKS),))
+        conn.execute("DELETE FROM ui_settings WHERE key = 'kalshi_fly_status'")
+    for d, name in ((kalshi_fly_state_dir(), "plastic_kalshi"), (kalshi_activity_dir(), "activity_kalshi")):
+        if d.exists():
+            if archive:
+                out_dir.mkdir(parents=True, exist_ok=True); shutil.move(str(d), str(out_dir / name))
+            else:
+                shutil.rmtree(d)
+    record_event("warning", "reset", f"kalshi fly reset to its bootstrap ({reason})", {"archived_to": str(out_dir) if archive else None, "rows": counts})
+    log.info("kalshi fly reset (%s): %s", reason, counts)
+    return {"archived_to": str(out_dir) if archive else None, "rows": counts}
 
 
 def activity_dir() -> Path:

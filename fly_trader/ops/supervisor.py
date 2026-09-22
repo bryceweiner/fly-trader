@@ -38,10 +38,22 @@ def _entry(name: str):
     if name == "pumpstream":
         from ..ingest import pumpstream
         return pumpstream.main
+    if name == "kalshi_history":               # the Kalshi corpus: settled markets, candles, trades, feature rows (kalshi/history.py)
+        from ..kalshi import history
+        return history.main
+    if name == "kalshi_stream":                # the Kalshi live feed (kalshi/stream.py)
+        from ..kalshi import stream
+        return stream.main
+    if name == "kalshi_runner":                # the Kalshi trading engine (kalshi/engine.py)
+        from ..kalshi import engine
+        return engine.main
+    if name == "kalshi_train":                 # the Kalshi training pipeline (kalshi/pipeline.py)
+        from ..kalshi import pipeline
+        return pipeline.main
     raise KeyError(name)
 
 
-WORKERS = ("discover", "runner", "train", "replay", "pumpstream")
+WORKERS = ("discover", "runner", "train", "replay", "pumpstream", "kalshi_stream", "kalshi_runner", "kalshi_history", "kalshi_train")
 
 
 class Supervisor:

@@ -1,10 +1,14 @@
 // The fly's brain in 3D: the neurons it runs on, coloured by population and lit by each minute's scoring, with the
 // KC→MBON synapses it has changed most drawn as lines. Standalone on purpose: it depends only on {data, parentElement}
 // (Streamlit's Custom Component v2 calls the default export with them; a web page can call it the same way with a
-// fetched payload). The data contract is documented in ui/brain3d/__init__.py.
+// fetched payload). The data contract is documented in ui/brain3d/__init__.py. Version 2 payloads carry ``flies``: two
+// flies drawn into the whole brain, each fly's activity and pathway indices mapped through its ``index`` (sub → full);
+// neurons both flies share (the central brain) show ``central_owner``'s activity.
 const THREE_URL = "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js";
 const EMPHASIS_SIZE = 2.4, BASE_SIZE = 1.1, DIM = 0.35, REST = 0.7;
 const WARM = [1.0, 0.55, 0.15], COOL = [0.25, 0.6, 1.0], GREEN = [0.2, 0.9, 0.35], RED = [1.0, 0.25, 0.2];
+const FLY_WARM = { memecoin: WARM, kalshi: [1.0, 0.35, 0.75] }, FLY_COOL = { memecoin: COOL, kalshi: [0.3, 0.9, 0.85] };   // the Kalshi fly lights magenta/teal
+const PALETTE_EXTRA = { VISUAL: [0.55, 0.55, 0.75] };
 const PALETTE = {
   KC: [1.0, 0.8, 0.2], MBON_APP: [0.3, 0.95, 0.4], MBON_AV: [1.0, 0.3, 0.3], MBON_OTHER: [1.0, 0.65, 0.2],
   DAN_PAM: [0.95, 0.3, 0.9], DAN_PPL1: [0.8, 0.25, 0.8], DAN_OTHER: [0.7, 0.3, 0.7],
@@ -12,7 +16,7 @@ const PALETTE = {
   GRN_SWEET: [0.35, 0.85, 0.8], GRN_BITTER: [0.25, 0.65, 0.75], GRN_OTHER: [0.3, 0.7, 0.7],
   MECH_JO: [0.4, 0.6, 0.9], MECH_BRISTLE: [0.45, 0.55, 0.85], MECH_OTHER: [0.4, 0.5, 0.8],
   THERMO_WARM: [0.9, 0.5, 0.4], THERMO_COOL: [0.5, 0.6, 0.95], THERMO_OTHER: [0.6, 0.55, 0.8],
-  CX: [0.65, 0.45, 0.95], HUNGER: [0.9, 0.6, 0.6], DESCENDING: [0.92, 0.92, 0.95], OTHER: [0.45, 0.45, 0.5],
+  CX: [0.65, 0.45, 0.95], HUNGER: [0.9, 0.6, 0.6], DESCENDING: [0.92, 0.92, 0.95], OTHER: [0.45, 0.45, 0.5], VISUAL: [0.55, 0.55, 0.75],
 };
 const POINT_VS = `
 attribute float psize; attribute float alpha; attribute vec3 col;
@@ -38,6 +42,15 @@ async function fetchGeometry(g) {
   if (geom.pos.length !== meta.n * 3) throw new Error("geometry size mismatch");
   geomCache.set(g.sha, geom);
   return geom;
+}
+
+const indexCache = new Map();          // url → Int32Array (sub-graph index → full-graph index)
+async function fetchIndex(ix) {
+  if (!ix) return null;
+  if (indexCache.has(ix.url)) return indexCache.get(ix.url);
+  const buf = await fetch(ix.url).then(r => { if (!r.ok) throw new Error(`index ${r.status}`); return r.arrayBuffer(); });
+  const arr = new Int32Array(buf); if (arr.length !== ix.n) throw new Error("index size mismatch");
+  indexCache.set(ix.url, arr); return arr;
 }
 
 function el(tag, cls, parent) { const e = document.createElement(tag); if (cls) e.className = cls; parent.appendChild(e); return e; }
@@ -146,17 +159,44 @@ function decode(b64) { const s = atob(b64); const u = new Uint8Array(s.length); 
 
 function recolor(inst, data) {
   const meta = inst.geom.meta, n = meta.n, col = inst.colAttr.array, pop = inst.pop;
-  const base = meta.pop_order.map(p => PALETTE[p] || PALETTE.OTHER);
-  const act = data.activity_b64 ? decode(data.activity_b64) : null; inst.activity = act && act.length === n ? act : null;
+  const base = meta.pop_order.map(p => PALETTE[p] || PALETTE_EXTRA[p] || PALETTE.OTHER);
+  let act = null, owner = new Uint8Array(0);           // owner[i]: 0 none, 1 memecoin, 2 kalshi — which fly lit neuron i
+  if (data.flies) {
+    act = new Int8Array(n); owner = new Uint8Array(n);
+    const flies = data.flies.slice().sort((a, b) => (a.name === data.central_owner ? 1 : 0) - (b.name === data.central_owner ? 1 : 0));   // the owner writes last
+    for (const f of flies) {
+      const ix = inst.indices ? inst.indices.get(f.name) : null; if (!ix || !f.activity_b64) continue;
+      const a = decode(f.activity_b64); if (a.length !== ix.length) continue;
+      const tag = f.name === "kalshi" ? 2 : 1;
+      for (let k = 0; k < ix.length; k++) { const i = ix[k]; act[i] = a[k]; owner[i] = tag; }
+    }
+    inst.activity = owner.some(v => v) ? act : null; inst.owner = owner;
+  } else { const a = data.activity_b64 ? decode(data.activity_b64) : null; inst.activity = a && a.length === n ? a : null; inst.owner = null; }
   for (let i = 0; i < n; i++) {
     const b = base[pop[i]]; let r, g, bl;
-    if (!inst.activity) { r = b[0] * REST; g = b[1] * REST; bl = b[2] * REST; }
-    else { const v = inst.activity[i] / 127; const m = Math.pow(Math.abs(v), 0.7); const h = v >= 0 ? WARM : COOL;
+    if (!inst.activity || (inst.owner && !inst.owner[i])) { r = b[0] * REST; g = b[1] * REST; bl = b[2] * REST; }
+    else { const v = inst.activity[i] / 127; const m = Math.pow(Math.abs(v), 0.7); const fly = inst.owner && inst.owner[i] === 2 ? "kalshi" : "memecoin";
+           const h = v >= 0 ? FLY_WARM[fly] : FLY_COOL[fly];
            r = b[0] * DIM * (1 - m) + h[0] * m; g = b[1] * DIM * (1 - m) + h[1] * m; bl = b[2] * DIM * (1 - m) + h[2] * m; }
     col[i * 3] = r; col[i * 3 + 1] = g; col[i * 3 + 2] = bl;
   }
-  inst.colAttr.needsUpdate = true; inst.minute = data.minute;
+  inst.colAttr.needsUpdate = true; inst.minute = minuteKey(data);
 }
+
+function minuteKey(data) { return data.flies ? JSON.stringify([data.central_owner, data.flies.map(f => f.minute)]) : data.minute; }
+
+function pathwayItems(inst, data) {      // [{...item, kc, mbon in scene indices, strategy}] over every fly (version 2) or the one payload
+  if (!data.flies) return ((data.pathways && data.pathways.items) || []).map(it => ({ ...it }));
+  const out = [];
+  for (const f of data.flies) {
+    const ix = inst.indices ? inst.indices.get(f.name) : null; if (!ix) continue;
+    for (const it of ((f.pathways && f.pathways.items) || [])) out.push({ ...it, kc: ix[it.kc], mbon: ix[it.mbon], strategy: `${f.name}:${it.strategy}` });
+  }
+  return out;
+}
+
+function strategyList(data) { return data.flies ? data.flies.flatMap(f => (f.strategies || []).map(s => `${f.name}:${s}`)) : (data.strategies || []); }
+function pathwayKey(data) { return data.flies ? JSON.stringify(data.flies.map(f => f.pathways ? f.pathways.key : null)) : (data.pathways ? data.pathways.key : null); }
 
 function strategyTints(inst, strategies) {
   const raw = cssVar(inst.dom.root, "--st-chart-categorical-colors", ""); const list = raw.split(",").map(hexToRgb).filter(Boolean);
@@ -166,7 +206,7 @@ function strategyTints(inst, strategies) {
 function rebuildLines(inst, data) {
   const { THREE, scene } = inst; const pos = inst.geom.pos;
   for (const l of inst.lines.values()) { scene.remove(l); l.geometry.dispose(); l.material.dispose(); } inst.lines.clear();
-  const items = (data.pathways && data.pathways.items) || []; const tints = strategyTints(inst, data.strategies || []);
+  const items = pathwayItems(inst, data); const tints = strategyTints(inst, strategyList(data));
   const groups = new Map(); for (const it of items) { if (!groups.has(it.strategy)) groups.set(it.strategy, []); groups.get(it.strategy).push(it); }
   const maxR = Math.max(1e-9, ...items.map(it => Math.abs(it.ratio)));
   for (const [strategy, its] of groups) {
@@ -180,7 +220,7 @@ function rebuildLines(inst, data) {
     const l = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.9 }));
     l.visible = !inst.hiddenStrategies.has(strategy); scene.add(l); inst.lines.set(strategy, l);
   }
-  inst.pkey = data.pathways ? data.pathways.key : null;
+  inst.pkey = pathwayKey(data);
 }
 
 function legend(inst, data) {
@@ -199,7 +239,7 @@ function legend(inst, data) {
       inst.alphaAttr.array.fill(on ? 1 : 0, lo, hi); inst.alphaAttr.needsUpdate = true;
     });
   }
-  const strategies = data.strategies || [];
+  const strategies = strategyList(data);
   if (strategies.length) {
     el("div", "hd", box).textContent = "Learned pathways (green +, red −)"; const tints = strategyTints(inst, strategies);
     for (const s of [...strategies, "shared"]) {
@@ -216,9 +256,9 @@ function message(inst, text) { const m = inst.dom.msg; m.textContent = text || "
 
 function apply(inst, data) {
   if (!inst.ready || !data) return;
-  const lk = JSON.stringify([inst.geom.meta.connectome_sha256, data.strategies || []]); if (inst.legendKey !== lk) legend(inst, data);
-  if (data.minute !== inst.minute || inst.minute === undefined) recolor(inst, data);
-  const pk = data.pathways ? data.pathways.key : null; if (pk !== inst.pkey) rebuildLines(inst, data);
+  const lk = JSON.stringify([inst.geom.meta.connectome_sha256, strategyList(data)]); if (inst.legendKey !== lk) legend(inst, data);
+  if (minuteKey(data) !== inst.minute || inst.minute === undefined) recolor(inst, data);
+  const pk = pathwayKey(data); if (pk !== inst.pkey) rebuildLines(inst, data);
   message(inst, data.message); inst.dom.hint.textContent = "drag to orbit · wheel to zoom · shift-drag to pan · double-click to recentre";
   requestRender(inst);
 }
@@ -229,6 +269,10 @@ async function boot(inst, data) {
     inst.emphasis = data.emphasis || [];
     const THREE = await three();
     let geom; try { geom = await fetchGeometry(data.geometry); } catch (e) { message(inst, `the neuron geometry could not be fetched (${e.message}) — is static serving on?`); return; }
+    if (data.flies) {                       // version 2: each fly's sub-graph → scene index map
+      inst.indices = new Map();
+      for (const f of data.flies) { try { inst.indices.set(f.name, await fetchIndex(f.index)); } catch (e) { message(inst, `${f.name}: index map could not be fetched (${e.message})`); } }
+    }
     if (inst.disposed) return;
     buildScene(inst, THREE, geom); inst.ready = true; apply(inst, inst.pending || data); inst.pending = null;
   } catch (e) {

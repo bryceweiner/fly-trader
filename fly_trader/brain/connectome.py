@@ -115,6 +115,9 @@ class Connectome:
                                                             self.pop_ranges, self.pathway_gains)
         self.W_KM0 = torch.from_numpy(np.ascontiguousarray(z["W_KM0"])).to(torch.float32)
         self.M_KM = torch.from_numpy(np.ascontiguousarray(z["M_KM"])).to(torch.bool)
+        # FlyBrain's finer annotation per neuron (VIS_R1R6, VIS_ME, LPTC, ...): the Kalshi fly finds its photoreceptors by it
+        self.flybrain_group = np.asarray(z["flybrain_group"]) if "flybrain_group" in z.files else None
+        self.flybrain_group_names = [str(x) for x in z["flybrain_group_names"]] if "flybrain_group_names" in z.files else []
         self.spectral_radius_raw = float(z["spectral_radius_raw"])
         self.content_sha256 = str(z["content_sha256"])
         self.s = float(scale["s"]) if scale and "s" in scale else float(z["s0"])
@@ -159,3 +162,27 @@ class SubConnectome:
         self.pathway_gains = getattr(c, "pathway_gains", {})
         self.excluded = exclude
         self.keep = keep
+        fg = getattr(c, "flybrain_group", None)
+        self.flybrain_group = fg[keep.numpy()] if fg is not None else None
+        self.flybrain_group_names = list(getattr(c, "flybrain_group_names", []))
+
+
+# ---------------------------------------------------------------- the Kalshi fly's graph: the optic lobes kept, the memecoin senses dropped
+VISUAL_SUB = tuple(AFFERENT_POPS)                # exclude these and VISUAL stays: the second fly's sub-connectome
+PHOTORECEPTOR_GROUPS = ("VIS_R1R6", "VIS_R7R8")  # FlyBrain groups of the retina's photoreceptors (R7R8 is absent in the v783 join)
+
+
+def photoreceptor_rows(graph) -> torch.Tensor:
+    """Rows of ``graph`` (a Connectome or SubConnectome) that are photoreceptors: VISUAL neurons whose FlyBrain group is
+    R1–R6 or R7–R8. The Kalshi fly's features enter here and travel the optic lobes into the central brain."""
+    if "VISUAL" not in graph.pop_ranges:
+        raise ValueError("this graph has no VISUAL population: the Kalshi fly needs the optic lobes")
+    fg = getattr(graph, "flybrain_group", None); names = list(getattr(graph, "flybrain_group_names", []) or [])
+    lo, hi = graph.pop_ranges["VISUAL"]
+    if fg is None or not names:
+        raise ValueError("the connectome artifact carries no flybrain_group annotation; rebuild it (brain/build.py)")
+    want = [i for i, n in enumerate(names) if n in PHOTORECEPTOR_GROUPS]
+    rows = np.flatnonzero(np.isin(fg[lo:hi], want)) + lo
+    if not len(rows):
+        raise ValueError(f"no photoreceptor rows: VISUAL groups present are {sorted(set(names[int(g)] for g in set(fg[lo:hi].tolist()) if int(g) < len(names)))}")
+    return torch.from_numpy(rows.astype(np.int64))

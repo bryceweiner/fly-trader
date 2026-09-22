@@ -22,9 +22,16 @@ WORKER_INFO = {   # name → (title, icon, what it does, role)
     "train": ("Trainer", ":material/model_training:", "On demand: builds decision points from the archive, backtests day by day and saves a new model.", "train"),
     "replay": ("History archive", ":material/history:", "Downloads the hourly trade archive and builds the training feature set.", "train"),
     "discover": ("Token stats", ":material/query_stats:", "Records Jupiter stats (holders, organic score, top-holder share) every 10 minutes for every token the selector can trade: history for future model inputs.", "optional"),
+    "kalshi_runner": ("Kalshi trading engine", ":material/candlestick_chart:", "Scores every quoted Kalshi market once a minute with the visual fly, trades its taker and maker paper books (and the subaccount when live) and lets it learn from settlements.", "trade"),
+    "kalshi_stream": ("Kalshi market feed", ":material/sensors:", "Streams every Kalshi quote, trade and market lifecycle event into 1-minute rows. The Kalshi engine reads these.", "trade"),
+    "kalshi_train": ("Kalshi trainer", ":material/model_training:", "Fits the Kalshi strategy stack walk-forward by settlement day and bootstraps the visual fly when none exists.", "train"),
+    "kalshi_history": ("Kalshi history", ":material/history:", "Seeds settled markets and trades from the open dataset, fills 1-minute candles from the API and builds the feature rows.", "train"),
 }
+WORKER_TYPE = {"runner": "memecoins", "pumpstream": "memecoins", "train": "memecoins", "replay": "memecoins", "discover": "memecoins",
+               "kalshi_runner": "prediction markets", "kalshi_stream": "prediction markets", "kalshi_train": "prediction markets", "kalshi_history": "prediction markets"}
 ROLE_LABEL = {"trade": "needed to trade", "train": "needed to train", "optional": "optional"}
-ORDER = [n for n in ("runner", "pumpstream", "train", "replay", "discover") if n in WORKERS]
+ORDER = [n for n in ("runner", "pumpstream", "train", "replay", "discover", "kalshi_runner", "kalshi_stream", "kalshi_train", "kalshi_history") if n in WORKERS]
+KALSHI_BOOKS = {"paper_kalshi_taker": "Taker · paper", "paper_kalshi_maker": "Maker · paper", "live_kalshi_taker": "Taker · live", "live_kalshi_maker": "Maker · live"}
 
 
 # ---------------------------------------------------------------- formatting
@@ -57,6 +64,14 @@ def sol(x, nd: int = 4, signed: bool = False) -> str:
 
 def pct(x, nd: int = 2, signed: bool = True) -> str:
     return "—" if x is None else f"{float(x) * 100:{'+' if signed else ''}.{nd}f}%"
+
+
+def usd(x, nd: int = 2, signed: bool = False) -> str:
+    return "—" if x is None else f"{'+' if signed and float(x) >= 0 else ''}{'-' if float(x) < 0 else ''}${abs(float(x)):,.{nd}f}"
+
+
+def cents(x, nd: int = 0) -> str:
+    return "—" if x is None else f"{float(x):.{nd}f}c"
 
 
 # ---------------------------------------------------------------- models
@@ -169,6 +184,76 @@ def system_state() -> dict:
             "circuit": circuit}
 
 
+# ---------------------------------------------------------------- prediction markets (Kalshi)
+def kalshi_state() -> dict:
+    """What the Kalshi side is doing: feed, engine, the visual fly, training, history, rails (circuit 2) and books."""
+    from fly_trader.kalshi import fly as KF, selector as kselector
+    sup = get_supervisor(); ws = sup.status(); now = datetime.now(timezone.utc)
+    fly, fly_at = setting("kalshi_fly_status"); st_, _ = setting("kalshi_stream_status"); tr, tr_at = setting("kalshi_training_pipeline")
+    rp, _ = setting("kalshi_fly_replay"); hs, hs_at = setting("kalshi_history_status"); ts_, ts_at = setting("training_status")
+    circuit = q1("SELECT kill_switch, kill_reason, tripped, fail_count, entries_paused FROM circuit_state WHERE id = 2") or {}
+    ft = st_.get("flushed_through")
+    feed_age = (now - datetime.fromisoformat(ft)).total_seconds() - 60 if ft else None
+    feed_ok = ws["kalshi_stream"]["alive"] and feed_age is not None and feed_age < STALE_FEED_S
+    runner = ws["kalshi_runner"]["alive"]
+    stage = str(fly.get("stage") or "")
+    if not runner:
+        err = (ws["kalshi_runner"].get("error") or "").splitlines()
+        trading, why = "stopped", ("The Kalshi engine is stopped: " + err[0].split(": ", 1)[-1]) if err else "The Kalshi engine is stopped."
+    elif stage in ("", "not trading"):
+        trading, why = "waiting", fly.get("detail") or "The visual fly has not qualified yet: it trades once its replay passed and a deployable bootstrap exists."
+    elif circuit.get("kill_switch"):
+        trading, why = "blocked", "Kalshi kill switch tripped" + (f" ({circuit['kill_reason']})" if circuit.get("kill_reason") else "") + ": no new entries."
+    elif circuit.get("entries_paused"):
+        trading, why = "paused", "New Kalshi entries are paused by the operator; open positions still run to settlement."
+    elif not feed_ok:
+        trading, why = "holding", "The Kalshi feed is stale: no entries until it recovers (the fly keeps learning)."
+    elif stage.startswith("catching"):
+        trading, why = "starting", "Catching up on the minutes the feed wrote while the engine was away."
+    else:
+        trading, why = "trading", "Trading both arms every minute: IOC entries and resting bids."
+    live = bool(config.KALSHI_LIVE_ENABLED) and not config.kalshi_live_prerequisites_missing() and runner and stage == "trading"
+    books = {b: q1("SELECT wealth, exposure, n_open, drawdown, ts FROM wealth_marks WHERE book = %s ORDER BY ts DESC LIMIT 1", (b,)) for b in KALSHI_BOOKS}
+    with __import__("fly_trader.db.connection", fromlist=["transaction"]).transaction() as conn:
+        sel = kselector.latest_current(conn); boot = KF.latest_current(conn); dep = KF.latest_deployable(conn)
+    training = ws["kalshi_train"]["alive"] and str(tr.get("stage") or "").startswith(("training", "bootstrapping"))
+    return {"workers": ws, "runner": runner, "trading": trading, "trading_why": why, "live_money": live, "fly": fly, "fly_at": fly_at, "replay": rp or None,
+            "feed": st_, "feed_ok": feed_ok, "feed_age": feed_age, "train": tr, "train_at": tr_at, "training": training, "train_progress": ts_ if training else {},
+            "history": hs, "history_at": hs_at, "circuit": circuit, "books": books, "selector": sel, "bootstrap": boot, "deployable": dep,
+            "prerequisites_missing": config.kalshi_live_prerequisites_missing()}
+
+
+KALSHI_BADGE = {"trading": ("Kalshi trading", "green"), "holding": ("Kalshi holding: feed stale", "orange"), "paused": ("Kalshi entries paused", "orange"),
+                "blocked": ("Kalshi kill switch", "red"), "starting": ("Kalshi starting", "blue"), "stopped": ("Kalshi not trading", "gray"),
+                "waiting": ("Kalshi waiting for the fly", "gray")}
+
+
+def kalshi_strip() -> None:
+    """The prediction-markets row of the status strip."""
+    k = kalshi_state(); fly = k["fly"]
+    with st.container(horizontal=True, gap="small"):
+        if k["live_money"]:
+            st.badge("Kalshi live money", icon=":material/payments:", color="red", help=f"Both arms mirror onto Kalshi subaccount {config.KALSHI_SUBACCOUNT} (cap ${config.KALSHI_CAPITAL_USD:g}).")
+        else:
+            st.badge("Kalshi paper", icon=":material/receipt:", color="blue", help="Prediction-market trades are simulated at the quoted book with real fees; "
+                     + ("live mirroring is off (KALSHI_LIVE_ENABLED=0)." if not config.KALSHI_LIVE_ENABLED else "live gated: " + ", ".join(k["prerequisites_missing"])))
+        text, color = KALSHI_BADGE[k["trading"]]
+        st.badge(text, icon=":material/candlestick_chart:", color=color, help=k["trading_why"])
+        if fly.get("stage") and fly.get("stage") != "not trading":
+            st.badge(f"Visual fly learning · drift {float(fly.get('drift') or 0):.1%}" if not fly.get("learning_frozen") else "Visual fly: learning frozen", icon=":material/visibility:",
+                     color="violet" if not fly.get("learning_frozen") else "orange",
+                     help=f"The Kalshi fly on {fly.get('device') or '?'}: {fly.get('pending', 0)} settlements pending; edge lines " + ", ".join(f"{a} {float(v):.3f}" for a, v in (fly.get("lines") or {}).items()))
+        else:
+            st.badge("Visual fly not trading", icon=":material/visibility:", color="gray", help=fly.get("detail") or k["trading_why"])
+        tr = k["train"]
+        st.badge(f"Kalshi training · {tr.get('stage', '')}" if k["training"] else "Kalshi not training", icon=":material/model_training:", color="blue" if k["training"] else "gray")
+        hs = k["history"]
+        if k["workers"]["kalshi_history"]["alive"]:
+            st.badge(f"Kalshi history · {hs.get('stage', '')}", icon=":material/history:", color="blue", help=f"{hs.get('done', '?')} of {hs.get('total', '?')} markets filled")
+        st.badge("Kalshi feed live" if k["feed_ok"] else "Kalshi feed stale", icon=":material/sensors:", color="green" if k["feed_ok"] else "red",
+                 help=f"newest complete minute closed {k['feed_age']:.0f} s ago" if k["feed_age"] is not None else "no minute written yet")
+
+
 TRADING_BADGE = {"trading": ("Trading", "green"), "holding": ("Holding: feed stale", "orange"), "paused": ("Entries paused", "orange"),
                  "blocked": ("Kill switch tripped", "red"), "starting": ("Starting", "blue"), "stopped": ("Not trading", "gray"),
                  "waiting": ("Waiting for a qualified model", "gray")}
@@ -176,6 +261,14 @@ TRADING_BADGE = {"trading": ("Trading", "green"), "holding": ("Holding: feed sta
 
 @st.fragment(run_every="5s")
 def status_strip() -> None:
+    memecoin_strip()
+    try:
+        kalshi_strip()
+    except Exception as e:                     # the Kalshi side must never take the memecoin console down
+        st.caption(f"Kalshi status unavailable: {type(e).__name__}: {e}")
+
+
+def memecoin_strip() -> None:
     s = system_state()
     with st.container(horizontal=True, gap="small"):
         if s["live_money"]:

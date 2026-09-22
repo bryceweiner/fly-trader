@@ -9,7 +9,7 @@ from fly_trader.db.connection import transaction
 from fly_trader.db.queries import q, q1
 from fly_trader.ops import procs
 from fly_trader.ops.supervisor import get_supervisor
-from fly_trader.ui.common import ORDER, ROLE_LABEL, WORKER_INFO, ago, jv
+from fly_trader.ui.common import ORDER, ROLE_LABEL, WORKER_INFO, WORKER_TYPE, ago, jv
 
 
 def _set_autostart(name: str) -> None:
@@ -41,7 +41,10 @@ def workers() -> None:
                 st.markdown(f"External **{name}** · pid {a['pid']} · started {ago(a['started_at'])}")
                 if st.button("Stop external", key=f"ext_stop_{name}"):
                     procs.stop(name); st.rerun()
+    shown = None
     for name in ORDER:
+        if WORKER_TYPE.get(name) != shown:
+            shown = WORKER_TYPE.get(name); st.markdown(f"#### {shown.capitalize()}")
         title, icon, desc, role = WORKER_INFO[name]; stt = status[name]
         state = "stopping" if stt["stopping"] else "running" if stt["alive"] else "crashed" if stt.get("error") else "stopped"
         with st.container(border=True):

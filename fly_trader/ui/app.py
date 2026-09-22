@@ -30,14 +30,24 @@ def _autostart_once() -> None:
 
 
 _autostart_once()
-pages = [
-    st.Page("app_pages/overview.py", title="Overview", icon=":material/dashboard:", default=True),
-    st.Page("app_pages/trades.py", title="Trades", icon=":material/swap_horiz:"),
-    st.Page("app_pages/model.py", title="Model & training", icon=":material/psychology:"),
-    st.Page("app_pages/data.py", title="Data pipelines", icon=":material/database:"),
-    st.Page("app_pages/processes.py", title="Processes", icon=":material/settings_applications:"),
-    st.Page("app_pages/safety.py", title="Safety & wallet", icon=":material/shield:"),
-]
+pages = {
+    "Memecoins": [
+        st.Page("app_pages/overview.py", title="Overview", icon=":material/dashboard:", default=True),
+        st.Page("app_pages/trades.py", title="Trades", icon=":material/swap_horiz:"),
+        st.Page("app_pages/model.py", title="Model & training", icon=":material/psychology:"),
+        st.Page("app_pages/data.py", title="Data pipelines", icon=":material/database:"),
+    ],
+    "Prediction markets": [
+        st.Page("app_pages/kalshi_overview.py", title="Kalshi overview", icon=":material/visibility:", url_path="kalshi"),
+        st.Page("app_pages/kalshi_trades.py", title="Kalshi trades", icon=":material/receipt_long:", url_path="kalshi-trades"),
+        st.Page("app_pages/kalshi_model.py", title="Kalshi model & training", icon=":material/neurology:", url_path="kalshi-model"),
+        st.Page("app_pages/kalshi_data.py", title="Kalshi data", icon=":material/database:", url_path="kalshi-data"),
+    ],
+    "System": [
+        st.Page("app_pages/processes.py", title="Processes", icon=":material/settings_applications:"),
+        st.Page("app_pages/safety.py", title="Safety & wallet", icon=":material/shield:"),
+    ],
+}
 page = st.navigation(pages, position="top")
 status_strip()
 try:

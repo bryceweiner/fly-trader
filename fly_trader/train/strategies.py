@@ -45,6 +45,25 @@ from .scaling import RobustScaler
 
 log = logging.getLogger(__name__)
 HOLDS_MIN = (10, 20, 30, 45, 60, 90, 120, 180, 240)
+
+
+@dataclass
+class StackSpec:
+    """What a trading type supplies to the stack machinery: its candidate sets, inputs, universe, labels and holds. The
+    memecoin selector is ``MEMECOIN`` (the default of every function here); the Kalshi selector supplies its own
+    (fly_trader/kalshi/strategies.py), where a "hold" is the arm (taker | maker) and every position is held to settlement."""
+    name: str
+    strategies: dict                 # name -> {"holds", "vars", "highs"}
+    base_mask: object                # (name, X, cols, high) -> mask
+    trigger_value: object            # (name, var, X, cols) -> values
+    groups: dict                     # input groups the ev step tries, on top of legacy_cols
+    legacy_cols: list
+    ev_hold: object                  # the hold the input-group step fits at
+    in_universe: object              # (X, cols) -> mask
+    label: object                    # (ds, H) -> net return per row for hold H, or None when the set has no label for it
+    hold_s: object                   # (ds, H) -> seconds: a scalar, or one per row
+    oos: object                      # (ds, rows, y, col_idx, H, stop, label) -> out-of-sample score per row (NaN elsewhere)
+    random_hold: object = None       # (ds) -> hold_s for the random baseline (None: ds.horizon_s)
 EV_HOLD = 120
 WIN_MIN, PF_MIN, SIGN_ALPHA = 0.65, 1.3, 0.05
 # The bars a setting must clear, as a key: results fitted under another objective (train/wallet_skill.py's saved candidates)
@@ -274,11 +293,12 @@ def trigger_value(name: str, var: str, X: np.ndarray, cols: list[str]) -> np.nda
     return -_col(cols, X, "ret_1m") if var == "neg_ret_1m" else _col(cols, X, var)
 
 
-def trigger_mask(name: str, thr: dict, X: np.ndarray, cols: list[str]) -> np.ndarray:
+def trigger_mask(name: str, thr: dict, X: np.ndarray, cols: list[str], spec: "StackSpec | None" = None) -> np.ndarray:
+    tv = (spec or memecoin_spec()).trigger_value
     m = np.ones(len(X), bool)
     for var, t in thr.items():
         if t is not None and np.isfinite(t):
-            m &= trigger_value(name, var, X, cols) >= t
+            m &= tv(name, var, X, cols) >= t
     return m
 
 
@@ -301,10 +321,16 @@ class StrategyFit:
     regimes: list = field(default_factory=list)                   # blocked mkt_vol_1h decile bins [(lo, hi)]
     passed: bool = False
     reason: str = ""
+    spec: object = None                                            # the StackSpec it was fitted under (None: MEMECOIN)
+
+    @property
+    def hold(self):
+        """Seconds each position is held, for ``ds``-independent scalars; per-row holds come from ``spec.hold_s(ds, H)``."""
+        return self.hold_min
 
     def pick(self, ds: DecisionSet, rows: np.ndarray, uni: np.ndarray) -> np.ndarray:
-        X, c = ds.X, ds.cols
-        p = rows & uni & base_mask(self.name, X, c, self.high) & trigger_mask(self.name, self.thr, X, c) & (self.oos >= self.line)
+        sp = self.spec or memecoin_spec(); X, c = ds.X, ds.cols
+        p = rows & uni & sp.base_mask(self.name, X, c, self.high) & trigger_mask(self.name, self.thr, X, c, sp) & (self.oos >= self.line)
         if self.meta_cut is not None and self.meta_p is not None:
             p &= self.meta_p >= self.meta_cut
         if self.hours:
@@ -315,36 +341,36 @@ class StrategyFit:
 
 
 def fit_strategy(ds: DecisionSet, name: str, cols: list[str], uni: np.ndarray, sel: np.ndarray, day0, stop=None, holds=None,
-                 cache_tag: str = "") -> StrategyFit | None:
+                 cache_tag: str = "", spec: "StackSpec | None" = None) -> StrategyFit | None:
     """Coordinate ascent over (hold, line, trigger thresholds, high window) on the selection half; each hold's OOS scores
     come from its own walk-forward (models fit on the strategy's candidates, label = net return over that hold).
     ``holds``: fit these holds instead of the strategy's whole grid — one walk-forward per hold is the expensive part, so
     the input-group comparison runs at a single hold and only the strategies themselves scan the grid. ``cache_tag``
     distinguishes fits whose inputs share their column names but hold different values (the wallet-skill candidates), which
     would otherwise collide in the walk-forward cache."""
-    spec = STRATEGIES[name]; X, c = ds.X, ds.cols; ci = np.asarray([c.index(x) for x in cols])
+    sp = spec or memecoin_spec(); st = sp.strategies[name]; X, c = ds.X, ds.cols; ci = np.asarray([c.index(x) for x in cols])
     oos = {}
     loose = uni & np.zeros(len(ds.y), bool)
-    for high in spec["highs"]:
-        loose |= uni & base_mask(name, X, c, high)
-    for H in (holds or spec["holds"]):
-        y = ds.fwd_h[H] if H in ds.fwd_h else (ds.fwd_pess if H * 60 == ds.horizon_s else None)
+    for high in st["highs"]:
+        loose |= uni & sp.base_mask(name, X, c, high)
+    for H in (holds or st["holds"]):
+        y = sp.label(ds, H)
         if y is None:
             continue
-        oos[H] = _cached(ds, cols, f"{name}|hold{H}{cache_tag}", stop, lambda H=H, y=y: wf_regress(ds, loose, y, ci, stop, label=f"{name} {H} min"))
+        oos[H] = _cached(ds, cols, f"{sp.name}|{name}|hold{H}{cache_tag}", stop, lambda H=H, y=y: sp.oos(ds, loose, y, ci, H, stop, f"{name} {H}"))
     if not oos:
         return None
-    ret = lambda H: ds.fwd_h[H] if H in ds.fwd_h else ds.fwd_pess
+    ret = lambda H: sp.label(ds, H)
     best = None; best_p = None; trials = 0; seen = None
-    thr = {v: None for v in spec["vars"]}; high = spec["highs"][0]; H = next(iter(oos))
+    thr = {v: None for v in st["vars"]}; high = st["highs"][0]; H = next(iter(oos))
     g0 = quantile_grid(oos[H][sel & loose]); line = g0[0] if g0 else float("inf")      # the loosest line until a trial passes
-    grids = {v: quantile_grid(trigger_value(name, v, X[sel & loose], c)) for v in spec["vars"]}
+    grids = {v: quantile_grid(sp.trigger_value(name, v, X[sel & loose], c)) for v in st["vars"]}
 
     def trial(H_, line_, thr_, high_):
         nonlocal best, best_p, trials, seen
         trials += 1
-        pk = sel & uni & base_mask(name, X, c, high_) & trigger_mask(name, thr_, X, c) & (oos[H_] >= line_)
-        s = score_pick(ds, pk, H_ * 60.0, ret(H_), day0)
+        pk = sel & uni & sp.base_mask(name, X, c, high_) & trigger_mask(name, thr_, X, c, sp) & (oos[H_] >= line_)
+        s = score_pick(ds, pk, sp.hold_s(ds, H_), ret(H_), day0)
         if s.n > 0 and (seen is None or s.total > seen.total):
             seen = s                    # the most profitable setting that actually traded (an empty pick scores 0 and must not win this)
         if better(s, best):
@@ -355,29 +381,30 @@ def fit_strategy(ds: DecisionSet, name: str, cols: list[str], uni: np.ndarray, s
                 trial(H_, line_, thr, high)
         if best_p:
             H, line, thr, high = best_p
-        for v in spec["vars"]:
+        for v in st["vars"]:
             for t in [None] + grids[v]:
                 trial(H, line, {**thr, v: t}, high)
             if best_p:
                 H, line, thr, high = best_p
-        for high_ in spec["highs"]:
+        for high_ in st["highs"]:
             trial(H, line, thr, high_)
         if best_p:
             H, line, thr, high = best_p
     if best_p is None:
         return StrategyFit(name, H, float("inf"), thr, high, cols, oos=oos[H], trials=trials, best_seen=seen.dict() if seen else {},
-                           reason="no setting met PF and the trade count on the selection half")
+                           reason="no setting met PF and the trade count on the selection half", spec=sp)
     H, line, thr, high = best_p
-    return StrategyFit(name, H, float(line), thr, high, cols, oos=oos[H], selection=best.dict(), trials=trials, best_seen=seen.dict() if seen else {})
+    return StrategyFit(name, H, float(line), thr, high, cols, oos=oos[H], selection=best.dict(), trials=trials, best_seen=seen.dict() if seen else {}, spec=sp)
 
 
 # ---------------------------------------------------------------- meta-label, veto, gates
 def fit_meta(ds: DecisionSet, s: StrategyFit, uni: np.ndarray, sel: np.ndarray, day0, stop=None) -> tuple[np.ndarray, float | None, dict]:
+    sp = s.spec or memecoin_spec()
     """Nested: a classifier of P(net return > 0 over the strategy's hold) on its OOS candidates (primary score ≥ 0 and
     the fitted trigger), walk-forward, the primary score among its inputs; the cut-off (deciles among the selection
     half's candidates) jointly with the line."""
-    X, c = ds.X, ds.cols; ci = np.asarray([c.index(x) for x in s.cols]); y_r = ds.fwd_h.get(s.hold_min, ds.fwd_pess)
-    rows = uni & base_mask(s.name, X, c, s.high) & trigger_mask(s.name, s.thr, X, c) & np.isfinite(s.oos) & (s.oos >= 0) & np.isfinite(y_r)
+    X, c = ds.X, ds.cols; ci = np.asarray([c.index(x) for x in s.cols]); y_r = sp.label(ds, s.hold_min)
+    rows = uni & sp.base_mask(s.name, X, c, s.high) & trigger_mask(s.name, s.thr, X, c, sp) & np.isfinite(s.oos) & (s.oos >= 0) & np.isfinite(y_r)
     log.info("meta-label %s: %d candidate rows of %d, %d inputs, hold %d min", s.name, int(rows.sum()), len(ds.y), len(ci) + 1, s.hold_min)
     feats = lambda idx: np.c_[X[np.ix_(idx, ci)], s.oos[idx]]
     p = wf_classify(ds, rows, feats, (y_r > 0).astype(np.int8), 2, stop)[:, 1]
@@ -391,7 +418,7 @@ def fit_meta(ds: DecisionSet, s: StrategyFit, uni: np.ndarray, sel: np.ndarray, 
             if trials % 25 == 0:
                 log.info("meta-label %s: trial %d/%d, %.1f GB resident", s.name, trials, len(lines) * len(cuts), _rss_gb())
             pk = sel & rows & (s.oos >= line) & (p >= cut)
-            sc = score_pick(ds, pk, s.hold_min * 60.0, y_r, day0)
+            sc = score_pick(ds, pk, sp.hold_s(ds, s.hold_min), y_r, day0)
             if sc.n > 0 and (seen is None or sc.total > seen.total):
                 seen = sc                                     # the most profitable cut-off that actually traded
             if better(sc, best):
@@ -405,6 +432,7 @@ def system_pick(ds: DecisionSet, fits: list[StrategyFit], rows: np.ndarray, uni:
     N = len(ds.y); pick = np.zeros(N, bool); hold = np.full(N, np.nan); ret = np.full(N, np.nan, np.float32); who = np.full(N, -1)
     key = np.full(N, -np.inf)
     for k, f in enumerate(fits):
+        sp = f.spec or memecoin_spec()
         pk = f.pick(ds, rows, uni)
         if combine == "kelly" and tables and tables.get(f.name):
             v = np.array([((sizing.band_for(tables[f.name], m) or {}).get("kelly") or 0.0) for m in (f.oos[pk] - f.line)])
@@ -413,7 +441,7 @@ def system_pick(ds: DecisionSet, fits: list[StrategyFit], rows: np.ndarray, uni:
             kv = np.where(pk, f.oos, -np.inf)
         take = pk & (kv > key)
         key = np.where(take, kv, key); who = np.where(take, k, who); pick |= pk
-        hold = np.where(take, f.hold_min * 60.0, hold); ret = np.where(take, ds.fwd_h.get(f.hold_min, ds.fwd_pess), ret)
+        hold = np.where(take, sp.hold_s(ds, f.hold_min), hold); ret = np.where(take, sp.label(ds, f.hold_min), ret)
     return pick, np.where(np.isnan(hold), 0.0, hold), ret, who
 
 
@@ -474,13 +502,14 @@ def _comp(name, passed, reason, sel=None, ev=None, params=None, trials=0, best=N
     return c
 
 
-def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days_n: int | None = None) -> Stack:
+def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days_n: int | None = None, spec: "StackSpec | None" = None) -> Stack:
     """Every component in order, each on top of the accepted ones; see the module docstring. ``holdout_days_n``: how many
     of the last days to withhold from every fit (default ``HOLDOUT_DAYS``). A caller whose ``ds`` is already restricted to
     days before some later date -- the fly's bootstrap teacher (train/fly_selector.py) -- passes 0: its out-of-sample
     proof is the replay that follows, and withholding again would only cost it its most recent three weeks."""
-    from .selector import deploy_decision, in_universe
-    uni = in_universe(ds.X, ds.cols)
+    from .selector import deploy_decision
+    sp = spec or memecoin_spec()
+    uni = sp.in_universe(ds.X, ds.cols)
     n_hold = HOLDOUT_DAYS if holdout_days_n is None else int(holdout_days_n)
     holdout_days = list(ds.days[-n_hold:]) if n_hold and len(ds.days) > n_hold + 4 else []
     fit_days = [d for d in ds.days if d not in set(holdout_days)]
@@ -493,9 +522,9 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
              len(holdout_days), holdout_days[0] if holdout_days else "-", holdout_days[-1] if holdout_days else "-")
     comps = []
     # 1. input groups, judged on the ev strategy: all groups at once; if that is rejected, each group on its own, accumulating
-    best = fit_strategy(ds, "ev", LEGACY_COLS, uni, sel, day0, stop, holds=(EV_HOLD,))
-    groups, cols = [], list(LEGACY_COLS)
-    trial_sets = [list(GROUPS)] + [[g] for g in GROUPS]
+    best = fit_strategy(ds, "ev", sp.legacy_cols, uni, sel, day0, stop, holds=(sp.ev_hold,), spec=sp)
+    groups, cols = [], list(sp.legacy_cols)
+    trial_sets = ([list(sp.groups)] if sp.groups else []) + [[g] for g in sp.groups]
 
     def _score_of(f):
         return Score(**{k: v for k, v in f.selection.items() if k in Score.__dataclass_fields__}) if f is not None and f.selection else None
@@ -503,23 +532,23 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
     for gs in trial_sets:
         if stop is not None and stop.is_set():
             break
-        if gs != list(GROUPS) and set(groups) == set(GROUPS):
+        if gs != list(sp.groups) and set(groups) == set(sp.groups):
             break
         add = [g for g in gs if g not in groups]
         if not add:
             continue
-        gi = [ds.cols.index(x) for x in (x for g in add for x in GROUPS[g]) if x in ds.cols]
+        gi = [ds.cols.index(x) for x in (x for g in add for x in sp.groups[g]) if x in ds.cols]
         sample = np.flatnonzero(tested)[:200_000]
         if gi and len(sample) and not (np.ptp(ds.X[np.ix_(sample, gi)], axis=0) > 0).any():
             comps.append(_comp(f"inputs: {'+'.join(add)}", False, "these inputs are empty in this corpus (every value identical), so there is nothing to learn from",
                                params={"groups": add})); continue
-        cand_cols = cols + [x for g in add for x in GROUPS[g]]
-        f = fit_strategy(ds, "ev", cand_cols, uni, sel, day0, stop, holds=(EV_HOLD,))
+        cand_cols = cols + [x for g in add for x in sp.groups[g]]
+        f = fit_strategy(ds, "ev", cand_cols, uni, sel, day0, stop, holds=(sp.ev_hold,), spec=sp)
         if f is None:
             continue
         sel_s = _score_of(f) or Score()
         if better(sel_s, _score_of(best)):
-            evs = score_pick(ds, f.pick(ds, ev, uni), f.hold_min * 60.0, ds.fwd_h.get(f.hold_min, ds.fwd_pess), day0)
+            evs = score_pick(ds, f.pick(ds, ev, uni), sp.hold_s(ds, f.hold_min), sp.label(ds, f.hold_min), day0)
             ok = passes(evs, fallback=not sel_s.admissible)
             comps.append(_comp(f"inputs: {'+'.join(add)}", ok, "improves the ev strategy on the selection half" + ("" if ok else ", fails on the evaluation half"),
                                f.selection, evs.dict(), {"groups": add}, f.trials, best=f.best_seen))
@@ -530,14 +559,14 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
                                best=f.best_seen))
     # 2. strategies
     fits = []
-    for name in STRATEGIES:
-        log.info("fitting strategy %s over holds %s", name, STRATEGIES[name]["holds"])
-        f = fit_strategy(ds, name, cols, uni, sel, day0, stop)         # the full hold grid: the group step above fitted one hold only
+    for name in sp.strategies:
+        log.info("fitting strategy %s over holds %s", name, sp.strategies[name]["holds"])
+        f = fit_strategy(ds, name, cols, uni, sel, day0, stop, spec=sp)         # the full hold grid: the group step above fitted one hold only
         if f is None or not f.selection:
             comps.append(_comp(f"strategy: {name}", False, (f.reason if f else "no candidates") or "no admissible setting", trials=f.trials if f else 0,
                                best=f.best_seen if f else None)); continue
-        y_r = ds.fwd_h.get(f.hold_min, ds.fwd_pess)
-        evs = score_pick(ds, f.pick(ds, ev, uni), f.hold_min * 60.0, y_r, day0)
+        y_r = sp.label(ds, f.hold_min)
+        evs = score_pick(ds, f.pick(ds, ev, uni), sp.hold_s(ds, f.hold_min), y_r, day0)
         sel_adm = f.selection.get("admissible")
         f.evaluation = evs.dict(); f.passed = passes(evs, fallback=not sel_adm)
         f.reason = ("meets ≥65 % winners and PF ≥1.3 on both halves" if sel_adm and evs.admissible else
@@ -551,7 +580,7 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
     # sizing tables from each strategy's out-of-sample trades (selection half: used to choose the combination rule)
     tables = {}
     for f in fits:
-        y_r = ds.fwd_h.get(f.hold_min, ds.fwd_pess); t = taken_idx(ds.ts, ds.mint, f.hold_min * 60.0, np.flatnonzero(f.pick(ds, sel, uni)))
+        y_r = sp.label(ds, f.hold_min); t = taken_idx(ds.ts, ds.mint, sp.hold_s(ds, f.hold_min), np.flatnonzero(f.pick(ds, sel, uni)))
         tables[f.name] = sizing.build_table(f.oos[t] - f.line, y_r[t])
     # 3. combination rule
     best_c = None; combine = "score"
@@ -611,7 +640,8 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
     s_sel = score_pick(ds, pk & sel, hd, rt, day0); s_ev = score_pick(ds, pk & ev, hd, rt, day0)
     tr_ev = taken_idx(ds.ts, ds.mint, hd, np.flatnonzero(pk & ev))
     from .decisions import random_trades, summarize
-    rnd = summarize(random_trades(ds, ev & uni, max(1, len(tr_ev))))
+    rnd = summarize(random_trades(ds, ev & uni, max(1, len(tr_ev)), hold_s=sp.random_hold(ds) if sp.random_hold else None,
+                                  returns=sp.label(ds, sp.ev_hold) if sp.random_hold else None))
     dep, why = deploy_decision({"n": s_ev.n, "mean": s_ev.mean}, rnd)
     strict = s_sel.admissible and s_ev.admissible
     fb = (not strict) and s_sel.base_ok and s_ev.base_ok
@@ -627,54 +657,56 @@ def _without_meta(f: StrategyFit, old) -> StrategyFit:
     return g
 
 
-def score_holdout(ds: DecisionSet, models: dict, days: list) -> dict:
+def score_holdout(ds: DecisionSet, models: dict, days: list, spec: "StackSpec | None" = None) -> dict:
     """The deployed decision (``decide``: strategies, win filters, dump veto and gates as they would trade) scored on the
     days ``fit_stack`` withheld from every fit. It decides nothing — recorded and reported only. Feeding it back into any
     choice would make it a second evaluation half rather than a holdout."""
     from .decisions import random_trades, summarize
-    from .selector import in_universe
+    sp = spec or memecoin_spec()
     if not days or not (models.get("strategies") or {}):
         return {}
-    eligible = np.isin(ds.day, days) & in_universe(ds.X, ds.cols)
+    eligible = np.isin(ds.day, days) & sp.in_universe(ds.X, ds.cols)
     rows = np.flatnonzero(eligible)
     out = {"days": [str(days[0]), str(days[-1])], "rows": int(len(rows))}
     if not len(rows):
         return out
-    d = decide(models, ds.X[rows], ds.cols, ds.ts[rows])
+    d = decide(models, ds.X[rows], ds.cols, ds.ts[rows], spec=sp)
     take = d["allow"]
     if not take.any():
         return {**out, "n": 0}
-    idx = rows[take]; holds = d["hold_s"][take]
-    hold_full = np.zeros(len(ds.y)); hold_full[idx] = holds
-    ret_full = np.full(len(ds.y), np.nan, np.float32)
-    for hm in {int(h // 60) for h in holds}:
-        r = idx[(holds // 60).astype(int) == hm]
-        ret_full[r] = ds.fwd_h.get(hm, ds.fwd_pess)[r]
+    idx = rows[take]
+    hold_full = np.zeros(len(ds.y)); ret_full = np.full(len(ds.y), np.nan, np.float32)
+    for name, m in models["strategies"].items():
+        r = idx[d["strategy"][take] == name]
+        if len(r):
+            hs = sp.hold_s(ds, m["hold_min"]); hold_full[r] = hs[r] if np.ndim(hs) else hs
+            ret_full[r] = sp.label(ds, m["hold_min"])[r]
     tr = taken_idx(ds.ts, ds.mint, hold_full, idx)
     s = score_trades(ds, tr, ret_full, days[0])
-    rnd = summarize(random_trades(ds, eligible, max(1, len(tr))))
+    rnd = summarize(random_trades(ds, eligible, max(1, len(tr)), hold_s=sp.random_hold(ds) if sp.random_hold else None,
+                                  returns=sp.label(ds, sp.ev_hold) if sp.random_hold else None))
     return {**out, **s.dict(), "random_mean": rnd.get("mean")}
 
 
 # ---------------------------------------------------------------- deployment: final models and live decisions
-def final_models(ds: DecisionSet, stack: Stack, exclude_days: list | None = None) -> dict:
+def final_models(ds: DecisionSet, stack: Stack, exclude_days: list | None = None, spec: "StackSpec | None" = None) -> dict:
     """Every accepted component refit on all days (the walk-forward only chose their settings): per strategy its GBM over
     its candidates and hold, its win classifier on all its out-of-sample candidates; the veto on all candidate trades.
     ``exclude_days``: leave those days out of every fit, so the result can be scored on days it has never seen. Deployment
     refits on everything; only the holdout measurement excludes, or it would be scoring itself in sample."""
-    from .selector import in_universe
-    uni = in_universe(ds.X, ds.cols); out = {"strategies": {}, "veto": None, "combine": stack.combine}
+    sp = spec or memecoin_spec()
+    uni = sp.in_universe(ds.X, ds.cols); out = {"strategies": {}, "veto": None, "combine": stack.combine, "spec": sp.name}
     keep = ~np.isin(ds.day, exclude_days) if exclude_days else np.ones(len(ds.y), bool)
     for f in stack.fits:
-        ci = np.asarray([ds.cols.index(x) for x in f.cols]); y = ds.fwd_h.get(f.hold_min, ds.fwd_pess)
+        ci = np.asarray([ds.cols.index(x) for x in f.cols]); y = sp.label(ds, f.hold_min)
         loose = np.zeros(len(ds.y), bool)
-        for high in STRATEGIES[f.name]["highs"]:
-            loose |= uni & base_mask(f.name, ds.X, ds.cols, high)
+        for high in sp.strategies[f.name]["highs"]:
+            loose |= uni & sp.base_mask(f.name, ds.X, ds.cols, high)
         rows = np.flatnonzero(loose & np.isfinite(y) & keep)
-        gbm, scaler = fit_regressor(ds.X[np.ix_(rows, ci)], y[rows], seed=99)
+        gbm, scaler = sp.fit_final(ds, rows, ci, f.hold_min) if getattr(sp, "fit_final", None) else fit_regressor(ds.X[np.ix_(rows, ci)], y[rows], seed=99)
         meta = None
         if f.meta_cut is not None:
-            mr = np.flatnonzero(uni & base_mask(f.name, ds.X, ds.cols, f.high) & trigger_mask(f.name, f.thr, ds.X, ds.cols) & np.isfinite(f.oos) & (f.oos >= 0) & np.isfinite(y) & keep)
+            mr = np.flatnonzero(uni & sp.base_mask(f.name, ds.X, ds.cols, f.high) & trigger_mask(f.name, f.thr, ds.X, ds.cols, sp) & np.isfinite(f.oos) & (f.oos >= 0) & np.isfinite(y) & keep)
             mc, ms = fit_classifier(np.c_[ds.X[np.ix_(mr, ci)], f.oos[mr]], (y[mr] > 0).astype(np.int8), seed=99)
             meta = {"model": mc, "scaler": ms, "cut": f.meta_cut}
         out["strategies"][f.name] = {"gbm": gbm, "scaler": scaler, "cols": list(f.cols), "line": f.line, "hold_min": f.hold_min, "thr": dict(f.thr), "high": f.high,
@@ -689,20 +721,22 @@ def final_models(ds: DecisionSet, stack: Stack, exclude_days: list | None = None
     return out
 
 
-def decide_all(models: dict, X: np.ndarray, cols: list[str], t_start) -> dict:
+def decide_all(models: dict, X: np.ndarray, cols: list[str], t_start, spec: "StackSpec | None" = None) -> dict:
     """Every accepted strategy's own view of each row: ``trig`` (its fitted trigger fires), ``score`` (its predicted net
     return over its hold, −inf off the trigger), ``allow`` (at/above its line and not blocked by its win filter, its
     gates or the dump veto), ``why`` (the blocking filter), plus its line, hold and sizing table. ``t_start``: the minute
     start (a scalar, or one per row) — the hour gates use it."""
+    sp = spec or memecoin_spec()
     X = np.atleast_2d(X); n = len(X)
     hour = ((np.broadcast_to(np.asarray(t_start, dtype=np.float64), (n,)) // 3600) % 24).astype(int)
     out = {}
     for name, m in (models.get("strategies") or {}).items():
         ci = np.asarray([cols.index(x) for x in m["cols"]])
-        trig = base_mask(name, X, cols, m["high"]) & trigger_mask(name, m["thr"], X, cols)
+        trig = sp.base_mask(name, X, cols, m["high"]) & trigger_mask(name, m["thr"], X, cols, sp)
         sc = np.full(n, -np.inf); why = np.full(n, "", dtype=object)
         if trig.any():
-            ti = np.flatnonzero(trig); sc[ti] = m["gbm"].predict(m["scaler"].transform(X[np.ix_(ti, ci)]))
+            ti = np.flatnonzero(trig)
+            sc[ti] = sp.score_final(m, X[np.ix_(ti, ci)], X[ti], cols, m["hold_min"]) if getattr(sp, "score_final", None) else m["gbm"].predict(m["scaler"].transform(X[np.ix_(ti, ci)]))
         ok = trig & (sc >= m["line"])
         if m.get("meta") is not None and ok.any():
             idx = np.flatnonzero(ok)
@@ -731,10 +765,11 @@ def decide_all(models: dict, X: np.ndarray, cols: list[str], t_start) -> dict:
     return out
 
 
-def decide(models: dict, X: np.ndarray, cols: list[str], t_start) -> dict:
+def decide(models: dict, X: np.ndarray, cols: list[str], t_start, spec: "StackSpec | None" = None) -> dict:
     """The selector's decision for each row of one minute (``t_start`` = the minute's start): which strategy trades it,
     its predicted net return, hold, line and sizing table, and whether a filter blocks it (with the reason)."""
-    X = np.atleast_2d(X); n = len(X); per = decide_all(models, X, cols, t_start)
+    sp = spec or memecoin_spec()
+    X = np.atleast_2d(X); n = len(X); per = decide_all(models, X, cols, t_start, sp)
     best_key = np.full(n, -np.inf); strat = np.full(n, None, dtype=object); score = np.full(n, -1.0); hold = np.zeros(n)
     thr = np.full(n, np.inf); tables = [[] for _ in range(n)]; allow = np.zeros(n, bool); reason = np.full(n, "no strategy fires", dtype=object)
     for name, d in per.items():
@@ -744,6 +779,28 @@ def decide(models: dict, X: np.ndarray, cols: list[str], t_start) -> dict:
         take = d["trig"] & (sc >= d["line"]) & (key > best_key)
         best_key = np.where(take, key, best_key)
         for i in np.flatnonzero(take):
-            strat[i] = name; score[i] = sc[i]; hold[i] = d["hold_min"] * 60.0; thr[i] = d["line"]; tables[i] = d["sizing"]
+            strat[i] = name; score[i] = sc[i]; hold[i] = sp.hold_seconds(d["hold_min"]) if getattr(sp, "hold_seconds", None) else d["hold_min"] * 60.0; thr[i] = d["line"]; tables[i] = d["sizing"]
             allow[i] = bool(d["allow"][i]); reason[i] = d["why"][i] or "trade"
     return {"strategy": strat, "score": score, "hold_s": hold, "threshold": thr, "tables": tables, "allow": allow, "reason": reason}
+
+
+# ---------------------------------------------------------------- the memecoin stack's spec (every default above)
+def _memecoin_label(ds: DecisionSet, H):
+    if H in ds.fwd_h:
+        return ds.fwd_h[H]
+    return ds.fwd_pess if H * 60 == ds.horizon_s else None
+
+
+def _memecoin_in_universe(X, cols):
+    from .selector import in_universe
+    return in_universe(X, cols)
+
+
+def memecoin_spec() -> StackSpec:
+    """The memecoin spec, read from this module's globals at call time (tests monkeypatch STRATEGIES, GROUPS, LEGACY_COLS)."""
+    return StackSpec(name="memecoin", strategies=STRATEGIES, base_mask=base_mask, trigger_value=trigger_value, groups=GROUPS, legacy_cols=list(LEGACY_COLS),
+                     ev_hold=EV_HOLD, in_universe=_memecoin_in_universe, label=_memecoin_label, hold_s=lambda ds, H: H * 60.0,
+                     oos=lambda ds, rows, y, ci, H, stop, label: wf_regress(ds, rows, y, ci, stop, label=label + " min"))
+
+
+MEMECOIN = memecoin_spec()
