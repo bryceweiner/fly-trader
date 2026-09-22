@@ -60,7 +60,9 @@ class Supervisor:
             live_pids = {p.pid for p in __import__("psutil").process_iter()}
             rows = conn.execute("SELECT id, pid FROM processes WHERE stopped_at IS NULL AND cmd[1] = 'thread'").fetchall()
             for r in rows:
-                if int(r["pid"]) != self.pid and int(r["pid"]) not in live_pids:
+                # A row with our own pid is a previous console's too: this one has registered nothing yet. In a container
+                # the console is always pid 1, so without this every restart refused to register its workers.
+                if int(r["pid"]) == self.pid or int(r["pid"]) not in live_pids:
                     conn.execute("UPDATE processes SET stopped_at = now(), exit_code = -1 WHERE id = %s", (r["id"],))
 
     # ---- queries ----
