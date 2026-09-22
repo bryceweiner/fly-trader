@@ -27,6 +27,8 @@ connectome they run on. The training pipeline lives on [`master`](https://github
 - **Rails:** 20 % below the wallet's peak it stops entering and sells every open position (the kill switch); three
   failed transactions in a row trip a circuit breaker; a stale market feed halts entries; if live fills trail the paper
   mirror by more than 2 points per trade over 50 trades, entries pause and it tells you.
+- **Watch it think.** The Overview page draws the fly's brain in three dimensions: every neuron lit by the minute's
+  scoring, and the synapses it has changed by learning drawn as lines. Drag to orbit, hover a neuron for its cell type.
 
 ## Requirements
 

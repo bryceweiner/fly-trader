@@ -32,6 +32,10 @@ if [ -n "$T" ] && [ ! -e "data/corpus/wallet_skill/$T" ]; then
     || echo "fly-trader: WARNING could not fetch the wallet-skill table; the paper selector will not trade and the fly's skill inputs read as zero until it is present"
 fi
 
+# The console's 3D brain view: each neuron's position, built once per connectome on the training machine and shipped
+# (this image has no FlyWire annotations to build it from). The console serves it from its static directory.
+mkdir -p fly_trader/ui/static/brain && cp models/geometry/* fly_trader/ui/static/brain/ 2>/dev/null || true
+
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f seed/seed.sql
 
 echo "fly-trader: console at http://localhost:8501"
