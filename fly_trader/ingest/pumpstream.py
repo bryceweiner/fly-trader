@@ -389,8 +389,13 @@ def load_skill(agg: Aggregator, now: float | None = None) -> None:
         return
     f = SKILL_DIR / f"{day}.parquet"
     if not f.exists():
-        agg.skill = None; agg.skill_day = day
-        return
+        have = sorted(SKILL_DIR.glob("????-??-??.parquet")) if SKILL_DIR.exists() else []
+        if not have:
+            agg.skill = None; agg.skill_day = day
+            return
+        f = have[-1]              # a shipped table going stale beats none: without one the selector fails closed and the fly's skill inputs read as zero
+        log.warning("no wallet skill table for %s: using the newest on disk, %s (skill inputs %d days stale)", day, f.stem,
+                    (datetime.fromisoformat(day) - datetime.fromisoformat(f.stem)).days)
     t = pq.read_table(f, columns=["wallet", "bucket"])
     agg.skill = dict(zip(t["wallet"].to_pylist(), t["bucket"].to_pylist())); agg.skill_day = day
     log.info("wallet skill table for %s loaded: %d wallets", day, len(agg.skill))
