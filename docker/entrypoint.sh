@@ -38,5 +38,6 @@ mkdir -p fly_trader/ui/static/brain && cp models/geometry/* fly_trader/ui/static
 
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f seed/seed.sql
 
+echo "fly-trader: device $(python -c 'from fly_trader.brain import device; print(device.describe(device.resolve()))' 2>/dev/null || echo unknown)"
 echo "fly-trader: console at http://localhost:8501"
 exec fly-trader ui --port "${PORT:-8501}"

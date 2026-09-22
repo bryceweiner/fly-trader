@@ -23,7 +23,7 @@ services:
       DATABASE_URL: postgresql://fly:fly@db:5432/fly_trader
       DATA_DIR: /app/data
       LOG_DIR: /app/logs
-      DEVICE: cpu
+      DEVICE: auto          # the CPU in this image; an NVIDIA GPU with docker-compose.cuda.yml
     volumes:
       - ./data:/app/data        # models, the fly's plastic state, its hourly snapshots: survives restarts and rebuilds
       - ./logs:/app/logs

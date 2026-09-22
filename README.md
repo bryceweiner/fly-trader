@@ -35,7 +35,9 @@ connectome they run on. The training pipeline lives on [`master`](https://github
 - Docker (Desktop on macOS/Windows, or Engine + Compose v2 on Linux). ~2 GB of disk for the image and database.
 - A [Helius](https://dashboard.helius.dev) API key (free tier is enough) and a [Jupiter](https://portal.jup.ag) API key.
 - 0.5 SOL you are prepared to lose. Not more: the caps below are sized for 0.5.
-- Any CPU. No GPU is used.
+- Any 64-bit CPU: the fly scores about as fast on 16 CPU threads as on a GPU (its forward pass is a memory-bound
+  scatter over a million synapses). An NVIDIA GPU is used when you start it with the CUDA override (see below). Apple
+  GPUs are not reachable from inside Docker.
 
 ## Start trading
 
@@ -110,6 +112,21 @@ Edit `.env`, then `docker compose restart fly`. The ones that matter:
 
 Scaling the wallet up scales the position caps with it (`MAX_POSITION_FRACTION`), but `MAX_POSITION_SOL` is a hard
 ceiling: raise it deliberately or not at all.
+
+## NVIDIA GPU
+
+Optional. The CPU image trades fine; a GPU makes the once-a-minute scoring and the fly's learning a little faster.
+You need the NVIDIA driver (560 or newer) and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+on the host; then start with the CUDA override instead of the plain command in step 3:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.cuda.yml up -d --build
+```
+
+The image is built with the CUDA 12.6 torch wheel (`TORCH_INDEX: cu126` in `docker-compose.cuda.yml`; `cu130` for the
+newest drivers) and the container is given every GPU. `DEVICE=auto` in `.env` then resolves to the GPU; the console's
+Model page shows which device the fly is on. Batch sizes are derived from the card's free memory, so an 8 GB card works;
+on a shared card set `DEVICE_MEMORY_GB` in `.env` to what the fly may use.
 
 ## Refreshing the model
 
