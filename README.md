@@ -1,115 +1,136 @@
-# fly-trader
+# fly-trader — distribution
 
-**A fruit-fly connectome that trades Solana memecoins.**
-Website: [fly-trader.app](https://fly-trader.app) · Token: $FLY (coming soon) · X community: coming soon
+**A fruit-fly connectome that trades Solana memecoins with your money.**
 
-fly-trader trains the central brain of the [FlyWire](https://flywire.ai) adult *Drosophila* connectome (41,756 neurons, 1.04 M synapses; FAFB v783) to trade PumpSwap tokens that graduated from [pump.fun](https://pump.fun). A gradient-boosted selector learns which tokens to buy from 1-minute market data at real trading costs; the fly is then trained to make the same calls through its own wiring. Every decision is journaled to Postgres.
+> ## ⚠️ Read this first
+>
+> This software signs real transactions from a wallet you fund. It buys tokens that graduated from pump.fun, holds them
+> for about two hours, and sells. **It can lose everything in that wallet, quickly.** The model was trained on a few
+> months of data; the market it trades is adversarial and changes. Nothing here is a claim of profit, and nothing here is
+> financial advice. Run it only with money you can lose entirely, on a wallet used for nothing else. MIT licence — no
+> warranty of any kind. See [LICENSE](LICENSE).
 
-It is an experiment. No performance is claimed. The strategy trades a paper book; live execution is default-deny and not yet wired to it.
+This is the ready-to-run branch: the trading engine, its console, a trained fly, the selector that taught it, and the
+connectome they run on. The training pipeline lives on [`master`](https://github.com/bryceweiner/fly-trader).
 
-> **Not financial advice.** This software can sign real transactions from a wallet you fund. It may lose all of that money. See the [Terms of Service](https://fly-trader.app/terms.html).
+## What it does
 
-## How it works
-
-```
-PumpAPI hourly archive ─▶ 1-minute candles ─▶ features (live engine) ─▶ selector (walk-forward) ─▶ fly (distilled)
-PumpAPI live stream ───▶ 1-minute candles ─▶ features ─▶ loaded model ─▶ buy / hold 2 h / sell ─▶ paper book
-Jupiter Tokens v2 ─────▶ token stats (history for future inputs)
-```
-
-| Piece | Where | What |
-|---|---|---|
-| Market data | `fly_trader/ingest/replay_pull.py`, `pumpstream.py` | Every PumpSwap trade of pump.fun tokens, from the free hourly archive (training) and the live stream (trading), aggregated to the same 1-minute candles |
-| Features | `fly_trader/market/features.py`, `train/mature.py` | One engine for training and trading: returns, volatility, order flow, volume, liquidity, trade counts, age, drawdowns, launch facts and creator history |
-| Costs | `fly_trader/market/exit_cost.py` | Measured, not assumed: the PumpSwap pool fee by market cap (1.25 % → 0.30 %), Jupiter's 10 bps, the network fee, and constant-product price impact |
-| Selector | `fly_trader/train/selector.py`, `decisions.py` | Gradient-boosted model of each minute's net return over a 2-hour hold. Walk-forward over the whole archive; the buy line is chosen on the first half of the held-out days and judged on the second; it trades only if that half made money after costs and beat random picks |
-| Fly | `fly_trader/train/fly_selector.py`, `brain/connectome.py` | The FlyWire central brain as a rate network on its real, signed synapses: features enter the sensory neurons, a decoder reads the descending neurons; trained to reproduce the selector's predictions, then traded identically |
-| Sizing | `fly_trader/agent/sizing.py` | Position size from the model's measured certainty: a fraction of the growth-optimal bet for its score band, capped by the bankroll and the pool's depth |
-| Pipeline | `fly_trader/train/pipeline.py` | Every 7 days (or on request): retrain the selector, then the fly from it; the trading engine switches models without a restart |
-| Trading engine | `fly_trader/agent/selector_session.py` | Scores every eligible token once a minute, buys, holds for the model's hold time, sells; kill switch, pause and reserve rails |
-| Console | `fly_trader/ui/app.py` | One Streamlit app that runs every worker as an in-process thread and shows what the system is doing |
+- Every minute it scores every PumpSwap token that graduated from pump.fun at least six hours ago, from live 1-minute
+  candles (a token needs that much history before its features mean anything).
+- The fly — the FlyWire *Drosophila* central brain (41,756 neurons) as a rate network on its real signed synapses —
+  predicts each token's net return over the next 120 minutes. It was taught by a gradient-boosted selector; it then keeps
+  learning from what its own trades earn, through plasticity at its mushroom body's KC→MBON synapses.
+- It buys when the predicted return clears its own buy line, sizes the position from measured certainty (a quarter
+  of the growth-optimal bet, capped), holds 120 minutes, sells.
+- **It starts on paper.** After 20 closed paper trades it switches itself to the wallet and stays there. Before that,
+  and whenever the wallet is unfunded or a key is missing, it trades paper and says so on the console.
+- **Rails:** 20 % below the wallet's peak it stops entering and sells every open position (the kill switch); three
+  failed transactions in a row trip a circuit breaker; a stale market feed halts entries; if live fills trail the paper
+  mirror by more than 2 points per trade over 50 trades, entries pause and it tells you.
 
 ## Requirements
 
-- macOS on Apple Silicon (the fly trains on the Metal GPU via PyTorch MPS; 64 GB+ recommended for the full archive)
-- Python 3.13 and [uv](https://docs.astral.sh/uv/)
-- PostgreSQL 15+ (`brew install postgresql@17`)
-- A Jupiter API key (token stats); a Helius API key and a funded wallet only for live execution
+- Docker (Desktop on macOS/Windows, or Engine + Compose v2 on Linux). ~2 GB of disk for the image and database.
+- A [Helius](https://dashboard.helius.dev) API key (free tier is enough) and a [Jupiter](https://portal.jup.ag) API key.
+- 0.5 SOL you are prepared to lose. Not more: the caps below are sized for 0.5.
+- Any CPU. No GPU is used.
 
-## Install
+## Start trading
 
-```bash
-git clone https://github.com/bryceweiner/fly-trader.git
-cd fly-trader
-uv sync
-cp .env.example .env          # paste your keys; leave LIVE_ENABLED=0
-createdb fly_trader
-uv run fly-trader init-db
-uv run fly-trader build-connectome   # ~100 MB download, verifies 139,255 neurons / 2,698,236 edges
-uv run fly-trader ui                 # Streamlit console at http://localhost:8501
-```
+1. Download this branch and open a terminal in it:
+   ```bash
+   git clone -b distribution https://github.com/bryceweiner/fly-trader.git && cd fly-trader
+   ```
+2. Create your `.env` and paste the two API keys into it:
+   ```bash
+   cp .env.example .env
+   ```
+3. Start it:
+   ```bash
+   docker compose up -d --build
+   ```
+   The first start builds the image (several minutes), creates the database, installs the models and starts the market
+   feed and the trading engine.
+4. Create the bot wallet — it prints the public key and writes the secret into your `.env`:
+   ```bash
+   docker compose exec fly fly-trader wallet new
+   ```
+   **Back up `.env` now.** It is the only copy of that key.
+5. Send **0.5 SOL** to the printed address, then restart the engine so it picks up the key:
+   ```bash
+   docker compose restart fly
+   ```
+6. Open the console: <http://localhost:8501>. Watch the **Overview** page.
 
-The console starts the market feed, the history archive (downloads the archive and builds the training features), the trainer, the trading engine and the token-stats worker. Training starts once every archived day has its features.
+That is all. From here it runs on its own. The first ~24 hours are a warm-up (it needs a day of candles before it
+scores anything); then it trades paper until 20 trades have closed; then it trades the wallet.
 
-## Train
+## Day to day
 
-The trainer runs by itself every 7 days; "Retrain now" in the console queues a run. From the CLI:
+| Want to | Do |
+|---|---|
+| See what it is doing | <http://localhost:8501> — **Overview** (books, open positions, wealth), **Trades**, **Safety & wallet** (rails, wallet), **Processes** |
+| Pause new entries | Safety & wallet → **Pause entries**, or `docker compose exec fly fly-trader pause-entries` |
+| Clear a tripped kill switch | Safety & wallet → **Clear kill switch**, or `docker compose exec fly fly-trader reset-circuit --kill` (re-bases the peak) |
+| Stop everything | `docker compose down` — **open positions stay open in the wallet**; start again and it sells them on schedule, or sell them yourself |
+| See the logs | `docker compose logs -f fly` |
+| Start again from nothing | `docker compose down -v` (deletes the database) and delete `data/` |
 
-```bash
-uv run fly-trader train-selector        # walk-forward backtest over the whole archive, saves the model
-uv run fly-trader train-fly-selector    # trains the fly to imitate the latest selector
-```
+The console listens on `127.0.0.1` only. Do not expose it: it can start and stop the engine and clear the rails.
 
-## Trade
+## What is in the box
 
-The trading engine trades the paper book as soon as a model qualifies. Live execution is not wired to the selector yet; the wallet and signing path exist:
+| Path | What |
+|---|---|
+| `models/policies/fly_*.pt` | the fly (`brain_snapshots` #62): taught by selector #59, two strategies (`ev`, `capitulation`), 120-minute hold, its own buy lines |
+| `models/selectors/selector_*.joblib` | the selector that taught it (#59), kept so the console can show the paper selector alongside |
+| `models/connectome/` | the FlyWire FAFB v783 central brain as the fly runs on it (14 MB), with its calibrated scale |
+| `models/wallet_skill/` | the fitted wallet-skill inputs: `config.json` (the horizon and lookback the model was trained with) and the name of the newest per-day table. The table itself (~300 MB) is on Hugging Face; the container fetches it once at first start |
+| `seed/seed.sql` | the database rows that admit the fly to trade: the model records, the passed replay verdict, autostart |
+| `.env.example` | every knob, set for 0.5 SOL |
+| `docker-compose.yml`, `Dockerfile`, `docker/entrypoint.sh` | one Postgres, one engine + console |
 
-```bash
-uv run fly-trader wallet new          # writes BOT_PRIVATE_KEY to .env, prints the pubkey
-uv run fly-trader swap-smoke --sol 0.01   # one real round trip to prove signing and routing
-```
+The fly's replay verdict shipped here: over the 28 evaluation days it made +1.52 % per trade after real costs (profit
+factor 1.13) against −5.27 % for random picks of the same tokens. That is a backtest on one corpus, not a forecast.
 
-Rails: kill switch at −30 % from peak (blocks entries), gas reserve, circuit breaker, stale-feed halt, pause. `pause-entries`, `resume-entries`, `reset-circuit` and `status` are available from the CLI and the console.
+## Tuning
 
-## Configuration
+Edit `.env`, then `docker compose restart fly`. The ones that matter:
 
-Every knob is an environment variable read by `fly_trader/config.py`; `.env.example` lists the ones you are expected to touch. Notable ones:
-
-| Variable | Default | Meaning |
+| Variable | Shipped | Meaning |
 |---|---|---|
-| `CAPITAL_SOL` | — | starting paper bankroll |
-| `GAS_RESERVE_SOL` | `0.30` | never deployed |
-| `KELLY_FRACTION` | `0.25` | share of the growth-optimal bet per score band |
-| `MAX_POSITION_FRACTION` / `MAX_POOL_SHARE` | `0.10` / `0.02` | largest position: of the bankroll / of the pool's SOL reserve |
-| `KILL_SWITCH_DRAWDOWN` | `0.30` | drawdown from peak that blocks new entries |
-| `DEVICE` | `mps` | torch device for the fly |
-| `LIVE_ENABLED` | `0` | signing on mainnet |
+| `CAPITAL_SOL` | 0.5 | what you funded; also the paper warm-up bankroll |
+| `MAX_POSITION_SOL` / `MAX_POSITION_FRACTION` | 0.05 / 0.10 | per-position caps (the smaller wins) |
+| `GAS_RESERVE_SOL` | 0.05 | never spent |
+| `KILL_SWITCH_DRAWDOWN` / `KILL_SWITCH_LIQUIDATE` | 0.20 / 1 | drawdown from peak that halts and sells everything |
+| `HANDOVER_MIN_TRADES` | 20 | closed paper trades before it goes live |
+| `LIVE_ENABLED` | 1 | set 0 to run paper only |
 
-## CLI reference
+Scaling the wallet up scales the position caps with it (`MAX_POSITION_FRACTION`), but `MAX_POSITION_SOL` is a hard
+ceiling: raise it deliberately or not at all.
 
-```
-init-db  wallet {new,show}  ui [--port]  run  status  worker {start,stop,status} [name]
-pumpstream  replay-pull  discover [--once]
-assemble-replay  build-corpus-meta  build-mature  build-corpus-features  backtest-corpus
-train-selector [--days]  train-fly-selector [--days --test-days --line --epochs]  selector-eval  reset-training
-build-connectome  swap-smoke [--sol]  verify-fills  close-empty-atas
-pause-entries  resume-entries  reset-circuit [--kill]
-```
+## Refreshing the model
 
-## Tests
+The model is a snapshot of one training run. To ship a newer one, on a `master` checkout with its database, after a
+passed replay:
 
 ```bash
-createdb fly_trader_test
-uv run pytest -q
+.venv/bin/python tools/make_seed.py --out dist
+cp -R dist/models/* models/ && cp -R dist/seed/* seed/
 ```
 
-## Data and citations
+Commit `models/` and `seed/` on this branch. The seed is idempotent: an install that already has these rows is not
+changed by it, so pull the branch, `docker compose up -d --build`, and the new model is in place.
 
-- FlyWire consortium, Dorkenwald et al., *Neuronal wiring diagram of an adult brain*, Nature 2024. Annotations: Schlegel et al., Nature 2024. Signs: Shiu et al., Nature 2024.
-- Connectome export: [snedea/flybrain](https://github.com/snedea/flybrain) (MIT).
-- Whole-connectome graph models: FlyGM, arXiv 2602.17997; ConnecTorch.
-- Market data: [PumpAPI](https://pumpapi.io) archive and stream; [Jupiter](https://jup.ag) Tokens API.
+## Also on Hugging Face
 
-## License
+- Model and this code: [`bryceweiner/fly-trader`](https://huggingface.co/bryceweiner/fly-trader)
+- The training database (the full corpus, for retraining on `master`): [`bryceweiner/fly-trader-seed`](https://huggingface.co/datasets/bryceweiner/fly-trader-seed)
+
+## Credits
+
+FlyWire consortium, Dorkenwald et al., *Neuronal wiring diagram of an adult brain*, Nature 2024; annotations Schlegel
+et al. 2024; synapse signs Shiu et al. 2024. Connectome export: [snedea/flybrain](https://github.com/snedea/flybrain)
+(MIT). Market data: [PumpAPI](https://pumpapi.io); routing: [Jupiter](https://jup.ag).
 
 [MIT](LICENSE).

@@ -1,0 +1,19 @@
+{
+ "connectome": "fafb783_d1bad40e798b.npz",
+ "content_sha256": "d1bad40e798b65881c05c38a896f67f51b5b8ff1d32b4c5166e4d2f9fd9a5c7c",
+ "s": 0.003683247034028392,
+ "s_km": 0.05893195254445427,
+ "ts": "2026-09-12T15:58:01.074657+00:00",
+ "s_note": "0.25 x calibrated s: sparse regime under the real encoder input (scale_sweep_encoder)",
+ "pathway_gains": {
+  "DAN_PAM->MBON_APP": 0.0,
+  "DAN_PAM->MBON_AV": 0.0,
+  "DAN_PAM->MBON_OTHER": 0.0,
+  "DAN_PAM->KC": 0.0,
+  "DAN_PPL1->MBON_APP": 0.0,
+  "DAN_PPL1->MBON_AV": 0.0,
+  "DAN_PPL1->MBON_OTHER": 0.0,
+  "DAN_PPL1->KC": 0.0
+ },
+ "pathway_gains_note": "dopamine acts on MBONs through KC->MBON plasticity (GPCR modulation), not fast excitation: Hige 2015, Handler 2019; direct DAN->MBON/KC edges silenced"
+}

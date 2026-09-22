@@ -3,6 +3,7 @@
 data/
 logs/
 dist/
+models/wallet_skill/*.parquet   # ~300 MB: on Hugging Face, fetched by docker/entrypoint.sh
 __pycache__/
 *.pyc
 .pytest_cache/

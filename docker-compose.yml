@@ -1,0 +1,39 @@
+# fly-trader, fire-and-forget: one Postgres, one trading container. The console is published on 127.0.0.1 only --
+# it can start and stop the workers and clear the kill switch, so it must never face the internet.
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: fly
+      POSTGRES_PASSWORD: fly
+      POSTGRES_DB: fly_trader
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fly -d fly_trader"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  fly:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://fly:fly@db:5432/fly_trader
+      DATA_DIR: /app/data
+      LOG_DIR: /app/logs
+      DEVICE: cpu
+    volumes:
+      - ./data:/app/data        # models, the fly's plastic state, its hourly snapshots: survives restarts and rebuilds
+      - ./logs:/app/logs
+      - ./.env:/app/.env        # `fly-trader wallet new` writes the bot key here
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
