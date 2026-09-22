@@ -77,7 +77,19 @@ def main(out: Path) -> None:
     cdir = config.BRAIN_DIR / "connectome"; current = (cdir / "current.txt").read_text().strip()
     for name in ("current.txt", "scale.json", current):
         shutil.copy2(cdir / name, models / "connectome" / name)
-    print(f"seed written to {out}/: fly #{fly['id']} ({Path(rows[int(fly['id'])]['path']).name}), selector #{sel_id}, connectome {current}")
+    # The fly's inputs include wallet skill: config.json names the fitted (h, L) that FLY_VERSION carries, and the day's
+    # table maps wallets to skill deciles. The newest table ships (~300 MB: too big for GitHub, so the distribution keeps
+    # it on Hugging Face and the container fetches it once); the engine falls back to it while it goes stale.
+    from fly_trader.train.mature import SKILL_DIR
+    tables = sorted(SKILL_DIR.glob("????-??-??.parquet"))
+    if not (SKILL_DIR / "config.json").exists() or not tables:
+        raise SystemExit("no wallet-skill config or tables: the fly's inputs need them (fly-trader fit-wallet-skill)")
+    sk = models / "wallet_skill"; sk.mkdir(exist_ok=True)
+    for name in ("config.json", "fit.json"):
+        if (SKILL_DIR / name).exists():
+            shutil.copy2(SKILL_DIR / name, sk / name)
+    shutil.copy2(tables[-1], sk / tables[-1].name); (sk / "TABLE").write_text(tables[-1].name + "\n")
+    print(f"seed written to {out}/: fly #{fly['id']} ({Path(rows[int(fly['id'])]['path']).name}), selector #{sel_id}, connectome {current}, skill table {tables[-1].name}")
     print(f"  fly taught by: {fly['meta'].get('teacher')}")
     print(f"  replay verdict: {v.get('reason')}")
 

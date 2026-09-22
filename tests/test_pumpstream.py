@@ -69,3 +69,23 @@ def test_midnight_late_legs_and_lagging_stream():
     assert agg.flush_bound(M + 75) == M            # lagging but live: waits for the minute's events
     agg.last_event_wall = M + 55
     assert agg.flush_bound(M + 75) == M + 60       # quiet for 20 s: the wall clock completes it
+
+
+def test_load_skill_falls_back_to_the_newest_table_on_disk(tmp_path, monkeypatch):
+    """A distribution ships one table and no pipeline to make the next: the engine keeps using the newest it has rather
+    than dropping the skill inputs (the selector fails closed without them, the fly reads them as zero)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from fly_trader.train import mature
+    monkeypatch.setattr(mature, "SKILL_DIR", tmp_path / "skill"); (tmp_path / "skill").mkdir()
+    agg = pumpstream.Aggregator()
+    pumpstream.load_skill(agg, datetime(2026, 9, 25, 12, tzinfo=timezone.utc).timestamp())
+    assert agg.skill is None and agg.skill_day == "2026-09-25"                                   # nothing on disk: as before
+    for d, w in (("2026-09-20", "OLD"), ("2026-09-23", "NEW")):
+        pq.write_table(pa.table({"wallet": [w], "bucket": pa.array([7], pa.int8())}), tmp_path / "skill" / f"{d}.parquet")
+    agg.skill = None
+    pumpstream.load_skill(agg, datetime(2026, 9, 25, 12, tzinfo=timezone.utc).timestamp())
+    assert agg.skill == {"NEW": 7} and agg.skill_day == "2026-09-25"                             # the newest, two days stale
+    pumpstream.load_skill(agg, datetime(2026, 9, 23, 12, tzinfo=timezone.utc).timestamp())
+    assert agg.skill == {"NEW": 7} and agg.skill_day == "2026-09-23"                             # the day's own table when it exists
