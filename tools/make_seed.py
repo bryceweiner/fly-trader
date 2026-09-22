@@ -89,6 +89,11 @@ def main(out: Path) -> None:
         if (SKILL_DIR / name).exists():
             shutil.copy2(SKILL_DIR / name, sk / name)
     shutil.copy2(tables[-1], sk / tables[-1].name); (sk / "TABLE").write_text(tables[-1].name + "\n")
+    # The console's 3D brain view needs each neuron's position (brain/geometry.py), built from the FlyWire annotations
+    # TSV that a distribution does not ship; the built files depend only on the connectome, so they ship instead and
+    # docker/entrypoint.sh copies them into the console's static directory.
+    from fly_trader.brain.geometry import build_geometry
+    build_geometry(models / "geometry")
     print(f"seed written to {out}/: fly #{fly['id']} ({Path(rows[int(fly['id'])]['path']).name}), selector #{sel_id}, connectome {current}, skill table {tables[-1].name}")
     print(f"  fly taught by: {fly['meta'].get('teacher')}")
     print(f"  replay verdict: {v.get('reason')}")

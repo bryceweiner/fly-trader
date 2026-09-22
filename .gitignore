@@ -3,6 +3,8 @@
 data/
 logs/
 dist/
+# generated neuron geometry for the console's 3D view (brain/geometry.py)
+fly_trader/ui/static/brain/
 __pycache__/
 *.pyc
 .pytest_cache/

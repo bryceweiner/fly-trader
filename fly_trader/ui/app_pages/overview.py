@@ -6,6 +6,8 @@ import streamlit as st
 
 from fly_trader import config
 from fly_trader.db.queries import q, q1
+from fly_trader.ui import brain3d
+from fly_trader.ui.brain3d import feed
 from fly_trader.ui.common import BOOK, ago, backtest_line, labels, pct, sol, system_state
 
 
@@ -31,6 +33,35 @@ def narrative(s: dict) -> str:
         tr = s["train_status"]; step, total = tr.get("step"), tr.get("total")
         lines.append(f"Training is running: {tr.get('stage', '')}" + (f" ({step}/{total})" if step is not None and total else "") + ".")
     return "\n\n".join(lines)
+
+
+@st.fragment(run_every="5s")
+def brain() -> None:
+    """The fly's brain: every neuron it runs on, lit by the minute's scoring; the synapses it has changed most as lines."""
+    s = system_state(); fly = s["fly"]; running = bool(fly.get("stage")) and fly.get("stage") != "not trading"
+    with st.container(border=True):
+        st.markdown(":material/neurology: **The fly's brain** · the 41,756 neurons it runs on, lit by each minute's scoring (warm = positive, cool = negative); "
+                    "green and red lines are the KC→MBON synapses it has changed most")
+        try:
+            meta = brain3d.geometry()
+        except FileNotFoundError as e:
+            st.caption(f"No brain to draw: {e}"); return
+        minutes = feed.minutes(feed.activity_mtime())
+        st.session_state.setdefault("brain_live", True)
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            st.toggle("Follow live", key="brain_live", help="Show the newest minute as it arrives; moving the slider turns this off.")
+            mode = st.segmented_control("Learned pathways", list(feed.MODES), key="brain_pmode", default="since bootstrap") or "since bootstrap"
+        act = None
+        if minutes:
+            if st.session_state["brain_live"] or st.session_state.get("brain_minute") not in minutes:
+                st.session_state["brain_minute"] = minutes[-1]
+            stamp = st.select_slider("Minute (UTC)", options=minutes, key="brain_minute", format_func=feed.label,
+                                     on_change=lambda: st.session_state.__setitem__("brain_live", False))
+            act = feed.activity_at(stamp)
+        pth = feed.pathways(mode, fly, meta) if running else {"mode": feed.MODES[mode], "key": "none", "reference": None, "items": [], "note": None, "changed": 0}
+        msg = None if minutes else ("The fly has not scored a minute yet." if running else "The fly is not running: this is the resting brain.")
+        brain3d.brain_view(brain3d.payload(meta, act, pth, list((fly.get("channels") or {}).keys()), message=msg), key="brain3d")
+        st.caption(feed.caption(act, pth, fly, meta))
 
 
 @st.fragment(run_every="5s")
@@ -133,6 +164,7 @@ def race() -> None:
             st.line_chart(df, x_label="", y_label="SOL", height=240)
 
 
+brain()
 summary()
 race()
 book()

@@ -9,7 +9,8 @@ tables (fly_*) and state file; the circuit (kill switch, trip, failure count, pe
 re-arms it); wallet events, tokens, pools, market data, API logs, events, other ui_settings.
 
 ``reset_fly`` is the explicit console action: the plastic fly starts again from its bootstrap (its book, its learned
-KC→MBON changes, scored minutes, calibrations, rollbacks and snapshots are archived and cleared; the bootstrap is kept).
+KC→MBON changes, scored minutes, calibrations, rollbacks, snapshots and its recorded network activity are archived and
+cleared; the bootstrap is kept). ``reset_training_state`` never touches the activity files either.
 
 ``reset_training_stats`` is the training-side counterpart, run at the start of every training run: the previous runs'
 walk-forward / iteration events and the console's training status are archived and cleared (models are kept).
@@ -98,6 +99,11 @@ def fly_state_dir() -> Path:
     return config.BRAIN_DIR / "plastic"
 
 
+def activity_dir() -> Path:
+    """The fly's per-minute network activity for the console's brain view (``brain/activity.py``)."""
+    return config.BRAIN_DIR / "activity"
+
+
 def reset_fly(reason: str = "operator", archive: bool = True) -> dict:
     """The plastic fly starts again from its bootstrap: its paper book, sessions, learned state and statistics are
     archived and cleared. The live book, the selector's book and the bootstrap snapshots are kept."""
@@ -114,12 +120,12 @@ def reset_fly(reason: str = "operator", archive: bool = True) -> dict:
         counts = _wipe(conn, plan, out_dir if archive else None)
         conn.execute("DELETE FROM book_state WHERE book = %s", (FLY_BOOK,))
         conn.execute("DELETE FROM ui_settings WHERE key = 'fly_status'")
-    d = fly_state_dir()
-    if d.exists():
-        if archive:
-            out_dir.mkdir(parents=True, exist_ok=True); shutil.move(str(d), str(out_dir / "plastic"))
-        else:
-            shutil.rmtree(d)
+    for d, name in ((fly_state_dir(), "plastic"), (activity_dir(), "activity")):     # its learned state and its recorded activity
+        if d.exists():
+            if archive:
+                out_dir.mkdir(parents=True, exist_ok=True); shutil.move(str(d), str(out_dir / name))
+            else:
+                shutil.rmtree(d)
     record_event("warning", "reset", f"plastic fly reset to its bootstrap ({reason})", {"archived_to": str(out_dir) if archive else None, "rows": counts})
     log.info("plastic fly reset (%s): %s", reason, counts)
     return {"archived_to": str(out_dir) if archive else None, "rows": counts}
