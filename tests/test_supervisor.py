@@ -51,3 +51,30 @@ def test_a_previous_consoles_row_with_our_own_pid_is_stale(monkeypatch, db_conn)
     assert row["stopped_at"] is not None and row["exit_code"] == -1                     # closed at construction, not at start
     assert sup.start("discover", started_by="test")                                     # and the worker registers again
     sup.stop("discover", grace_s=5)
+
+
+def test_a_new_console_waits_for_the_one_it_replaces(monkeypatch, db_conn):
+    """Killing a console and starting the next one within seconds left the old one still winding its workers down: their
+    rows looked live, registration was refused, and the market feed never came back. The new console waits for the old
+    pid to go before judging its rows stale."""
+    from types import SimpleNamespace
+    from fly_trader.db.connection import transaction
+    old_pid = 999_999_001; seen = {"calls": 0}
+    with transaction() as conn:
+        conn.execute("UPDATE processes SET stopped_at = now() WHERE stopped_at IS NULL AND cmd[1] = 'thread'")
+        rid = conn.execute("INSERT INTO processes (name, pid, cmd, log_path, started_by) VALUES ('pumpstream', %s, %s, 'logs/pumpstream.log', 'test') RETURNING id",
+                           (old_pid, ["thread", "pumpstream"])).fetchone()["id"]
+    import psutil
+    real = psutil.process_iter
+
+    def fake_iter():                                   # the old console is alive for the first two looks, then gone
+        seen["calls"] += 1
+        return list(real()) + ([SimpleNamespace(pid=old_pid)] if seen["calls"] <= 2 else [])
+    monkeypatch.setattr(psutil, "process_iter", fake_iter); monkeypatch.setattr(S.time, "sleep", lambda s: None)
+    monkeypatch.setattr(S, "_entry", lambda name: (lambda stop_event=None: stop_event.wait(5)))
+    monkeypatch.setattr(S.Supervisor, "external", lambda self: {})
+    sup = S.Supervisor()
+    with transaction() as conn:
+        row = conn.execute("SELECT stopped_at FROM processes WHERE id = %s", (rid,)).fetchone()
+    assert row["stopped_at"] is not None and seen["calls"] >= 3             # waited, saw it go, closed the row
+    assert sup.start("pumpstream", started_by="test"); sup.stop("pumpstream", grace_s=5)
