@@ -33,6 +33,8 @@ log = logging.getLogger(__name__)
 CANDLE_DAYS = 17.0
 CHUNK_MIN = 5000
 SEED_KEY = "kalshi_dataset_seed"
+WALK_KEY = "kalshi_refresh_walk"          # where the exchange walk is (tier, page cursor) and through when it last completed
+RECOVER_DAYS = 3                          # a completed walk is re-covered this far back next round: a market settles after it closes
 STATUS_KEY = "kalshi_history_status"
 IDLE_S = 300.0
 
@@ -162,9 +164,23 @@ def market_volume(m: dict) -> float | None:
         return None
 
 
+def walk_state() -> dict:
+    with transaction() as conn:
+        r = conn.execute("SELECT value FROM ui_settings WHERE key = %s", (WALK_KEY,)).fetchone()
+    return (r["value"] if isinstance(r["value"], dict) else json.loads(r["value"] or "{}")) if r else {}
+
+
+def _save_walk(conn, st: dict) -> None:
+    conn.execute("INSERT INTO ui_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+                 (WALK_KEY, json.dumps(st, default=str)))
+
+
 def refresh_markets(rest: KalshiRest, stop: threading.Event | None = None, max_pages: int = 10_000) -> int:
     """Settled yes/no markets with volume ≥ KALSHI_MIN_MARKET_VOLUME closing after the dataset's newest day (or the start),
-    from the live tier then the archive; stops a walk once a page lies entirely before that (both tiers page newest first)."""
+    from the live tier then the archive (both page newest first). The walk is resumable: after every page its tier and page
+    cursor are saved with that page's rows (``ui_settings[WALK_KEY]``), so a timeout, a crash or a restart continues from the
+    next page instead of walking the newest months again. A completed walk records when it began; later rounds walk only the
+    live tier for markets closing since then (less ``RECOVER_DAYS``), and the archive is never walked twice."""
     start = _start(); n = 0
     with transaction() as conn:
         known_e, known_s = _known_events(conn), _known_series(conn)
@@ -172,13 +188,27 @@ def refresh_markets(rest: KalshiRest, stop: threading.Event | None = None, max_p
     if r and r["t"] and r["t"] > start:
         start = r["t"]                                         # the archive covers the days before; the API fills from there on
     min_vol = float(config.KALSHI_MIN_MARKET_VOLUME)
-    for tier, gen in (("live", rest.markets(status="settled", mve_filter="exclude", min_close_ts=int(start.timestamp()))),
-                      ("historical", rest.historical_markets(mve_filter="exclude"))):
-        for k, page in enumerate(gen):
+    st = walk_state(); now = datetime.now(timezone.utc)
+    if st.get("complete_through"):
+        lower = max(start, datetime.fromisoformat(st["complete_through"]) - timedelta(days=RECOVER_DAYS)); tiers = ["live"]
+    else:
+        lower = start; tiers = ["live", "historical"]
+    tier = st.get("tier") if st.get("tier") in tiers else None; cursor = st.get("cursor") if tier else None
+    if tier is None:                                           # a fresh walk: from the newest settlements down to ``lower``
+        tier = tiers[0]; cursor = None; st = {**st, "walk_started": now.isoformat(), "tier": tier, "cursor": None, "lower": lower.isoformat()}
+        with transaction() as conn:
+            _save_walk(conn, st)
+    if st.get("lower"):
+        lower = max(lower, datetime.fromisoformat(st["lower"]))
+    for tier in tiers[tiers.index(tier):]:
+        gen = (rest.markets(status="settled", mve_filter="exclude", min_close_ts=int(lower.timestamp()), cursor=cursor, with_cursor=True) if tier == "live"
+               else rest.historical_markets(mve_filter="exclude", cursor=cursor, with_cursor=True))
+        for k, (page, nxt) in enumerate(gen):
             if stop is not None and stop.is_set() or k >= max_pages:
-                break
-            settled = [m for m in page if (m.get("result") in ("yes", "no")) and (D.ts(m.get("close_time")) or start) >= start and (market_volume(m) or 0.0) >= min_vol]
+                return n
+            settled = [m for m in page if (m.get("result") in ("yes", "no")) and (D.ts(m.get("close_time")) or lower) >= lower and (market_volume(m) or 0.0) >= min_vol]
             closes = [D.ts(m.get("close_time")) for m in page if D.ts(m.get("close_time"))]
+            done_tier = not nxt or (closes and max(closes) < lower)
             with transaction() as conn:
                 D.upsert_markets(conn, settled, tier)
                 conn.cursor().executemany("INSERT INTO kalshi_corpus (ticker, status, settled_ts, result, open_time, close_time, seeded_from, volume) VALUES (%s,'pending',%s,%s,%s,%s,%s,%s) "
@@ -187,10 +217,16 @@ def refresh_markets(rest: KalshiRest, stop: threading.Event | None = None, max_p
                                           "volume = COALESCE(EXCLUDED.volume, kalshi_corpus.volume)",
                                           [(m["ticker"], D.ts(m.get("settlement_ts") or m.get("settled_time")), m.get("result"), D.ts(m.get("open_time")), D.ts(m.get("close_time")), tier, market_volume(m)) for m in settled])
                 ensure_catalogue(rest, conn, {m["event_ticker"] for m in settled if m.get("event_ticker")}, known_e, known_s)
+                nxt_tier = tiers[tiers.index(tier) + 1] if done_tier and tiers.index(tier) + 1 < len(tiers) else (None if done_tier else tier)
+                st = {**st, "tier": nxt_tier, "cursor": None if done_tier else nxt, "oldest_close": min(closes).isoformat() if closes else st.get("oldest_close")}
+                if done_tier and nxt_tier is None:             # every tier walked: settlements since this walk began are the next round's work
+                    st = {**st, "complete_through": st.get("walk_started") or now.isoformat(), "walk_started": None, "lower": None}
+                _save_walk(conn, st)                           # the page's rows and the place after them commit together
             n += len(settled)
-            _status(stage=f"refreshing {tier} markets", refreshed=n, tier_page=k)
-            if closes and max(closes) < start:
+            _status(stage=f"refreshing {tier} markets", refreshed=n, tier_page=k, oldest_close=st.get("oldest_close"))
+            if done_tier:
                 break
+        cursor = None
     return n
 
 

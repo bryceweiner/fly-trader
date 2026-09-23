@@ -11,7 +11,7 @@ import streamlit as st
 from fly_trader import config
 from fly_trader.db.queries import q, q1
 from fly_trader.ops.supervisor import WORKERS, get_supervisor
-from fly_trader.train.selector import is_current, is_deployable
+from fly_trader.train.selector import DATA_VERSION, is_current, is_deployable
 
 BOOK = "paper_selector"
 STALE_FEED_S = 180            # agent/minute_engine.py: no entries or exits when the newest complete minute is older
@@ -120,12 +120,17 @@ def loaded_model() -> dict | None:
     return {**s, "run": jv(r["config"]), "since": r["started_at"]} if s else None
 
 
-OUTDATED = "Trained on outdated data (before the data fixes of 2026-09-14), so its backtest is not valid and it will not be loaded."
+def outdated_line(meta: dict) -> str:
+    """Which definitions changed since this model was trained (its backtest is not comparable to a current model's)."""
+    d = (meta or {}).get("data") or {}
+    diff = [f"{k} {d.get(k)} → {v}" for k, v in DATA_VERSION.items() if d.get(k) != v and (k != "cols" or "cols" in d)]
+    return ("Trained on earlier definitions (" + "; ".join(diff) + "), so its backtest is not comparable to a current model's and it is loaded only when pinned."
+            if diff else "Trained before the definitions were recorded, so its backtest is not comparable and it is loaded only when pinned.")
 
 
 def backtest_line(meta: dict) -> str:
     if not is_current(meta):
-        return OUTDATED
+        return outdated_line(meta)
     wf, rb = meta.get("walk_forward") or {}, meta.get("random_baseline") or {}
     if not wf:
         return "No backtest recorded."

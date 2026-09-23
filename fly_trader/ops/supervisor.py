@@ -54,6 +54,7 @@ def _entry(name: str):
 
 
 WORKERS = ("discover", "runner", "train", "replay", "pumpstream", "kalshi_stream", "kalshi_runner", "kalshi_history", "kalshi_train")
+REPLACE_WAIT_S = 20.0        # how long a new console waits for the one it replaces to finish winding down (its workers flush on stop)
 
 
 class Supervisor:
@@ -69,8 +70,14 @@ class Supervisor:
         self.pid = os.getpid()
         setup("console")
         with transaction() as conn:  # thread rows left by a previous console process are stale
-            live_pids = {p.pid for p in __import__("psutil").process_iter()}
+            psutil = __import__("psutil")
             rows = conn.execute("SELECT id, pid FROM processes WHERE stopped_at IS NULL AND cmd[1] = 'thread'").fetchall()
+            others = {int(r["pid"]) for r in rows if int(r["pid"]) != self.pid}
+            for _ in range(int(REPLACE_WAIT_S / 0.5)):     # a console being replaced is still winding its workers down: wait for it,
+                if not others & {p.pid for p in psutil.process_iter()}:     # or its rows look live and the workers never start
+                    break
+                time.sleep(0.5)
+            live_pids = {p.pid for p in psutil.process_iter()}
             for r in rows:
                 # A row with our own pid is a previous console's too: this one has registered nothing yet. In a container
                 # the console is always pid 1, so without this every restart refused to register its workers.

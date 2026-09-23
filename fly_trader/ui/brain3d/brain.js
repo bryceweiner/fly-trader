@@ -27,6 +27,20 @@ const POINT_FS = `
 varying vec3 vColor; varying float vAlpha;
 void main() { if (vAlpha < 0.05) discard; vec2 d = gl_PointCoord - 0.5; float r = dot(d, d); if (r > 0.25) discard;
   gl_FragColor = vec4(vColor, vAlpha * smoothstep(0.25, 0.1, r)); }`;
+// The glow: a second point layer for the neurons that are active this minute -- a soft gaussian halo in the activity's
+// hue, sized and brightened by its magnitude, blended additively so neighbouring halos build into a haze. It shares the
+// base layer's positions, sizes and visibility (the legend hides both at once) and only the vertices with hstr > 0 draw.
+const GLOW_MIN = 0.12, GLOW_SIZE = [2.6, 4.0], GLOW_ALPHA = [0.16, 0.42];
+const HALO_VS = `
+attribute float psize; attribute float alpha; attribute vec3 hcol; attribute float hstr;
+varying vec3 vColor; varying float vA; uniform float uScale;
+void main() { vColor = hcol; vA = alpha * (hstr > 0.0 ? ${GLOW_ALPHA[0]} + ${GLOW_ALPHA[1]} * hstr : 0.0);
+  vec4 mv = modelViewMatrix * vec4(position, 1.0);
+  gl_PointSize = psize * (${GLOW_SIZE[0]} + ${GLOW_SIZE[1]} * hstr) * uScale * (320.0 / -mv.z); gl_Position = projectionMatrix * mv; }`;
+const HALO_FS = `
+varying vec3 vColor; varying float vA;
+void main() { if (vA < 0.01) discard; vec2 d = gl_PointCoord - 0.5; float r2 = dot(d, d) * 4.0;
+  float a = exp(-3.0 * r2) - exp(-3.0); if (a <= 0.0) discard; gl_FragColor = vec4(vColor, vA * a); }`;
 
 let threeP = null;
 const geomCache = new Map();          // sha → {pos, meta}
@@ -65,6 +79,10 @@ function ensureDom(parent) {
 
 function cssVar(root, name, fallback) { const v = getComputedStyle(root).getPropertyValue(name).trim(); return v || fallback; }
 function hexToRgb(s) { const m = /^#?([0-9a-f]{6})$/i.exec(s.trim()); if (!m) return null; const n = parseInt(m[1], 16); return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255]; }
+function isDark(root) {              // additive glow reads on a dark ground; on a light theme it would wash to white
+  const c = hexToRgb(cssVar(root, "--st-secondary-background-color", "#0e1117")) || [0.06, 0.07, 0.09];
+  return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2] < 0.5;
+}
 function popOf(meta) {                // per-vertex population index, computed once per geometry
   const idx = new Uint8Array(meta.n);
   meta.pop_order.forEach((name, i) => { const [lo, hi] = meta.pop_ranges[name]; idx.fill(i, lo, hi); });
@@ -87,8 +105,16 @@ function buildScene(inst, THREE, geom) {
   const mat = new THREE.ShaderMaterial({ vertexShader: POINT_VS, fragmentShader: POINT_FS, uniforms: { uScale: { value: renderer.getPixelRatio() } },
                                         transparent: true, depthWrite: false, depthTest: true });
   const points = new THREE.Points(g, mat); scene.add(points);
+  const hg = new THREE.BufferGeometry();                       // the glow layer shares position, size and visibility with the points
+  for (const name of ["position", "psize", "alpha"]) hg.setAttribute(name, g.getAttribute(name));
+  hg.setAttribute("hcol", new THREE.BufferAttribute(new Float32Array(n * 3), 3)); hg.setAttribute("hstr", new THREE.BufferAttribute(new Float32Array(n), 1));
+  hg.boundingSphere = g.boundingSphere;
+  const hmat = new THREE.ShaderMaterial({ vertexShader: HALO_VS, fragmentShader: HALO_FS, uniforms: mat.uniforms, transparent: true, depthWrite: false, depthTest: false,
+                                         blending: isDark(dom.root) ? THREE.AdditiveBlending : THREE.NormalBlending });
+  const halo = new THREE.Points(hg, hmat); halo.renderOrder = 1; halo.frustumCulled = false; scene.add(halo);
   const r = g.boundingSphere ? g.boundingSphere.radius : 300;
-  Object.assign(inst, { THREE, renderer, scene, camera, points, geom, pop, colAttr: g.getAttribute("col"), alphaAttr: g.getAttribute("alpha"),
+  Object.assign(inst, { THREE, renderer, scene, camera, points, halo, geom, pop, colAttr: g.getAttribute("col"), alphaAttr: g.getAttribute("alpha"),
+                        hcolAttr: hg.getAttribute("hcol"), hstrAttr: hg.getAttribute("hstr"),
                         lines: new Map(), orbitState: { theta: 0.6, phi: 1.15, dist: r / Math.sin(Math.PI / 8) * 1.15, target: new THREE.Vector3(), minDist: r * 0.15, maxDist: r * 8 },
                         raf: 0, hidden: new Set(), hiddenStrategies: new Set(), dragging: false, listeners: [] });
   placeCamera(inst); orbit(inst); hover(inst); resize(inst);
@@ -172,15 +198,22 @@ function recolor(inst, data) {
     }
     inst.activity = owner.some(v => v) ? act : null; inst.owner = owner;
   } else { const a = data.activity_b64 ? decode(data.activity_b64) : null; inst.activity = a && a.length === n ? a : null; inst.owner = null; }
+  const hcol = inst.hcolAttr.array, hstr = inst.hstrAttr.array; let glowing = 0;
   for (let i = 0; i < n; i++) {
-    const b = base[pop[i]]; let r, g, bl;
+    const b = base[pop[i]]; let r, g, bl, s = 0;
     if (!inst.activity || (inst.owner && !inst.owner[i])) { r = b[0] * REST; g = b[1] * REST; bl = b[2] * REST; }
-    else { const v = inst.activity[i] / 127; const m = Math.pow(Math.abs(v), 0.7); const fly = inst.owner && inst.owner[i] === 2 ? "kalshi" : "memecoin";
+    else { const v = inst.activity[i] / 127, mag = Math.abs(v), m = Math.pow(mag, 0.7); const fly = inst.owner && inst.owner[i] === 2 ? "kalshi" : "memecoin";
            const h = v >= 0 ? FLY_WARM[fly] : FLY_COOL[fly];
-           r = b[0] * DIM * (1 - m) + h[0] * m; g = b[1] * DIM * (1 - m) + h[1] * m; bl = b[2] * DIM * (1 - m) + h[2] * m; }
-    col[i * 3] = r; col[i * 3 + 1] = g; col[i * 3 + 2] = bl;
+           r = b[0] * DIM * (1 - m) + h[0] * m; g = b[1] * DIM * (1 - m) + h[1] * m; bl = b[2] * DIM * (1 - m) + h[2] * m;
+           if (mag > GLOW_MIN) {                                  // the glow: strength 0..1 above the threshold, in that fly's hue, a hot core toward white
+             s = Math.pow((mag - GLOW_MIN) / (1 - GLOW_MIN), 0.8); const w = 0.35 * s * s;
+             r = r * (1 - w) + w; g = g * (1 - w) + w; bl = bl * (1 - w) + w;
+             hcol[i * 3] = h[0] * 0.8 + 0.2 * s; hcol[i * 3 + 1] = h[1] * 0.8 + 0.2 * s; hcol[i * 3 + 2] = h[2] * 0.8 + 0.2 * s; glowing++;
+           } }
+    col[i * 3] = r; col[i * 3 + 1] = g; col[i * 3 + 2] = bl; hstr[i] = s;
   }
-  inst.colAttr.needsUpdate = true; inst.minute = minuteKey(data);
+  inst.colAttr.needsUpdate = true; inst.hcolAttr.needsUpdate = true; inst.hstrAttr.needsUpdate = true;
+  inst.halo.visible = glowing > 0; inst.minute = minuteKey(data);
 }
 
 function minuteKey(data) { return data.flies ? JSON.stringify([data.central_owner, data.flies.map(f => f.minute)]) : data.minute; }
@@ -285,6 +318,7 @@ function dispose(inst) {
   for (const [t, ty, fn, o] of inst.listeners || []) t.removeEventListener(ty, fn, o);
   if (inst.ro) inst.ro.disconnect();
   if (inst.lines) for (const l of inst.lines.values()) { l.geometry.dispose(); l.material.dispose(); }
+  if (inst.halo) { inst.halo.geometry.dispose(); inst.halo.material.dispose(); }
   if (inst.points) { inst.points.geometry.dispose(); inst.points.material.dispose(); }
   if (inst.renderer) { inst.renderer.dispose(); inst.renderer.forceContextLoss(); }
 }

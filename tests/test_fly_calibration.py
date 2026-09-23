@@ -37,3 +37,15 @@ def test_calibrate_picks_the_most_profitable_line_and_keeps_it_when_too_few_trad
     assert cal.line in fly_calibrate.candidates(scores) and cal.sizing
     few = fly_calibrate.calibrate(ts[:50], mint[:50], 1800.0, scores[:50], rets[:50], prev_line=0.123, prev_sizing=[{"lo": 0.0, "kelly": 0.1}])
     assert few.line == 0.123 and not few.changed and few.sizing == [{"lo": 0.0, "kelly": 0.1}]
+
+
+def test_a_losing_line_never_wins_even_when_it_is_the_only_one_with_enough_trades():
+    """With a day of resolved rows only the lowest line clears 100 trades; on 2026-09-23 it took the live fly from a 4.1 %
+    line to 0.25 % on 119 trades that lost 1.1 % each. Most total profit means profit: a losing line keeps the previous one."""
+    rng = np.random.default_rng(1); n = 400
+    ts = np.arange(n, dtype=float) * 60; mint = np.array([f"m{i % 200}" for i in range(n)])
+    scores = rng.uniform(0.0, 0.03, n); rets = np.full(n, -0.011) + rng.normal(0, 0.001, n)            # everything above 0.0025 trades and loses
+    cal = fly_calibrate.calibrate(ts, mint, 1800.0, scores, rets, prev_line=0.0406, prev_sizing=[{"lo": 0.0, "kelly": 0.2}])
+    assert cal.line == 0.0406 and not cal.changed                                                       # the bootstrap's line survives the bad day
+    assert any(t["trades"] >= 100 and t["total"] < 0 for t in cal.lines)                                # the losing candidate was there and was refused
+    assert fly_calibrate.calibrate(ts, mint, 1800.0, scores, rets).line == fly_calibrate.MIN_EV           # no previous line: the floor, never the loser

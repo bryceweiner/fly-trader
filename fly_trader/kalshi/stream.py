@@ -373,14 +373,14 @@ def _logged(name: str, fn, *args):
 async def _run(stop: threading.Event | None, agg: Aggregator) -> None:
     import websockets
     ctx = ssl.create_default_context(cafile=certifi.where()); backoff = 1.0
-    headers = auth_headers()
-    if headers is None:
+    if auth_headers() is None:
         raise RuntimeError("the Kalshi websocket needs KALSHI_API_KEY_ID and a readable KALSHI_PRIVATE_KEY_PATH")
     private = config.KALSHI_SUBACCOUNT > 0 or config.KALSHI_LIVE_ENABLED
     last_status = last_flush = last_quotes = last_life = 0.0; last_cat = time.time() - CATALOGUE_S + 30; last_msg = 0.0; rate_n = 0; rate_t = time.time()
     bg: dict[str, asyncio.Task | None] = {"catalogue": None, "fetch": None, "archive": None}; last_archive = time.time() - ARCHIVE_S + 120
     while not (stop is not None and stop.is_set()):
         try:
+            headers = auth_headers()                          # signed with the current timestamp: a reconnect with the first handshake's signature is refused (401)
             async with websockets.connect(config.KALSHI_WS_URL, additional_headers=headers, ssl=ctx, open_timeout=15, max_queue=None, ping_interval=20, ping_timeout=20) as ws:
                 for cmd in subscribe_commands(private):
                     await ws.send(json.dumps(cmd))

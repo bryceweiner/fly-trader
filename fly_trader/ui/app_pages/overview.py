@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 
 from fly_trader import config
+from fly_trader.agent.selector_session import pinned_snapshot
 from fly_trader.db.queries import q, q1
 from fly_trader.ui import brain3d
 from fly_trader.ui.brain3d import feed
@@ -23,6 +24,8 @@ def narrative(s: dict) -> str:
                      f"model is (up to {config.MAX_POSITION_FRACTION:.0%} of the bankroll, never the {config.GAS_RESERVE_SOL:g} SOL gas reserve) — "
                      f"and sells it **{run.get('horizon_min') or meta.get('horizon_min') or 30} minutes** later. {money}")
         lines.append(backtest_line(meta))
+        if pinned_snapshot() == m["id"]:
+            lines[-1] += " **It trades because you pinned it** (Model page); unpin it to let a current model take over."
     fly = s["fly"]
     if fly.get("stage") and fly.get("stage") != "not trading":
         lines.append("**The plastic fly** " + ("holds the seat" if s["handover"] else "races the selector on its own paper book")

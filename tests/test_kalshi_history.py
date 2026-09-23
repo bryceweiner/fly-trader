@@ -54,3 +54,76 @@ def test_prune_marks_pending_rows_beyond_the_bounds_as_skipped(monkeypatch):
     assert got["TSTH-P1"][0] == "skipped" and got["TSTH-P3"] == ("skipped", 20.0)
     assert H.market_volume({"volume_fp": "12.50"}) == 12.5 and H.market_volume({"volume": 3}) == 3.0 and H.market_volume({}) is None
     _clean()
+
+
+class FakeRest:
+    """Two tiers of settled markets, newest first, four per page with opaque cursors; ``fail_after`` pages raises a timeout."""
+
+    def __init__(self, live: list, hist: list, fail_after: int | None = None):
+        self.live, self.hist, self.fail_after = live, hist, fail_after; self.calls: list = []
+
+    def _walk(self, rows, cursor, with_cursor, min_close_ts=None):
+        if min_close_ts is not None:
+            rows = [m for m in rows if datetime.fromisoformat(m["close_time"].replace("Z", "+00:00")).timestamp() >= min_close_ts]
+        i = int(cursor.split(":")[1]) if cursor else 0
+        while i < len(rows):
+            self.calls.append(("page", i))
+            if self.fail_after is not None and len([c for c in self.calls if c[0] == "page"]) > self.fail_after:
+                raise TimeoutError("network")
+            page = rows[i:i + 4]; nxt = f"c:{i + 4}" if i + 4 < len(rows) else None
+            yield (page, nxt) if with_cursor else page
+            if nxt is None:
+                return
+            i += 4
+
+    def markets(self, cursor=None, with_cursor=False, **params):
+        yield from self._walk(self.live, cursor, with_cursor, params.get("min_close_ts"))
+
+    def historical_markets(self, cursor=None, with_cursor=False, **params):
+        yield from self._walk(self.hist, cursor, with_cursor)
+
+    def event(self, et, with_nested_markets=False):
+        self.calls.append(("event", et)); return {"event": {"event_ticker": et, "series_ticker": "TSTH", "category": "Politics"}}
+
+    def series(self, st):
+        return {"ticker": st, "category": "Politics"}
+
+
+def _mk(i: int, close: datetime, vol=5000.0) -> dict:
+    return {"ticker": f"TSTH-W{i}", "event_ticker": f"TSTH-E{i % 3}", "result": "yes", "close_time": close.strftime("%Y-%m-%dT%H:%M:%SZ"), "open_time": (close - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "settlement_ts": close.strftime("%Y-%m-%dT%H:%M:%SZ"), "volume_fp": f"{vol:.2f}", "status": "settled", "market_type": "binary", "title": "t"}
+
+
+def _clean_walk():
+    _clean()
+    with transaction() as c:
+        c.execute("DELETE FROM ui_settings WHERE key = %s", (H.WALK_KEY,)); c.execute("DELETE FROM kalshi_events WHERE event_ticker LIKE 'TSTH-%'"); c.execute("DELETE FROM kalshi_series WHERE ticker = 'TSTH'")
+
+
+def test_the_exchange_walk_resumes_from_its_saved_page_and_later_rounds_cover_only_new_settlements(monkeypatch):
+    _clean_walk(); monkeypatch.setattr(config, "KALSHI_MIN_MARKET_VOLUME", 100.0); monkeypatch.setattr(config, "KALSHI_HISTORY_START", "2026-01-01")
+    t0 = datetime(2026, 9, 20, tzinfo=timezone.utc)
+    live = [_mk(i, t0 - timedelta(hours=6 * i)) for i in range(10)]                     # 3 pages
+    hist = [_mk(100 + i, datetime(2026, 7, 20, tzinfo=timezone.utc) - timedelta(days=i)) for i in range(6)]   # 2 pages
+    rest = FakeRest(live, hist, fail_after=4)                                             # dies on the 5th page fetch (2nd of the archive)
+    with pytest.raises(TimeoutError):
+        H.refresh_markets(rest)
+    st = H.walk_state()
+    assert st["tier"] == "historical" and st["cursor"] == "c:4" and st.get("complete_through") is None and st["walk_started"]
+    with transaction() as c:
+        assert c.execute("SELECT count(*) AS n FROM kalshi_corpus WHERE ticker LIKE 'TSTH-W%'").fetchone()["n"] == 14        # 10 live + the archive's first page
+    rest2 = FakeRest(live, hist)
+    n = H.refresh_markets(rest2)
+    assert n == 2 and rest2.calls == [("page", 4)]                                         # resumed at the archive's second page: no live page fetched again
+    st = H.walk_state()
+    assert st["tier"] is None and st["cursor"] is None and st["complete_through"] and st["walk_started"] is None
+    with transaction() as c:
+        assert c.execute("SELECT count(*) AS n FROM kalshi_corpus WHERE ticker LIKE 'TSTH-W%'").fetchone()["n"] == 16
+    # the next round: only the live tier, only markets closing since the completed walk began (less the recovery margin)
+    rest3 = FakeRest(live + [_mk(50, t0 + timedelta(days=1))], hist)
+    n = H.refresh_markets(rest3)
+    assert n == 1 and all(c[0] != "page" or True for c in rest3.calls) and not any(c[1] for c in rest3.calls if c[0] == "event" and "E100" in c[1])
+    assert [c for c in rest3.calls if c[0] == "page"] == [("page", 0)]                   # one live page, the archive untouched
+    with transaction() as c:
+        assert c.execute("SELECT count(*) AS n FROM kalshi_corpus WHERE ticker = 'TSTH-W50'").fetchone()["n"] == 1
+    _clean_walk()

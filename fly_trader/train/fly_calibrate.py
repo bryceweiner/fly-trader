@@ -3,8 +3,8 @@
 Every day (live: the first minute after 00:00 UTC; replay: every day boundary) on the scored minutes whose labels
 resolved in the last ``WINDOW_DAYS`` days. Candidate lines: the selector's ``LINE_CANDIDATES`` plus the window's score
 quantiles (a compressed score scale still gets a usable line); the line with the most total net profit (fixed size, one
-position per token, the hold) over at least ``MIN_LINE_TRADES`` trades wins — the selector's rule — otherwise the previous line
-stays. Sizing: ``agent/sizing.build_table`` on the window's trades at that line (the previous table if too few).
+position per token, the hold) over at least ``MIN_LINE_TRADES`` trades wins — the selector's rule — and a line that lost
+money over the window never does; otherwise the previous line stays. Sizing: ``agent/sizing.build_table`` on the window's trades at that line (the previous table if too few).
 The fly never trades the selector's line: its scores live on their own scale.
 """
 from __future__ import annotations
@@ -47,7 +47,9 @@ def calibrate(ts: np.ndarray, mint: np.ndarray, horizon_s: float, scores: np.nda
     for c in candidates(scores[rows]):
         tr = taken_idx(ts, mint, horizon_s, rows[scores[rows] >= c]); r = rets[tr]
         table.append({"line": c, "trades": int(len(r)), "mean": float(r.mean()) if len(r) else None, "total": float(r.sum())})
-    ok = [t for t in table if t["trades"] >= min_trades]
+    # A line must have made money over the window to be chosen: with a day of resolved rows the only candidate with
+    # enough trades is the lowest line, and on 2026-09-23 it took the live fly from 4.1 % to 0.25 % on 119 losing trades.
+    ok = [t for t in table if t["trades"] >= min_trades and t["total"] > 0]
     line = max(ok, key=lambda t: t["total"])["line"] if ok else (prev_line if prev_line is not None else MIN_EV)
     tr = taken_idx(ts, mint, horizon_s, rows[scores[rows] >= line]); r = rets[tr]
     table_s = sizing.build_table(scores[tr] - line, r) or list(prev_sizing or [])

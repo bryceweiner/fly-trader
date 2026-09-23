@@ -148,15 +148,15 @@ class KalshiRest:
     def get(self, path: str, **params) -> dict:
         return self.request("GET", path, params)
 
-    def pages(self, path: str, key: str, params: dict | None = None, limit: int = 1000, max_pages: int = 10_000):
-        """Cursor walk: yields each page's ``key`` list until the cursor ends or a page is empty."""
-        cursor = None
+    def pages(self, path: str, key: str, params: dict | None = None, limit: int = 1000, max_pages: int = 10_000, cursor: str | None = None, with_cursor: bool = False):
+        """Cursor walk: yields each page's ``key`` list until the cursor ends or a page is empty. ``cursor`` resumes a walk
+        from a page cursor seen before; ``with_cursor`` yields ``(items, next_cursor)`` so the caller can persist its place."""
         for _ in range(max_pages):
             data = self.request("GET", path, {**(params or {}), "limit": limit, "cursor": cursor})
-            items = data.get(key) or []
+            items = data.get(key) or []; nxt = data.get("cursor") or None
             if items:
-                yield items
-            cursor = data.get("cursor")
+                yield (items, nxt) if with_cursor else items
+            cursor = nxt
             if not cursor or not items:
                 break
 
@@ -164,12 +164,12 @@ class KalshiRest:
     def exchange_status(self) -> dict:
         return self.get("/exchange/status")
 
-    def markets(self, **params):
+    def markets(self, cursor: str | None = None, with_cursor: bool = False, **params):
         """Pages of market rows (``status`` one of unopened|open|closed|settled|...; ``min_settled_ts`` etc.)."""
-        yield from self.pages("/markets", "markets", params)
+        yield from self.pages("/markets", "markets", params, cursor=cursor, with_cursor=with_cursor)
 
-    def historical_markets(self, **params):
-        yield from self.pages("/historical/markets", "markets", params)
+    def historical_markets(self, cursor: str | None = None, with_cursor: bool = False, **params):
+        yield from self.pages("/historical/markets", "markets", params, cursor=cursor, with_cursor=with_cursor)
 
     def historical_cutoff(self) -> dict:
         return self.get("/historical/cutoff")
