@@ -40,9 +40,12 @@ const EVM: Record<NetworkName, EvmNetwork> = {
 
 const mainnet = NETWORK === 'mainnet'
 
+/** VITE_EVM_RPC points the build at another node, e.g. a local anvil for the dry run (the chain id must match). */
+const evm: EvmNetwork = { ...EVM[NETWORK], rpcUrl: (env.VITE_EVM_RPC || '').trim() || EVM[NETWORK].rpcUrl }
+
 export const config = {
   network: NETWORK,
-  evm: EVM[NETWORK],
+  evm,
   solana: {
     cluster: (mainnet ? 'mainnet' : 'devnet') as 'mainnet' | 'devnet',
     /** appended to Solscan links */
