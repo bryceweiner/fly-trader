@@ -1,0 +1,52 @@
+{
+  "spec": "docs/vault/SPEC.md \u00a72",
+  "note": "Test-only keys derived from public strings; never fund them.",
+  "vectors": [
+    {
+      "name": "mainnet",
+      "fields": {
+        "domain": "fly-trader.app",
+        "uri": "https://fly-trader.app/vault.html",
+        "chain_id": 4663,
+        "sol_chain": "mainnet",
+        "evm": "0xc85382f3028a0d2a96b13768048da55f27d02332",
+        "sol": "HdkTVFM1vaZYZeFc9YsDzPT8fmFgq1CL7z8g2m1ujHDo",
+        "nonce": "0123456789abcdef0123456789abcdef",
+        "issued_at": "2026-09-28T00:00:00Z",
+        "expires_at": "2026-09-28T00:15:00Z"
+      },
+      "evm_checksummed": "0xc85382f3028a0d2A96B13768048dA55F27d02332",
+      "evm_text": "fly-trader.app wants you to sign in with your Ethereum account:\n0xc85382f3028a0d2A96B13768048dA55F27d02332\n\nPay the SOL the $FLY vault owes this address to Solana wallet HdkTVFM1vaZYZeFc9YsDzPT8fmFgq1CL7z8g2m1ujHDo.\n\nURI: https://fly-trader.app/vault.html\nVersion: 1\nChain ID: 4663\nNonce: 0123456789abcdef0123456789abcdef\nIssued At: 2026-09-28T00:00:00Z\nExpiration Time: 2026-09-28T00:15:00Z\nRequest ID: fly-vault-claim-v1",
+      "sol_text": "fly-trader.app wants you to sign in with your Solana account:\nHdkTVFM1vaZYZeFc9YsDzPT8fmFgq1CL7z8g2m1ujHDo\n\nReceive the SOL the $FLY vault owes Ethereum account 0xc85382f3028a0d2A96B13768048dA55F27d02332.\n\nURI: https://fly-trader.app/vault.html\nVersion: 1\nChain ID: mainnet\nNonce: 0123456789abcdef0123456789abcdef\nIssued At: 2026-09-28T00:00:00Z\nExpiration Time: 2026-09-28T00:15:00Z\nRequest ID: fly-vault-claim-v1",
+      "evm_sig": "0x8c76efdec815a7b977151fdc8706a51f924273007e218a1ec929a4e3d749425a4132d73c8fea1a2e42cbb761cd966ed742118d6c5e17d8d7358f80a6dfeb41891b",
+      "sol_sig": "66AZYUdR7Uro8iq5zJxY9ra6wToHXUQF4f8s2uhyTPJAkTa1HQ2F5VrTKW65995yw52Bkmid6dnkZZRKP71rGrYs",
+      "test_keys": {
+        "evm_private_key": "0x7a76b518c6d470a8c2cefa96cfb105c33bbdc76b9507bee9a48dce32c854d164",
+        "sol_seed": "7b9a351d9fbad1eab9eeaecdb97b4b557fcd8b39726578a86266f52f022f22f7"
+      }
+    },
+    {
+      "name": "rehearsal",
+      "fields": {
+        "domain": "localhost:5173",
+        "uri": "http://localhost:5173/vault.html",
+        "chain_id": 46630,
+        "sol_chain": "devnet",
+        "evm": "0x9cf336e87e8c176929804275dc3e3b6f58101842",
+        "sol": "G3mon5EZuTVDnMhqYk7dgAGSnAExYvVzG4kXLhmwhjQJ",
+        "nonce": "fedcba9876543210fedcba9876543210",
+        "issued_at": "2026-09-28T01:00:00Z",
+        "expires_at": "2026-09-28T01:15:00Z"
+      },
+      "evm_checksummed": "0x9Cf336E87e8C176929804275Dc3e3b6F58101842",
+      "evm_text": "localhost:5173 wants you to sign in with your Ethereum account:\n0x9Cf336E87e8C176929804275Dc3e3b6F58101842\n\nPay the SOL the $FLY vault owes this address to Solana wallet G3mon5EZuTVDnMhqYk7dgAGSnAExYvVzG4kXLhmwhjQJ.\n\nURI: http://localhost:5173/vault.html\nVersion: 1\nChain ID: 46630\nNonce: fedcba9876543210fedcba9876543210\nIssued At: 2026-09-28T01:00:00Z\nExpiration Time: 2026-09-28T01:15:00Z\nRequest ID: fly-vault-claim-v1",
+      "sol_text": "localhost:5173 wants you to sign in with your Solana account:\nG3mon5EZuTVDnMhqYk7dgAGSnAExYvVzG4kXLhmwhjQJ\n\nReceive the SOL the $FLY vault owes Ethereum account 0x9Cf336E87e8C176929804275Dc3e3b6F58101842.\n\nURI: http://localhost:5173/vault.html\nVersion: 1\nChain ID: devnet\nNonce: fedcba9876543210fedcba9876543210\nIssued At: 2026-09-28T01:00:00Z\nExpiration Time: 2026-09-28T01:15:00Z\nRequest ID: fly-vault-claim-v1",
+      "evm_sig": "0x3dad54759a99a0cb0d5d401a5b9d4a71ae764ddd16bc851112fdabac0259e7547444152544e73e2fef1c25ec6c00fcd5a117951fdd78e82d620a956f1e9b12c71b",
+      "sol_sig": "4QkaHVP4Fr8DzezNYBJyCH9XYGzMNx2tptqsj9z7m1jw7Dgw72RFcv9MSBbEr48WXKdsLSXs2Fyi2h2jMb9SXpRz",
+      "test_keys": {
+        "evm_private_key": "0xae6ea96d83d6b06e8187daed4bab6820c3247603c3a28c99799c681ebcb13ad4",
+        "sol_seed": "0720c9a88be2166cab8f2ae7f9d461b060b19b707105138b5534bb3f5e589d1b"
+      }
+    }
+  ]
+}

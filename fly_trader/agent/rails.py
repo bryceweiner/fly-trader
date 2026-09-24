@@ -67,6 +67,14 @@ def check_drawdown(conn, wealth: float, peak: float) -> bool:
     return False
 
 
+def kill_rebase_at(conn, circuit_id: int = 1):
+    """When the kill switch was last cleared: peaks are measured from marks after it, so clearing really re-bases.
+    (Before this, the live book recomputed its peak from every wealth mark ever and re-tripped the next minute.)"""
+    r = conn.execute("SELECT max(ts) AS ts FROM circuit_events WHERE kind = 'reset' AND (detail->>'kill')::boolean "
+                     "AND COALESCE((detail->>'circuit')::int, 1) = %s", (circuit_id,)).fetchone()
+    return r["ts"] if r else None
+
+
 def check_book_drawdown(conn, book: str, wealth: float, peak: float) -> bool:
     """A paper race book's own kill switch: KILL_SWITCH_DRAWDOWN below the book's peak halts that book's entries only,
     so one book's drawdown never stops the other during the race. Returns whether the book is halted."""

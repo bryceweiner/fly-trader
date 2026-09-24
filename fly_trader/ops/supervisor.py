@@ -38,10 +38,13 @@ def _entry(name: str):
     if name == "pumpstream":
         from ..ingest import pumpstream
         return pumpstream.main
+    if name == "vault":                        # the $FLY vault: flows, settlement, claims, public stats (fly_trader/vault)
+        from ..vault import worker
+        return worker.main
     raise KeyError(name)
 
 
-WORKERS = ("discover", "runner", "train", "replay", "pumpstream")
+WORKERS = ("discover", "runner", "train", "replay", "pumpstream", "vault")
 REPLACE_WAIT_S = 20.0        # how long a new console waits for the one it replaces to finish winding down (its workers flush on stop)
 
 

@@ -1,0 +1,47 @@
+# The hosted $FLY vault fly (docs/vault/SPEC.md). Installed by bootstrap-host.sh as /srv/fly/docker-compose.yml and
+# driven by the updater (fly_update.py): FLY_RELEASE picks the image tag it built from a verified release.
+# Nothing listens on a public interface: the console is on 127.0.0.1 (reach it with an SSH tunnel) and the fly only
+# makes outbound connections (Solana RPC, Jupiter, pumpapi, Robinhood Chain RPC, the site's relay, Telegram).
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: fly
+      POSTGRES_PASSWORD: fly
+      POSTGRES_DB: fly_trader
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fly -d fly_trader"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    logging: {driver: json-file, options: {max-size: "20m", max-file: "5"}}
+  fly:
+    image: fly-trader:${FLY_RELEASE:?set by the updater}
+    env_file: /srv/fly/vault.env
+    environment:
+      DATABASE_URL: postgresql://fly:fly@db:5432/fly_trader
+      DATA_DIR: /app/data
+      LOG_DIR: /app/logs
+      BOT_PRIVATE_KEY_FILE: /run/secrets/bot_key
+      VAULT_ENABLED: "1"
+    volumes:
+      - /srv/fly/data:/app/data
+      - /srv/fly/logs:/app/logs
+      - /srv/fly/secrets/bot_key:/run/secrets/bot_key:ro
+      - ${FLY_RELEASES:-/srv/fly/releases}:/releases:ro
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 150s
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 14g
+    logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}
+volumes:
+  pgdata:

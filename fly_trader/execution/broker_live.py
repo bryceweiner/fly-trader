@@ -38,7 +38,7 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 from .. import config
-from ..chain.balances import Snapshot, compute_delta, snapshot_balances
+from ..chain.balances import tx_deltas, Snapshot, compute_delta, snapshot_balances
 from ..chain.cluster_guard import assert_signing_allowed
 from ..chain.jupiter_swap import JupiterError, JupiterSwap
 from ..db.connection import transaction
@@ -278,6 +278,18 @@ class LiveBroker:
         delta = compute_delta(pre, post)
         lam = int(delta["lamports_delta"])
         tok = int(delta["token_deltas"].get(mint, 0))
+        if config.VAULT_ENABLED and chain_status == "confirmed":
+            # the vault fly's wallet also receives deposits and pays claims: take the swap's own deltas from the
+            # transaction, so SOL landing between the two snapshots never becomes part of a trade's cost or proceeds
+            try:
+                exact = tx_deltas(self.rpc.get_transaction(signature), str(taker), mint)
+            except Exception as e:
+                exact = None; log.warning("getTransaction for exact fill deltas failed: %s", type(e).__name__)
+            if exact is not None:
+                if exact != (lam, tok):
+                    log.warning("fill %s: snapshot deltas (%d, %d) differ from the transaction's (%d, %d); using the transaction",
+                                signature[:12], lam, tok, exact[0], exact[1])
+                lam, tok = exact
         # a confirmed sell that moved the tokens is a fill even at lam <= 0 (a rugged token's dust proceeds < fees)
         verified = (lam < 0 and tok > 0) if side == "buy" else (tok < 0 and (lam > 0 or chain_status == "confirmed"))
         jup_status = (ex or {}).get("status")
@@ -407,7 +419,7 @@ def swap_smoke(sol: float) -> None:
     print(f"net lamports delta: {net} ({net / config.LAMPORTS_PER_SOL:.9f} SOL)")
 
 
-def close_empty_atas(rpc=None, keypair=None, url: str | None = None, batch: int = CLOSE_ATA_BATCH) -> dict:
+def close_empty_atas(rpc=None, keypair=None, url: str | None = None, batch: int = CLOSE_ATA_BATCH, skip_mints: set | None = None) -> dict:
     """Close every zero-balance token account owned by the bot (rent back to the wallet).
     SPL Token / Token-2022 CloseAccount = instruction index 9, accounts [account, destination, owner].
     One v0 transaction per ``batch`` accounts; each is recorded as wallet_events(kind='ata_closed')."""
@@ -416,7 +428,8 @@ def close_empty_atas(rpc=None, keypair=None, url: str | None = None, batch: int 
     owner = kp.pubkey()
     owner_s = str(owner)
     rpc = rpc or HttpSolanaRpc()
-    empties = [a for a in rpc.get_token_accounts_by_owner(owner_s) if int(a["amount"]) == 0]
+    skip = set(skip_mints or ())
+    empties = [a for a in rpc.get_token_accounts_by_owner(owner_s) if int(a["amount"]) == 0 and a["mint"] not in skip and not a.get("is_native")]
     result = {"pubkey": owner_s, "candidates": len(empties), "closed": 0, "signatures": [], "failed": []}
     if not empties:
         return result
@@ -439,7 +452,7 @@ def close_empty_atas(rpc=None, keypair=None, url: str | None = None, batch: int 
             record_event("error", "close_empty_atas", "close transaction rejected", {"accounts": accounts, "error": err})
             continue
         status, _st = await_confirmation(rpc, sig, bh["last_valid_block_height"])
-        detail = {"accounts": accounts, "signature": sig, "status": status}
+        detail = {"accounts": accounts, "signature": sig, "status": status, "slot": int((_st or {}).get("slot") or 0)}
         try:
             with transaction(url) as conn:
                 conn.execute("INSERT INTO wallet_events (kind, pubkey, detail) VALUES ('ata_closed', %s, %s)",

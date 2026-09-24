@@ -264,6 +264,16 @@ class MinuteEngine:
         return out
 
 
+
+def release_stamp():
+    """``ui_settings['release_applied_at']``: changes whenever ops/release.apply_release installs new models."""
+    try:
+        with transaction() as conn:
+            r = conn.execute("SELECT value FROM ui_settings WHERE key = 'release_applied_at'").fetchone()
+        return None if r is None else str(r["value"])
+    except Exception:
+        return None
+
 def _status(key: str, value: dict) -> None:
     try:
         with transaction() as conn:
@@ -307,9 +317,14 @@ def main(stop_event: threading.Event | None = None, live: bool = False) -> None:
         return
     m_start = math.floor(time.time() / 60) * 60
     engine.warm_up(m_start); engine.last_minute = m_start - 60; last_check = time.time(); n_min = 0
+    last_release, last_stamp_check = release_stamp(), 0.0
     try:
         while not (stop_event is not None and stop_event.is_set()):
             now = time.time(); m1 = math.floor(now / 60) * 60
+            if now - last_stamp_check >= 15.0:
+                last_stamp_check, stamp = now, release_stamp()
+                if stamp != last_release:              # a release was applied (ops/release.py): reload at once
+                    last_release, last_check = stamp, 0.0
             if now - last_check >= MODEL_CHECK_S:
                 last_check = now
                 for b in engine.books:

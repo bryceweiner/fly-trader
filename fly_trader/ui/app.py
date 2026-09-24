@@ -37,6 +37,7 @@ pages = [
     st.Page("app_pages/data.py", title="Data pipelines", icon=":material/database:"),
     st.Page("app_pages/processes.py", title="Processes", icon=":material/settings_applications:"),
     st.Page("app_pages/safety.py", title="Safety & wallet", icon=":material/shield:"),
+    st.Page("app_pages/vault.py", title="$FLY vault", icon=":material/savings:", url_path="vault"),
 ]
 page = st.navigation(pages, position="top")
 status_strip()

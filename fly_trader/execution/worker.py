@@ -98,8 +98,9 @@ class ExecutionWorker:
             self.results.put(res)
 
     def _execute(self, req: ExecRequest) -> ExecResult:
+        from ..vault import walletlock                 # the vault fly: swap + ledger commit are one step for its snapshots
         try:
-            with transaction() as conn:
+            with walletlock.maybe_exclusive(config.VAULT_ENABLED), transaction() as conn:
                 fr = self.broker.swap(conn, decision_id=req.decision_id, book="live", side=req.side, mint=req.mint,
                                       amount_in=req.amount_in, slippage_bps=req.slippage_bps,
                                       max_slippage_bps=req.max_slippage_bps, step_bps=config.SLIPPAGE_STEP_BPS)

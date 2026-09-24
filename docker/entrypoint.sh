@@ -36,7 +36,12 @@ fi
 # (this image has no FlyWire annotations to build it from). The console serves it from its static directory.
 mkdir -p fly_trader/ui/static/brain && cp models/geometry/* fly_trader/ui/static/brain/ 2>/dev/null || true
 
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f seed/seed.sql
+if [ -f seed/release_seed.json ]; then
+  # a signed release (the vault server's updater): register this image's models with fresh ids, idempotently
+  fly-trader apply-release /app --bootstrap
+else
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f seed/seed.sql
+fi
 
 echo "fly-trader: device $(python -c 'from fly_trader.brain import device; print(device.describe(device.resolve()))' 2>/dev/null || echo unknown)"
 echo "fly-trader: console at http://localhost:8501"

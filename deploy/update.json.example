@@ -1,0 +1,10 @@
+{
+  "repo": "bryceweiner/fly-trader",
+  "allowed_signers": "/etc/fly/allowed_signers",
+  "principal": "bryce",
+  "namespace": "fly-trader-release",
+  "root": "/srv/fly",
+  "project": "fly",
+  "telegram_bot_token": "",
+  "telegram_chat_id": ""
+}

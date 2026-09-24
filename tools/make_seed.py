@@ -29,7 +29,7 @@ from fly_trader.db.connection import transaction
 from fly_trader.train import fly_selector, selector
 
 CONTAINER_DATA = "/app/data"
-AUTOSTART = {"pumpstream": True, "runner": True, "train": False, "replay": False, "discover": False}
+AUTOSTART = {"pumpstream": True, "runner": True, "train": False, "replay": False, "discover": False, "vault": True}
 
 
 def _lit(v) -> str:
@@ -73,6 +73,18 @@ def main(out: Path) -> None:
         stmts.append(f"INSERT INTO ui_settings (key, value) VALUES ({_lit(k)}, {_lit(val)}::jsonb) ON CONFLICT (key) DO NOTHING;")
     (out / "seed").mkdir(exist_ok=True)
     (out / "seed" / "seed.sql").write_text("\n".join(stmts) + "\n")
+    # the same rows WITHOUT ids, for installs that are already running (ops/release.apply_release assigns fresh ids)
+    import hashlib
+    def _sha(pth: Path) -> str:
+        return hashlib.sha256(pth.read_bytes()).hexdigest()
+    snaps = []
+    for sid, r in sorted(rows.items()):
+        sub = "policies" if r["kind"] == "fly_selector" else "selectors"
+        f = models / sub / Path(r["path"]).name
+        snaps.append({"kind": r["kind"], "file": f.name, "sha256": _sha(f), "note": r["note"], "source_id": sid})
+    pin_sha = next(x["sha256"] for x in snaps if x["source_id"] == int(sel_id))
+    (out / "seed" / "release_seed.json").write_text(json.dumps(
+        {"snapshots": snaps, "verdict": v, "pinned_selector_sha256": pin_sha, "autostart": AUTOSTART}, indent=1, default=str) + "\n")
 
     cdir = config.BRAIN_DIR / "connectome"; current = (cdir / "current.txt").read_text().strip()
     for name in ("current.txt", "scale.json", current):

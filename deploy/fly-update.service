@@ -1,0 +1,10 @@
+[Unit]
+Description=fly-trader vault: pull and apply signed releases from Hugging Face
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/fly/fly_update.py run
+Environment=FLY_UPDATE_CONF=/etc/fly/update.json
+TimeoutStartSec=3600

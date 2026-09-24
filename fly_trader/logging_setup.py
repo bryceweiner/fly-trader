@@ -9,6 +9,7 @@ from __future__ import annotations
 import collections
 import json
 import logging
+import logging.handlers
 import re
 import sys
 import threading
@@ -101,7 +102,7 @@ def setup(name: str, level: int = logging.INFO, to_file: bool = True) -> logging
             tf = _ThreadFilter(name)
             if to_file:
                 config.LOG_DIR.mkdir(parents=True, exist_ok=True)
-                fh = logging.FileHandler(Path(config.LOG_DIR) / f"{name}.log")
+                fh = logging.handlers.RotatingFileHandler(Path(config.LOG_DIR) / f"{name}.log", maxBytes=50_000_000, backupCount=5)
                 fh.setFormatter(fmt)
                 fh.addFilter(_ScrubFilter())
                 fh.addFilter(tf)

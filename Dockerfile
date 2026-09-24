@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1 \
     UV_PROJECT_ENVIRONMENT=/app/.venv \
     PATH="/app/.venv/bin:${PATH}"
 
-RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client ca-certificates curl \
+RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client ca-certificates curl age \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
@@ -23,4 +23,6 @@ RUN uv venv /app/.venv \
     && chmod +x /app/docker/entrypoint.sh
 
 EXPOSE 8501
+# healthy = the database answers and the console's worker threads run (the vault server's updater waits on this)
+HEALTHCHECK --interval=30s --timeout=20s --start-period=300s --retries=5 CMD fly-trader health || exit 1
 ENTRYPOINT ["/app/docker/entrypoint.sh"]
