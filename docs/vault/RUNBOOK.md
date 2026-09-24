@@ -13,13 +13,25 @@ handles your keys.
   `~/.ssh/fly_release.pub` or an age key.
 - **HF storage bucket.** Create a private bucket named `bryceweiner/fly-vault-backups`, then a fine-grained token that
   can write only to that bucket.
-- **Hardware-wallet EVM account.** This account owns the vault.
+- **Vault owner key.** Until the hardware wallet is back, the owner is a temporary key in Foundry's encrypted
+  keystore on the Mac (you type the password; it is never on disk in plaintext):
+  ```
+  cast wallet new ~/.foundry/keystores vault-owner
+  cast wallet address --account vault-owner
+  ```
+  Use a long unique password kept in your password manager. Keep an extra copy of
+  `~/.foundry/keystores/vault-owner` (it is encrypted) off the Mac. Fund the address with only a little ETH on
+  Robinhood Chain for gas. What a leaked owner key can do: pause new locks, or schedule an upgrade that stays public
+  for 8 days. Holders can leave within 7, and the fly alerts you when an upgrade is scheduled. It can never move locked
+  $FLY.
 
 ## 1. Rehearsal (testnet 46630 + Solana devnet)
 1. Deploy the contracts to the testnet:
    ```
    cd contracts
-   forge script script/DeployTestnet.s.sol --rpc-url https://rpc.testnet.chain.robinhood.com --ledger --broadcast
+   cast wallet new ~/.foundry/keystores rehearsal        # throwaway; fund it from faucet.testnet.chain.robinhood.com
+   forge script script/DeployTestnet.s.sol --rpc-url https://rpc.testnet.chain.robinhood.com --account rehearsal \
+     --sender $(cast wallet address --account rehearsal) --broadcast
    ```
    The addresses land in `contracts/deployments/46630.json`.
 2. Build the site against the testnet:
@@ -47,8 +59,9 @@ handles your keys.
 1. Deploy:
    ```
    cd contracts
-   FLY_TOKEN=0x2fC7f9E2911f20b2C4660d2AEf808aa91bDdb3D3 OWNER=<hardware account> \
-     forge script script/Deploy.s.sol --rpc-url https://rpc.mainnet.chain.robinhood.com --ledger --broadcast
+   OWNER=$(cast wallet address --account vault-owner)
+   FLY_TOKEN=0x2fC7f9E2911f20b2C4660d2AEf808aa91bDdb3D3 OWNER=$OWNER \
+     forge script script/Deploy.s.sol --rpc-url https://rpc.mainnet.chain.robinhood.com --account vault-owner --sender $OWNER --broadcast
    ```
    The script refuses to run on chain 4663 unless the delays are 8 days (timelock) and 7 days (withdrawal).
 2. Verify the contracts on Blockscout. `contracts/README.md` has a manual fallback if Cloudflare blocks forge.
@@ -105,6 +118,19 @@ handles your keys.
    If it came from another address, run `fly-trader vault reclassify <sig> deposit`.
 3. The fly trades live after the handover: at least 20 paper trades.
 4. Settlements run every Monday at 00:00 UTC. Claims open from the first one.
+
+## Hand the vault to the hardware wallet (when you're home)
+One timelock batch moves the proposer, canceller and pauser roles to the hardware wallet and removes them from the
+temporary key. It is public on-chain and takes the same 8 days as an upgrade.
+```
+cd contracts
+export VAULT=<proxy> TIMELOCK=<timelock> OLD_OWNER=$(cast wallet address --account vault-owner) NEW_OWNER=<hardware address>
+MODE=schedule forge script script/HandOver.s.sol --rpc-url https://rpc.mainnet.chain.robinhood.com --account vault-owner --sender $OLD_OWNER --broadcast
+# 8 days later, from any funded key:
+MODE=execute  forge script script/HandOver.s.sol --rpc-url https://rpc.mainnet.chain.robinhood.com --account vault-owner --sender $OLD_OWNER --broadcast
+```
+Then delete the keystore file. Until the batch executes the temporary key can still cancel it, so keep the key safe
+until then.
 
 ## Day to day
 - **New models or code:** run `publish_release.py`, with `--models` to refresh the models. The server applies the
