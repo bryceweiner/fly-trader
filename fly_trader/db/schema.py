@@ -378,6 +378,9 @@ def apply_schema(url: str | None = None) -> int:
                         for stmt in MIGRATIONS[v]:
                             cur.execute(stmt)
                         current = v
+                from ..vault.schema import VAULT_DDL     # idempotent, outside the ladder: same DDL on master and distribution
+                for stmt in VAULT_DDL:
+                    cur.execute(stmt)
                 target = max(current, SCHEMA_VERSION)
                 cur.execute(
                     "INSERT INTO schema_version (singleton, version) VALUES (true, %s) "

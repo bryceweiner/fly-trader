@@ -14,7 +14,8 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env", override=False)
 
-SECRET_ENV_NAMES = ("HELIUS_API_KEY", "JUPITER_API_KEY", "BOT_PRIVATE_KEY", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH")
+SECRET_ENV_NAMES = ("HELIUS_API_KEY", "JUPITER_API_KEY", "BOT_PRIVATE_KEY", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH",
+                    "RELAY_SECRET", "TELEGRAM_BOT_TOKEN", "VAULT_BACKUP_HF_TOKEN", "VAULT_SOLANA_RPC_URL")
 
 
 def utcnow() -> datetime:
@@ -157,13 +158,45 @@ def live_prerequisites_missing() -> list[str]:
         missing.append("MAX_POSITION_SOL")
     if GAS_RESERVE_SOL <= 0:
         missing.append("GAS_RESERVE_SOL")
-    if not env_str("BOT_PRIVATE_KEY"):
+    if not env_str("BOT_PRIVATE_KEY") and not env_str("BOT_PRIVATE_KEY_FILE"):
         missing.append("BOT_PRIVATE_KEY")
     if not JUPITER_API_KEY:
         missing.append("JUPITER_API_KEY")
     if not HELIUS_API_KEY:
         missing.append("HELIUS_API_KEY")
     return missing
+
+# ---- the $FLY vault (fly_trader/vault, docs/vault/SPEC.md): only the hosted vault fly sets VAULT_ENABLED ----
+VAULT_ENABLED = env_bool("VAULT_ENABLED", False)
+VAULT_CLUSTER = env_str("VAULT_CLUSTER", "mainnet-beta")           # devnet only for the rehearsal (trading off, claims on devnet)
+VAULT_SOLANA_RPC_URL = env_str("VAULT_SOLANA_RPC_URL")             # overrides Helius for the vault's reads/claims (the devnet rehearsal)
+FUNDING_ADDRESSES = env_list("FUNDING_ADDRESSES", [])              # SOL from these is a deposit; from anyone else, profit
+RH_CHAIN_ID = env_int("RH_CHAIN_ID", 4663)
+RH_RPC_URL = env_str("RH_RPC_URL", "https://rpc.mainnet.chain.robinhood.com")
+VAULT_ADDRESS = env_str("VAULT_ADDRESS")                            # the FlyVault proxy
+VAULT_TIMELOCK = env_str("VAULT_TIMELOCK")                          # its TimelockController (upgrade announcements)
+VAULT_START_BLOCK = env_int("VAULT_START_BLOCK", 0)                 # the proxy's deployment block: the indexer starts there
+VAULT_IMPL_CODEHASHES = env_list("VAULT_IMPL_CODEHASHES", [])       # implementation code hashes a settlement accepts
+VAULT_PERIOD_S = env_int("VAULT_PERIOD_S", 7 * 86400)               # one settlement period; the rehearsal uses 900
+VAULT_EPOCH = env_int("VAULT_EPOCH", 345_600)                       # boundaries at EPOCH + k*PERIOD; 345600 = Monday 1970-01-05 00:00 UTC
+CLAIM_MIN_LAMPORTS = env_int("CLAIM_MIN_LAMPORTS", 2_000_000)       # 0.002 SOL: above the rent-exempt minimum of a new wallet
+RELAY_URL = env_str("RELAY_URL")                                    # the site origin; the fly calls {RELAY_URL}/api/...
+RELAY_KEY_ID = env_str("RELAY_KEY_ID", "k1")
+RELAY_SECRET = env_str("RELAY_SECRET")
+VAULT_SITE_DOMAIN = env_str("VAULT_SITE_DOMAIN", "fly-trader.app")  # the domain and URI claim texts must carry
+VAULT_SITE_URI = env_str("VAULT_SITE_URI", "https://fly-trader.app/vault.html")
+FLY_TOKEN_ADDRESS = env_str("FLY_TOKEN_ADDRESS", "0x2fC7f9E2911f20b2C4660d2AEf808aa91bDdb3D3")
+FLY_POOL = env_str("FLY_POOL", "0xe6925f7bdedf22c2714c749d0ff208ce9e4bc1540938fa2b9ab2379486322edd")
+GECKO_NETWORK = env_str("GECKO_NETWORK", "robinhood")
+TELEGRAM_BOT_TOKEN = env_str("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = env_str("TELEGRAM_CHAT_ID")
+VAULT_BACKUP_RECIPIENT = env_str("VAULT_BACKUP_RECIPIENT")          # age / ssh-ed25519 public key the backups are encrypted to
+VAULT_BACKUP_BUCKET = env_str("VAULT_BACKUP_BUCKET")                # private HF storage bucket, e.g. bryceweiner/fly-vault-backups
+VAULT_BACKUP_HF_TOKEN = env_str("VAULT_BACKUP_HF_TOKEN")            # scoped to that bucket only
+
+
+def vault_solana_rpc_url() -> str:
+    return VAULT_SOLANA_RPC_URL or helius_http_url()
 
 # ---- Kalshi prediction markets (fly_trader/kalshi; the same key names as better_bot, whose client is vendored) ----
 KALSHI_API_KEY_ID = env_str("KALSHI_API_KEY_ID")

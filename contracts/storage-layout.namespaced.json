@@ -1,0 +1,176 @@
+{
+  "storage": [
+    {
+      "astId": 5577,
+      "contract": "test/utils/StorageLayoutProbe.sol:StorageLayoutProbe",
+      "label": "flyVaultStorage",
+      "offset": 0,
+      "slot": "0",
+      "type": "t_struct(FlyVaultStorage)4796_storage"
+    }
+  ],
+  "types": {
+    "t_address": {
+      "encoding": "inplace",
+      "label": "address",
+      "numberOfBytes": "20"
+    },
+    "t_array(t_uint256)dyn_storage": {
+      "encoding": "dynamic_array",
+      "label": "uint256[]",
+      "numberOfBytes": "32",
+      "base": "t_uint256"
+    },
+    "t_contract(IERC20)1023": {
+      "encoding": "inplace",
+      "label": "contract IERC20",
+      "numberOfBytes": "20"
+    },
+    "t_enum(RequestState)4757": {
+      "encoding": "inplace",
+      "label": "enum FlyVault.RequestState",
+      "numberOfBytes": "1"
+    },
+    "t_mapping(t_address,t_array(t_uint256)dyn_storage)": {
+      "encoding": "mapping",
+      "key": "t_address",
+      "label": "mapping(address => uint256[])",
+      "numberOfBytes": "32",
+      "value": "t_array(t_uint256)dyn_storage"
+    },
+    "t_mapping(t_address,t_uint256)": {
+      "encoding": "mapping",
+      "key": "t_address",
+      "label": "mapping(address => uint256)",
+      "numberOfBytes": "32",
+      "value": "t_uint256"
+    },
+    "t_mapping(t_uint256,t_struct(Request)4767_storage)": {
+      "encoding": "mapping",
+      "key": "t_uint256",
+      "label": "mapping(uint256 => struct FlyVault.Request)",
+      "numberOfBytes": "32",
+      "value": "t_struct(Request)4767_storage"
+    },
+    "t_struct(FlyVaultStorage)4796_storage": {
+      "encoding": "inplace",
+      "label": "struct FlyVault.FlyVaultStorage",
+      "numberOfBytes": "256",
+      "members": [
+        {
+          "astId": 4771,
+          "contract": "test/utils/StorageLayoutProbe.sol:StorageLayoutProbe",
+          "label": "token",
+          "offset": 0,
+          "slot": "0",
+          "type": "t_contract(IERC20)1023"
+        },
+        {
+          "astId": 4773,
+          "contract": "test/utils/StorageLayoutProbe.sol:StorageLayoutProbe",
+          "label": "totalLocked",
+          "offset": 0,
+          "slot": "1",
+          "type": "t_uint256"
+        },
+        {
+          "astId": 4775,
+          "contract": "test/utils/StorageLayoutProbe.sol:StorageLayoutProbe",
+          "label": "totalPending",
+          "offset": 0,
+          "slot": "2",
+          "type": "t_uint256"
+        },
+        {
+          "astId": 4777,
+          "contract": "test/utils/StorageLayoutProbe.sol:StorageLayoutProbe",
+          "label": "lastRequestId",
+          "offset": 0,
+          "slot": "3",
+          "type": "t_uint256"
+        },
+        {
+          "astId": 4781,
+          "contract": "test/utils/StorageLayoutProbe.sol:StorageLayoutProbe",
+          "label": "locked",
+          "offset": 0,
+          "slot": "4",
+          "type": "t_mapping(t_address,t_uint256)"
+        },
+        {
+          "astId": 4785,
+          "contract": "test/utils/StorageLayoutProbe.sol:StorageLayoutProbe",
+          "label": "pending",
+          "offset": 0,
+          "slot": "5",
+          "type": "t_mapping(t_address,t_uint256)"
+        },
+        {
+          "astId": 4790,
+          "contract": "test/utils/StorageLayoutProbe.sol:StorageLayoutProbe",
+          "label": "requests",
+          "offset": 0,
+          "slot": "6",
+          "type": "t_mapping(t_uint256,t_struct(Request)4767_storage)"
+        },
+        {
+          "astId": 4795,
+          "contract": "test/utils/StorageLayoutProbe.sol:StorageLayoutProbe",
+          "label": "requestIds",
+          "offset": 0,
+          "slot": "7",
+          "type": "t_mapping(t_address,t_array(t_uint256)dyn_storage)"
+        }
+      ]
+    },
+    "t_struct(Request)4767_storage": {
+      "encoding": "inplace",
+      "label": "struct FlyVault.Request",
+      "numberOfBytes": "64",
+      "members": [
+        {
+          "astId": 4759,
+          "contract": "test/utils/StorageLayoutProbe.sol:StorageLayoutProbe",
+          "label": "user",
+          "offset": 0,
+          "slot": "0",
+          "type": "t_address"
+        },
+        {
+          "astId": 4761,
+          "contract": "test/utils/StorageLayoutProbe.sol:StorageLayoutProbe",
+          "label": "readyAt",
+          "offset": 20,
+          "slot": "0",
+          "type": "t_uint64"
+        },
+        {
+          "astId": 4764,
+          "contract": "test/utils/StorageLayoutProbe.sol:StorageLayoutProbe",
+          "label": "state",
+          "offset": 28,
+          "slot": "0",
+          "type": "t_enum(RequestState)4757"
+        },
+        {
+          "astId": 4766,
+          "contract": "test/utils/StorageLayoutProbe.sol:StorageLayoutProbe",
+          "label": "amount",
+          "offset": 0,
+          "slot": "1",
+          "type": "t_uint256"
+        }
+      ]
+    },
+    "t_uint256": {
+      "encoding": "inplace",
+      "label": "uint256",
+      "numberOfBytes": "32"
+    },
+    "t_uint64": {
+      "encoding": "inplace",
+      "label": "uint64",
+      "numberOfBytes": "8"
+    }
+  }
+}

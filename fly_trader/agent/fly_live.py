@@ -79,7 +79,11 @@ class LiveMirror:
         opens = ledger.open_positions(conn, BOOK); held_mints = {p["mint"] for p in opens} | set(inflight)
         c = rails.load_circuit(conn)
         blocked = "kill switch" if c.kill_switch else "circuit tripped" if c.tripped else "paused" if c.entries_paused else None
-        bankroll = sol_free + sum(float(p["cost_sol"]) for p in opens); cash = sol_free; n_enter = 0; skipped = []
+        reserved = 0.0
+        if config.VAULT_ENABLED:                     # SOL owed to vault lockers stays in the wallet but is never traded
+            from ..vault import nav as vault_nav
+            reserved = vault_nav.reserved_lamports(conn) / config.LAMPORTS_PER_SOL
+        bankroll = sol_free + sum(float(p["cost_sol"]) for p in opens) - reserved; cash = sol_free - reserved; n_enter = 0; skipped = []
         for e in entries:
             if e["mint"] in held_mints:
                 skipped.append((e["mint"], "held")); continue
@@ -98,11 +102,19 @@ class LiveMirror:
             gross_v += gross; exposure += float(p["cost_sol"])
             exit_cost += gross * exit_cost_fraction(gross, ctx.resqs.get(p["mint"]) or ctx.last_resq(p["mint"]), ctx.mcap(p["mint"], px), p.get("program_label"), ctx.fees.get(p["mint"]))
         wealth = sol_free + gross_v - exit_cost
-        pk = conn.execute("SELECT max(wealth) AS pk FROM wealth_marks WHERE book = %s", (BOOK,)).fetchone(); peak = max(float(pk["pk"] or 0.0), wealth)
+        rebase = rails.kill_rebase_at(conn)
+        pk = conn.execute("SELECT max(wealth) AS pk FROM wealth_marks WHERE book = %s AND (%s::timestamptz IS NULL OR ts > %s)",
+                          (BOOK, rebase, rebase)).fetchone(); peak = max(float(pk["pk"] or 0.0), wealth)
         conn.execute("INSERT INTO wealth_marks (beat_id, book, ts, sol_free, positions_value, exit_cost, wealth, peak, drawdown, exposure, n_open) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                      "ON CONFLICT (beat_id, book) DO NOTHING",
                      (beat_id, BOOK, m1, sol_free, gross_v - exit_cost, exit_cost, wealth, peak, (1.0 - wealth / peak) if peak > 0 else 0.0, exposure, len(opens)))
-        killed = rails.check_drawdown(conn, wealth, peak)
+        if config.VAULT_ENABLED:                     # deposits, withdrawals and payouts are not performance
+            vault_nav.mark(conn, m1, snap.lamports, int(round(gross_v * config.LAMPORTS_PER_SOL)),
+                           int(round(exit_cost * config.LAMPORTS_PER_SOL)))
+            ix = vault_nav.status(conn, since=rebase)
+            killed = rails.check_drawdown(conn, ix["value"], ix["peak"], unit="index")
+        else:
+            killed = rails.check_drawdown(conn, wealth, peak)
         n_liq = self.liquidate(conn, ctx, run_id, beat_id) if killed and config.KILL_SWITCH_LIQUIDATE else 0
         gap = self.gap(conn)
         if ctx.m1_epoch - self.last_sweep >= SWEEP_S:

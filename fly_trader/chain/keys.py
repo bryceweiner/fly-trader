@@ -24,6 +24,7 @@ from ..db.connection import transaction
 log = logging.getLogger(__name__)
 
 ENV_NAME = "BOT_PRIVATE_KEY"
+FILE_ENV_NAME = "BOT_PRIVATE_KEY_FILE"
 ENV_PATH = config.REPO_ROOT / ".env"
 _ENV_LINE = re.compile(r"^\s*(?:export\s+)?BOT_PRIVATE_KEY\s*=")
 
@@ -61,8 +62,16 @@ def _keypair_from(raw: str | None) -> Keypair:
 
 
 def load_keypair(raw: str | None = None) -> Keypair:
-    """Keypair from ``BOT_PRIVATE_KEY`` (or ``raw``). Accepts base58 or a JSON int array."""
-    return _keypair_from(raw if raw is not None else os.environ.get(ENV_NAME))
+    """Keypair from ``BOT_PRIVATE_KEY`` (or ``raw``), else from the file ``BOT_PRIVATE_KEY_FILE`` names (the hosted fly
+    mounts its key read-only there so it never sits in the container's environment). Base58 or a JSON int array."""
+    if raw is None:
+        raw = os.environ.get(ENV_NAME)
+        if not (raw or "").strip() and os.environ.get(FILE_ENV_NAME, "").strip():
+            try:
+                raw = Path(os.environ[FILE_ENV_NAME].strip()).read_text(encoding="utf-8")
+            except OSError as e:
+                raise WalletKeyError(f"could not read {FILE_ENV_NAME}: {type(e).__name__}") from None
+    return _keypair_from(raw)
 
 
 def bot_pubkey(raw: str | None = None) -> str:
@@ -83,6 +92,25 @@ def env_file_has_key(path: Path | None = None) -> bool:
         return False
     with open(path, encoding="utf-8") as f:
         return any(_ENV_LINE.match(line) for line in f)
+
+
+def create_wallet_file(key_file: Path, url: str | None = None) -> str:
+    """The hosted vault fly's variant: write the new key to its own file (mode 600, refused if it exists) instead of
+    .env, so the secret is mounted read-only into the container and never enters its environment. Returns the pubkey."""
+    key_file = Path(key_file)
+    kp = Keypair()
+    pubkey = str(kp.pubkey())
+    fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)   # O_EXCL: never overwrite a key
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(base58.b58encode(bytes(kp)).decode() + "\n")
+    del kp
+    try:
+        with transaction(url) as conn:
+            conn.execute("INSERT INTO wallet_events (kind, pubkey, detail) VALUES ('created', %s, %s)", (pubkey, Jsonb({"key_file": str(key_file)})))
+    except Exception as e:
+        log.warning("wallet_events insert failed after wallet creation: %s", type(e).__name__)
+    log.info("bot wallet created: %s (key file)", pubkey)
+    return pubkey
 
 
 def create_wallet(env_path: Path | None = None, url: str | None = None) -> str:

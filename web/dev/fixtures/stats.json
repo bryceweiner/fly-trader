@@ -1,0 +1,106 @@
+{
+ "ref": 1790164800,
+ "stats": {
+  "v": 1,
+  "ts": 1790164780,
+  "cluster": "mainnet",
+  "fly": {
+   "state": "live",
+   "wallet": "62xmPWibK9SVZte9q1HBuajWr8D9MVdxFFaTwD8X2abr",
+   "handover": true,
+   "kill_switch": false,
+   "entries_paused": false,
+   "model": {
+    "fly": 62,
+    "selector": 59,
+    "release": 3
+   }
+  },
+  "wallet": {
+   "native": 4864851959,
+   "token_accounts": 6100000,
+   "open_cost": 750000000,
+   "positions_value": 760970000,
+   "exit_cost": 9131640,
+   "nav": 5622790319
+  },
+  "ledger": {
+   "deposits": 5000000000,
+   "withdrawals": 0,
+   "claims_paid": 321130224,
+   "realized": 942082183,
+   "booked_realized": 893682183,
+   "allocated": 815064546,
+   "reserved": 493934322,
+   "pot": 127017637
+  },
+  "prices": {
+   "sol_usd": 218.37,
+   "fly_usd": 0.0000412,
+   "ts": 1790164755
+  },
+  "vault": {
+   "address": "0x0000000000000000000000000000000000000000",
+   "chain_id": 4663,
+   "total_locked": "412750000000000000123456789",
+   "total_pending": "18000000000000000000000000",
+   "earners": 41,
+   "finalized_block": 70639000,
+   "paused": false,
+   "impl": "0x0000000000000000000000000000000000000000",
+   "upgrade_scheduled": null
+  },
+  "settlement": {
+   "next_at": 1790553600,
+   "last": {
+    "id": 3,
+    "period_start": 1789344000,
+    "period_end": 1789948800,
+    "realized": 815611208,
+    "pot": 546661784,
+    "allocated": 546115122,
+    "carried": 546662,
+    "earners": 32,
+    "total_weight": "28512000000000000000000000000000",
+    "status": "allocated"
+   }
+  },
+  "positions": [
+   {
+    "mint": "6oTuvvW1rzD52JAXsuUvwY2GCKjK7DnkLoQy1B8xpump",
+    "symbol": "MOTH",
+    "opened_at": 1790162400,
+    "cost": 180000000,
+    "value": 194940000,
+    "entry_price": 0.00000412,
+    "mark_price": 0.00000446196,
+    "hold_min": 40
+   },
+   {
+    "mint": "6WcAMCE7vSM35gsoHeB8snrHy8JA6bF5xtTUN7a7pump",
+    "symbol": "NECTAR",
+    "opened_at": 1790163900,
+    "cost": 250000000,
+    "value": 244750000,
+    "entry_price": 0.0000187,
+    "mark_price": 0.0000183073,
+    "hold_min": 15
+   },
+   {
+    "mint": "AA7pwT2dDYyv3rPUHWtQvMbKGP54NAdh44ymetSDpump",
+    "symbol": "FRUIT",
+    "opened_at": 1790159400,
+    "cost": 320000000,
+    "value": 321280000,
+    "entry_price": 0.000093,
+    "mark_price": 0.000093372,
+    "hold_min": 90
+   }
+  ],
+  "index": {
+   "value": 1.17874,
+   "peak": 1.17874,
+   "drawdown": 0.012
+  }
+ }
+}

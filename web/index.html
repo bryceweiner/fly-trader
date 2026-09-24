@@ -1,78 +1,40 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>fly-trader — a fruit fly connectome that trades Robinhood Chain memecoins</title>
+  <!-- @include head -->
+  <title>fly-trader — a fruit fly connectome that trades Solana memecoins</title>
   <meta name="description" content="fly-trader runs the complete FlyWire fruit-fly connectome — 139,255 neurons, 2.7 million connections — as a trained trading policy on pump.fun graduates. Open source, experimental, no promises.">
   <link rel="canonical" href="https://fly-trader.app/">
-  <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <meta property="og:type" content="website">
   <meta property="og:title" content="fly-trader">
   <meta property="og:description" content="A fruit fly is learning to trade. 139,255 real neurons, real synapses, real markets. Open source and experimental.">
   <meta property="og:url" content="https://fly-trader.app/">
   <meta property="og:image" content="https://fly-trader.app/assets/og.png">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="theme-color" content="#0b0a10">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 
-<header class="nav">
-  <div class="shell nav-inner">
-    <a class="logo" href="#home" aria-label="fly-trader home">fly<span>trader</span></a>
-    <ul class="nav-links">
-      <li><a href="#home">Home</a></li>
-      <li><a href="#about">About</a></li>
-      <li><a href="#fly">$FLY</a></li>
-      <li><a href="#get-started">Get Started</a></li>
-    </ul>
-    <div class="nav-right">
-      <a class="icon-link" data-link="github" href="https://github.com/bryceweiner/fly-trader" target="_blank" rel="noopener" aria-label="GitHub repository">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.1.79-.25.79-.56v-2.17c-3.2.7-3.87-1.37-3.87-1.37-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.76 2.69 1.25 3.35.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.41-2.69 5.38-5.25 5.67.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>
-      </a>
-      <a class="icon-link" data-link="x" href="#" target="_blank" rel="noopener" aria-label="X community">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.24 2.25h3.31l-7.23 8.26 8.5 11.24h-6.66l-5.21-6.82-5.97 6.82H1.67l7.73-8.84L1.25 2.25h6.83l4.71 6.23 5.45-6.23zm-1.16 17.52h1.83L7.08 4.13H5.12l11.96 15.64z"/></svg>
-      </a>
-      <button class="burger" type="button" aria-label="Open menu" aria-expanded="false" aria-controls="mobile-menu">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
-      </button>
-    </div>
-  </div>
-  <nav class="mobile-menu" id="mobile-menu" hidden>
-    <ul>
-      <li><a href="#home">Home</a></li>
-      <li><a href="#about">About</a></li>
-      <li><a href="#fly">$FLY</a></li>
-      <li><a href="#get-started">Get Started</a></li>
-      <li><a data-link="github" href="https://github.com/bryceweiner/fly-trader" target="_blank" rel="noopener">GitHub</a></li>
-      <li><a data-link="x" href="#" target="_blank" rel="noopener">X community</a></li>
-    </ul>
-  </nav>
-</header>
+<!-- @include header -->
 
-<main>
+<main id="main">
 
 <!-- ============ HERO ============ -->
 <section class="hero" id="home">
   <div class="hero-media" aria-hidden="true">
-    <video autoplay muted loop playsinline preload="metadata" poster="assets/fafb.png">
-      <source src="assets/hero.av1.mp4" type='video/mp4; codecs="av01.0.08M.08"'>
-      <source src="assets/hero.h264.mp4" type='video/mp4; codecs="avc1.640028"'>
+    <video autoplay muted loop playsinline preload="metadata" poster="/assets/fafb.png">
+      <source src="/assets/hero.av1.mp4" type='video/mp4; codecs="av01.0.08M.08"'>
+      <source src="/assets/hero.h264.mp4" type='video/mp4; codecs="avc1.640028"'>
     </video>
     <picture class="hero-poster">
-      <source srcset="assets/fafb.webp" type="image/webp">
-      <img src="assets/fafb.png" alt="" width="768" height="600">
+      <source srcset="/assets/fafb.webp" type="image/webp">
+      <img src="/assets/fafb.png" alt="" width="768" height="600">
     </picture>
   </div>
   <div class="hero-scrim" aria-hidden="true"></div>
 
   <div class="shell">
     <div class="hero-content">
-      <div class="chip"><span class="dot" aria-hidden="true"></span>Experimental · Robinhood Chain mainnet</div>
+      <div class="chip"><span class="dot" aria-hidden="true"></span>Experimental · Solana mainnet · $FLY on Robinhood Chain</div>
 
       <h1 class="display hero-title headline" id="headline" aria-live="polite">
         <span class="passage is-active">
@@ -97,7 +59,7 @@
       <div class="btn-row hard-shadow">
         <a class="btn primary" href="#get-started">Get Started</a>
         <a class="btn" href="#about">About the Fly</a>
-        <a class="btn violet" href="#fly">$FLY</a>
+        <a class="btn violet" href="vault.html">$FLY Vault</a>
       </div>
     </div>
   </div>
@@ -165,7 +127,7 @@
     <div class="sub">
       <h3 class="sub-title">Training data</h3>
       <div class="prose">
-        <p>The fly learns from the post-graduation life of pump.fun tokens on Robinhood Chain: candles and per-trade rows pulled from pump.fun's own swap API, an hourly historical replay archive, and a live tape of every swap on watched pools streamed through Helius. Token metadata and holder statistics come from Jupiter. All of it is stored in Postgres and Parquet and every decision is replayable from journaled inputs.</p>
+        <p>The fly learns from the post-graduation life of pump.fun tokens on Solana: candles and per-trade rows pulled from pump.fun's own swap API, an hourly historical replay archive, and a live tape of every swap on watched pools streamed through Helius. Token metadata and holder statistics come from Jupiter. All of it is stored in Postgres and Parquet and every decision is replayable from journaled inputs.</p>
       </div>
       <div class="stat-grid">
         <div class="stat"><span class="micro">Market features</span><div class="value">45</div><p class="note">Per token per beat, over 1 m · 5 m · 15 m · 1 h · 3 h windows</p></div>
@@ -263,7 +225,7 @@
     <div class="section-head">
       <span class="micro accent">02 · Token</span>
       <h2 class="section-title">$FLY</h2>
-      <p class="lede">A Robinhood Chain token launching on ponsfamily.com alongside the software. It exists to gather the community around the experiment. It has no utility today.</p>
+      <p class="lede">$FLY is the project's token on Robinhood Chain. Lock it in the vault and the fly pays you a share of its closed-trade profit every week, in SOL.</p>
     </div>
 
     <div class="token-grid">
@@ -272,7 +234,7 @@
           <div><span class="micro">Ticker</span><div class="v accent">$FLY</div></div>
           <div><span class="micro">Total supply</span><div class="v">1,000,000,000</div></div>
           <div><span class="micro">Chain</span><div class="v">Robinhood Chain</div></div>
-          <div><span class="micro">Venue</span><div class="v">ponsfamily.com</div></div>
+          <div><span class="micro">Launched on</span><div class="v">ponsfamily.com</div></div>
           <div class="wide">
             <span class="micro">Contract address</span>
             <div class="ca-row">
@@ -282,21 +244,30 @@
           </div>
         </div>
         <div class="btn-row mt-24">
-          <a class="btn violet" id="buy-fly" href="#" target="_blank" rel="noopener" aria-disabled="true">Buy on ponsfamily.com</a>
+          <a class="btn violet" href="vault.html">Open the Vault</a>
+          <a class="btn" href="trading.html">Buy on the Trading page</a>
+        </div>
+        <div class="btn-row mt-24">
+          <a class="btn" id="buy-fly" href="#" target="_blank" rel="noopener" aria-disabled="true">ponsfamily.com</a>
           <a class="btn" data-link="x" href="#" target="_blank" rel="noopener">Join the X community</a>
         </div>
-        <p class="micro mt-24">Contract address and buy link are published here and on the X community at launch. Anything elsewhere is not us.</p>
+        <p class="micro mt-24">The contract address above and in the X community is the only one. Anything elsewhere is not us.</p>
       </div>
 
       <div>
         <div class="panel">
-          <span class="micro">Utility</span>
-          <p class="coming-soon">Coming soon!</p>
-          <p>Ties between $FLY and the fly-trader software are forthcoming and will be announced on this page and in the X community. Until they are announced, the token does nothing and confers nothing.</p>
+          <span class="micro">The vault</span>
+          <ol class="plain-steps">
+            <li><strong>Lock.</strong> Lock $FLY in the FlyVault contract on Robinhood Chain. Locked $FLY earns from the moment it is locked.</li>
+            <li><strong>Earn.</strong> Every Monday 00:00 UTC the fly's closed-trade profit for the week, above the operator's deposits and net of every fee, is split between lockers by locked $FLY × time locked. 100 % of it goes to lockers.</li>
+            <li><strong>Claim.</strong> Connect your Robinhood Chain wallet and a Solana wallet, sign one claim with both, and the fly sends your SOL, usually within a minute. Payouts never expire.</li>
+            <li><strong>Withdraw.</strong> Request a withdrawal at any time. That amount stops earning at once and can be withdrawn 7 days later. Cancelling the request locks it again.</li>
+          </ol>
+          <p>Everything is public: the fly's wallet, its open positions, every trade, every deposit and every weekly settlement are on the <a href="vault.html">Vault page</a>.</p>
         </div>
         <div class="notice danger mt-24">
-          <span class="micro">Disclaimer</span>
-          <p>$FLY is a memecoin. It is not an offer or solicitation to buy securities, and nothing on this site is investment, financial, legal, or tax advice. There is no expectation of profit from the efforts of others; the token may lose all of its value. It confers no ownership, revenue, governance, or other rights, and no utility is promised. Do your own research, understand the risks of ponsfamily.com and Robinhood Chain tokens, and comply with the law where you live. Only spend what you can afford to lose.</p>
+          <span class="micro">Risks</span>
+          <p>The fly can lose money, and weeks with a loss pay nothing: losses are carried forward and must be made back before anything is paid again. The vault is a smart contract and can have bugs; it can be upgraded after a public 8-day delay. $FLY's price is set by the market and can go to zero. Only lock what you can afford to lose.</p>
         </div>
       </div>
     </div>
@@ -326,7 +297,7 @@
         <li><strong>Python 3.13 and uv</strong><span>uv installs everything else. No other runtime is required.</span></li>
         <li><strong>PostgreSQL</strong><span>Local database for the tape, decisions, fills, and brain snapshots. Homebrew's works.</span></li>
         <li><strong>A Helius API key</strong><span>Streams swaps and resolves transactions. The free developer tier is enough to watch.</span></li>
-        <li><strong>A Robinhood Chain wallet (optional)</strong><span>Only for live trading. The bot creates its own; you fund it with what you are willing to lose.</span></li>
+        <li><strong>A Solana wallet (optional)</strong><span>Only for live trading. The bot creates its own; you fund it with what you are willing to lose.</span></li>
         <li><strong>Patience</strong><span>The connectome build downloads about 100 MB of FlyWire data and the first training run takes hours.</span></li>
       </ul>
     </div>
@@ -394,43 +365,6 @@ uv run fly-trader swap-smoke --sol 0.01</pre>
 
 </main>
 
-<footer class="footer">
-  <div class="shell">
-    <div class="footer-grid">
-      <div class="footer-brand">
-        <a class="logo" href="#home">fly<span>trader</span></a>
-        <p>A fruit-fly connectome trading Robinhood Chain memecoins. Open source, experimental, and honest about both.</p>
-      </div>
-      <div>
-        <h5 class="micro">Project</h5>
-        <ul>
-          <li><a href="#about">About</a></li>
-          <li><a href="#fly">$FLY</a></li>
-          <li><a href="#get-started">Get Started</a></li>
-        </ul>
-      </div>
-      <div>
-        <h5 class="micro">Community</h5>
-        <ul>
-          <li><a data-link="github" href="https://github.com/bryceweiner/fly-trader" target="_blank" rel="noopener">GitHub</a></li>
-          <li><a data-link="x" href="#" target="_blank" rel="noopener">X community</a></li>
-        </ul>
-      </div>
-      <div>
-        <h5 class="micro">Legal</h5>
-        <ul>
-          <li><a href="terms.html">Terms of Service</a></li>
-          <li><a href="privacy.html">Privacy Policy</a></li>
-        </ul>
-      </div>
-    </div>
-    <div class="footer-bottom">
-      <span>© <span id="year">2026</span> fly-trader · MIT licensed · <a href="https://ponsfamily.com" target="_blank" rel="noopener">ponsfamily.com</a></span>
-      <span>Not financial advice · <a href="https://flywire.ai" target="_blank" rel="noopener">Connectome: FlyWire</a></span>
-    </div>
-  </div>
-</footer>
-
-<script src="site.js"></script>
+<!-- @include footer -->
 </body>
 </html>

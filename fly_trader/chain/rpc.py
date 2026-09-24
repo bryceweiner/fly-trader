@@ -71,6 +71,12 @@ def _request_summary(method: str, params: list | None) -> dict:
         return {"n": len(params[0]), "signature_prefixes": [str(s)[:12] for s in params[0]]}
     if method == "getTransaction" and params:
         return {"signature_prefix": str(params[0])[:12]}
+    if method == "getSignaturesForAddress" and params:
+        opts = dict(params[1]) if len(params) > 1 and isinstance(params[1], dict) else {}
+        for k in ("before", "until"):
+            if opts.get(k):
+                opts[k] = str(opts[k])[:12]
+        return {"address": str(params[0]), **opts}
     return {"params": params}
 
 
@@ -147,19 +153,39 @@ class HttpSolanaRpc:
         res = self.call("getBalance", [str(pubkey), {"commitment": COMMITMENT}])
         return int(res["value"])
 
-    def get_token_accounts_by_owner(self, pubkey) -> list[dict]:
+    def get_balance_ctx(self, pubkey, commitment: str = COMMITMENT, min_context_slot: int | None = None) -> tuple[int, int]:
+        """(lamports, context slot). ``min_context_slot`` makes a lagging node refuse instead of answering stale."""
+        opts: dict = {"commitment": commitment}
+        if min_context_slot:
+            opts["minContextSlot"] = int(min_context_slot)
+        res = self.call("getBalance", [str(pubkey), opts])
+        return int(res["value"]), int(res["context"]["slot"])
+
+    def get_signatures_for_address(self, pubkey, before: str | None = None, until: str | None = None,
+                                   limit: int = 1000, commitment: str = "finalized") -> list[dict]:
+        """Newest first: ``{signature, slot, err, blockTime, confirmationStatus, memo}``."""
+        opts: dict = {"limit": int(limit), "commitment": commitment}
+        if before:
+            opts["before"] = before
+        if until:
+            opts["until"] = until
+        return self.call("getSignaturesForAddress", [str(pubkey), opts]) or []
+
+    def get_token_accounts_by_owner(self, pubkey, commitment: str = COMMITMENT) -> list[dict]:
         """All token accounts of ``pubkey`` under BOTH token programs, as
-        ``{address, mint, amount:int, decimals, program}``."""
+        ``{address, mint, amount:int, decimals, program, lamports, is_native, state}``."""
         out: list[dict] = []
         for program in TOKEN_PROGRAM_IDS:
             res = self.call("getTokenAccountsByOwner",
-                            [str(pubkey), {"programId": program}, {"encoding": "jsonParsed", "commitment": COMMITMENT}])
+                            [str(pubkey), {"programId": program}, {"encoding": "jsonParsed", "commitment": commitment}])
             for item in (res or {}).get("value") or []:
                 try:
                     info = item["account"]["data"]["parsed"]["info"]
                     amt = info["tokenAmount"]
                     out.append({"address": item["pubkey"], "mint": info["mint"], "amount": int(amt["amount"]),
-                                "decimals": int(amt["decimals"]), "program": program})
+                                "decimals": int(amt["decimals"]), "program": program,
+                                "lamports": int(item["account"].get("lamports") or 0),
+                                "is_native": bool(info.get("isNative")), "state": info.get("state")})
                 except (KeyError, TypeError, ValueError):
                     log.warning("unparsed token account %s", item.get("pubkey") if isinstance(item, dict) else "?")
         return out

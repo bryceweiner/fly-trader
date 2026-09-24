@@ -1,0 +1,38 @@
+[
+ {
+  "id": 3,
+  "period_start": 1789344000,
+  "period_end": 1789948800,
+  "realized": 815611208,
+  "pot": 546661784,
+  "allocated": 546115122,
+  "carried": 546662,
+  "earners": 32,
+  "total_weight": "28512000000000000000000000000000",
+  "status": "allocated"
+ },
+ {
+  "id": 2,
+  "period_start": 1788739200,
+  "period_end": 1789344000,
+  "realized": 242990976,
+  "pot": 0,
+  "allocated": 0,
+  "carried": 0,
+  "earners": 23,
+  "total_weight": "23328000000000000000000000000000",
+  "status": "allocated"
+ },
+ {
+  "id": 1,
+  "period_start": 1788134400,
+  "period_end": 1788739200,
+  "realized": 269218643,
+  "pot": 269218643,
+  "allocated": 268949424,
+  "carried": 269219,
+  "earners": 14,
+  "total_weight": "18144000000000000000000000000000",
+  "status": "allocated"
+ }
+]

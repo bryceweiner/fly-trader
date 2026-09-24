@@ -1,0 +1,38 @@
+{
+  "name": "fly-trader-web",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "fly-trader.app: static site with the Trading and Vault pages",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@noble/curves": "1.9.7",
+    "@reown/appkit": "1.8.24",
+    "@reown/appkit-adapter-solana": "1.8.24",
+    "@reown/appkit-adapter-wagmi": "1.8.24",
+    "@wagmi/connectors": "6.2.0",
+    "@wagmi/core": "2.22.1",
+    "bs58": "6.0.0",
+    "lightweight-charts": "5.2.1",
+    "viem": "2.56.8",
+    "wagmi": "2.19.5"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.43",
+    "typescript": "7.0.2",
+    "vite": "8.3.0",
+    "vitest": "4.1.11"
+  },
+  "overrides": {
+    "@wagmi/connectors": "6.2.0"
+  }
+}

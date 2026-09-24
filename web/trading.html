@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <!-- @include head -->
+  <title>Trade $FLY — fly-trader</title>
+  <meta name="description" content="Buy and sell $FLY on Robinhood Chain with ETH or USDG through KyberSwap, with a live chart of the Fly / NVDA pool. No site fee.">
+  <link rel="canonical" href="https://fly-trader.app/trading.html">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Trade $FLY — fly-trader">
+  <meta property="og:description" content="Live $FLY chart and swaps with ETH or USDG on Robinhood Chain.">
+  <meta property="og:url" content="https://fly-trader.app/trading.html">
+  <meta property="og:image" content="https://fly-trader.app/assets/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+</head>
+<body>
+<!-- @include header -->
+
+<main id="main">
+<section class="section page">
+  <div class="shell">
+    <div class="section-head">
+      <span class="micro accent">Trading</span>
+      <h1 class="page-title">Trade $FLY</h1>
+      <p class="lede">Swap ETH or USDG for $FLY on Robinhood Chain, or back. Routes come from KyberSwap's aggregator and every transaction is signed in your own wallet. The site adds no fee.</p>
+    </div>
+
+    <div id="network-note" hidden></div>
+
+    <div class="stat-grid market-strip" aria-label="$FLY market">
+      <div class="stat"><span class="micro">Price</span><div class="value" id="m-price">—</div></div>
+      <div class="stat"><span class="micro">24 h change</span><div class="value" id="m-change">—</div></div>
+      <div class="stat"><span class="micro">FDV</span><div class="value violet" id="m-fdv">—</div></div>
+      <div class="stat"><span class="micro">Liquidity</span><div class="value violet" id="m-liq">—</div></div>
+      <div class="stat"><span class="micro">24 h volume</span><div class="value lime" id="m-vol">—</div></div>
+    </div>
+    <p class="micro source-note" id="m-source">Market data: GeckoTerminal, Fly / NVDA pool</p>
+
+    <div class="trade-layout">
+      <div class="panel chart-panel">
+        <div class="panel-head">
+          <span class="micro">$FLY / USD</span>
+          <div class="tabs" role="tablist" aria-label="Candle interval" id="interval-tabs">
+            <button type="button" role="tab" data-interval="15m" aria-selected="false">15m</button>
+            <button type="button" role="tab" data-interval="1h" aria-selected="true">1h</button>
+            <button type="button" role="tab" data-interval="4h" aria-selected="false">4h</button>
+            <button type="button" role="tab" data-interval="1d" aria-selected="false">1d</button>
+          </div>
+        </div>
+        <div class="chart" id="price-chart" role="img" aria-label="$FLY price candles and volume"></div>
+        <p class="chart-msg micro" id="chart-msg" hidden></p>
+        <p class="chart-credit">Chart by <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView Lightweight Charts™</a> · data from <a href="https://www.geckoterminal.com/" target="_blank" rel="noopener">GeckoTerminal</a></p>
+      </div>
+
+      <aside class="trade-side">
+        <div class="panel">
+          <span class="micro">Wallet</span>
+          <div id="wallet-bar"></div>
+        </div>
+
+        <form class="panel swap" id="swap-form" novalidate>
+          <div class="tabs full" role="tablist" aria-label="Side" id="side-tabs">
+            <button type="button" role="tab" data-side="buy" aria-selected="true">Buy $FLY</button>
+            <button type="button" role="tab" data-side="sell" aria-selected="false">Sell $FLY</button>
+          </div>
+
+          <div class="field">
+            <label for="swap-asset" id="swap-asset-label">Pay with</label>
+            <select id="swap-asset">
+              <option value="ETH">ETH</option>
+              <option value="USDG">USDG</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="swap-amount" id="swap-amount-label">You pay (ETH)</label>
+            <div class="input-row">
+              <input id="swap-amount" type="text" inputmode="decimal" autocomplete="off" placeholder="0.0" spellcheck="false">
+              <button type="button" class="btn small" id="swap-max">Max</button>
+            </div>
+            <p class="hint" id="swap-balance">Balance: —</p>
+          </div>
+
+          <dl class="quote" id="swap-quote" aria-live="polite">
+            <div><dt>You receive (est.)</dt><dd id="q-out">—</dd></div>
+            <div><dt>Minimum received</dt><dd id="q-min">—</dd></div>
+            <div><dt>Price impact</dt><dd id="q-impact">—</dd></div>
+            <div><dt>Network fee (est.)</dt><dd id="q-gas">—</dd></div>
+          </dl>
+
+          <details class="slippage">
+            <summary>Slippage tolerance: <span id="slip-view">1.00 %</span></summary>
+            <div class="chips-row" role="group" aria-label="Slippage presets">
+              <button type="button" class="chip-btn" data-slip="50">0.5 %</button>
+              <button type="button" class="chip-btn" data-slip="100">1 %</button>
+              <button type="button" class="chip-btn" data-slip="300">3 %</button>
+            </div>
+            <div class="field">
+              <label for="slip-input">Custom (%)</label>
+              <input id="slip-input" type="text" inputmode="decimal" autocomplete="off" value="1">
+            </div>
+          </details>
+
+          <button type="submit" class="btn primary block" id="swap-btn" disabled>Enter an amount</button>
+          <p class="status-line" id="swap-status" role="status" aria-live="polite" hidden></p>
+          <p class="hint">Approvals are for the exact amount only. The swap is sent to KyberSwap's router <a class="mono" id="router-link" href="#" target="_blank" rel="noopener">—</a> and nowhere else; the site refuses any other.</p>
+        </form>
+
+        <div class="panel">
+          <span class="micro">Balances</span>
+          <div class="kv compact">
+            <div><span class="micro">ETH</span><div class="v" id="b-eth">—</div></div>
+            <div><span class="micro">USDG</span><div class="v" id="b-usdg">—</div></div>
+            <div><span class="micro">$FLY in wallet</span><div class="v accent" id="b-fly">—</div></div>
+            <div><span class="micro">$FLY locked</span><div class="v" id="b-locked">—</div><a class="hint-link" href="vault.html">Vault →</a></div>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <div class="sub">
+      <h2 class="sub-title">Contracts</h2>
+      <div class="kv">
+        <div><span class="micro">$FLY token</span><div class="v"><a class="mono" id="c-fly" href="#" target="_blank" rel="noopener">—</a></div></div>
+        <div><span class="micro">USDG</span><div class="v"><a class="mono" id="c-usdg" href="#" target="_blank" rel="noopener">—</a></div></div>
+        <div><span class="micro">KyberSwap router</span><div class="v"><a class="mono" id="c-router" href="#" target="_blank" rel="noopener">—</a></div></div>
+        <div><span class="micro">Main pool</span><div class="v"><a class="mono" id="c-pool" href="#" target="_blank" rel="noopener">Fly / NVDA</a></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+
+<!-- @include footer -->
+<script type="module" src="/src/pages/trading.ts"></script>
+</body>
+</html>

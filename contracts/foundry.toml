@@ -1,0 +1,41 @@
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["dependencies"]
+# Pinned compiler. 0.8.36's open known bugs are via-IR-only or `delete bytesMem[i]`; neither applies here.
+solc_version = "0.8.36"
+auto_detect_solc = false
+# Cancun opcodes (TSTORE/MCOPY) are not verified on Robinhood Chain; Arbitrum supports PUSH0 (shanghai).
+evm_version = "shanghai"
+optimizer = true
+optimizer_runs = 10_000
+remappings = [
+  "@openzeppelin/contracts/=dependencies/@openzeppelin-contracts-5.7.0/",
+  "@openzeppelin/contracts-upgradeable/=dependencies/@openzeppelin-contracts-upgradeable-5.7.0/",
+  "forge-std/=dependencies/forge-std-1.16.2/src/",
+]
+# Deploy scripts write address summaries to deployments/ and the upgrade scripts read them back.
+fs_permissions = [{ access = "read-write", path = "./deployments" }]
+
+[fuzz]
+runs = 512
+
+[invariant]
+runs = 128
+depth = 128
+fail_on_revert = true
+
+[rpc_endpoints]
+robinhood = "https://rpc.mainnet.chain.robinhood.com"
+robinhood_testnet = "https://rpc.testnet.chain.robinhood.com"
+
+[soldeer]
+remappings_generate = false
+recursive_deps = false
+
+[dependencies]
+forge-std = "1.16.2"
+"@openzeppelin-contracts" = "5.7.0"
+"@openzeppelin-contracts-upgradeable" = "5.7.0"

@@ -33,3 +33,20 @@ def signing_allowed() -> bool:
         return True
     except SigningRefused:
         return False
+
+
+def assert_vault_signing_allowed() -> None:
+    """The vault's own signing (claim payouts, principal withdrawals, token-account closes). On mainnet it is the same
+    gate as trading. The devnet rehearsal (``VAULT_CLUSTER=devnet``) may sign with a throwaway key that is not a
+    mainnet trading key: trading stays refused there because SOLANA_CLUSTER is not mainnet-beta."""
+    if not config.VAULT_ENABLED:
+        raise SigningRefused("refusing to sign: VAULT_ENABLED is not set")
+    if config.VAULT_CLUSTER == "mainnet-beta":
+        assert_signing_allowed()
+        return
+    if config.VAULT_CLUSTER != "devnet":
+        raise SigningRefused(f"refusing to sign: VAULT_CLUSTER {config.VAULT_CLUSTER!r} is not mainnet-beta or devnet")
+    if config.SOLANA_CLUSTER == "mainnet-beta" and config.LIVE_ENABLED:
+        raise SigningRefused("refusing to sign on devnet while live mainnet trading is enabled in the same process")
+    if not config.VAULT_SOLANA_RPC_URL:
+        raise SigningRefused("refusing to sign on devnet without VAULT_SOLANA_RPC_URL pointing at devnet")

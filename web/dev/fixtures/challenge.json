@@ -1,0 +1,11 @@
+{
+ "nonce": "",
+ "issued_at": "",
+ "expires_at": "",
+ "domain": "",
+ "uri": "",
+ "chain_id": 4663,
+ "sol_chain": "mainnet",
+ "request_id": "fly-vault-claim-v1",
+ "min_lamports": 2000000
+}

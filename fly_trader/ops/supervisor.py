@@ -38,6 +38,9 @@ def _entry(name: str):
     if name == "pumpstream":
         from ..ingest import pumpstream
         return pumpstream.main
+    if name == "vault":                        # the $FLY vault: flows, settlement, claims, public stats (fly_trader/vault)
+        from ..vault import worker
+        return worker.main
     if name == "kalshi_history":               # the Kalshi corpus: settled markets, candles, trades, feature rows (kalshi/history.py)
         from ..kalshi import history
         return history.main
@@ -53,7 +56,7 @@ def _entry(name: str):
     raise KeyError(name)
 
 
-WORKERS = ("discover", "runner", "train", "replay", "pumpstream", "kalshi_stream", "kalshi_runner", "kalshi_history", "kalshi_train")
+WORKERS = ("discover", "runner", "train", "replay", "pumpstream", "vault", "kalshi_stream", "kalshi_runner", "kalshi_history", "kalshi_train")
 REPLACE_WAIT_S = 20.0        # how long a new console waits for the one it replaces to finish winding down (its workers flush on stop)
 
 

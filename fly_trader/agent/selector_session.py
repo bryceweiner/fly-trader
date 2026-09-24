@@ -76,10 +76,14 @@ class SelectorBook:
         one model instead of a blend of every retrain that lands during it."""
         import joblib
         from ..train import selector as sel
-        if pinned_snapshot() is not None:
-            return False
+        pin = pinned_snapshot()
         with transaction() as conn:
-            r = sel.latest_current(conn)
+            if pin is not None:                        # a pin freezes the book, but a NEW pin (a release) switches to it
+                if pin == self.snapshot_id:
+                    return False
+                r = conn.execute("SELECT id, path FROM brain_snapshots WHERE id = %s", (pin,)).fetchone()
+            else:
+                r = sel.latest_current(conn)
         if not r or r["id"] == self.snapshot_id:
             return False
         m = joblib.load(r["path"])

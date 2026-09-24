@@ -15,5 +15,12 @@ __pycache__/
 .claude/
 
 # large media assets - deployed straight to Gandi, not tracked in GitHub source repo
-web/assets/*.mp4
+web/public/assets/*.mp4
 media/*.mp4
+
+# vault project build outputs (web bundle for Gandi)
+build/
+web/relay.json
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

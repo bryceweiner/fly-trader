@@ -47,3 +47,21 @@ def compute_delta(pre: Snapshot, post: Snapshot) -> dict:
         "lamports_delta": int(post.lamports) - int(pre.lamports),
         "token_deltas": {m: int(post.tokens.get(m, 0)) - int(pre.tokens.get(m, 0)) for m in sorted(mints)},
     }
+
+
+def tx_deltas(tx: dict, owner: str, mint: str) -> tuple[int, int] | None:
+    """(lamports, raw tokens of ``mint``) the transaction moved for ``owner``, wSOL counted as lamports. Unlike two
+    balance snapshots this ignores anything else that landed in between (a deposit, a claim payout). None if unreadable."""
+    try:
+        keys = tx["transaction"]["message"]["accountKeys"]
+        meta = tx["meta"]
+        idx = next(i for i, k in enumerate(keys) if (k.get("pubkey") if isinstance(k, dict) else str(k)) == owner)
+        lam = int(meta["postBalances"][idx]) - int(meta["preBalances"][idx])
+
+        def tok(rows, m):
+            return sum(int(r["uiTokenAmount"]["amount"]) for r in rows or [] if r.get("owner") == owner and r.get("mint") == m)
+        pre, post = meta.get("preTokenBalances"), meta.get("postTokenBalances")
+        lam += tok(post, config.WSOL_MINT) - tok(pre, config.WSOL_MINT)
+        return lam, tok(post, mint) - tok(pre, mint)
+    except (KeyError, TypeError, ValueError, StopIteration):
+        return None

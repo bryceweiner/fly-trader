@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <!-- @include head -->
+  <title>$FLY Vault — fly-trader</title>
+  <meta name="description" content="Lock $FLY on Robinhood Chain and receive a weekly share of the fly's closed-trade profit in SOL. Live wallet, positions, trades and settlements.">
+  <link rel="canonical" href="https://fly-trader.app/vault.html">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="$FLY Vault — fly-trader">
+  <meta property="og:description" content="Lock $FLY, earn a weekly SOL share of the fly's closed-trade profit. Everything about the fly is public.">
+  <meta property="og:url" content="https://fly-trader.app/vault.html">
+  <meta property="og:image" content="https://fly-trader.app/assets/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+</head>
+<body>
+<!-- @include header -->
+
+<main id="main">
+<section class="section page">
+  <div class="shell">
+    <div class="section-head">
+      <span class="micro accent">Vault</span>
+      <h1 class="page-title">The $FLY vault</h1>
+      <p class="lede">Lock $FLY on Robinhood Chain. Every Monday 00:00 UTC the fly pays 100 % of its closed-trade profit above the operator's deposits to lockers, split by how much they locked and for how long. You claim it in SOL.</p>
+    </div>
+
+    <div class="banners" id="banners" aria-live="polite"></div>
+
+    <!-- tiles -->
+    <div class="stat-grid tiles">
+      <div class="stat">
+        <span class="micro">Locked in the vault</span>
+        <div class="value" id="t-locked">—</div>
+        <p class="note"><span id="t-locked-usd">—</span> · <span id="t-pending">—</span> pending withdrawal · <span id="t-earners">—</span> earners</p>
+      </div>
+      <div class="stat">
+        <span class="micro">Fly NAV</span>
+        <div class="value violet" id="t-nav">—</div>
+        <p class="note"><span id="t-nav-usd">—</span> · ≈ <span id="t-nav-fly">—</span> $FLY</p>
+      </div>
+      <div class="stat">
+        <span class="micro">Next settlement</span>
+        <div class="value lime" id="t-countdown">—</div>
+        <p class="note" id="t-next">Monday 00:00 UTC</p>
+      </div>
+      <div class="stat">
+        <span class="micro">Data</span>
+        <div class="value" id="t-age">—</div>
+        <p class="note" id="t-state">—</p>
+      </div>
+    </div>
+
+    <div class="sub mt-0">
+      <h2 class="sub-title">Trading wallet</h2>
+      <div class="kv four">
+        <div class="wide"><span class="micro">The fly's Solana wallet</span><div class="v" id="w-address">—</div></div>
+        <div><span class="micro">SOL balance</span><div class="v" id="w-native">—</div></div>
+        <div><span class="micro">Open positions (value)</span><div class="v" id="w-positions">—</div></div>
+        <div><span class="micro">Operator deposits</span><div class="v" id="w-deposits">—</div></div>
+        <div><span class="micro">Operator withdrawals</span><div class="v" id="w-withdrawals">—</div></div>
+        <div><span class="micro">Owed to lockers (reserved)</span><div class="v accent" id="w-owed">—</div></div>
+        <div><span class="micro">Claimed by lockers</span><div class="v" id="w-claimed">—</div></div>
+        <div><span class="micro">Realized profit R</span><div class="v" id="w-realized">—</div></div>
+        <div><span class="micro">Booked trade P&amp;L</span><div class="v" id="w-booked">—</div></div>
+        <div><span class="micro">Allocated to lockers, all time</span><div class="v" id="w-allocated">—</div></div>
+        <div><span class="micro">Pot for the next settlement</span><div class="v lime-text" id="w-pot">—</div></div>
+        <div><span class="micro">Est. cost to exit positions</span><div class="v" id="w-exit">—</div></div>
+        <div><span class="micro">Last settlement</span><div class="v" id="w-last">—</div></div>
+      </div>
+      <p class="hint mt-12">R is measured from the wallet itself: SOL + token-account rent + open positions at cost − deposits + withdrawals + claims paid. Booked P&amp;L is the sum of the fly's own closed-trade records; the two should match up to fees and rent the trade records do not see.</p>
+    </div>
+
+    <!-- NAV history -->
+    <div class="sub">
+      <div class="panel chart-panel">
+        <div class="panel-head">
+          <span class="micro">NAV history</span>
+          <div class="tabs" role="tablist" aria-label="NAV unit" id="nav-tabs">
+            <button type="button" role="tab" data-unit="sol" aria-selected="true">SOL</button>
+            <button type="button" role="tab" data-unit="usd" aria-selected="false">USD</button>
+            <button type="button" role="tab" data-unit="index" aria-selected="false">Index</button>
+          </div>
+        </div>
+        <div class="chart" id="nav-chart" role="img" aria-label="Fly NAV over time"></div>
+        <p class="chart-msg micro" id="nav-msg" hidden></p>
+        <div class="panel-foot">
+          <button type="button" class="btn small" id="nav-more" hidden>Load older</button>
+          <p class="chart-credit">Chart by <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView Lightweight Charts™</a></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- your position + claim -->
+    <div class="sub">
+      <div class="two-col">
+        <div class="panel" id="position-panel">
+          <span class="micro">Your position</span>
+          <div id="wallet-bar"></div>
+          <div id="position-body" class="mt-16">
+            <p class="muted">Connect an EVM wallet to see your $FLY, lock, and withdraw.</p>
+          </div>
+        </div>
+
+        <div class="panel" id="claim-panel">
+          <span class="micro">Claim SOL</span>
+          <div id="claim-body">
+            <p class="muted">Connect both wallets above: the EVM wallet that locked $FLY, and the Solana wallet that should receive the SOL.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- tables -->
+    <div class="sub">
+      <h2 class="sub-title">Settlements</h2>
+      <div class="table-wrap"><table class="data" id="tbl-settlements">
+        <thead><tr><th scope="col">Week ending</th><th scope="col" class="num">R at settlement</th><th scope="col" class="num">Pot</th><th scope="col" class="num">Allocated</th><th scope="col" class="num">Carried</th><th scope="col" class="num">Earners</th><th scope="col">Status</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <button type="button" class="btn small mt-12" data-more="settlements" hidden>Load more</button>
+    </div>
+
+    <div class="sub">
+      <h2 class="sub-title">Open positions</h2>
+      <div class="table-wrap"><table class="data" id="tbl-positions">
+        <thead><tr><th scope="col">Token</th><th scope="col">Opened</th><th scope="col" class="num">Cost</th><th scope="col" class="num">Value</th><th scope="col" class="num">P&amp;L</th><th scope="col" class="num">Entry</th><th scope="col" class="num">Mark</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+
+    <div class="sub">
+      <h2 class="sub-title">Closed trades</h2>
+      <div class="table-wrap"><table class="data" id="tbl-trades">
+        <thead><tr><th scope="col">Closed</th><th scope="col">Token</th><th scope="col" class="num">Held</th><th scope="col" class="num">Cost</th><th scope="col" class="num">Proceeds</th><th scope="col" class="num">Realized</th><th scope="col">Exit</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <button type="button" class="btn small mt-12" data-more="trades" hidden>Load more</button>
+    </div>
+
+    <div class="sub">
+      <h2 class="sub-title">Wallet flows</h2>
+      <p class="hint">Every SOL movement that is not a trade: operator deposits and withdrawals, profit from outside, and claims paid.</p>
+      <div class="table-wrap"><table class="data" id="tbl-flows">
+        <thead><tr><th scope="col">Time</th><th scope="col">Kind</th><th scope="col" class="num">SOL</th><th scope="col">Counterparty</th><th scope="col">Transaction</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <button type="button" class="btn small mt-12" data-more="flows" hidden>Load more</button>
+    </div>
+
+    <!-- how it works -->
+    <div class="sub" id="how">
+      <h2 class="sub-title">How it works</h2>
+      <ol class="steps">
+        <li><div><h4>Lock</h4><p>Lock $FLY in the FlyVault contract. It takes two wallet confirmations: an approval for exactly that amount, then the lock. Locked $FLY starts earning at once.</p></div></li>
+        <li><div><h4>The fly trades</h4><p>The fly trades Solana memecoins from its own wallet. Its wallet, open positions, trades and every deposit are shown above as they happen.</p></div></li>
+        <li><div><h4>Weekly settlement</h4><p>Every Monday 00:00 UTC the fly adds up its closed-trade profit, after every fee, above what the operator deposited. Open positions count at cost, so only closed trades pay. If that total is higher than everything already paid out, the difference is split between lockers by locked $FLY × time locked during the week. A week with a loss pays nothing, and the loss has to be made back before anything is paid again. A week with no lockers carries its pot to the next one.</p></div></li>
+        <li><div><h4>Claim</h4><p>Connect your EVM wallet and any Solana wallet, and sign one claim with each. The fly checks both signatures and sends all the SOL owed to your EVM address to your Solana wallet, usually within a minute. What you have earned stays yours until you claim it; it never expires.</p></div></li>
+        <li><div><h4>Withdraw</h4><p>Request a withdrawal for any part of your locked $FLY. That part stops earning immediately and can be withdrawn 7 days later. Until then you can cancel the request, which locks it again. Withdrawals cannot be paused.</p></div></li>
+        <li><div><h4>Upgrades</h4><p>The contract can be upgraded only through a timelock with an 8-day public delay, longer than the 7-day withdrawal wait, so anyone who disagrees with a scheduled upgrade can leave first. Pausing blocks new locks and cancellations only.</p></div></li>
+      </ol>
+    </div>
+
+    <div class="sub" id="risks">
+      <h2 class="sub-title">Risks</h2>
+      <ul class="risk-list">
+        <li><strong>The fly can lose money.</strong> Profit is not guaranteed. Weeks with losses pay nothing, and a drawdown can last many weeks.</li>
+        <li><strong>Smart-contract risk.</strong> The vault and the timelock are code. Bugs, however unlikely, can lock or lose tokens.</li>
+        <li><strong>Operational risk.</strong> The fly runs on one server with one hot wallet. Outages delay claims; a compromised key could lose the SOL waiting to be claimed.</li>
+        <li><strong>Wallet risk.</strong> Anyone with your wallet keys can withdraw your $FLY or claim your SOL. Check what you sign: this page only ever asks you to approve the vault or the KyberSwap router, and to sign claim texts that start with this site's domain.</li>
+        <li><strong>Price risk.</strong> $FLY and SOL prices move. What you are paid is SOL; its dollar value can fall.</li>
+      </ul>
+    </div>
+
+    <div class="sub">
+      <h2 class="sub-title">Contracts and wallets</h2>
+      <div class="kv">
+        <div><span class="micro">FlyVault</span><div class="v" id="c-vault">—</div></div>
+        <div><span class="micro">Timelock (8 days)</span><div class="v" id="c-timelock">—</div></div>
+        <div><span class="micro">$FLY token</span><div class="v" id="c-fly">—</div></div>
+        <div><span class="micro">The fly's Solana wallet</span><div class="v" id="c-wallet">—</div></div>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+
+<!-- @include footer -->
+<script type="module" src="/src/pages/vault.ts"></script>
+</body>
+</html>

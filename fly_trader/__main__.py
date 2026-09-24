@@ -21,7 +21,7 @@ def _cmd_init_db(args):
 def _cmd_wallet(args):
     from .chain import keys
     if args.action == "new":
-        print(keys.create_wallet())
+        print(keys.create_wallet_file(args.key_file) if args.key_file else keys.create_wallet())
     else:
         print(keys.show_wallet())
 
@@ -269,7 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="fly-trader")
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("init-db").set_defaults(fn=_cmd_init_db)
-    w = sub.add_parser("wallet"); w.add_argument("action", choices=["new", "show"]); w.set_defaults(fn=_cmd_wallet)
+    w = sub.add_parser("wallet"); w.add_argument("action", choices=["new", "show"]); w.add_argument("--key-file", default=None, help="write the new key to this file (mode 600) instead of .env"); w.set_defaults(fn=_cmd_wallet)
     d = sub.add_parser("discover"); d.add_argument("--once", action="store_true"); d.set_defaults(fn=_cmd_discover)
     sub.add_parser("replay-pull").set_defaults(fn=_cmd_replay_pull)
     sub.add_parser("refetch-pool-ids", help="mark archive hours without pool_id for re-download").set_defaults(fn=_cmd_refetch_pool_ids)
@@ -307,6 +307,12 @@ def build_parser() -> argparse.ArgumentParser:
     rt = sub.add_parser("reset-training"); rt.add_argument("--no-archive", action="store_true"); rt.set_defaults(fn=_cmd_reset_training)
     sub.add_parser("verify-fills").set_defaults(fn=_cmd_verify_fills)
     sub.add_parser("close-empty-atas").set_defaults(fn=_cmd_close_atas)
+    ar = sub.add_parser("apply-release", help="install a verified release's models (the hosted fly's updater calls this)")
+    ar.add_argument("dir"); ar.add_argument("--bootstrap", action="store_true"); ar.set_defaults(fn=_cmd_apply_release)
+    sub.add_parser("health", help="exit 0 when the database answers and workers run (container HEALTHCHECK)").set_defaults(fn=_cmd_health)
+    sub.add_parser("ready-for-restart", help="exit 0 when no order, claim payment or settlement is in flight").set_defaults(fn=_cmd_ready)
+    from .vault import cli as vault_cli
+    vault_cli.add(sub)
     wk = sub.add_parser("worker"); wk.add_argument("action", choices=["start", "stop", "status"]); wk.add_argument("name", nargs="?"); wk.set_defaults(fn=_cmd_worker)
     # ---- Kalshi prediction markets (fly_trader/kalshi) ----
     ks = sub.add_parser("kalshi-subaccount", help="create the fly's dedicated Kalshi subaccount (writes KALSHI_SUBACCOUNT to .env) or list balances")
@@ -330,6 +336,25 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("kalshi-resume-entries").set_defaults(fn=_cmd_kalshi_resume)
     kr = sub.add_parser("kalshi-reset-circuit"); kr.add_argument("--kill", action="store_true"); kr.set_defaults(fn=_cmd_kalshi_reset_circuit)
     return p
+
+
+
+def _cmd_apply_release(args) -> None:
+    from pathlib import Path
+    from .ops import release
+    print(release.apply_release(Path(args.dir), bootstrap=args.bootstrap))
+
+
+def _cmd_health(args) -> None:
+    from .ops import release
+    ok, why = release.health(); print(why)
+    raise SystemExit(0 if ok else 1)
+
+
+def _cmd_ready(args) -> None:
+    from .ops import release
+    ok, why = release.ready_for_restart(); print(why)
+    raise SystemExit(0 if ok else 1)
 
 
 def main(argv=None) -> int:

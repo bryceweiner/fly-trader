@@ -1,0 +1,38 @@
+{
+ "evm": "0x0000000000000000000000000000000000000000",
+ "allocated": 29635922,
+ "claimed": 8337432,
+ "in_flight": 0,
+ "owed": 21298490,
+ "allocations": [
+  {
+   "period_end": 1788739200,
+   "lamports": 8337432,
+   "weight": "561600000000000000000000000000",
+   "share": 0.031
+  },
+  {
+   "period_end": 1789344000,
+   "lamports": 0,
+   "weight": "648000000000000000000000000000",
+   "share": 0.035
+  },
+  {
+   "period_end": 1789948800,
+   "lamports": 21298490,
+   "weight": "734400000000000000000000000000",
+   "share": 0.039
+  }
+ ],
+ "claims": [
+  {
+   "id": 7,
+   "status": "paid",
+   "lamports": 8337432,
+   "sol": "CYiERAYBdh9jr6QKzstHgeK45yeFe6YhCFbfg5dgaYE9",
+   "tx": "5Y9kuVBVPzhpH5xxmjHhAfuBNcirQHzmVWAykNdi6whrY4xFHp83khuiF66v3psDUVAwdKdzKsDwUWjhsmtCjARr",
+   "created_at": 1788829200,
+   "updated_at": 1788829241
+  }
+ ]
+}
