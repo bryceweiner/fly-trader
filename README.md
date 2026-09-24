@@ -128,6 +128,16 @@ newest drivers) and the container is given every GPU. `DEVICE=auto` in `.env` th
 Model page shows which device the fly is on. Batch sizes are derived from the card's free memory, so an 8 GB card works;
 on a shared card set `DEVICE_MEMORY_GB` in `.env` to what the fly may use.
 
+## Updates
+
+The container keeps itself current. Every hour it asks Hugging Face whether
+[`bryceweiner/fly-trader`](https://huggingface.co/bryceweiner/fly-trader) has a new release; when it has, it downloads
+the new code and model, restarts (about a minute; the paper books, the fly's learned state and any open positions are
+untouched -- open positions are sold on schedule by the restarted engine) and keeps the previous release beside the new
+one. If the new release does not come up within five minutes it goes back to the previous one and never tries that
+release again. `docker compose logs -f fly` shows what it did. `AUTO_UPDATE=0` in `.env` turns this off; then the
+"Refreshing the model" steps below are the manual way.
+
 ## Refreshing the model
 
 The model is a snapshot of one training run. To ship a newer one, on a `master` checkout with its database, after a
