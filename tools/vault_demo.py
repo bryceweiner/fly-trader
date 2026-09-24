@@ -1,6 +1,9 @@
 """A local dry run of the whole $FLY vault on this Mac: chain, contracts, relay, the fly's vault worker, and the site.
 
     .venv/bin/python tools/vault_demo.py up        # start everything (about a minute)
+    .venv/bin/python tools/vault_demo.py up --paper   # the same, but the vault shares the RUNNING fly's paper book
+                                                     # (paper_fly in the fly_trader database): its real NAV, positions,
+                                                     # trades and closed-trade profit, just no real SOL
     .venv/bin/python tools/vault_demo.py status
     .venv/bin/python tools/vault_demo.py down
 
@@ -34,6 +37,8 @@ ANVIL = "http://127.0.0.1:8545"
 RELAY_PORT = 8612
 DEVNET = "http://127.0.0.1:8899"          # a local solana-test-validator: unlimited airdrops
 DB = "fly_vault_demo"
+PAPER_BOOK = "paper_fly"
+VAULT_TABLES = ("vault_allocations", "vault_settlements", "vault_claims", "vault_flows", "vault_kv", "vault_nav", "vault_events", "vault_scan")
 SECRET = "demo-relay-secret-not-for-production"
 # anvil's public test accounts (well known; never fund them on a real chain)
 ACCTS = ["0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
@@ -116,8 +121,13 @@ def transfer(secret: str, to: str, lamports: int) -> str:
     return r.get("result") or str(r.get("error"))
 
 
+def paper_mode() -> bool:
+    return (D / "paper").exists()
+
+
 def fly_env(dep: dict, keys: dict) -> dict:
-    return {"DATABASE_URL": f"postgresql:///{DB}", "VAULT_ENABLED": "1", "VAULT_CLUSTER": "devnet", "VAULT_SOLANA_RPC_URL": DEVNET,
+    db = "fly_trader" if paper_mode() else DB
+    return {"VAULT_BOOK": PAPER_BOOK if paper_mode() else "live", "DATABASE_URL": f"postgresql:///{db}", "VAULT_ENABLED": "1", "VAULT_CLUSTER": "devnet", "VAULT_SOLANA_RPC_URL": DEVNET,
             "SOLANA_CLUSTER": "devnet", "LIVE_ENABLED": "0", "BOT_PRIVATE_KEY": "", "BOT_PRIVATE_KEY_FILE": str(D / "fly_key"),
             "FUNDING_ADDRESSES": keys["funder"]["pubkey"], "RH_CHAIN_ID": "46630", "RH_RPC_URL": ANVIL,
             "VAULT_ADDRESS": dep["vault"], "VAULT_TIMELOCK": dep["timelock"], "VAULT_START_BLOCK": "0", "VAULT_PERIOD_S": "300",
@@ -126,8 +136,11 @@ def fly_env(dep: dict, keys: dict) -> dict:
             "GAS_RESERVE_SOL": "0.01", "TELEGRAM_BOT_TOKEN": "", "LOG_DIR": str(D / "fly-logs")}
 
 
-def up() -> None:
+def up(paper: bool = False) -> None:
     D.mkdir(exist_ok=True)
+    (D / "paper").unlink(missing_ok=True)
+    if paper:
+        (D / "paper").write_text(PAPER_BOOK)
     # 1. chains: a local Solana validator (plays devnet) and anvil (plays Robinhood testnet)
     spawn("solana", [str(Path.home() / ".local/share/solana/install/active_release/bin/solana-test-validator"),
                      "--reset", "--quiet", "--ledger", str(D / "ledger"), "--rpc-port", "8899"])
@@ -151,8 +164,11 @@ def up() -> None:
         sh("cast", "send", dep["vault"], "lock(uint256)", amt + "000000000000000000", "--rpc-url", ANVIL, "--private-key", pk)
         time.sleep(3)
     # 3. database for the demo fly
-    subprocess.run(["createdb", DB], capture_output=True)
-    sh(PY, "-c", "from fly_trader.db import schema; schema.apply_schema()", env={"DATABASE_URL": f"postgresql:///{DB}"}, cwd=REPO)
+    if paper:                                  # the running fly's own database: only the vault_* tables are touched
+        sh("psql", "-d", "fly_trader", "-qc", "TRUNCATE " + ", ".join(VAULT_TABLES))
+    else:
+        subprocess.run(["createdb", DB], capture_output=True)
+        sh(PY, "-c", "from fly_trader.db import schema; schema.apply_schema()", env={"DATABASE_URL": f"postgresql:///{DB}"}, cwd=REPO)
     # 4. relay
     rd = D / "relay"; rd.mkdir(exist_ok=True)
     (rd / "relay.json").write_text(json.dumps({"keys": {"k1": SECRET}, "db_path": str(rd / "relay.sqlite3"), "domain": "localhost:5173",
@@ -164,18 +180,21 @@ def up() -> None:
     wait_http(f"http://127.0.0.1:{RELAY_PORT}/api/account?evm=0x" + "00" * 20, "relay")
     # 5. devnet SOL: 1 SOL deposit from the funder, 0.25 SOL straight to the fly (= profit for lockers)
     keys = sol_keys()
-    got = airdrop(keys["funder"]["pubkey"], 1.5)
+    if paper:                                  # no deposits or gifts: the book's own trades are the profit; SOL here only pays claims
+        airdrop(keys["fly"]["pubkey"], 5)
+    got = False if paper else airdrop(keys["funder"]["pubkey"], 1.5)
     time.sleep(15)
     if got and balance(keys["funder"]["pubkey"]) > 1_100_000_000:
         print("deposit tx:", transfer(keys["funder"]["secret"], keys["fly"]["pubkey"], 1_000_000_000)[:20], "…")
-    else:
+    elif not paper:
         print("WARNING: devnet airdrop to the funder failed (rate limit); fund", keys["funder"]["pubkey"], "at faucet.solana.com")
-    if not airdrop(keys["fly"]["pubkey"], 0.25):
+    if not paper and not airdrop(keys["fly"]["pubkey"], 0.25):
         print("WARNING: devnet airdrop to the fly failed; send devnet SOL to", keys["fly"]["pubkey"], "to create profit")
     # 6. the vault fly (vault worker only, its own database)
     (D / "fly-logs").mkdir(exist_ok=True)
     env = fly_env(dep, keys)
-    sh(PY, "-c", "from fly_trader.vault import state; import time; state.put('vault_started_at', int(time.time()) - 600)", env=env, cwd=REPO)
+    start = "int(time.time())" if paper else "int(time.time()) - 600"      # paper: profit counts from now on
+    sh(PY, "-c", f"from fly_trader.vault import state; import time; state.put('vault_started_at', {start})", env=env, cwd=REPO)
     spawn("fly", [PY, "-c", "from fly_trader.vault import worker; worker.main()"], env=env, cwd=REPO)
     # 7. the site
     web_env = {"VITE_NETWORK": "testnet", "VITE_EVM_RPC": ANVIL, "VITE_VAULT_ADDRESS": dep["vault"], "VITE_TIMELOCK_ADDRESS": dep["timelock"],
@@ -195,6 +214,9 @@ def down() -> None:
         except (ProcessLookupError, ValueError, PermissionError):
             pass
         pid_file.unlink()
+    if paper_mode():
+        subprocess.run(["psql", "-d", "fly_trader", "-qc", "TRUNCATE " + ", ".join(VAULT_TABLES)], capture_output=True)
+        (D / "paper").unlink(missing_ok=True)
     subprocess.run(["dropdb", "--if-exists", DB], capture_output=True)
     for f in ("relay/relay.sqlite3", "relay/relay.sqlite3-wal", "relay/relay.sqlite3-shm", "sol_keys.json", "fly_key", "vault.log"):
         (D / f).unlink(missing_ok=True)
@@ -215,4 +237,8 @@ def status() -> None:
 
 
 if __name__ == "__main__":
-    {"up": up, "down": down, "status": status}.get(sys.argv[1] if len(sys.argv) > 1 else "", lambda: print(__doc__))()
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "up":
+        up(paper="--paper" in sys.argv)
+    else:
+        {"down": down, "status": status}.get(cmd, lambda: print(__doc__))()

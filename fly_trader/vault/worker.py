@@ -63,13 +63,23 @@ class Jobs:
         claims.process(self.relay, self.rpc, self.keypair, self.rh)
 
     def scan(self):
-        flows.scan(self.rpc, self.wallet)
+        if not settle.paper():                                   # a paper book has no wallet to scan
+            flows.scan(self.rpc, self.wallet)
 
     def index(self):
         self.index_state = rh_index.run_once(self.rh)
 
     def mark(self):
-        """The live book marks NAV every trade minute; before the handover (or while the feed is stale) this does."""
+        """The live book marks NAV every trade minute; before the handover (or while the feed is stale) this does.
+        A paper vault copies its book's own wealth marks: the running fly's real NAV, just not real SOL."""
+        if settle.paper():
+            with transaction() as conn:
+                for r in conn.execute("SELECT ts, sol_free, positions_value, exit_cost FROM wealth_marks WHERE book = %s AND ts > "
+                                      "COALESCE((SELECT max(ts) FROM vault_nav), to_timestamp(0)) ORDER BY ts LIMIT 5000", (config.VAULT_BOOK,)).fetchall():
+                    L = config.LAMPORTS_PER_SOL
+                    nav.mark(conn, r["ts"], int(round(float(r["sol_free"]) * L)), int(round((float(r["positions_value"]) + float(r["exit_cost"])) * L)),
+                             int(round(float(r["exit_cost"]) * L)))
+            return
         with transaction() as conn:
             r = conn.execute("SELECT max(ts) AS t FROM vault_nav").fetchone()
         if r["t"] and (datetime.now(timezone.utc) - r["t"]).total_seconds() < 150:
@@ -91,6 +101,8 @@ class Jobs:
         publish.push(self.relay, self.wallet)
 
     def backup(self):
+        if settle.paper():
+            return
         if not backup.configured():
             alerts.send("encrypted backups are not configured (VAULT_BACKUP_*): losing the server would lose the wallet",
                         key="backup_missing", cooldown_s=24 * 3600)
@@ -101,8 +113,8 @@ class Jobs:
     def close_atas(self):
         from ..chain.cluster_guard import assert_vault_signing_allowed
         from ..execution.broker_live import close_empty_atas
-        if config.VAULT_CLUSTER != "mainnet-beta":
-            return                                               # the devnet rehearsal holds no token accounts worth closing
+        if config.VAULT_CLUSTER != "mainnet-beta" or settle.paper():
+            return                                               # the devnet rehearsal / a paper vault holds no token accounts worth closing
         assert_vault_signing_allowed()
         with walletlock.exclusive(timeout_s=120):
             with transaction() as conn:

@@ -28,6 +28,8 @@ export interface Settlement {
 export interface Stats {
   v: number
   ts: number
+  /** the book the vault shares: 'live', or a paper book on a dry run */
+  book?: string
   cluster: string
   fly: {
     state: 'starting' | 'paper' | 'live' | 'halted' | string

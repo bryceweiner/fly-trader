@@ -49,6 +49,12 @@ function renderBanners() {
   if (!config.vault) {
     out.push(banner('info', 'Vault not deployed yet', ['The FlyVault contract is not live yet, so locking is not open. The fly\'s numbers below are already public.']))
   }
+  if (s?.book && s.book !== 'live') {
+    out.push(banner('info', 'Paper book', [
+      `These are the running fly's real decisions on its paper book (${s.book}): real market, real model, real trades and NAV, but no real SOL moves. `,
+      'Deposits show the paper starting bankroll; the wallet address pays test claims only.',
+    ]))
+  }
   if (state.statsError) {
     out.push(banner('warn', 'Stats unavailable', [state.statsError, ' On-chain data and your position still work.']))
   } else if (s && now() - s.ts > 600) {
@@ -100,6 +106,7 @@ function renderStats() {
     setText('t-nav-fly', s.prices.sol_usd > 0 && flyUsd > 0 ? token(BigInt(Math.floor((navSol * s.prices.sol_usd) / flyUsd)) * 10n ** 18n, 18, 0) : '—')
     setText('t-state', `Fly ${s.fly.state}${s.cluster && s.cluster !== 'mainnet' ? ` · ${s.cluster}` : ''} · index ${s.index.value.toFixed(3)}`)
     $('w-address').replaceChildren(link(explorer.solAccount(s.fly.wallet), s.fly.wallet))
+    if (s.book && s.book !== 'live') $('w-address').append(` (claims only; the trading is paper book ${s.book})`)
     $('c-wallet').replaceChildren(link(explorer.solAccount(s.fly.wallet), short(s.fly.wallet, 6, 6)))
     const L = s.ledger
     setText('w-native', SOL(s.wallet.native))

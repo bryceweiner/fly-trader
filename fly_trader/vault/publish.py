@@ -43,9 +43,16 @@ def stats(conn, wallet: str, now: float | None = None) -> dict:
     cost, _mints = settle.open_positions(conn)
     w["open_cost"] = cost
     f = settle.flow_totals(conn, 2**62)
-    r_now = settle.realized(w["native"], w["token_acct"], cost, f["deposits"], f["withdrawals"], f["payouts"])
+    if settle.paper():                                     # a paper book: R is its closed-trade profit since the vault started
+        start = int(state.get("vault_started_at", conn=conn) or 0)
+        rs = conn.execute("SELECT COALESCE(sum(realized_sol), 0) AS s FROM positions WHERE book = %s AND status = 'closed' "
+                          "AND closed_at >= to_timestamp(%s)", (config.VAULT_BOOK, start)).fetchone()["s"]
+        r_now = int(round(float(rs) * LAMPORTS))
+        f["deposits"] = int(round(config.CAPITAL_SOL * LAMPORTS))
+    else:
+        r_now = settle.realized(w["native"], w["token_acct"], cost, f["deposits"], f["withdrawals"], f["payouts"])
     a = settle.allocated_total(conn)
-    booked = conn.execute("SELECT COALESCE(sum(realized_sol), 0) AS s FROM positions WHERE book = 'live' AND status = 'closed'").fetchone()["s"]
+    booked = conn.execute("SELECT COALESCE(sum(realized_sol), 0) AS s FROM positions WHERE book = %s AND status = 'closed'", (config.VAULT_BOOK,)).fetchone()["s"]
     c = rails.load_circuit(conn)
     ho = handover.state(conn)
     fs = _ui(conn, "fly_status") or {}
@@ -55,7 +62,7 @@ def stats(conn, wallet: str, now: float | None = None) -> dict:
     tot = rh_index.totals(conn)
     last = conn.execute("SELECT * FROM vault_settlements WHERE status = 'allocated' ORDER BY period_end DESC LIMIT 1").fetchone()
     from ..execution import ledger
-    opens = ledger.open_positions(conn, "live")           # the same rows, decimals and holds the live book trades on
+    opens = ledger.open_positions(conn, config.VAULT_BOOK)           # the same rows, decimals and holds the live book trades on
     positions = []
     for p in opens:
         px = float(p["last_mark_price"] or p["entry_price"] or 0.0)
@@ -65,7 +72,7 @@ def stats(conn, wallet: str, now: float | None = None) -> dict:
                           "entry_price": float(p["entry_price"] or 0.0), "mark_price": px, "hold_min": int((p["hold_s"] or 0) // 60)})
     up = (ix.get("upgrade_scheduled") or {}).get("next")
     return {
-        "v": 1, "ts": int(now), "cluster": "mainnet" if config.VAULT_CLUSTER == "mainnet-beta" else config.VAULT_CLUSTER,
+        "v": 1, "ts": int(now), "book": config.VAULT_BOOK, "cluster": "mainnet" if config.VAULT_CLUSTER == "mainnet-beta" else config.VAULT_CLUSTER,
         "fly": {"state": fly_state, "wallet": wallet, "handover": bool(ho), "kill_switch": bool(c.kill_switch),
                 "entries_paused": bool(c.entries_paused),
                 "model": {"fly": fs.get("bootstrap"), "selector": (_ui(conn, "pinned_selector_snapshot") or {}).get("id"),
@@ -105,7 +112,7 @@ def history(conn, cur: dict) -> tuple[dict, dict]:
     if pts:
         out["nav"] = pts
     trades = conn.execute("SELECT id, mint, opened_at, closed_at, cost_sol, realized_sol, forced_exit_kind FROM positions "
-                          "WHERE book = 'live' AND status = 'closed' AND id > %s ORDER BY id LIMIT 500", (int(cur.get("trades", 0)),)).fetchall()
+                          "WHERE book = %s AND status = 'closed' AND id > %s ORDER BY id LIMIT 500", (config.VAULT_BOOK, int(cur.get("trades", 0)))).fetchall()
     if trades:
         out["trades"] = [{"id": int(t["id"]), "mint": t["mint"], "symbol": _symbol(conn, t["mint"]), "opened_at": _t(t["opened_at"]),
                           "closed_at": _t(t["closed_at"]), "cost": int(round(float(t["cost_sol"]) * LAMPORTS)),

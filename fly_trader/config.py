@@ -168,6 +168,7 @@ def live_prerequisites_missing() -> list[str]:
 
 # ---- the $FLY vault (fly_trader/vault, docs/vault/SPEC.md): only the hosted vault fly sets VAULT_ENABLED ----
 VAULT_ENABLED = env_bool("VAULT_ENABLED", False)
+VAULT_BOOK = env_str("VAULT_BOOK", "live")                         # the book the vault shares: live; a paper book (e.g. paper_fly) for a dry run on real decisions without real SOL
 VAULT_CLUSTER = env_str("VAULT_CLUSTER", "mainnet-beta")           # devnet only for the rehearsal (trading off, claims on devnet)
 VAULT_SOLANA_RPC_URL = env_str("VAULT_SOLANA_RPC_URL")             # overrides Helius for the vault's reads/claims (the devnet rehearsal)
 FUNDING_ADDRESSES = env_list("FUNDING_ADDRESSES", [])              # SOL from these is a deposit; from anyone else, profit
