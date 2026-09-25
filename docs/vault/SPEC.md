@@ -185,7 +185,7 @@ Relay config: `relay.json`, kept next to `wsgi.py` and never inside `site/`:
 ### 4.1 Stats snapshot (`stats`, pushed every 60 s)
 ```json
 {
- "v": 1, "ts": 0, "cluster": "mainnet",
+ "v": 1, "ts": 0, "book": "live", "cluster": "mainnet",
  "fly": {"state": "starting|paper|live|halted", "wallet": "<base58>", "handover": false, "kill_switch": false,
          "entries_paused": false, "model": {"fly": 62, "selector": 59, "release": 3}},
  "wallet": {"native": 0, "token_accounts": 0, "open_cost": 0, "positions_value": 0, "exit_cost": 0, "nav": 0},
@@ -202,7 +202,9 @@ Relay config: `relay.json`, kept next to `wsgi.py` and never inside `site/`:
 - `wallet.nav` = native + token_accounts + positions_value − exit_cost.
 - `ledger.realized` is R. `pot` = max(0, R − allocated). `reserved` = allocated − claims_paid.
 - `settlement.last` is a settlements item (§4.2) or null.
-- `vault.upgrade_scheduled` is `{"eta": ts, "id": "0x…"}` or null.
+- `vault.upgrade_scheduled` is `{"eta": ts, "id": "0x…"}` or null: the soonest pending timelock operation whose target is the
+  vault (upgrade, role change) or the timelock itself (`updateDelay`, proposer changes). `eta` is the block time of
+  `CallScheduled` plus its `delay`.
 
 ### 4.2 History items
 - `nav`: `{"ts", "nav", "index", "sol_usd"}`

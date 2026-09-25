@@ -29,10 +29,17 @@ Requires Foundry (tested with forge 1.5.1). Dependencies are pinned in `soldeer.
 cd contracts
 forge soldeer install          # forge-std 1.16.2, @openzeppelin-contracts(-upgradeable) 5.7.0
 forge build
-forge test -vv                 # unit, upgrade, invariant, script tests; fork tests are skipped
+forge test -vv                 # unit, upgrade, invariant, red-team, script tests; fork tests are skipped
 FORK=1 forge test --match-contract ForkTest -vv   # forks RH mainnet and uses the real $FLY (RH_RPC_URL overrides the RPC)
 forge snapshot                 # refreshes .gas-snapshot
 ```
+
+`test/RedTeam.t.sol` holds the adversarial cases: reentrancy through the unguarded functions, false-returning and
+no-return tokens, donations, forged or replayed request ids, a permanent pause, a malicious implementation behind
+the timelock (holders who request within a day of the schedule are out before it executes), a smuggled
+re-`initialize`, an `UPGRADER_ROLE` grant to an EOA (public for 8 days, then no delay: treat it like an upgrade), a
+timelock admin trying to skip the delay, and a check that no plain storage slot is ever written. `forge lint` and
+Slither (`slither . --filter-paths "dependencies|test|script"`) report nothing beyond informational items.
 
 Compiler settings: solc 0.8.36, optimizer 10,000 runs, `evm_version = "shanghai"`. Cancun opcodes are not
 verified on this chain, so the contracts use the storage-based `ReentrancyGuard` and never the transient one.

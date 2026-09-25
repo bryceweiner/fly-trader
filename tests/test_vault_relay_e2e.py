@@ -34,8 +34,9 @@ def relay(tmp_path, monkeypatch):
     (tmp_path / "relay.json").write_text(json.dumps(cfg))
     monkeypatch.setenv("FLY_RELAY_CONFIG", str(tmp_path / "relay.json"))
     monkeypatch.syspath_prepend(str(WEB))
-    for m in [m for m in sys.modules if m == "wsgi" or m.startswith("relay")]:
-        sys.modules.pop(m)
+    # web/relay/tests imports the same modules and patches them in place; evicting them here would leave those tests
+    # patching stale module objects (their HMAC clock then drifts out of the ±300 s window), so restore them after.
+    evicted = {m: sys.modules.pop(m) for m in list(sys.modules) if m == "wsgi" or m == "relay" or m.startswith("relay.")}
     wsgi = importlib.import_module("wsgi")
     srv = make_server("127.0.0.1", 0, wsgi.application, handler_class=_Quiet)
     th = threading.Thread(target=srv.serve_forever, daemon=True); th.start()
@@ -52,6 +53,9 @@ def relay(tmp_path, monkeypatch):
         c.execute("INSERT INTO vault_allocations VALUES (%s, %s, 1, 25000000)", (sid, V["evm_checksummed"]))
     yield base, RelayClient(base, "k1", SECRET)
     srv.shutdown()
+    for m in [m for m in sys.modules if m == "wsgi" or m == "relay" or m.startswith("relay.")]:
+        sys.modules.pop(m)
+    sys.modules.update(evicted)
 
 
 def _get(url):

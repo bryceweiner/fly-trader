@@ -83,23 +83,41 @@ def _block_times(rpc: evm.EvmRpc, logs: list[dict]) -> dict[int, int]:
 
 
 def _timelock_ops(rpc: evm.EvmRpc, frm: int, to: int, ops: dict, times: dict) -> dict:
-    """Pending timelock operations aimed at the vault proxy: id -> {eta}; executed/cancelled ones drop out."""
+    """Pending timelock operations aimed at the vault proxy or at the timelock itself (role changes, `updateDelay`):
+    id -> {eta, id, target}; executed/cancelled ones drop out. Anything the owner key schedules is public here, so
+    holders and the operator see it during the delay."""
     if not config.VAULT_TIMELOCK:
         return ops
     logs = rpc.get_logs(config.VAULT_TIMELOCK, frm, to, [[T_SCHEDULED, T_EXECUTED, T_TL_CANCELLED]])
     times.update(_block_times(rpc, logs))
-    vault = (config.VAULT_ADDRESS or "").lower()
+    watched = {(config.VAULT_ADDRESS or "").lower(), config.VAULT_TIMELOCK.lower()}
     for lg in logs:
         t0, op = lg["topics"][0].lower(), lg["topics"][1]
         if t0 == T_SCHEDULED:
+            # CallScheduled(bytes32 indexed id, uint256 indexed index, address target, uint256 value, bytes data,
+            #               bytes32 predecessor, uint256 delay): words 0 target, 1 value, 2 offset of data, 3 predecessor,
+            #               4 delay; the dynamic tail (data length, data) starts at word 5.
             w = evm.data_words(lg["data"])
             target = ("0x" + w[0][-40:]).lower()
-            delay = evm.word_to_int(w[5]) if len(w) > 5 else 0
-            if target == vault:
-                ops[op] = {"eta": times[int(lg["blockNumber"], 16)] + delay, "id": op}
+            delay = evm.word_to_int(w[4]) if len(w) > 4 else 0
+            if target in watched:
+                ops[op] = {"eta": times[int(lg["blockNumber"], 16)] + delay, "id": op, "target": target}
         else:
             ops.pop(op, None)
     return ops
+
+
+def _announce(before: dict, after: dict) -> None:
+    """Telegram the operator once per newly scheduled operation (docs/vault/RUNBOOK.md promises this)."""
+    from datetime import datetime, timezone
+    from . import alerts
+    for op, o in after.items():
+        if op in before:
+            continue
+        what = "the vault (upgrade or role change)" if o.get("target") == (config.VAULT_ADDRESS or "").lower() else "the timelock itself (delay or proposer change)"
+        eta = datetime.fromtimestamp(int(o["eta"]), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        alerts.send(f"timelock operation {op[:10]}… scheduled on {what}; executable from {eta}. Cancel it if you did not schedule it.",
+                    key=f"tl_op:{op}", cooldown_s=30 * 86400)
 
 
 def run_once(rpc: evm.EvmRpc | None = None, max_steps: int = 20) -> dict:
@@ -147,6 +165,7 @@ def run_once(rpc: evm.EvmRpc | None = None, max_steps: int = 20) -> dict:
         through_time = head_time if to == head else int(rpc.block(to)["timestamp"], 16)
         frm = to + 1
         rng = min(MAX_RANGE, rng * 2)
+    _announce((st.get("upgrade_scheduled") or {}).get("ops") or {}, ops)
     impl = rpc.implementation(config.VAULT_ADDRESS, hex(through) if through else "finalized")
     detail = {"through_time": through_time, "impl": impl, "impl_codehash": rpc.code_hash(impl, "finalized"), "paused": paused,
               "range": rng, "upgrade_scheduled": {"ops": ops, "next": min(ops.values(), key=lambda o: o["eta"]) if ops else None}}

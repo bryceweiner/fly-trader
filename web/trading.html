@@ -88,15 +88,15 @@
           </dl>
 
           <details class="slippage">
-            <summary>Slippage tolerance: <span id="slip-view">1.00 %</span></summary>
-            <div class="chips-row" role="group" aria-label="Slippage presets">
-              <button type="button" class="chip-btn" data-slip="50">0.5 %</button>
-              <button type="button" class="chip-btn" data-slip="100">1 %</button>
-              <button type="button" class="chip-btn" data-slip="300">3 %</button>
+            <summary>Slippage tolerance: <span id="slip-view">0.2 %</span></summary>
+            <div class="field">
+              <label for="slip-select">Preset</label>
+              <select id="slip-select" aria-label="Slippage presets"></select>
             </div>
             <div class="field">
-              <label for="slip-input">Custom (%)</label>
-              <input id="slip-input" type="text" inputmode="decimal" autocomplete="off" value="1">
+              <label for="slip-input">Custom (0.2–10 %)</label>
+              <input id="slip-input" type="text" inputmode="decimal" autocomplete="off" value="0.2" aria-describedby="slip-hint">
+              <p class="hint" id="slip-hint">The least you accept: the swap reverts instead of delivering less. Selling $FLY through the launchpad pool can need more than the default.</p>
             </div>
           </details>
 

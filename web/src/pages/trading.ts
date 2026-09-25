@@ -12,10 +12,14 @@ import {
   buildRoute,
   clampSlippage,
   DEFAULT_SLIPPAGE_BPS,
+  formatSlippage,
   getRoute,
+  isSuspiciousQuote,
   minReceived,
   NATIVE,
+  parseSlippagePercent,
   priceImpact,
+  SLIPPAGE_LADDER_BPS,
   type Route,
 } from '../lib/kyber'
 import { $, busy, mountWalletBar, setText, statusLine, tabs, txLink } from '../lib/ui'
@@ -211,8 +215,9 @@ function showQuote(route: Route, s: { tokenIn: Asset; tokenOut: Asset }) {
   if (!(inUsd > 0) && state.side === 'sell' && flyUsd > 0) inUsd = Number(formatUnits(BigInt(r.amountIn), 18)) * flyUsd
   const impact = priceImpact(inUsd, outUsd)
   const impactEl = $('q-impact')
-  impactEl.textContent = impact == null ? 'unknown' : pct(Math.max(0, impact), true)
-  impactEl.className = impact != null && impact > 0.05 ? 'red' : impact != null && impact > 0.02 ? 'amber' : ''
+  const suspicious = isSuspiciousQuote(impact)
+  impactEl.textContent = impact == null ? 'unknown' : suspicious ? `quote claims a ${pct(-impact, true)} gain: the pools may not honour it` : pct(Math.max(0, impact), true)
+  impactEl.className = suspicious || (impact != null && impact > 0.05) ? 'red' : impact != null && impact > 0.02 ? 'amber' : ''
   setText('q-gas', usd(parseFloat(r.gasUsd)))
   const bal = state.balances[s.tokenIn.symbol]
   if (!state.account) {
@@ -250,6 +255,10 @@ async function swap() {
     const value = BigInt(built.transactionValue || '0')
     const expected = isAddressEqual(s.tokenIn.address, NATIVE) ? amount : 0n
     if (value !== expected) throw new Error('Refusing the swap: KyberSwap built a transaction with an unexpected ETH value.')
+    // Dry run on the node first: a route the pools cannot honour at this slippage fails here, with a plain
+    // explanation, instead of costing a wallet prompt and a reverted transaction.
+    status('Checking the swap against the chain…', 'busy')
+    await publicClient().call({ account, to: built.routerAddress, data: built.data, value })
     status('Confirm the swap in your wallet…', 'busy')
     const hash = await sendTransaction(cfg, { account, to: built.routerAddress, data: built.data, value, chainId: config.evm.chainId })
     status('Waiting for confirmation…', 'busy')
@@ -291,13 +300,18 @@ $('swap-max').addEventListener('click', () => {
   scheduleQuote()
 })
 
+const slipSelect = $<HTMLSelectElement>('slip-select')
+const slipInput = $<HTMLInputElement>('slip-input')
+slipSelect.replaceChildren(
+  ...SLIPPAGE_LADDER_BPS.map((bps) => Object.assign(document.createElement('option'), { value: String(bps), textContent: formatSlippage(bps) })),
+  Object.assign(document.createElement('option'), { value: '', textContent: 'Custom' }),
+)
+
 function setSlippage(bps: number) {
   state.slippageBps = clampSlippage(bps)
-  setText('slip-view', (state.slippageBps / 100).toFixed(2) + ' %')
-  $<HTMLInputElement>('slip-input').value = String(state.slippageBps / 100)
-  for (const b of document.querySelectorAll<HTMLButtonElement>('[data-slip]')) {
-    b.setAttribute('aria-pressed', String(Number(b.dataset.slip) === state.slippageBps))
-  }
+  setText('slip-view', formatSlippage(state.slippageBps))
+  slipInput.value = String(state.slippageBps / 100)
+  slipSelect.value = SLIPPAGE_LADDER_BPS.includes(state.slippageBps) ? String(state.slippageBps) : ''
   try {
     localStorage.setItem('fly.slippageBps', String(state.slippageBps))
   } catch {
@@ -305,12 +319,18 @@ function setSlippage(bps: number) {
   }
   if (state.route) scheduleQuote()
 }
-for (const b of document.querySelectorAll<HTMLButtonElement>('[data-slip]')) {
-  b.addEventListener('click', () => setSlippage(Number(b.dataset.slip)))
-}
-$<HTMLInputElement>('slip-input').addEventListener('change', (e) => {
-  const v = parseFloat((e.target as HTMLInputElement).value)
-  if (Number.isFinite(v) && v > 0) setSlippage(v * 100)
+slipSelect.addEventListener('change', () => {
+  if (slipSelect.value) setSlippage(Number(slipSelect.value))
+  else slipInput.focus()
+})
+slipInput.addEventListener('change', () => {
+  const bps = parseSlippagePercent(slipInput.value)
+  if (bps == null) {
+    status('Slippage must be a number between 0.2 % and 10 %.', 'error')
+    slipInput.value = String(state.slippageBps / 100)
+    return
+  }
+  setSlippage(bps)
 })
 try {
   const saved = Number(localStorage.getItem('fly.slippageBps'))

@@ -17,6 +17,8 @@ contract VaultHandler is Test {
     address[] public actors;
     uint256 public donated;
     uint256 public withdrawnTotal;
+    mapping(address => uint256) public lockedBy; // everything each actor ever locked
+    mapping(address => uint256) public withdrawnBy; // everything each actor ever got back
     mapping(bytes32 => uint256) public calls;
 
     constructor(FlyVault v, MockFLY f, address pauser_, uint256 withdrawDelay_) {
@@ -44,6 +46,7 @@ contract VaultHandler is Test {
         fly.mint(a, amount);
         vm.prank(a);
         vault.lock(amount);
+        lockedBy[a] += amount;
         calls["lock"]++;
     }
 
@@ -89,6 +92,7 @@ contract VaultHandler is Test {
         vault.withdraw(id);
         assertEq(fly.balanceOf(a), before + amount);
         withdrawnTotal += amount;
+        withdrawnBy[a] += amount;
         calls["withdraw"]++;
     }
 
@@ -129,6 +133,16 @@ contract InvariantTest is VaultTest {
 
     function invariant_exactAccounting() public view {
         assertEq(fly.balanceOf(address(vault)), vault.totalLocked() + vault.totalPending() + handler.donated());
+    }
+
+    /// Nobody ever holds (locked + pending) other than exactly what they put in minus what they took out, and nobody
+    /// takes out more than they put in.
+    function invariant_perActorAccountingIsExact() public view {
+        for (uint256 i; i < handler.actorCount(); ++i) {
+            address a = handler.actors(i);
+            assertLe(handler.withdrawnBy(a), handler.lockedBy(a));
+            assertEq(vault.locked(a) + vault.pendingOf(a), handler.lockedBy(a) - handler.withdrawnBy(a));
+        }
     }
 
     function invariant_sumOfLockedIsTotalLocked() public view {

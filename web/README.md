@@ -30,6 +30,33 @@ verify signatures; the fly does.
 
 To use a real relay in dev instead: `VITE_RELAY_PROXY=https://staging.example npm run dev` (proxies `/api`).
 
+### Integration tests (real chains)
+
+`e2e/` drives the page libraries (`src/lib/vault.ts`, `evm.ts`, `claim.ts`, `kyber.ts`) the way the pages do, with a
+wagmi mock connector standing in for the wallet:
+
+```sh
+.venv/bin/python tools/vault_demo.py up      # from the repo root: anvil + validator + relay + vault fly + site
+e2e/run.sh vault                              # lock/approve, request, cancel, withdraw, pause, every page error text,
+                                              # then two claims paid by the fly on the local validator (~5 min)
+anvil --fork-url https://rpc.mainnet.chain.robinhood.com --port 8546 &
+e2e/run.sh trading                            # KyberSwap quotes + calldata, buy and sell simulated on mainnet (eth_call
+                                              # with state overrides), approval and error paths on the fork
+```
+
+Known state on 2026-09-24: KyberSwap's quotes for *selling* $FLY claimed more USD out than in (a mispriced hop
+through the Uniswap v4 pool), and its router then refused the swap at every slippage up to the page's 10 % cap.
+The page marks such a quote as suspicious and its pre-flight `eth_call` reports the refusal before any wallet prompt.
+The sell test walks the page's slippage ladder (0.2 %, then 0.5 % steps to 10 %) and prints the first step the real
+pools honour; a step above the default is a finding worth reading.
+
+They are not part of `npm test`. The vault suite is rerunnable (fresh keys each run; it funds a new settlement for
+the claim section and waits up to 12 minutes for it). The trading suite talks to the public KyberSwap API, which
+throttles bursts; it backs off for minutes rather than skip. The slippage ladder is measured with `eth_call` on
+the real chain (state overrides give the test wallet its balance; nothing is sent). The swap is then also sent on
+the fork at the measured step; start the fork right before the run, because one more than a few minutes old drifts
+from the chain and KyberSwap's executor refuses it early (reported as "fork drift", not as a failure).
+
 ## Environment (build time, `.env` / `.env.production` or the shell)
 
 | Variable | Default | Meaning |

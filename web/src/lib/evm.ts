@@ -89,6 +89,9 @@ export function humanError(e: unknown): string {
     if (name && REVERTS[name]) return REVERTS[name](revert?.data?.args ?? [])
     if (name) return `The contract refused: ${name}.`
     if (/insufficient funds/i.test(e.message)) return `Not enough ETH on ${config.evm.name} to pay for gas.`
+    if (/Return amount is not enough/i.test(e.message)) {
+      return 'The pools would return less than your slippage tolerance allows, so the router refuses the swap. Raise the slippage and try again.'
+    }
     return e.shortMessage || e.message
   }
   return e instanceof Error ? e.message : String(e)

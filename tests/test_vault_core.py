@@ -198,3 +198,37 @@ def test_relay_hmac_matches_the_relay_implementation():
     ours = relay_client.sign_headers("GET", "https://x.app/api/fly/claims?limit=50&after=3", b"", "k1", secret, ts=1790000000, nonce="0" * 32)
     theirs = mod.sign("GET", "/api/fly/claims", "limit=50&after=3", b"", "k1", secret, ts=1790000000, nonce="0" * 32)
     assert ours["X-Fly-Sig"] == theirs["X-Fly-Sig"]
+
+
+def test_timelock_ops_read_the_delay_word_and_watch_both_targets(monkeypatch):
+    """CallScheduled's delay is the 5th data word (after target, value, the offset of `data`, predecessor); reading the
+    dynamic tail instead once made every upgrade look executable ~100 s after scheduling."""
+    from fly_trader import config
+    vault_addr, tl = "0x" + "ab" * 20, "0x" + "cd" * 20
+    monkeypatch.setattr(config, "VAULT_ADDRESS", vault_addr)
+    monkeypatch.setattr(config, "VAULT_TIMELOCK", tl)
+    monkeypatch.setattr(config, "TELEGRAM_BOT_TOKEN", None)
+
+    def sched(target, delay, opid):
+        data = "0x" + _word(int(target, 16)) + _word(0) + _word(160) + _word(0) + _word(delay) + _word(4) + "4f1ef286" + "0" * 56
+        return {"topics": [rh_index.T_SCHEDULED, opid, "0x" + _word(0)], "data": data, "blockNumber": hex(7), "blockTimestamp": hex(1_000)}
+
+    class Rpc:
+        def __init__(self, logs):
+            self.logs = logs
+
+        def get_logs(self, *a, **k):
+            return self.logs
+
+        def block(self, n):
+            return {"timestamp": hex(1_000)}
+
+    a, b, c = "0x" + "11" * 32, "0x" + "22" * 32, "0x" + "33" * 32
+    logs = [sched(vault_addr, 691_200, a), sched(tl, 691_200, b), sched("0x" + "ee" * 20, 5, c)]
+    ops = rh_index._timelock_ops(Rpc(logs), 1, 10, {}, {})
+    assert ops[a] == {"eta": 1_000 + 691_200, "id": a, "target": vault_addr}
+    assert ops[b]["eta"] == 1_000 + 691_200 and ops[b]["target"] == tl
+    assert c not in ops                                              # a call to some other contract is not ours
+    done = {"topics": [rh_index.T_EXECUTED, a, "0x" + _word(0)], "data": "0x", "blockNumber": hex(8), "blockTimestamp": hex(1_001)}
+    gone = {"topics": [rh_index.T_TL_CANCELLED, b], "data": "0x", "blockNumber": hex(9), "blockTimestamp": hex(1_002)}
+    assert rh_index._timelock_ops(Rpc([done, gone]), 11, 12, dict(ops), {}) == {}
