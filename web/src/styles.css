@@ -1738,3 +1738,10 @@ table.data .num {
     grid-template-columns: 1fr;
   }
 }
+
+/* the vault's headline tiles: two (settlement timing and data freshness are not published) */
+@media (min-width: 900px) {
+  .stat-grid.tiles {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}

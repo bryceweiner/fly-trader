@@ -7,7 +7,7 @@ import { api, ApiError, poll, type Account, type ClaimStatus, type Cursor, type 
 import { LineChart } from '../lib/chart'
 import { ClaimError, runClaim, solSignatureBytes, type ClaimStep } from '../lib/claim'
 import { humanError } from '../lib/evm'
-import { ago, duration, nextMondayUtc, parseAmount, pct, short, sol, solDelta, token, tokenFloat, usd, utc } from '../lib/format'
+import { ago, duration, parseAmount, pct, short, sol, solDelta, token, tokenFloat, usd, utc } from '../lib/format'
 import { $, busy, h, link, mountWalletBar, setText, statusLine, tabs, txLink } from '../lib/ui'
 import * as vault from '../lib/vault'
 
@@ -104,7 +104,6 @@ function renderStats() {
     setText('t-nav', SOL(s.wallet.nav, 3))
     setText('t-nav-usd', s.prices.sol_usd > 0 ? usd(navSol * s.prices.sol_usd) : '—')
     setText('t-nav-fly', s.prices.sol_usd > 0 && flyUsd > 0 ? token(BigInt(Math.floor((navSol * s.prices.sol_usd) / flyUsd)) * 10n ** 18n, 18, 0) : '—')
-    setText('t-state', `Fly ${s.fly.state}${s.cluster && s.cluster !== 'mainnet' ? ` · ${s.cluster}` : ''} · index ${s.index.value.toFixed(3)}`)
     $('w-address').replaceChildren(link(explorer.solAccount(s.fly.wallet), s.fly.wallet))
     if (s.book && s.book !== 'live') $('w-address').append(` (claims only; the trading is paper book ${s.book})`)
     $('c-wallet').replaceChildren(link(explorer.solAccount(s.fly.wallet), short(s.fly.wallet, 6, 6)))
@@ -128,11 +127,6 @@ function renderStats() {
 }
 
 function tick() {
-  const s = state.stats
-  const next = s?.settlement.next_at && s.settlement.next_at > now() ? s.settlement.next_at : nextMondayUtc(now())
-  setText('t-countdown', duration(next - now()))
-  setText('t-next', utc(next))
-  setText('t-age', s ? ago(now() - s.ts) : state.statsError ? 'offline' : '—')
   for (const el of document.querySelectorAll<HTMLElement>('[data-ready-at]')) {
     const left = Number(el.dataset.readyAt) - now()
     el.textContent = left > 0 ? `ready in ${duration(left)}` : 'ready now'
