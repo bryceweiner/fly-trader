@@ -1,0 +1,9 @@
+testMode: property
+testLimit: 200000
+seqLen: 120
+shrinkLimit: 2000
+# block time moves up to 9 days between calls, so requests pass their 7-day readyAt
+maxTimeDelay: 777600
+maxBlockDelay: 60000
+corpusDir: echidna-corpus
+cryticArgs: ["--foundry-compile-all"]

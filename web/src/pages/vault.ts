@@ -133,6 +133,10 @@ function tick() {
     const left = Number(el.dataset.readyAt) - now()
     el.textContent = left > 0 ? `ready in ${duration(left)}` : 'ready now'
   }
+  // A Withdraw button rendered before readyAt would otherwise stay disabled until the next position refresh.
+  for (const btn of document.querySelectorAll<HTMLButtonElement>('button[data-withdraw-at]')) {
+    if (btn.disabled && !txRunning && now() >= Number(btn.dataset.withdrawAt)) btn.disabled = false
+  }
 }
 setInterval(tick, 1000)
 
@@ -412,7 +416,7 @@ function renderPosition() {
               h('span', { class: 'micro', 'data-ready-at': r.readyAt }, ready ? 'ready now' : `ready in ${duration(r.readyAt - now())}`),
               h('span', { class: 'req-actions' },
                 h('button', { type: 'button', class: 'btn small', disabled: paused, title: paused ? 'Paused: cancelling is blocked' : 'Lock this amount again', onclick: (e: Event) => void busy(e.currentTarget as HTMLButtonElement, () => tx((step) => vault.cancelRequest(cfg, evm, r.id, step))) }, 'Cancel'),
-                h('button', { type: 'button', class: 'btn small primary', disabled: !ready, onclick: (e: Event) => void busy(e.currentTarget as HTMLButtonElement, () => tx((step) => vault.withdraw(cfg, evm, r.id, step))) }, 'Withdraw'),
+                h('button', { type: 'button', class: 'btn small primary', disabled: !ready, 'data-withdraw-at': r.readyAt, onclick: (e: Event) => void busy(e.currentTarget as HTMLButtonElement, () => tx((step) => vault.withdraw(cfg, evm, r.id, step))) }, 'Withdraw'),
               ),
             )
           }),

@@ -10,3 +10,6 @@ broadcast/**/dry-run/
 deployments/31337.json
 deployments/*.dry-run.json
 .env
+# echidna campaign output
+crytic-export/
+echidna-corpus/

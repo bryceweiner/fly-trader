@@ -42,7 +42,7 @@ const routerAbi = parseAbi([
   'struct SwapExecutionParams { address callTarget; address approveTarget; bytes targetData; SwapDescriptionV2 desc; bytes clientData; }',
   'function swap(SwapExecutionParams execution) payable returns (uint256 returnAmount, uint256 gasUsed)',
 ])
-function swapCalldata(o: { src?: Address; dst?: Address; to?: Address; amount?: bigint; minOut?: bigint }): Hex {
+function swapCalldata(o: { src?: Address; dst?: Address; to?: Address; amount?: bigint; minOut?: bigint; fee?: [Address, bigint] }): Hex {
   return encodeFunctionData({
     abi: routerAbi,
     functionName: 'swap',
@@ -56,8 +56,8 @@ function swapCalldata(o: { src?: Address; dst?: Address; to?: Address; amount?: 
           dstToken: o.dst ?? FLY,
           srcReceivers: [],
           srcAmounts: [],
-          feeReceivers: [],
-          feeAmounts: [],
+          feeReceivers: o.fee ? [o.fee[0]] : [],
+          feeAmounts: o.fee ? [o.fee[1]] : [],
           dstReceiver: o.to ?? USER,
           amount: o.amount ?? 1000n,
           minReturnAmount: o.minOut ?? 998_000n,
@@ -210,6 +210,13 @@ describe('AUDIT FINDING: route and calldata are verified against what the user a
   it('buildRoute refuses calldata for other tokens than the route', async () => {
     ok({ data: swapCalldata({ dst: EVIL }), routerAddress: ROUTER, transactionValue: '1000', amountIn: '1000', amountOut: '1000000' })
     await expect(buildRoute(route(), USER, 20)).rejects.toBeInstanceOf(KyberError)
+  })
+  it('buildRoute refuses calldata that lists a fee, even one inside the slippage floor', async () => {
+    const floor = minReceived(1_000_000n, 20)
+    ok({ data: swapCalldata({ minOut: floor, fee: [EVIL, 1n] }), routerAddress: ROUTER, transactionValue: '1000', amountIn: '1000', amountOut: '1000000' })
+    await expect(buildRoute(route(), USER, 20)).rejects.toThrow(/pays a fee/)
+    ok({ data: swapCalldata({ minOut: floor, fee: [EVIL, 0n] }), routerAddress: ROUTER, transactionValue: '1000', amountIn: '1000', amountOut: '1000000' })
+    await expect(buildRoute(route(), USER, 20)).rejects.toThrow(/pays a fee/)
   })
   it('buildRoute accepts well-formed calldata for the user at the right floor', async () => {
     ok({ data: swapCalldata({ minOut: minReceived(1_000_000n, 20) }), routerAddress: ROUTER, transactionValue: '1000', amountIn: '1000', amountOut: '1000000' })

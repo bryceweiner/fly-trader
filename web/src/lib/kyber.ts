@@ -153,6 +153,10 @@ export function checkBuild(built: BuiltRoute, route: Route, account: Address, sl
   if (!isAddressEqual(desc.dstReceiver, account)) return refuse('a transaction that pays another address')
   if (!sameToken(desc.srcToken, rs.tokenIn) || !sameToken(desc.dstToken, rs.tokenOut)) return refuse('a transaction for other tokens')
   if (desc.amount !== amountIn) return refuse('a transaction for a different amount')
+  // The router takes any listed fee out of the swapped amount (src) or the output (dst). minReturnAmount still bounds
+  // the loss, but a fee would silently eat the slippage budget, and the page promises no fee: builds without our
+  // fee parameters carry empty lists (checked on mainnet 2026-09-25).
+  if (desc.feeReceivers.length || desc.feeAmounts.some((x) => x !== 0n)) return refuse('a transaction that pays a fee')
   if (desc.minReturnAmount < minReceived(builtOut, slippageBps)) return refuse('a transaction without the slippage limit you chose')
 }
 

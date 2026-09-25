@@ -17,7 +17,7 @@ import { config } from '../src/config'
 import { robinhood } from '../src/lib/chains'
 import { approveExact, ensureChain, humanError } from '../src/lib/evm'
 import { buildRoute, DEFAULT_SLIPPAGE_BPS, getRoute, isSuspiciousQuote, minReceived, NATIVE, priceImpact, SLIPPAGE_LADDER_BPS, type BuiltRoute, type Route } from '../src/lib/kyber'
-import { pub, rpc, walletFor } from './harness'
+import { freshWallet, pub, rpc, walletFor } from './harness'
 
 const FLY = config.fly.address as Address
 const USDG = config.usdg!.address
@@ -97,8 +97,11 @@ describe('trading: buy and sell $FLY through KyberSwap', () => {
   beforeAll(async () => {
     expect(config.kyber.enabled).toBe(true)
     expect(await pub.getChainId()).toBe(4663)
-    ;({ cfg, address: user } = await walletFor(5))
-    await rpc('anvil_setBalance', [user, '0x' + parseEther('10').toString(16)])
+    // A fresh key, never anvil's well-known ones: on Robinhood mainnet some of those carry EIP-7702 delegations to
+    // sweepers (anvil key 5 forwards any ETH it receives), so a sell paying ETH to them fails the router's
+    // "Return amount is not enough" check at any slippage. That, not KyberSwap, broke the sell test on 2026-09-25.
+    ;({ cfg, address: user } = await freshWallet())
+    expect(await mainnet.getCode({ address: user }), 'the test wallet must be a plain EOA on mainnet').toBeUndefined()
     await ensureChain(cfg)
   })
 
@@ -228,7 +231,10 @@ describe('trading: buy and sell $FLY through KyberSwap', () => {
     expect(delivered!).toBeLessThan(spend) // a round trip through two pools cannot come back with more ETH than went in
     // and for real on the fork: the balance was set above, the exact approval is in place
     const ethBefore = await pub.getBalance({ address: user })
-    const status = await sendOnFork(cfg, user, builds.get(boundary)!)
+    // The fork already executed the buy above, which moved its pool against this sell; mainnet (measured above) has
+    // not. So the fork gets the build with the widest floor the page offers: it still proves the exact approval and
+    // a real execution, where the boundary build would fail on the fork's own price impact.
+    const status = await sendOnFork(cfg, user, builds.get(top)!)
     if (status !== 'drift') {
       expect(status).toBe('success')
       expect(await pub.readContract({ address: FLY, abi: erc20Abi, functionName: 'balanceOf', args: [user] })).toBe(0n)

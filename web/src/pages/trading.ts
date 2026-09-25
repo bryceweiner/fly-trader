@@ -260,7 +260,16 @@ async function swap() {
     // Dry run on the node first: a route the pools cannot honour at this slippage fails here, with a plain
     // explanation, instead of costing a wallet prompt and a reverted transaction.
     status('Checking the swap against the chain…', 'busy')
-    await publicClient().call({ account, to: built.routerAddress, data: built.data, value })
+    try {
+      await publicClient().call({ account, to: built.routerAddress, data: built.data, value })
+    } catch (e) {
+      // The router measures what arrives at the wallet. A smart account (EIP-7702 delegation or contract) that
+      // forwards incoming ETH receives nothing, so every slippage fails; saying "raise the slippage" would mislead.
+      if (isAddressEqual(s.tokenOut.address, NATIVE) && /Return amount is not enough/i.test(String((e as Error)?.message)) && (await publicClient().getCode({ address: account }).catch(() => undefined))) {
+        throw new Error('The router refused because your wallet did not keep the ETH it was sent: it is a smart account (EIP-7702 or contract) that forwards incoming ETH. Sell for USDG instead, or use another wallet.')
+      }
+      throw e
+    }
     status('Confirm the swap in your wallet…', 'busy')
     const hash = await sendTransaction(cfg, { account, to: built.routerAddress, data: built.data, value, chainId: config.evm.chainId })
     status('Waiting for confirmation…', 'busy')

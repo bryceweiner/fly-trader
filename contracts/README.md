@@ -47,6 +47,11 @@ warns above the Lock form). `test/InvariantExit.t.sol` fuzzes with upgrades mid-
 actor leave (paused or not) and checks each gets back exactly what they locked. `test/Symbolic.t.sol` holds Halmos
 proofs: `halmos --contract SymbolicVaultTest` (run `forge clean` first if forge built without ASTs). `forge lint` and
 Slither (`slither . --filter-paths "dependencies|test|script"`) report nothing beyond informational items.
+`test/echidna/EchidnaVault.sol` is an Echidna property harness (three holders, a pauser, donations, outsiders trying
+privileged calls, block time jumping up to 9 days): `echidna test/echidna/EchidnaVault.sol --contract EchidnaVault
+--config test/echidna/echidna.yaml`. `test/mutation/mutate.py` mutation-tests FlyVault against the forge suite (see its
+header). 2026-09-25: Echidna held all 7 properties over 200k calls, and every mutant that compiles and changes behaviour
+was killed (84 of 84); `forge coverage` reports 100 % lines, statements, branches and functions for `FlyVault.sol`.
 
 Compiler settings: solc 0.8.36, optimizer 10,000 runs, `evm_version = "shanghai"`. Cancun opcodes are not
 verified on this chain, so the contracts use the storage-based `ReentrancyGuard` and never the transient one.
