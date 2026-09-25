@@ -33,7 +33,7 @@ def cap(conn, native: int, token_acct: int = 0) -> dict:
     r = settle.realized(native, token_acct, cost, f["deposits"], f["withdrawals"], f["payouts"])
     a = settle.allocated_total(conn)
     principal = f["deposits"] - f["withdrawals"] + min(0, r - a)
-    liquid = native - nav.reserved_lamports(conn) - int(round(config.GAS_RESERVE_SOL * config.LAMPORTS_PER_SOL)) - FEE
+    liquid = native - nav.reserved_in_trading(conn) - int(round(config.GAS_RESERVE_SOL * config.LAMPORTS_PER_SOL)) - FEE
     return {"principal": principal, "liquid": liquid, "cap": max(0, min(principal, liquid)), "realized": r, "allocated": a}
 
 

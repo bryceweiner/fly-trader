@@ -98,7 +98,7 @@ def open_positions(conn) -> tuple[int, set[str]]:
 
 def last_own_slot(conn) -> int:
     r = conn.execute("SELECT GREATEST((SELECT max(slot) FROM fills WHERE book = 'live'), "
-                     "(SELECT max(slot) FROM vault_flows WHERE kind IN ('claim', 'withdrawal')), "
+                     "(SELECT max(slot) FROM vault_flows WHERE kind IN ('claim', 'withdrawal', 'sweep')), "
                      "(SELECT max((detail->>'slot')::bigint) FROM wallet_events WHERE kind = 'ata_closed' AND detail ? 'slot')) AS s").fetchone()
     return int(r["s"] or 0)
 
@@ -113,7 +113,7 @@ def flow_totals(conn, through_slot: int) -> dict:
     return {"deposits": int(r["d"]), "withdrawals": int(r["wd"]), "payouts": int(r["p"]), "gifts": int(r["gifts"])}
 
 
-def snapshot(rpc, wallet: str, wait_s: float = FINALITY_WAIT_S) -> dict:
+def snapshot(rpc, wallet: str, wait_s: float = FINALITY_WAIT_S, payout_wallet: str | None = None) -> dict:
     """The wallet at a finalized slot S that already contains every transaction our own code sent, read while no
     swap, claim or withdrawal can run, plus every flow up to S."""
     from . import flows, walletlock
@@ -129,6 +129,8 @@ def snapshot(rpc, wallet: str, wait_s: float = FINALITY_WAIT_S) -> dict:
                         continue                                  # a fill landed while we waited for the lock
                     cost, mints = open_positions(conn)
                 native, slot = rpc.get_balance_ctx(wallet, commitment="finalized", min_context_slot=max(last, 1))
+                if payout_wallet:                         # the payout wallet is part of the same book (vault/payout.py)
+                    native += rpc.get_balance_ctx(payout_wallet, commitment="finalized", min_context_slot=max(last, 1))[0]
                 accts = rpc.get_token_accounts_by_owner(wallet, commitment="finalized")
             break
         if time.monotonic() > deadline:
@@ -193,8 +195,8 @@ def paper_snapshot() -> dict:
             "payouts": paid, "realized_override": realized_}
 
 
-def take_snapshot(rpc, wallet: str, t0: int, t1: int) -> int:
-    snap = paper_snapshot() if paper() else snapshot(rpc, wallet)
+def take_snapshot(rpc, wallet: str, t0: int, t1: int, payout_wallet: str | None = None) -> int:
+    snap = paper_snapshot() if paper() else snapshot(rpc, wallet, payout_wallet=payout_wallet)
     r = snap["realized_override"] if "realized_override" in snap else \
         realized(snap["native"], snap["token_acct"], snap["open_cost"], snap["deposits"], snap["withdrawals"], snap["payouts"])
     with transaction() as conn:
@@ -261,14 +263,14 @@ def allocate_settlement(sid: int, index_state: dict) -> dict:
     return {"allocated": total, "pot": p["pot"], "earners": len(alloc), "carried": p["pot"] - total, "sha256": digest}
 
 
-def run_once(rpc, wallet: str, index_state: dict, now: float | None = None) -> dict:
+def run_once(rpc, wallet: str, index_state: dict, now: float | None = None, payout_wallet: str | None = None) -> dict:
     """Advance settlement by at most one step per phase; safe to call every minute."""
     if state.halted():
         return {"halted": True}
     out: dict = {}
     d = due(now)
     if d:
-        sid = take_snapshot(rpc, wallet, *d)
+        sid = take_snapshot(rpc, wallet, *d, payout_wallet=payout_wallet)
         out["snapshot"] = sid
     with transaction() as conn:
         pend = conn.execute("SELECT id FROM vault_settlements WHERE status = 'snapshotted' ORDER BY period_end").fetchall()

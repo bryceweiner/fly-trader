@@ -96,7 +96,7 @@ def known_ours(conn, signatures: list[str]) -> set[str]:
         "SELECT signature AS s FROM orders WHERE signature = ANY(%(s)s) "
         "UNION SELECT signature FROM fills WHERE signature = ANY(%(s)s) "
         "UNION SELECT tx_signature FROM vault_claims WHERE tx_signature = ANY(%(s)s) "
-        "UNION SELECT signature FROM vault_flows WHERE signature = ANY(%(s)s) AND kind IN ('withdrawal', 'claim') "
+        "UNION SELECT signature FROM vault_flows WHERE signature = ANY(%(s)s) AND kind IN ('withdrawal', 'claim', 'sweep') "
         "UNION SELECT detail->>'signature' FROM wallet_events WHERE detail->>'signature' = ANY(%(s)s) "
         "UNION SELECT (value->>'signature') FROM vault_kv WHERE key LIKE 'ours:%%' AND value->>'signature' = ANY(%(s)s)",
         {"s": list(signatures)}).fetchall()

@@ -6,7 +6,8 @@ received -> verified -> (waiting_liquidity) -> sending -> paid | rejected | fail
 * One claim in flight per holder (partial unique index); the amount is fixed when the claim moves to ``sending``.
 * The payment row (signature, blockhash, last valid height) is written BEFORE broadcast; after a crash the claim is
   re-checked on chain and re-signed only once its blockhash can no longer land, so a holder is never paid twice.
-* A payment never takes the wallet below the gas reserve; owed SOL is reserved out of the bankroll, so waiting is rare.
+* Claims are paid from the payout wallet (vault/payout.py), topped up after every settlement; a claim it cannot cover
+  waits (``waiting_liquidity``) until the next top-up, which the vault worker runs every minute.
 """
 from __future__ import annotations
 
@@ -132,7 +133,9 @@ def pay(cid: int, rpc, keypair, wait=None) -> str:
             alerts.send(f"claim {cid} failed after {MAX_ATTEMPTS} attempts ({row['lamports']} lamports to {row['sol']})")
             return "failed"
         native = rpc.get_balance(str(keypair.pubkey()))
-        gas = int(round(config.GAS_RESERVE_SOL * config.LAMPORTS_PER_SOL))
+        # claims are paid from the payout wallet (vault/payout.py), which holds only what is owed plus a fee buffer:
+        # it keeps just enough for this transaction's fee, not the trading wallet's gas reserve
+        gas = 0
         if native - int(row["lamports"]) - 10_000 < gas:
             with transaction() as conn:
                 _set(conn, cid, "waiting_liquidity", reason="wallet below the gas reserve after this payment")

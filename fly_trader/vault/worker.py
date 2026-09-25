@@ -15,7 +15,7 @@ from .. import config
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..logging_setup import setup
-from . import alerts, backup, claims, flows, nav, publish, rh_index, settle, state, walletlock
+from . import alerts, backup, claims, flows, nav, payout, publish, rh_index, settle, state, walletlock
 
 log = logging.getLogger(__name__)
 LOOP_S = 10.0
@@ -31,6 +31,10 @@ class Jobs:
         from .relay_client import RelayClient
         self.keypair = load_keypair()
         self.wallet = str(self.keypair.pubkey())
+        self.payout_kp = payout.load_keypair()               # claims are paid from here, never from the trading wallet
+        self.payout_wallet = str(self.payout_kp.pubkey())
+        if self.payout_wallet == self.wallet:
+            raise RuntimeError("the payout wallet must be a different key from the trading wallet")
         self.rpc = HttpSolanaRpc(config.vault_solana_rpc_url())
         self.rh = EvmRpc(config.RH_RPC_URL, config.RH_CHAIN_ID)
         self.relay = RelayClient()
@@ -60,7 +64,7 @@ class Jobs:
 
     # ---- jobs ----
     def claims(self):
-        claims.process(self.relay, self.rpc, self.keypair, self.rh)
+        claims.process(self.relay, self.rpc, self.payout_kp, self.rh)
 
     def scan(self):
         if not settle.paper():                                   # a paper book has no wallet to scan
@@ -85,7 +89,7 @@ class Jobs:
         if r["t"] and (datetime.now(timezone.utc) - r["t"]).total_seconds() < 150:
             return
         with walletlock.try_shared() as consistent:
-            native = self.rpc.get_balance(self.wallet)
+            native = self.rpc.get_balance(self.wallet) + payout.cached_balance()     # both wallets are one book
             with transaction() as conn:
                 cost, _ = settle.open_positions(conn)
                 m1 = datetime.fromtimestamp(int(time.time() // 60 * 60), timezone.utc)
@@ -95,7 +99,17 @@ class Jobs:
 
     def settle(self):
         st = getattr(self, "index_state", None) or rh_index.index_state()
-        settle.run_once(self.rpc, self.wallet, st)
+        settle.run_once(self.rpc, self.wallet, st, payout_wallet=None if settle.paper() else self.payout_wallet)
+
+    def sweep(self):
+        """Keep the payout wallet able to pay everything owed (after a settlement, or when a claim waits)."""
+        bal = payout.refresh_balance(self.rpc, self.payout_wallet)
+        if settle.paper():
+            return
+        with transaction() as conn:
+            owed = payout.owed_total(conn)
+        if bal < owed + int(config.PAYOUT_FEE_BUFFER_LAMPORTS) // 2:
+            payout.sweep(self.rpc, self.keypair, self.payout_wallet)
 
     def publish(self):
         publish.push(self.relay, self.wallet)
@@ -135,7 +149,7 @@ def main(stop_event: threading.Event | None = None) -> None:
     while not stop_event.is_set():
         jobs.run("claims", jobs.claims)
         if jobs.due("minute", MINUTE_S):
-            for name in ("scan", "index", "mark", "settle", "publish"):
+            for name in ("scan", "index", "sweep", "mark", "settle", "sweep", "publish"):
                 if stop_event.is_set():
                     break
                 jobs.run(name, getattr(jobs, name))

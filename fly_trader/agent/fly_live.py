@@ -82,7 +82,7 @@ class LiveMirror:
         reserved = 0.0
         if config.VAULT_ENABLED:                     # SOL owed to vault lockers stays in the wallet but is never traded
             from ..vault import nav as vault_nav
-            reserved = vault_nav.reserved_lamports(conn) / config.LAMPORTS_PER_SOL
+            reserved = vault_nav.reserved_in_trading(conn) / config.LAMPORTS_PER_SOL
         bankroll = sol_free + sum(float(p["cost_sol"]) for p in opens) - reserved; cash = sol_free - reserved; n_enter = 0; skipped = []
         for e in entries:
             if e["mint"] in held_mints:
@@ -109,7 +109,8 @@ class LiveMirror:
                      "ON CONFLICT (beat_id, book) DO NOTHING",
                      (beat_id, BOOK, m1, sol_free, gross_v - exit_cost, exit_cost, wealth, peak, (1.0 - wealth / peak) if peak > 0 else 0.0, exposure, len(opens)))
         if config.VAULT_ENABLED:                     # deposits, withdrawals and payouts are not performance
-            vault_nav.mark(conn, m1, snap.lamports, int(round(gross_v * config.LAMPORTS_PER_SOL)),
+            from ..vault import payout as vault_payout      # both wallets are one book: a sweep is not a loss
+            vault_nav.mark(conn, m1, snap.lamports + vault_payout.cached_balance(), int(round(gross_v * config.LAMPORTS_PER_SOL)),
                            int(round(exit_cost * config.LAMPORTS_PER_SOL)))
             ix = vault_nav.status(conn, since=rebase)
             killed = rails.check_drawdown(conn, ix["value"], ix["peak"], unit="index")

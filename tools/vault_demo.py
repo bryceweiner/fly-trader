@@ -79,11 +79,12 @@ def sol_keys() -> dict:
     if f.exists():
         return json.loads(f.read_text())
     keys = {}
-    for n in ("fly", "funder"):
+    for n in ("fly", "payout", "funder"):
         kp = Keypair()
         keys[n] = {"secret": base58.b58encode(bytes(kp)).decode(), "pubkey": str(kp.pubkey())}
     f.write_text(json.dumps(keys)); f.chmod(0o600)
-    (D / "fly_key").write_text(keys["fly"]["secret"] + "\n"); (D / "fly_key").chmod(0o600)
+    for n in ("fly", "payout"):
+        (D / f"{n}_key").write_text(keys[n]["secret"] + "\n"); (D / f"{n}_key").chmod(0o600)
     return keys
 
 
@@ -128,7 +129,7 @@ def paper_mode() -> bool:
 def fly_env(dep: dict, keys: dict) -> dict:
     db = "fly_trader" if paper_mode() else DB
     return {"VAULT_BOOK": PAPER_BOOK if paper_mode() else "live", "DATABASE_URL": f"postgresql:///{db}", "VAULT_ENABLED": "1", "VAULT_CLUSTER": "devnet", "VAULT_SOLANA_RPC_URL": DEVNET,
-            "SOLANA_CLUSTER": "devnet", "LIVE_ENABLED": "0", "BOT_PRIVATE_KEY": "", "BOT_PRIVATE_KEY_FILE": str(D / "fly_key"),
+            "SOLANA_CLUSTER": "devnet", "LIVE_ENABLED": "0", "BOT_PRIVATE_KEY": "", "BOT_PRIVATE_KEY_FILE": str(D / "fly_key"), "PAYOUT_PRIVATE_KEY_FILE": str(D / "payout_key"),
             "FUNDING_ADDRESSES": keys["funder"]["pubkey"], "RH_CHAIN_ID": "46630", "RH_RPC_URL": ANVIL,
             "VAULT_ADDRESS": dep["vault"], "VAULT_TIMELOCK": dep["timelock"], "VAULT_START_BLOCK": "0", "VAULT_PERIOD_S": "300",
             "RELAY_URL": f"http://127.0.0.1:{RELAY_PORT}", "RELAY_KEY_ID": "k1", "RELAY_SECRET": SECRET,
@@ -181,7 +182,7 @@ def up(paper: bool = False) -> None:
     # 5. devnet SOL: 1 SOL deposit from the funder, 0.25 SOL straight to the fly (= profit for lockers)
     keys = sol_keys()
     if paper:                                  # no deposits or gifts: the book's own trades are the profit; SOL here only pays claims
-        airdrop(keys["fly"]["pubkey"], 5)
+        airdrop(keys["payout"]["pubkey"], 5)
     got = False if paper else airdrop(keys["funder"]["pubkey"], 1.5)
     time.sleep(15)
     if got and balance(keys["funder"]["pubkey"]) > 1_100_000_000:
@@ -203,7 +204,7 @@ def up(paper: bool = False) -> None:
     spawn("site", ["npx", "vite", "--port", "5173", "--strictPort", "--host", "localhost"], env=web_env, cwd=REPO / "web")
     wait_http("http://localhost:5173/vault.html", "site")
     print(json.dumps({"site": "http://localhost:5173/vault.html", "trading": "http://localhost:5173/trading.html",
-                      "chain": ANVIL + " (id 46630)", **dep, "holders": holders, "fly_wallet": keys["fly"]["pubkey"],
+                      "chain": ANVIL + " (id 46630)", **dep, "holders": holders, "fly_wallet": keys["fly"]["pubkey"], "payout_wallet": keys["payout"]["pubkey"],
                       "funder": keys["funder"]["pubkey"], "logs": str(D)}, indent=1))
 
 
@@ -218,7 +219,7 @@ def down() -> None:
         subprocess.run(["psql", "-d", "fly_trader", "-qc", "TRUNCATE " + ", ".join(VAULT_TABLES)], capture_output=True)
         (D / "paper").unlink(missing_ok=True)
     subprocess.run(["dropdb", "--if-exists", DB], capture_output=True)
-    for f in ("relay/relay.sqlite3", "relay/relay.sqlite3-wal", "relay/relay.sqlite3-shm", "sol_keys.json", "fly_key", "vault.log"):
+    for f in ("relay/relay.sqlite3", "relay/relay.sqlite3-wal", "relay/relay.sqlite3-shm", "sol_keys.json", "fly_key", "payout_key", "vault.log"):
         (D / f).unlink(missing_ok=True)
     (REPO / "contracts" / "deployments" / "46630.json").unlink(missing_ok=True)
     print("demo stopped and wiped")

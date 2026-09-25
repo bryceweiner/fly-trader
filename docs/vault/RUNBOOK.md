@@ -74,7 +74,9 @@ handles your keys.
 ## 3. Server (Netcup RS 2000 G12, Ubuntu 24.04)
 1. Put your SSH key on the server. Then copy the `deploy/` folder from the distribution branch and run:
    `sudo bash deploy/bootstrap-host.sh "$(cat ~/.ssh/fly_release.pub)"`
-   It prints the **vault wallet address**. The key is created on the server and stays there.
+   It prints two addresses: the **trading wallet** and the **payout wallet**. Both keys are made on the server and stay
+   there. Keep both addresses private: the site never shows them, so nobody can watch the fly trade. Only ever fund the
+   trading wallet; the fly moves owed SOL to the payout wallet after each settlement and pays every claim from there.
 2. Edit `/srv/fly/vault.env`. Fill in:
    - `HELIUS_API_KEY`, `JUPITER_API_KEY`
    - `FUNDING_ADDRESSES`
@@ -113,7 +115,7 @@ handles your keys.
    writable, WAL works, and nothing caches `/api`.
 
 ## 5. Go live
-1. Send 5 SOL to the vault wallet from an address listed in `FUNDING_ADDRESSES`.
+1. Send 5 SOL to the **trading** wallet from an address listed in `FUNDING_ADDRESSES`.
 2. Check the deposit was counted: `fly-trader vault status` (inside the container) should show `deposits: 5000000000`.
    If it came from another address, run `fly-trader vault reclassify <sig> deposit`.
 3. The fly trades live after the handover: at least 20 paper trades.

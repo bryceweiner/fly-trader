@@ -168,6 +168,9 @@ def live_prerequisites_missing() -> list[str]:
 
 # ---- the $FLY vault (fly_trader/vault, docs/vault/SPEC.md): only the hosted vault fly sets VAULT_ENABLED ----
 VAULT_ENABLED = env_bool("VAULT_ENABLED", False)
+PAYOUT_PRIVATE_KEY_FILE = env_str("PAYOUT_PRIVATE_KEY_FILE")      # the second wallet claims are paid from (vault/payout.py)
+PAYOUT_FEE_BUFFER_LAMPORTS = env_int("PAYOUT_FEE_BUFFER_LAMPORTS", 10_000_000)   # kept in the payout wallet for claim fees
+PAYOUT_MIN_SWEEP_LAMPORTS = env_int("PAYOUT_MIN_SWEEP_LAMPORTS", 1_000_000)
 VAULT_BOOK = env_str("VAULT_BOOK", "live")                         # the book the vault shares: live; a paper book (e.g. paper_fly) for a dry run on real decisions without real SOL
 VAULT_CLUSTER = env_str("VAULT_CLUSTER", "mainnet-beta")           # devnet only for the rehearsal (trading off, claims on devnet)
 VAULT_SOLANA_RPC_URL = env_str("VAULT_SOLANA_RPC_URL")             # overrides Helius for the vault's reads/claims (the devnet rehearsal)
