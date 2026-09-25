@@ -18,6 +18,12 @@ WINDOW_DAYS = 30
 LAMPORTS = config.LAMPORTS_PER_SOL
 
 
+def reserved_in_trading(conn) -> int:
+    """What the TRADING wallet must hold back: owed SOL not yet swept to the payout wallet (vault/payout.py)."""
+    from . import payout
+    return max(0, reserved_lamports(conn) - payout.cached_balance())
+
+
 def reserved_lamports(conn) -> int:
     """Owed and not yet paid: everything allocated minus claims paid (in-flight claims are still in the wallet)."""
     r = conn.execute("SELECT COALESCE((SELECT sum(allocated) FROM vault_settlements WHERE status = 'allocated'), 0) - "

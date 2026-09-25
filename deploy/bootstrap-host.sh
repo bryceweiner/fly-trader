@@ -29,26 +29,33 @@ install -d -m 0700 /srv/fly/secrets
 install -d -m 0755 /etc/fly /usr/local/lib/fly
 echo "bryce ${RELEASE_PUBKEY}" > /etc/fly/allowed_signers
 chmod 0644 /etc/fly/allowed_signers
-# the trading wallet: an ed25519 seed made HERE, never copied off this box in plaintext (the fly's backup job writes an
-# age-encrypted copy for you). fly_trader.chain.keys accepts a base58 32-byte seed.
-if [ ! -e /srv/fly/secrets/bot_key ]; then
+# two wallets, each an ed25519 seed made HERE and never copied off this box in plaintext (the fly's backup job writes
+# age-encrypted copies for you): the trading wallet, and the payout wallet claims are paid from, so holders never see
+# the trading wallet. fly_trader.chain.keys accepts a base58 32-byte seed.
+make_key() {
+  local name="$1"
+  [ -e "/srv/fly/secrets/$name" ] && return 0
   umask 077
-  openssl genpkey -algorithm ed25519 -out /srv/fly/secrets/bot_key.pem
-  python3 - <<'PY'
-import subprocess
+  openssl genpkey -algorithm ed25519 -out "/srv/fly/secrets/$name.pem"
+  python3 - "$name" <<'PY'
+import subprocess, sys
+name = sys.argv[1]
 A = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 def b58(b):
     n = int.from_bytes(b, "big"); s = ""
     while n: n, r = divmod(n, 58); s = A[r] + s
     return "1" * (len(b) - len(b.lstrip(b"\0"))) + s
-priv = subprocess.run(["openssl", "pkey", "-in", "/srv/fly/secrets/bot_key.pem", "-outform", "DER"], check=True, capture_output=True).stdout[-32:]
-pub = subprocess.run(["openssl", "pkey", "-in", "/srv/fly/secrets/bot_key.pem", "-pubout", "-outform", "DER"], check=True, capture_output=True).stdout[-32:]
-open("/srv/fly/secrets/bot_key", "x").write(b58(priv) + "\n")
-print("vault wallet address:", b58(pub))
+pem = f"/srv/fly/secrets/{name}.pem"
+priv = subprocess.run(["openssl", "pkey", "-in", pem, "-outform", "DER"], check=True, capture_output=True).stdout[-32:]
+pub = subprocess.run(["openssl", "pkey", "-in", pem, "-pubout", "-outform", "DER"], check=True, capture_output=True).stdout[-32:]
+open(f"/srv/fly/secrets/{name}", "x").write(b58(priv) + "\n")
+print(f"{name}: {b58(pub)}")
 PY
-  shred -u /srv/fly/secrets/bot_key.pem
-  chmod 0400 /srv/fly/secrets/bot_key
-fi
+  shred -u "/srv/fly/secrets/$name.pem"
+  chmod 0400 "/srv/fly/secrets/$name"
+}
+make_key bot_key        # the trading wallet: fund it from a FUNDING_ADDRESSES address
+make_key payout_key     # the payout wallet: never fund it yourself; the fly tops it up after each settlement
 HERE="$(cd "$(dirname "$0")" && pwd)"
 install -m 0755 "$HERE/fly_update.py" /usr/local/lib/fly/fly_update.py
 [ -f /etc/fly/update.json ] || install -m 0600 "$HERE/update.json.example" /etc/fly/update.json

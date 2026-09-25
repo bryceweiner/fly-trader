@@ -45,12 +45,16 @@ def key_once() -> bool:
     if state.get("backup_key_done") or not configured():
         return False
     from ..chain.keys import load_keypair
-    kp = load_keypair()
+    from . import payout
     import base58
+    kp = load_keypair()
     with tempfile.TemporaryDirectory() as d:
-        out = Path(d) / "wallet-key.age"
-        _encrypt(base58.b58encode(bytes(kp)), out)
-        _upload([(out, f"keys/{kp.pubkey()}.age")])
+        files = []
+        for name, k in (("trading", kp), ("payout", payout.load_keypair())):
+            out = Path(d) / f"{name}-key.age"
+            _encrypt(base58.b58encode(bytes(k)), out)
+            files.append((out, f"keys/{name}-{k.pubkey()}.age"))
+        _upload(files)
     state.put("backup_key_done", {"ts": int(time.time()), "pubkey": str(kp.pubkey())})
     alerts.send(f"wallet key backup written (encrypted) for {kp.pubkey()}")
     return True

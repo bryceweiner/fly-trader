@@ -116,7 +116,10 @@ What the fly checks:
 - **The nonce.** Unique per EVM address and not expired.
 - **The amount.** Owed ≥ `CLAIM_MIN_LAMPORTS` (2,000,000).
 
-A valid claim pays **all** SOL owed to the EVM address, sent to `sol`.
+A valid claim pays **all** SOL owed to the EVM address, sent to `sol` from the **payout wallet**, never from the
+trading wallet. After each settlement the fly moves the owed SOL plus a 0.01 SOL fee buffer from the trading wallet to
+the payout wallet (a `sweep`). Both wallets count as one book for R, NAV and the kill switch, so a sweep is neither
+profit nor loss. Neither address is ever published.
 
 ## 3. Relay HTTP API (v1)
 

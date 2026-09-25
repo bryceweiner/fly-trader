@@ -26,11 +26,13 @@ services:
       DATA_DIR: /app/data
       LOG_DIR: /app/logs
       BOT_PRIVATE_KEY_FILE: /run/secrets/bot_key
+      PAYOUT_PRIVATE_KEY_FILE: /run/secrets/payout_key
       VAULT_ENABLED: "1"
     volumes:
       - /srv/fly/data:/app/data
       - /srv/fly/logs:/app/logs
       - /srv/fly/secrets/bot_key:/run/secrets/bot_key:ro
+      - /srv/fly/secrets/payout_key:/run/secrets/payout_key:ro
       - ${FLY_RELEASES:-/srv/fly/releases}:/releases:ro
     ports:
       - "127.0.0.1:8501:8501"
