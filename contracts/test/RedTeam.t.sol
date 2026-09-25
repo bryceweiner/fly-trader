@@ -285,7 +285,7 @@ contract RedTeamTest is VaultTest {
 
         EvilVault evil = new EvilVault();
         bytes memory data = abi.encodeCall(UUPSUpgradeable.upgradeToAndCall, (address(evil), ""));
-        uint256 t0 = block.timestamp;
+        uint256 t0 = vm.getBlockTimestamp(); // block.timestamp is re-read after skip() under via-IR (forge coverage)
         vm.prank(owner);
         timelock.schedule(address(vault), 0, data, bytes32(0), bytes32(0), TIMELOCK_DELAY);
 

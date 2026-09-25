@@ -259,7 +259,7 @@ contract FlyVaultTest is VaultTest {
 
     function test_withdraw_readyAtBoundary() public {
         _lock(alice, 100 ether);
-        uint256 requestedAt = block.timestamp;
+        uint256 requestedAt = vm.getBlockTimestamp(); // block.timestamp is re-read after skip() under via-IR (forge coverage)
         uint256 id = _request(alice, 25 ether);
         uint64 readyAt = uint64(requestedAt + WITHDRAW_DELAY);
 

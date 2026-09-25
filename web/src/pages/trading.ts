@@ -175,6 +175,7 @@ function labels() {
 }
 
 let quoteTimer: number | undefined
+let swapping = false
 function scheduleQuote() {
   clearTimeout(quoteTimer)
   quoteTimer = window.setTimeout(() => void quote(), 450)
@@ -228,7 +229,7 @@ function showQuote(route: Route, s: { tokenIn: Asset; tokenOut: Asset }) {
     swapBtn.disabled = true
   } else {
     swapBtn.textContent = state.side === 'buy' ? `Buy $FLY with ${s.tokenIn.symbol}` : `Sell $FLY for ${s.tokenOut.symbol}`
-    swapBtn.disabled = false
+    swapBtn.disabled = swapping // a re-quote while a swap waits in the wallet must not offer a second swap
   }
 }
 
@@ -238,9 +239,10 @@ async function swap() {
   const s = sides()
   const cfg = state.cfg
   const account = state.account
-  if (!s || !cfg || !account) return
+  if (!s || !cfg || !account || swapping) return
   const amount = parseAmount(amountEl.value, s.tokenIn.decimals)
   if (amount == null) return
+  swapping = true
   try {
     status('Checking network…', 'busy')
     await ensureChain(cfg)
@@ -270,6 +272,8 @@ async function swap() {
   } catch (e) {
     status(humanError(e), 'error')
     swapBtn.disabled = false
+  } finally {
+    swapping = false
   }
 }
 

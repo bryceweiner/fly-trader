@@ -1,3 +1,4 @@
+import { encodeFunctionData, parseAbi, type Address, type Hex } from 'viem'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   buildRoute,
@@ -29,6 +30,18 @@ function mockFetch(data: unknown) {
 }
 afterEach(() => vi.unstubAllGlobals())
 
+/** MetaAggregationRouterV2.swap calldata, as /route/build returns it. */
+function swapCalldata(o: { src: string; dst: string; to: string; amount: bigint; minOut: bigint }): Hex {
+  const abi = parseAbi([
+    'struct SwapDescriptionV2 { address srcToken; address dstToken; address[] srcReceivers; uint256[] srcAmounts; address[] feeReceivers; uint256[] feeAmounts; address dstReceiver; uint256 amount; uint256 minReturnAmount; uint256 flags; bytes permit; }',
+    'struct SwapExecutionParams { address callTarget; address approveTarget; bytes targetData; SwapDescriptionV2 desc; bytes clientData; }',
+    'function swap(SwapExecutionParams execution) payable returns (uint256 returnAmount, uint256 gasUsed)',
+  ])
+  const a = (x: string) => x as Address
+  const desc = { srcToken: a(o.src), dstToken: a(o.dst), srcReceivers: [], srcAmounts: [], feeReceivers: [], feeAmounts: [], dstReceiver: a(o.to), amount: o.amount, minReturnAmount: o.minOut, flags: 0n, permit: '0x' as Hex }
+  return encodeFunctionData({ abi, functionName: 'swap', args: [{ callTarget: a(EVIL), approveTarget: a(EVIL), targetData: '0x', desc, clientData: '0x' }] })
+}
+
 describe('router allowlist', () => {
   it('accepts the allowlisted router in any case', () => {
     expect(isAllowedRouter(ROUTER)).toBe(true)
@@ -50,7 +63,7 @@ describe('router allowlist', () => {
     await expect(buildRoute(route, EVIL, 100)).rejects.toThrow(/allowlisted/)
   })
   it('getRoute sends the client id and accepts the allowlisted router', async () => {
-    const fn = mockFetch({ routeSummary: { amountOut: '5' }, routerAddress: ROUTER.toLowerCase() })
+    const fn = mockFetch({ routeSummary: { tokenIn: NATIVE, tokenOut: FLY.toLowerCase(), amountIn: '10', amountOut: '5' }, routerAddress: ROUTER.toLowerCase() })
     const r = await getRoute(NATIVE, FLY, 10n)
     expect(r.routerAddress).toBe(ROUTER)
     const [url, init] = fn.mock.calls[0] as unknown as [string, RequestInit]
@@ -58,8 +71,10 @@ describe('router allowlist', () => {
     expect((init.headers as Record<string, string>)['x-client-id']).toBe('fly-trader')
   })
   it('buildRoute sends slippage in bps and a 20-minute deadline', async () => {
-    const fn = mockFetch({ data: '0xabc', routerAddress: ROUTER, transactionValue: '10', amountIn: '10', amountOut: '5' })
-    await buildRoute({ routeSummary: {} as never, routerAddress: ROUTER }, EVIL, 150, 1_000)
+    const data = swapCalldata({ src: NATIVE, dst: FLY, to: EVIL, amount: 10n, minOut: minReceived(5n, 150) })
+    const fn = mockFetch({ data, routerAddress: ROUTER, transactionValue: '10', amountIn: '10', amountOut: '5' })
+    const summary = { tokenIn: NATIVE, tokenOut: FLY, amountIn: '10', amountOut: '5' } as never
+    await buildRoute({ routeSummary: summary, routerAddress: ROUTER }, EVIL, 150, 1_000)
     const body = JSON.parse((fn.mock.calls[0] as unknown as [string, RequestInit])[1].body as string)
     expect(body).toMatchObject({ slippageTolerance: 150, deadline: 2_200, sender: EVIL, recipient: EVIL })
   })

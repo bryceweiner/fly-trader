@@ -108,6 +108,12 @@ def pay(cid: int, rpc, keypair, wait=None) -> str:
             return row["status"]
         if row.get("tx_signature"):                              # resume after a crash: did the last attempt land?
             st = (rpc.get_signature_statuses([row["tx_signature"]], search_history=True) or [None])[0]
+            if st and st.get("err") is None and st.get("confirmationStatus") in ("confirmed", "finalized"):
+                # Landed. Record it from the history lookup: await_confirmation polls without history, so once the
+                # status has aged out of the recent cache it would report "expired" and we would pay again.
+                with transaction() as conn:
+                    _record_paid(conn, cid, row, row["tx_signature"], int(st.get("slot") or 0), 5000)
+                return "paid"
             if st and st.get("err") is None:
                 status, info = wait(rpc, row["tx_signature"], row.get("last_valid_block_height"))
                 if status == "confirmed":
@@ -159,10 +165,17 @@ def process(relay, rpc, keypair, rh_rpc=None, now: float | None = None) -> dict:
     out = {"ingested": 0, "paid": 0, "rejected": 0}
     after = int(state.get("relay_claims_after") or 0)
     for c in relay.pending_claims(after=after):
-        with transaction() as conn:
-            if ingest(conn, c) is not None:
-                out["ingested"] += 1
-        after = max(after, int(c["id"]))
+        try:
+            with transaction() as conn:
+                if ingest(conn, c) is not None:
+                    out["ingested"] += 1
+        except Exception as e:                                   # a row we cannot store is skipped, not retried forever
+            log.warning("relay claim %s could not be stored: %s", c.get("id"), e)
+            alerts.send(f"relay claim {c.get('id')} was malformed and skipped: {e}", key="claim_malformed")
+        try:
+            after = max(after, int(c["id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
     state.put("relay_claims_after", after)
     if state.halted():
         return {**out, "halted": True}

@@ -2,7 +2,7 @@
  * KyberSwap aggregator on Robinhood Chain: quote (routes) and calldata (route/build).
  * The only contract we ever send a swap to, or approve, is the allowlisted router.
  */
-import { getAddress, isAddress, isAddressEqual, type Address, type Hex } from 'viem'
+import { decodeFunctionData, getAddress, isAddress, isAddressEqual, parseAbi, type Address, type Hex } from 'viem'
 import { config } from '../config'
 
 export const NATIVE = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE' as Address
@@ -47,6 +47,27 @@ export interface BuiltRoute {
 
 export class KyberError extends Error {}
 
+/** The two MetaAggregationRouterV2 entry points /route/build returns (selectors 0xe21fd0e9 and 0x8af033fb). */
+const ROUTER_ABI = parseAbi([
+  'struct SwapDescriptionV2 { address srcToken; address dstToken; address[] srcReceivers; uint256[] srcAmounts; address[] feeReceivers; uint256[] feeAmounts; address dstReceiver; uint256 amount; uint256 minReturnAmount; uint256 flags; bytes permit; }',
+  'struct SwapExecutionParams { address callTarget; address approveTarget; bytes targetData; SwapDescriptionV2 desc; bytes clientData; }',
+  'function swap(SwapExecutionParams execution) payable returns (uint256 returnAmount, uint256 gasUsed)',
+  'function swapSimpleMode(address caller, SwapDescriptionV2 desc, bytes executorData, bytes clientData) returns (uint256 returnAmount, uint256 gasUsed)',
+])
+
+/** How far the build's amountOut may fall below the quote the page showed (KyberSwap re-prices at build time). */
+export const BUILD_DRIFT_BPS = 50
+
+const sameToken = (a: string | undefined, b: string) => !!a && isAddress(a, { strict: false }) && isAddressEqual(a as Address, b as Address)
+
+function big(v: unknown): bigint | null {
+  try {
+    return typeof v === 'string' && /^\d+$/.test(v) ? BigInt(v) : null
+  } catch {
+    return null
+  }
+}
+
 export function isAllowedRouter(addr: string | null | undefined, allowed: string = config.kyber.router): boolean {
   return !!addr && isAddress(addr, { strict: false }) && isAddressEqual(addr as Address, allowed as Address)
 }
@@ -78,7 +99,12 @@ async function kyber<T>(path: string, init?: RequestInit): Promise<T> {
 export async function getRoute(tokenIn: Address, tokenOut: Address, amountIn: bigint, signal?: AbortSignal): Promise<Route> {
   const qs = new URLSearchParams({ tokenIn, tokenOut, amountIn: amountIn.toString(), gasInclude: 'true' })
   const data = await kyber<{ routeSummary: RouteSummary; routerAddress: string }>(`/routes?${qs}`, { signal })
-  return { routeSummary: data.routeSummary, routerAddress: assertRouter(data.routerAddress) }
+  const routerAddress = assertRouter(data.routerAddress)
+  const rs = data.routeSummary
+  if (!rs || !sameToken(rs.tokenIn, tokenIn) || !sameToken(rs.tokenOut, tokenOut) || big(rs.amountIn) !== amountIn || big(rs.amountOut) == null) {
+    throw new KyberError('Refusing the quote: KyberSwap answered for a different swap than the one asked for.')
+  }
+  return { routeSummary: rs, routerAddress }
 }
 
 export async function buildRoute(
@@ -98,7 +124,36 @@ export async function buildRoute(
       source: config.kyber.clientId,
     }),
   })
-  return { ...data, routerAddress: assertRouter(data.routerAddress) }
+  const built = { ...data, routerAddress: assertRouter(data.routerAddress) }
+  checkBuild(built, route, account, slippageBps)
+  return built
+}
+
+/** Decodes the router calldata and refuses it unless it swaps exactly the quoted tokens and amount, pays `account`,
+ *  and enforces at least the slippage floor the page showed. Guards against a compromised or buggy API: the router
+ *  allowlist alone would still let calldata send the output elsewhere or with no floor. */
+export function checkBuild(built: BuiltRoute, route: Route, account: Address, slippageBps: number): void {
+  const rs = route.routeSummary
+  const refuse = (why: string) => {
+    throw new KyberError(`Refusing the swap: KyberSwap built ${why}.`)
+  }
+  const amountIn = big(rs.amountIn)
+  const quotedOut = big(rs.amountOut)
+  const builtOut = big(built.amountOut)
+  if (amountIn == null || quotedOut == null || builtOut == null) return refuse('a transaction without readable amounts')
+  if (big(built.amountIn) !== amountIn) return refuse('a transaction for a different amount')
+  if (builtOut * 10_000n < quotedOut * BigInt(10_000 - BUILD_DRIFT_BPS)) return refuse('a transaction that delivers much less than quoted')
+  let desc
+  try {
+    const call = decodeFunctionData({ abi: ROUTER_ABI, data: built.data })
+    desc = call.functionName === 'swap' ? call.args[0].desc : call.args[1]
+  } catch {
+    return refuse('calldata the page cannot verify')
+  }
+  if (!isAddressEqual(desc.dstReceiver, account)) return refuse('a transaction that pays another address')
+  if (!sameToken(desc.srcToken, rs.tokenIn) || !sameToken(desc.dstToken, rs.tokenOut)) return refuse('a transaction for other tokens')
+  if (desc.amount !== amountIn) return refuse('a transaction for a different amount')
+  if (desc.minReturnAmount < minReceived(builtOut, slippageBps)) return refuse('a transaction without the slippage limit you chose')
 }
 
 export function clampSlippage(bps: number): number {

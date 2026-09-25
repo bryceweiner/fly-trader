@@ -39,6 +39,14 @@ addrCell('c-fly', config.fly.address ? explorer.evmAddress(config.fly.address) :
 
 /* ---------- banners ---------- */
 
+/** True when a contract upgrade is scheduled and a withdrawal requested now would be ready only after it can execute:
+ *  tokens locked now could not leave before it. */
+function upgradeBeatsExit(): boolean {
+  const up = state.stats?.vault.upgrade_scheduled
+  const delay = state.totals?.withdrawDelay ?? config.withdrawDelayS
+  return !!up && now() + delay >= up.eta
+}
+
 function banner(kind: 'info' | 'warn' | 'danger', title: string, body: (Node | string)[]): HTMLElement {
   return h('div', { class: `notice ${kind === 'danger' ? 'danger' : kind === 'info' ? 'info' : ''}` }, h('span', { class: 'micro' }, title), h('p', {}, ...body))
 }
@@ -64,8 +72,7 @@ function renderBanners() {
   }
   const up = s?.vault.upgrade_scheduled
   if (up) {
-    const delay = state.totals?.withdrawDelay ?? config.withdrawDelayS
-    const exitFirst = now() + delay < up.eta
+    const exitFirst = !upgradeBeatsExit()
     out.push(
       banner('warn', 'Contract upgrade scheduled', [
         `An upgrade of the vault contract can execute after ${utc(up.eta)} (in ${duration(up.eta - now())}). Operation `,
@@ -305,7 +312,14 @@ $<HTMLButtonElement>('nav-more').addEventListener('click', (e) =>
 
 /* ---------- your position ---------- */
 
-const posStatus = () => statusLine('pos-status')
+// The position panel is re-rendered on every refresh, so the last message lives here and is re-applied to the new
+// status line; otherwise "Confirmed" or a revert reason would vanish the moment the transaction finished.
+let posMsg: { msg: string | Node; kind: 'busy' | 'ok' | 'error' | 'info' } | null = null
+let txRunning = false
+const posStatus = () => (msg: string | Node, kind: 'busy' | 'ok' | 'error' | 'info' = 'info') => {
+  posMsg = msg ? { msg, kind } : null
+  statusLine('pos-status')(msg, kind)
+}
 
 function amountForm(id: string, label: string, max: bigint, cta: string, onSubmit: (amount: bigint) => Promise<void>, disabledNote?: string) {
   const input = h('input', { id: `${id}-amount`, type: 'text', inputmode: 'decimal', autocomplete: 'off', placeholder: '0.0', spellcheck: 'false' })
@@ -336,11 +350,14 @@ function amountForm(id: string, label: string, max: bigint, cta: string, onSubmi
 
 async function tx(run: (step: (m: string) => void) => Promise<`0x${string}`>) {
   const status = posStatus()
+  txRunning = true
   try {
     const hash = await run((m) => status(m, 'busy'))
     status(txLink(hash), 'ok')
   } catch (e) {
     status(humanError(e), 'error')
+  } finally {
+    txRunning = false
   }
   await refreshPosition()
   void refreshTotals()
@@ -370,6 +387,9 @@ function renderPosition() {
   if (!config.vault) {
     parts.push(h('p', { class: 'hint mt-16' }, 'Locking opens once the vault contract is deployed.'))
   } else if (p && cfg) {
+    if (upgradeBeatsExit()) {
+      parts.push(h('p', { class: 'hint red' }, 'A contract upgrade is scheduled and a withdrawal requested now would be ready only after it can execute: $FLY you lock now could not leave before the upgrade. See the banner above.'))
+    }
     parts.push(
       amountForm('lock', 'Lock $FLY', p.flyBalance, 'Lock', (amt) => tx((step) => vault.lock(cfg, evm, amt, step)), paused ? 'The vault is paused: locking is blocked for now.' : undefined),
       amountForm('req', 'Request a withdrawal (stops earning now; withdrawable after 7 days)', p.locked, 'Request', (amt) =>
@@ -418,6 +438,7 @@ function renderPosition() {
   }
   parts.push(h('p', { class: 'status-line', id: 'pos-status', role: 'status', 'aria-live': 'polite', hidden: true }))
   body.replaceChildren(...parts.filter((x): x is Node => x != null))
+  if (posMsg) statusLine('pos-status')(posMsg.msg, posMsg.kind)
 }
 
 function sharePct(p: vault.Position | null): string {
@@ -568,6 +589,7 @@ function onWallet(s: WalletState, w: Wallets) {
   state.evm = s.evm
   state.sol = s.sol
   if (evmChanged) {
+    posMsg = null
     state.position = null
     state.account = null
     renderPosition()
@@ -584,7 +606,8 @@ poll(refreshTotals, 60_000)
 poll(() => Promise.all(tables.map((t) => t.load(null))), 300_000)
 void loadNav(null, 2)
 poll(() => (nav.points.size ? loadNav(null, 1) : undefined), 120_000)
-poll(() => (state.evm && !state.claimRunning ? refreshPosition() : undefined), 45_000)
+// not while a transaction is in flight: a re-render would bring back enabled buttons mid-transaction
+poll(() => (state.evm && !state.claimRunning && !txRunning ? refreshPosition() : undefined), 45_000)
 renderPosition()
 setTimeout(() => {
   void mountWalletBar({ solana: true, onChange: onWallet }).then((w) => {

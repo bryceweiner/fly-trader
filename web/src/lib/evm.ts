@@ -26,7 +26,18 @@ export async function ensureChain(cfg: Config): Promise<void> {
 }
 
 export async function waitOk(cfg: Config, hash: Hex): Promise<void> {
-  const r = await waitForTransactionReceipt(cfg, { hash, chainId: config.evm.chainId })
+  let replaced: string | undefined
+  const r = await waitForTransactionReceipt(cfg, {
+    hash,
+    chainId: config.evm.chainId,
+    onReplaced: (x) => {
+      replaced = x.reason
+    },
+  })
+  // A sped-up ("repriced") transaction is the same call; a cancelled or replaced one is not what was asked for.
+  if (r.transactionHash !== hash && replaced !== 'repriced') {
+    throw new Error(`Transaction ${hash} was ${replaced ?? 'replaced'} in your wallet; nothing was done.`)
+  }
   if (r.status !== 'success') throw new Error(`Transaction ${hash} reverted.`)
 }
 

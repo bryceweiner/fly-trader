@@ -148,9 +148,15 @@ def use_challenge(conn, nonce: str, now: int) -> bool:
     return cur.rowcount == 1
 
 
+# In flight AND verified by the fly. A 'received' claim has only passed syntax checks (the relay checks no
+# signatures), so letting it block the address would let a stranger with no keys hold anyone's claim slot; the fly
+# rejects junk and pays each address at most once, whatever the relay accepts.
+VERIFIED_IN_FLIGHT = ("verified", "waiting_liquidity", "sending")
+
+
 def claim_in_flight(conn, evm: str) -> bool:
-    q = "SELECT 1 FROM claims WHERE evm = ? AND status IN (%s) LIMIT 1" % ",".join("?" * len(IN_FLIGHT))
-    return conn.execute(q, (evm,) + IN_FLIGHT).fetchone() is not None
+    q = "SELECT 1 FROM claims WHERE evm = ? AND status IN (%s) LIMIT 1" % ",".join("?" * len(VERIFIED_IN_FLIGHT))
+    return conn.execute(q, (evm,) + VERIFIED_IN_FLIGHT).fetchone() is not None
 
 
 def add_claim(conn, ch: dict, evm_sig: str, sol_sig: str, now: int) -> int:

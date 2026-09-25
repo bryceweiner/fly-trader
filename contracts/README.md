@@ -38,7 +38,14 @@ forge snapshot                 # refreshes .gas-snapshot
 no-return tokens, donations, forged or replayed request ids, a permanent pause, a malicious implementation behind
 the timelock (holders who request within a day of the schedule are out before it executes), a smuggled
 re-`initialize`, an `UPGRADER_ROLE` grant to an EOA (public for 8 days, then no delay: treat it like an upgrade), a
-timelock admin trying to skip the delay, and a check that no plain storage slot is ever written. `forge lint` and
+timelock admin trying to skip the delay, and a check that no plain storage slot is ever written.
+`test/RedTeamExtra.t.sol` (2026-09-25) adds ETH sends, allowance and request-id hijacking, request spam (another holder's
+gas is unchanged), a pauser who pauses and then loses its key, batched `updateDelay(0)` + upgrade, predecessors,
+cancelled operations, cross-vault ids, extreme amounts, and the other side of the exit window: someone who locks more
+than `TIMELOCK_DELAY - WITHDRAW_DELAY` after a malicious upgrade was scheduled cannot leave in time (the Vault page
+warns above the Lock form). `test/InvariantExit.t.sol` fuzzes with upgrades mid-run and, after every run, makes every
+actor leave (paused or not) and checks each gets back exactly what they locked. `test/Symbolic.t.sol` holds Halmos
+proofs: `halmos --contract SymbolicVaultTest` (run `forge clean` first if forge built without ASTs). `forge lint` and
 Slither (`slither . --filter-paths "dependencies|test|script"`) report nothing beyond informational items.
 
 Compiler settings: solc 0.8.36, optimizer 10,000 runs, `evm_version = "shanghai"`. Cancun opcodes are not

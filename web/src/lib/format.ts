@@ -133,9 +133,15 @@ export function nextMondayUtc(nowS: number): number {
 /**
  * Parses what a person typed into a token amount in base units.
  * Returns null for anything that is not a plain positive decimal with at most `decimals` fraction digits.
+ * Commas are accepted only as correct thousands grouping ("1,234.5"); a decimal comma ("0,5") is refused rather
+ * than read as 5.
  */
 export function parseAmount(input: string, decimals: number): bigint | null {
-  const s = input.trim().replace(/,/g, '')
+  let s = input.trim()
+  if (s.includes(',')) {
+    if (!/^\d{1,3}(,\d{3})+(\.\d*)?$/.test(s)) return null
+    s = s.replace(/,/g, '')
+  }
   if (!/^\d*\.?\d*$/.test(s) || s === '' || s === '.') return null
   const frac = s.split('.')[1] ?? ''
   if (frac.length > decimals) return null

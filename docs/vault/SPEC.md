@@ -138,13 +138,17 @@ with status 400, 401, 404, 409, 413, 429 or 503.
     - the nonce is known, unexpired, unused, and issued for this `evm` + `sol`
     - the signatures have valid syntax: `evm_sig` matches `^0x([0-9a-fA-F]{2}){65,1024}$`; `sol_sig` is base58 of 64 bytes
     - the published account's owed ≥ min
-    - no claim for this EVM address is in flight
-  - 409 if the nonce was already used or a claim is in flight.
+    - no claim for this EVM address that the fly has verified is in flight (`verified | waiting_liquidity |
+      sending`). An unverified `received` claim does not block, since it may be a stranger's junk; the fly pays
+      each address at most once whatever the relay accepts.
+  - 409 if the nonce was already used or a verified claim is in flight.
 - **`GET /api/claim/<id>`** returns `{"id", "status", "reason", "lamports", "tx", "created_at", "updated_at"}`.
   - Status is one of `received | verified | waiting_liquidity | sending | paid | rejected | failed`.
 - **Rate limits (token buckets):**
   - challenge: 30 per hour per IP
-  - claim: 10 per hour per IP and 5 per hour per EVM address
+  - claim: 10 per hour per IP and 5 per hour per EVM address and IP (so junk from one client cannot lock a holder out)
+  - behind a proxy, `client_ip_header` names the header to read, and the relay takes its rightmost entry (the one
+    the proxy appended).
   - reads: 600 per hour per IP.
 
 ### Fly only (HMAC)

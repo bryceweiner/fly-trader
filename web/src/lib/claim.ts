@@ -68,6 +68,18 @@ export function checkChallenge(c: Challenge, host: string): string | null {
     return `The relay issues claims for chain ${c.chain_id} / Solana ${c.sol_chain}, but this site is built for ${config.evm.chainId} / ${config.solana.cluster}.`
   }
   if (c.domain !== host) return `The relay issues claims for ${c.domain}. Open the Vault page at https://${c.domain} to claim.`
+  // The URI goes verbatim into both signed texts: no line breaks or spaces (which could forge extra lines), and
+  // only on the page's own origin.
+  let origin: string | null = null
+  try {
+    origin = /^[\x21-\x7e]+$/.test(c.uri) ? new URL(c.uri).origin : null
+  } catch {
+    origin = null
+  }
+  const local = /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host) // the local dry run is served over http
+  if (origin == null || (origin !== `https://${host}` && !(local && origin === `http://${host}`))) {
+    return 'The relay returned a malformed claim URI.'
+  }
   return null
 }
 

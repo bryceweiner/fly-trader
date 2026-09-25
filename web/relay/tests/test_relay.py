@@ -381,9 +381,12 @@ def test_claim_in_flight_409_then_allowed_after_terminal(client, vectors):
     v = vectors["mainnet"]
     client.push(accounts=[account()])
     first = submit(client, v).json()["id"]
-    for status in ("received", "verified", "waiting_liquidity", "sending"):
-        if status != "received":
-            result(client, {"id": first, "status": status})
+    # an unverified ('received') claim does not block: the relay checks no signatures, so it may be a stranger's junk
+    second = submit(client, v)
+    assert second.status == 202
+    result(client, {"id": second.json()["id"], "status": "rejected", "reason": "duplicate"})
+    for status in ("verified", "waiting_liquidity", "sending"):
+        result(client, {"id": first, "status": status})
         r = submit(client, v)
         assert r.status == 409 and "in flight" in r.json()["error"], status
     for terminal in ("paid", "rejected", "failed"):
@@ -412,11 +415,13 @@ def test_claim_per_evm_limit(client, vectors):
     v = vectors["mainnet"]
     client.push(accounts=[account()])
     for i in range(5):
-        r = submit(client, v, ip="192.0.2.%d" % i)
+        r = submit(client, v, ip="192.0.2.1")
         assert r.status == 202
         result(client, {"id": r.json()["id"], "status": "rejected", "reason": "bad signature"})
-    r = submit(client, v, ip="192.0.2.77")
+    r = submit(client, v, ip="192.0.2.1")
     assert r.status == 429 and r.header("Retry-After")
+    # the bucket is per address AND client: junk from one client cannot lock the holder out
+    assert submit(client, v, ip="192.0.2.77").status == 202
 
 
 def test_concurrent_submits_of_one_nonce_accept_exactly_one(client, vectors):

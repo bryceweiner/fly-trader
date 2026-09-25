@@ -151,7 +151,9 @@ def dumps(obj) -> str:
 def client_ip(environ: dict, cfg: Config) -> str:
     ip = ""
     if cfg.client_ip_header:
-        ip = (environ.get(cfg.client_ip_header) or "").split(",")[0].strip()
+        # The RIGHTMOST entry: proxies append the address they saw, so every entry left of it is client-controlled
+        # (taking the first one would let anyone pick their own rate-limit bucket).
+        ip = (environ.get(cfg.client_ip_header) or "").split(",")[-1].strip()
     return ratelimit.ip_key(ip or environ.get("REMOTE_ADDR", ""))
 
 
@@ -299,9 +301,9 @@ def post_claim(r: Req):
             raise HttpError(400, "owed is below the claim minimum")
         if store.claim_in_flight(conn, evm):
             raise HttpError(409, "a claim for this address is in flight")
-        # The per-address bucket is spent only by claims that pass every other check, so strangers
-        # sending junk for someone's address cannot drain it.
-        wait = ratelimit.take(conn, "claim_evm", evm, r.now)
+        # Per address AND client: the relay cannot tell a stranger's junk signatures from real ones, so a bucket
+        # keyed on the address alone would let strangers drain the holder's.
+        wait = ratelimit.take(conn, "claim_evm", "%s|%s" % (evm, r.ip), r.now)
         if wait:
             raise HttpError(429, "rate limited", [("Retry-After", str(int(wait) + 1))])
         if not store.use_challenge(conn, nonce, now):

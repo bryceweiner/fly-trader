@@ -86,7 +86,9 @@ def verify_evm(text: str, sig_hex: str, address: str, rpc: "evm.EvmRpc | None" =
         out = rpc.eth_call(want, data, gas=EIP1271_GAS)
     except Exception:
         raise SignatureInvalid("contract wallet rejected the signature") from None
-    if not out or out[:10].lower() != EIP1271_MAGIC:
+    # exactly one ABI word: bytes4 magic, left-aligned, zero padded (a fallback that echoes calldata starts with the
+    # selector too, and must not count as a yes)
+    if not out or out.lower() != EIP1271_MAGIC + "0" * 56:
         raise SignatureInvalid("contract wallet rejected the signature")
     return "eip1271"
 

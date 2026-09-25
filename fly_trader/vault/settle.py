@@ -156,16 +156,20 @@ def allocated_total(conn) -> int:
 
 
 def due(now: float | None = None) -> tuple[int, int] | None:
-    """(T0, T1) of the newest period that ended after the vault started and has no settlement yet."""
+    """(T0, T1) to settle next: T1 is the newest period end after the vault started; T0 is where the last settlement
+    ended (the first settlement covers the one period before T1). Normally that is one period. If periods were missed
+    (worker down, snapshot timeouts), it is one window over all of them: the profit is cumulative, so weighting it over
+    the whole window is exact, whereas settling only the newest period would hand the missed weeks' profit to that
+    period's holders."""
     now = time.time() if now is None else now
     start = int(state.get("vault_started_at") or 0)
     t1 = period_end_at_or_before(now)
     if not start or t1 <= start:
         return None
     with transaction() as conn:
-        if conn.execute("SELECT 1 FROM vault_settlements WHERE period_end = %s", (_ts(t1),)).fetchone():
-            return None
-    return t1 - int(config.VAULT_PERIOD_S), t1
+        last = conn.execute("SELECT max(period_end) AS e FROM vault_settlements").fetchone()["e"]
+    t0 = int(last.timestamp()) if last is not None else t1 - int(config.VAULT_PERIOD_S)
+    return (t0, t1) if t0 < t1 else None
 
 
 def paper() -> bool:
