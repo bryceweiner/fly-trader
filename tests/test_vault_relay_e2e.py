@@ -84,7 +84,8 @@ def test_push_claim_pay_report_roundtrip(relay, monkeypatch):
     base, client = relay
     publish.push(client, "WALLETPUBKEY")
     st = _get(base + "/api/stats")
-    assert st["fly"]["wallet"] == "WALLETPUBKEY" and st["ledger"]["allocated"] == 25_000_000
+    assert st["ledger"]["allocated"] == 25_000_000
+    assert "WALLETPUBKEY" not in json.dumps(st)            # the fly's address is never published
     acct = _get(base + "/api/account?evm=" + V["fields"]["evm"])
     assert acct["owed"] == 25_000_000
 
@@ -100,6 +101,6 @@ def test_push_claim_pay_report_roundtrip(relay, monkeypatch):
     out = claims.process(client, Rpc(), Keypair.from_seed(bytes([7]) * 32))
     assert out["paid"] == 1, out
     got = _get(f"{base}/api/claim/{body['id']}")
-    assert got["status"] == "paid" and got["lamports"] == 25_000_000
+    assert got["status"] == "paid" and got["lamports"] == 25_000_000 and not got.get("tx")   # the payout tx would name the fly
     publish.push(client, "WALLETPUBKEY")
     assert _get(base + "/api/account?evm=" + V["fields"]["evm"])["owed"] == 0

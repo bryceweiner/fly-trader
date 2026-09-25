@@ -221,7 +221,7 @@ def report(relay) -> int:
     if not rows:
         return 0
     relay.report([{"id": int(r["relay_id"]), "status": r["status"], "reason": r["reason"], "lamports": r["lamports"],
-                   "tx": r["tx_signature"] if r["status"] == "paid" else None} for r in rows])
+                   "tx": None} for r in rows])     # the payout tx names the fly's wallet: never published
     with transaction() as conn:
         conn.execute("UPDATE vault_claims SET reported_at = now() WHERE id = ANY(%s)", ([int(r["id"]) for r in rows],))
     return len(rows)

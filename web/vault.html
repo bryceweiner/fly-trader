@@ -43,7 +43,6 @@
     <div class="sub mt-0">
       <h2 class="sub-title">Trading wallet</h2>
       <div class="kv four">
-        <div class="wide"><span class="micro">The fly's Solana wallet</span><div class="v" id="w-address">—</div></div>
         <div><span class="micro">SOL balance</span><div class="v" id="w-native">—</div></div>
         <div><span class="micro">Operator deposits</span><div class="v" id="w-deposits">—</div></div>
         <div><span class="micro">Operator withdrawals</span><div class="v" id="w-withdrawals">—</div></div>
@@ -109,7 +108,7 @@
 
     <div class="sub">
       <h2 class="sub-title">Closed trades</h2>
-      <p class="hint">Trades appear once they close. Open positions and up-to-the-minute wallet figures are not published, so nobody can trade ahead of the fly; the wallet figures and the NAV chart run an hour behind.</p>
+      <p class="hint">Trades appear once they close. The fly's wallet address, open positions and up-to-the-minute wallet figures are not published, so nobody can trade ahead of the fly; the wallet figures and the NAV chart run an hour behind.</p>
       <div class="table-wrap"><table class="data" id="tbl-trades">
         <thead><tr><th scope="col">Closed</th><th scope="col">Token</th><th scope="col" class="num">Held</th><th scope="col" class="num">Cost</th><th scope="col" class="num">Proceeds</th><th scope="col" class="num">Realized</th><th scope="col">Exit</th></tr></thead>
         <tbody></tbody>
@@ -121,7 +120,7 @@
       <h2 class="sub-title">Wallet flows</h2>
       <p class="hint">Every SOL movement that is not a trade: operator deposits and withdrawals, profit from outside, and claims paid.</p>
       <div class="table-wrap"><table class="data" id="tbl-flows">
-        <thead><tr><th scope="col">Time</th><th scope="col">Kind</th><th scope="col" class="num">SOL</th><th scope="col">Counterparty</th><th scope="col">Transaction</th></tr></thead>
+        <thead><tr><th scope="col">Time</th><th scope="col">Kind</th><th scope="col" class="num">SOL</th></tr></thead>
         <tbody></tbody>
       </table></div>
       <button type="button" class="btn small mt-12" data-more="flows" hidden>Load more</button>
@@ -132,7 +131,7 @@
       <h2 class="sub-title">How it works</h2>
       <ol class="steps">
         <li><div><h4>Lock</h4><p>Lock $FLY in the FlyVault contract. It takes two wallet confirmations: an approval for exactly that amount, then the lock. Locked $FLY starts earning at once.</p></div></li>
-        <li><div><h4>The fly trades</h4><p>The fly trades Solana memecoins from its own wallet. Its wallet, every closed trade and every deposit are shown above. Open positions are not shown, and the wallet figures run an hour behind, so nobody can trade ahead of it.</p></div></li>
+        <li><div><h4>The fly trades</h4><p>The fly trades Solana memecoins from its own wallet. Every closed trade and every deposit is shown above. Its wallet address and open positions are not published, and the wallet figures run an hour behind, so nobody can trade ahead of it.</p></div></li>
         <li><div><h4>Weekly settlement</h4><p>Every Monday 00:00 UTC the fly adds up its closed-trade profit, after every fee, above what the operator deposited. Open positions count at cost, so only closed trades pay. If that total is higher than everything already paid out, the difference is split between lockers by locked $FLY × time locked during the week. A week with a loss pays nothing, and the loss has to be made back before anything is paid again. A week with no lockers carries its pot to the next one.</p></div></li>
         <li><div><h4>Claim</h4><p>Connect your EVM wallet and any Solana wallet, and sign one claim with each. The fly checks both signatures and sends all the SOL owed to your EVM address to your Solana wallet, usually within a minute. What you have earned stays yours until you claim it; it never expires.</p></div></li>
         <li><div><h4>Withdraw</h4><p>Request a withdrawal for any part of your locked $FLY. That part stops earning immediately and can be withdrawn 7 days later. Until then you can cancel the request, which locks it again. Withdrawals cannot be paused.</p></div></li>
@@ -157,7 +156,6 @@
         <div><span class="micro">FlyVault</span><div class="v" id="c-vault">—</div></div>
         <div><span class="micro">Timelock (8 days)</span><div class="v" id="c-timelock">—</div></div>
         <div><span class="micro">$FLY token</span><div class="v" id="c-fly">—</div></div>
-        <div><span class="micro">The fly's Solana wallet</span><div class="v" id="c-wallet">—</div></div>
       </div>
     </div>
   </div>

@@ -33,7 +33,6 @@ export interface Stats {
   cluster: string
   fly: {
     state: 'starting' | 'paper' | 'live' | 'halted' | string
-    wallet: string
     handover: boolean
     kill_switch: boolean
     entries_paused: boolean
@@ -87,10 +86,8 @@ export interface Trade {
 export interface Flow {
   id: number | string
   ts: number
-  signature: string
   direction: 'in' | 'out'
   kind: 'deposit' | 'profit' | 'withdrawal' | 'claim' | string
-  counterparty: string
   lamports: number
 }
 

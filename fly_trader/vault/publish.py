@@ -17,7 +17,8 @@ LAMPORTS = config.LAMPORTS_PER_SOL
 NAV_EVERY_S = 300                       # history points: one NAV mark per 5 min is plenty for a chart
 # Nothing public may help anyone front-run the fly: wallet figures and NAV points are published only once they are at
 # least this old, open positions are never published (a trade appears when it closes), and neither is the performance
-# index (it shows how close the kill switch is) nor the next settlement time; the snapshot's time is the hour.
+# index (it shows how close the kill switch is) nor the next settlement time; the snapshot's time is the hour. The fly's
+# wallet address is never published either, nor anything that leads to it (transaction signatures, deposit senders).
 PUBLIC_DELAY_S = 3600
 
 
@@ -66,7 +67,7 @@ def stats(conn, wallet: str, now: float | None = None) -> dict:
     up = (ix.get("upgrade_scheduled") or {}).get("next")
     return {
         "v": 1, "ts": int(now) // 3600 * 3600, "book": config.VAULT_BOOK, "cluster": "mainnet" if config.VAULT_CLUSTER == "mainnet-beta" else config.VAULT_CLUSTER,
-        "fly": {"state": fly_state, "wallet": wallet, "handover": bool(ho), "kill_switch": bool(c.kill_switch),
+        "fly": {"state": fly_state, "handover": bool(ho), "kill_switch": bool(c.kill_switch),
                 "entries_paused": bool(c.entries_paused),
                 "model": {"fly": fs.get("bootstrap"), "selector": (_ui(conn, "pinned_selector_snapshot") or {}).get("id"),
                           "release": (_ui(conn, "release") or {}).get("seq")}},
@@ -118,8 +119,9 @@ def history(conn, cur: dict) -> tuple[dict, dict]:
     fl = conn.execute("SELECT id, block_time, signature, direction, kind, counterparty, lamports FROM vault_flows "
                       "WHERE id > %s AND kind IN ('deposit', 'profit', 'withdrawal', 'claim') ORDER BY id LIMIT 500", (int(cur.get("flows", 0)),)).fetchall()
     if fl:
-        out["flows"] = [{"id": int(x["id"]), "ts": _t(x["block_time"]), "signature": x["signature"], "direction": x["direction"],
-                         "kind": x["kind"], "counterparty": x["counterparty"], "lamports": int(x["lamports"])} for x in fl]
+        # no signature or counterparty: either leads straight to the fly's wallet, which is not published
+        out["flows"] = [{"id": int(x["id"]), "ts": _t(x["block_time"]), "direction": x["direction"],
+                         "kind": x["kind"], "lamports": int(x["lamports"])} for x in fl]
     st = conn.execute("SELECT * FROM vault_settlements WHERE status = 'allocated' AND id > %s ORDER BY id", (int(cur.get("settlements", 0)),)).fetchall()
     if st:
         out["settlements"] = [settlement_item(s) for s in st]
@@ -145,7 +147,7 @@ def accounts(conn) -> list[dict]:
                     "allocations": [{"period_end": _t(a["period_end"]), "lamports": int(a["lamports"]), "weight": str(a["weight"]),
                                      "share": float(a["weight"]) / float(a["total_weight"]) if a["total_weight"] else 0.0} for a in allocs],
                     "claims": [{"id": int(c["id"]), "status": c["status"], "lamports": int(c["lamports"] or 0), "sol": c["sol"],
-                                "tx": c["tx_signature"] if c["status"] == "paid" else "", "created_at": _t(c["created_at"]),
+                                "tx": "", "created_at": _t(c["created_at"]),
                                 "updated_at": _t(c["updated_at"])} for c in cl]})
     return out
 

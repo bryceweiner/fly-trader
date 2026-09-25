@@ -190,7 +190,7 @@ Relay config: `relay.json`, kept next to `wsgi.py` and never inside `site/`:
 ```json
 {
  "v": 1, "ts": 0, "book": "live", "cluster": "mainnet",
- "fly": {"state": "starting|paper|live|halted", "wallet": "<base58>", "handover": false, "kill_switch": false,
+ "fly": {"state": "starting|paper|live|halted", "handover": false, "kill_switch": false,
          "entries_paused": false, "model": {"fly": 62, "selector": 59, "release": 3}},
  "wallet": {"native": 0, "nav": 0},
  "ledger": {"deposits": 0, "withdrawals": 0, "claims_paid": 0, "realized": 0, "booked_realized": 0,
@@ -203,7 +203,9 @@ Relay config: `relay.json`, kept next to `wsgi.py` and never inside `site/`:
 ```
 - **Nothing that helps trade ahead of the fly.** `ts` is rounded down to the hour; `wallet` (native SOL and marked NAV) is
   the newest mark at least 1 hour old; NAV history points are at least 1 hour old; open positions, the performance
-  index and the next settlement time are not published. A trade appears in `trades` history once it closes.
+  index and the next settlement time are not published. A trade appears in `trades` history once it closes. The
+  fly's wallet address is never published, nor anything that leads to it: no transaction signatures (flows, claim
+  payouts: `tx` is always empty) and no deposit senders.
 - `ledger.realized` is R. `pot` = max(0, R − allocated). `reserved` = allocated − claims_paid.
 - `settlement.last` is a settlements item (§4.2) or null.
 - `vault.upgrade_scheduled` is `{"eta": ts, "id": "0x…"}` or null: the soonest pending timelock operation whose target is the
@@ -213,7 +215,7 @@ Relay config: `relay.json`, kept next to `wsgi.py` and never inside `site/`:
 ### 4.2 History items
 - `nav`: `{"ts", "nav", "sol_usd"}` (points at least 1 hour old)
 - `trades`: `{"id", "mint", "symbol", "opened_at", "closed_at", "cost", "proceeds", "realized", "exit_kind"}`
-- `flows`: `{"id", "ts", "signature", "direction": "in|out", "kind": "deposit|profit|withdrawal|claim", "counterparty", "lamports"}`
+- `flows`: `{"id", "ts", "direction": "in|out", "kind": "deposit|profit|withdrawal|claim", "lamports"}`
 - `settlements`: `{"id", "period_start", "period_end", "realized", "pot", "allocated", "carried", "earners", "total_weight": "<str>", "status"}`
 
 ### 4.3 Account

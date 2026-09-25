@@ -60,7 +60,7 @@ function renderBanners() {
   if (s?.book && s.book !== 'live') {
     out.push(banner('info', 'Paper book', [
       `These are the running fly's real decisions on its paper book (${s.book}): real market, real model, real trades and NAV, but no real SOL moves. `,
-      'Deposits show the paper starting bankroll; the wallet address pays test claims only.',
+      'Deposits show the paper starting bankroll.',
     ]))
   }
   if (state.statsError) {
@@ -109,9 +109,6 @@ function renderStats() {
     setText('t-nav', SOL(s.wallet.nav, 3))
     setText('t-nav-usd', s.prices.sol_usd > 0 ? usd(navSol * s.prices.sol_usd) : '—')
     setText('t-nav-fly', s.prices.sol_usd > 0 && flyUsd > 0 ? token(BigInt(Math.floor((navSol * s.prices.sol_usd) / flyUsd)) * 10n ** 18n, 18, 0) : '—')
-    $('w-address').replaceChildren(link(explorer.solAccount(s.fly.wallet), s.fly.wallet))
-    if (s.book && s.book !== 'live') $('w-address').append(` (claims only; the trading is paper book ${s.book})`)
-    $('c-wallet').replaceChildren(link(explorer.solAccount(s.fly.wallet), short(s.fly.wallet, 6, 6)))
     const L = s.ledger
     setText('w-native', SOL(s.wallet.native))
     setText('w-deposits', SOL(L.deposits))
@@ -208,8 +205,6 @@ const ROWS: { [K in 'settlements' | 'trades' | 'flows']: (x: HistoryItems[K]) =>
       td(utc(x.ts)),
       td(h('span', { class: `tag ${x.kind}` }, x.kind)),
       td(`${x.direction === 'out' ? '−' : '+'}${sol(x.lamports)}`, `num ${x.direction === 'in' ? 'lime-text' : ''}`),
-      td(x.counterparty ? link(explorer.solAccount(x.counterparty), short(x.counterparty)) : '—'),
-      td(x.signature ? link(explorer.solTx(x.signature), short(x.signature, 6, 6)) : '—'),
     ),
 }
 
