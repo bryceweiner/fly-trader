@@ -92,7 +92,7 @@ def token_account_lamports(accounts: list[dict], open_mints: set[str]) -> int:
 
 
 def open_positions(conn) -> tuple[int, set[str]]:
-    rows = conn.execute("SELECT mint, cost_sol FROM positions WHERE book = 'live' AND status = 'open'").fetchall()
+    rows = conn.execute("SELECT mint, cost_sol FROM positions WHERE book = %s AND status = 'open'", (config.VAULT_BOOK,)).fetchall()
     return int(round(sum(float(r["cost_sol"] or 0.0) for r in rows) * LAMPORTS)), {r["mint"] for r in rows}
 
 
@@ -168,9 +168,31 @@ def due(now: float | None = None) -> tuple[int, int] | None:
     return t1 - int(config.VAULT_PERIOD_S), t1
 
 
+def paper() -> bool:
+    return config.VAULT_BOOK != "live"
+
+
+def paper_snapshot() -> dict:
+    """A paper book has no wallet: R is its closed-trade profit since the vault started (fees are inside each trade),
+    the latest wealth mark stands in for the wallet, and nothing flows in or out."""
+    start = int(state.get("vault_started_at") or 0)
+    with transaction() as conn:
+        r = conn.execute("SELECT COALESCE(sum(realized_sol), 0) AS s FROM positions WHERE book = %s AND status = 'closed' AND closed_at >= to_timestamp(%s)",
+                         (config.VAULT_BOOK, start)).fetchone()
+        m = conn.execute("SELECT sol_free FROM wealth_marks WHERE book = %s ORDER BY ts DESC LIMIT 1", (config.VAULT_BOOK,)).fetchone()
+        cost, _ = open_positions(conn)
+        paid = int(conn.execute("SELECT COALESCE(sum(lamports), 0) AS p FROM vault_flows WHERE kind = 'claim'").fetchone()["p"])
+    realized_ = int(round(float(r["s"]) * LAMPORTS))
+    native = int(round(float(m["sol_free"]) * LAMPORTS)) if m else 0
+    # realized() adds back payouts; here R is already the book's profit, so present it as native-only terms
+    return {"slot": 0, "at": int(time.time()), "native": native, "token_acct": 0, "open_cost": cost, "deposits": 0, "withdrawals": 0,
+            "payouts": paid, "realized_override": realized_}
+
+
 def take_snapshot(rpc, wallet: str, t0: int, t1: int) -> int:
-    snap = snapshot(rpc, wallet)
-    r = realized(snap["native"], snap["token_acct"], snap["open_cost"], snap["deposits"], snap["withdrawals"], snap["payouts"])
+    snap = paper_snapshot() if paper() else snapshot(rpc, wallet)
+    r = snap["realized_override"] if "realized_override" in snap else \
+        realized(snap["native"], snap["token_acct"], snap["open_cost"], snap["deposits"], snap["withdrawals"], snap["payouts"])
     with transaction() as conn:
         sid = conn.execute(
             "INSERT INTO vault_settlements (period_start, period_end, status, snapshot_slot, snapshot_at, native, token_acct, open_cost, "

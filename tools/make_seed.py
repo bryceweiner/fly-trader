@@ -67,8 +67,7 @@ def main(out: Path) -> None:
         cols = ("id", "ts", "run_id", "beat_id", "path", "sha256", "kind", "promoted_at", "promoted_by", "note")
         stmts.append(f"INSERT INTO brain_snapshots ({', '.join(cols)}) VALUES ({', '.join(_lit(r[c]) for c in cols)}) ON CONFLICT (id) DO NOTHING;")
     stmts.append("SELECT setval('brain_snapshots_id_seq', GREATEST((SELECT max(id) FROM brain_snapshots), 1));")
-    settings = {"fly_replay": v, "autostart": AUTOSTART,
-                "pinned_selector_snapshot": {"id": int(sel_id), "why": "shipped with the distribution: the selector this fly was taught by", "pinned_at": str(fly["meta"].get("S", ""))[:10]}}
+    settings = {"fly_replay": v, "autostart": AUTOSTART}      # no pin: the book loads the newest deployable selector on its own
     for k, val in settings.items():
         stmts.append(f"INSERT INTO ui_settings (key, value) VALUES ({_lit(k)}, {_lit(val)}::jsonb) ON CONFLICT (key) DO NOTHING;")
     (out / "seed").mkdir(exist_ok=True)
