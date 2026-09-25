@@ -45,7 +45,6 @@
       <div class="kv four">
         <div class="wide"><span class="micro">The fly's Solana wallet</span><div class="v" id="w-address">—</div></div>
         <div><span class="micro">SOL balance</span><div class="v" id="w-native">—</div></div>
-        <div><span class="micro">Open positions (value)</span><div class="v" id="w-positions">—</div></div>
         <div><span class="micro">Operator deposits</span><div class="v" id="w-deposits">—</div></div>
         <div><span class="micro">Operator withdrawals</span><div class="v" id="w-withdrawals">—</div></div>
         <div><span class="micro">Owed to lockers (reserved)</span><div class="v accent" id="w-owed">—</div></div>
@@ -54,7 +53,6 @@
         <div><span class="micro">Booked trade P&amp;L</span><div class="v" id="w-booked">—</div></div>
         <div><span class="micro">Allocated to lockers, all time</span><div class="v" id="w-allocated">—</div></div>
         <div><span class="micro">Pot for the next settlement</span><div class="v lime-text" id="w-pot">—</div></div>
-        <div><span class="micro">Est. cost to exit positions</span><div class="v" id="w-exit">—</div></div>
         <div><span class="micro">Last settlement</span><div class="v" id="w-last">—</div></div>
       </div>
       <p class="hint mt-12">R is measured from the wallet itself: SOL + token-account rent + open positions at cost − deposits + withdrawals + claims paid. Booked P&amp;L is the sum of the fly's own closed-trade records; the two should match up to fees and rent the trade records do not see.</p>
@@ -68,7 +66,6 @@
           <div class="tabs" role="tablist" aria-label="NAV unit" id="nav-tabs">
             <button type="button" role="tab" data-unit="sol" aria-selected="true">SOL</button>
             <button type="button" role="tab" data-unit="usd" aria-selected="false">USD</button>
-            <button type="button" role="tab" data-unit="index" aria-selected="false">Index</button>
           </div>
         </div>
         <div class="chart" id="nav-chart" role="img" aria-label="Fly NAV over time"></div>
@@ -111,15 +108,8 @@
     </div>
 
     <div class="sub">
-      <h2 class="sub-title">Open positions</h2>
-      <div class="table-wrap"><table class="data" id="tbl-positions">
-        <thead><tr><th scope="col">Token</th><th scope="col">Opened</th><th scope="col" class="num">Cost</th><th scope="col" class="num">Value</th><th scope="col" class="num">P&amp;L</th><th scope="col" class="num">Entry</th><th scope="col" class="num">Mark</th></tr></thead>
-        <tbody></tbody>
-      </table></div>
-    </div>
-
-    <div class="sub">
       <h2 class="sub-title">Closed trades</h2>
+      <p class="hint">Trades appear once they close. Open positions and up-to-the-minute wallet figures are not published, so nobody can trade ahead of the fly; the wallet figures and the NAV chart run an hour behind.</p>
       <div class="table-wrap"><table class="data" id="tbl-trades">
         <thead><tr><th scope="col">Closed</th><th scope="col">Token</th><th scope="col" class="num">Held</th><th scope="col" class="num">Cost</th><th scope="col" class="num">Proceeds</th><th scope="col" class="num">Realized</th><th scope="col">Exit</th></tr></thead>
         <tbody></tbody>

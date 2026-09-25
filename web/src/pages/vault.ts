@@ -7,7 +7,7 @@ import { api, ApiError, poll, type Account, type ClaimStatus, type Cursor, type 
 import { LineChart } from '../lib/chart'
 import { ClaimError, runClaim, solSignatureBytes, type ClaimStep } from '../lib/claim'
 import { humanError } from '../lib/evm'
-import { ago, duration, parseAmount, pct, short, sol, solDelta, token, tokenFloat, usd, utc } from '../lib/format'
+import { duration, parseAmount, pct, short, sol, solDelta, token, tokenFloat, usd, utc } from '../lib/format'
 import { $, busy, h, link, mountWalletBar, setText, statusLine, tabs, txLink } from '../lib/ui'
 import * as vault from '../lib/vault'
 
@@ -57,8 +57,6 @@ function renderBanners() {
   }
   if (state.statsError) {
     out.push(banner('warn', 'Stats unavailable', [state.statsError, ' On-chain data and your position still work.']))
-  } else if (s && now() - s.ts > 600) {
-    out.push(banner('warn', 'Stats are stale', [`The fly last published ${ago(now() - s.ts)}. It may be restarting.`]))
   }
   const paused = state.totals?.paused ?? s?.vault.paused
   if (paused) {
@@ -109,7 +107,6 @@ function renderStats() {
     $('c-wallet').replaceChildren(link(explorer.solAccount(s.fly.wallet), short(s.fly.wallet, 6, 6)))
     const L = s.ledger
     setText('w-native', SOL(s.wallet.native))
-    setText('w-positions', `${SOL(s.wallet.positions_value)} (cost ${sol(s.wallet.open_cost)})`)
     setText('w-deposits', SOL(L.deposits))
     setText('w-withdrawals', SOL(L.withdrawals))
     setText('w-owed', SOL(L.reserved))
@@ -118,10 +115,8 @@ function renderStats() {
     setText('w-booked', `${solDelta(L.booked_realized)} SOL (Δ ${solDelta(L.realized - L.booked_realized)})`)
     setText('w-allocated', SOL(L.allocated))
     setText('w-pot', SOL(L.pot))
-    setText('w-exit', SOL(s.wallet.exit_cost))
     const last = s.settlement.last
     setText('w-last', last ? `${utc(last.period_end, false)} · ${SOL(last.allocated)}` : 'none yet')
-    renderPositions(s)
   }
   renderBanners()
 }
@@ -168,26 +163,6 @@ function signed(l: number): HTMLTableCellElement {
 }
 function empty(tbody: HTMLElement, cols: number, text: string) {
   tbody.replaceChildren(h('tr', {}, h('td', { colspan: cols, class: 'muted' }, text)))
-}
-
-function renderPositions(s: Stats) {
-  const tbody = $('tbl-positions').querySelector('tbody')!
-  if (!s.positions.length) return empty(tbody, 7, 'No open positions.')
-  tbody.replaceChildren(
-    ...s.positions.map((p) =>
-      h(
-        'tr',
-        {},
-        td(link(explorer.solToken(p.mint), p.symbol || short(p.mint))),
-        td(`${duration(Math.max(0, s.ts - p.opened_at))} ago · holds ${duration(p.hold_min * 60)}`),
-        td(sol(p.cost), 'num'),
-        td(sol(p.value), 'num'),
-        td(p.cost > 0 ? pct((p.value - p.cost) / p.cost, true) : '—', `num ${p.value >= p.cost ? 'lime-text' : 'red'}`),
-        td(p.entry_price ? p.entry_price.toPrecision(4) : '—', 'num'),
-        td(p.mark_price ? p.mark_price.toPrecision(4) : '—', 'num'),
-      ),
-    ),
-  )
 }
 
 const ROWS: { [K in 'settlements' | 'trades' | 'flows']: (x: HistoryItems[K]) => HTMLTableRowElement } = {
@@ -272,7 +247,7 @@ const tables = [
 /* ---------- NAV chart ---------- */
 
 const nav = {
-  unit: 'sol' as 'sol' | 'usd' | 'index',
+  unit: 'sol' as 'sol' | 'usd',
   points: new Map<number, NavItem>(),
   next: null as Cursor | null,
   chart: null as LineChart | null,
@@ -282,7 +257,7 @@ const nav = {
 function navChart(): LineChart {
   if (nav.chart && nav.chartUnit === nav.unit) return nav.chart
   const fmt =
-    nav.unit === 'usd' ? (v: number) => usd(v) : nav.unit === 'index' ? (v: number) => v.toFixed(4) : (v: number) => v.toFixed(3)
+    nav.unit === 'usd' ? (v: number) => usd(v) : (v: number) => v.toFixed(3)
   nav.chart?.remove()
   nav.chart = new LineChart($('nav-chart'), fmt)
   nav.chartUnit = nav.unit
@@ -292,7 +267,7 @@ function navChart(): LineChart {
 function renderNav(fit: boolean) {
   const pts = [...nav.points.values()].map((p) => ({
     time: p.ts,
-    value: nav.unit === 'sol' ? p.nav / 1e9 : nav.unit === 'usd' ? (p.nav / 1e9) * p.sol_usd : p.index,
+    value: nav.unit === 'sol' ? p.nav / 1e9 : (p.nav / 1e9) * p.sol_usd,
   }))
   const msg = $('nav-msg')
   msg.hidden = pts.length > 0

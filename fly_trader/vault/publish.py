@@ -10,11 +10,15 @@ import time
 from .. import config
 from ..agent import handover, rails
 from ..db.connection import transaction
-from . import nav, prices, rh_index, settle, state
+from . import prices, rh_index, settle, state
 
 log = logging.getLogger(__name__)
 LAMPORTS = config.LAMPORTS_PER_SOL
 NAV_EVERY_S = 300                       # history points: one NAV mark per 5 min is plenty for a chart
+# Nothing public may help anyone front-run the fly: wallet figures and NAV points are published only once they are at
+# least this old, open positions are never published (a trade appears when it closes), and neither is the performance
+# index (it shows how close the kill switch is) nor the next settlement time; the snapshot's time is the hour.
+PUBLIC_DELAY_S = 3600
 
 
 def _ui(conn, key: str):
@@ -37,11 +41,9 @@ def settlement_item(r) -> dict:
 
 def stats(conn, wallet: str, now: float | None = None) -> dict:
     now = time.time() if now is None else now
-    m = conn.execute("SELECT * FROM vault_nav ORDER BY ts DESC LIMIT 1").fetchone()
-    w = {k: int(m[k]) if m else 0 for k in ("native", "token_acct", "positions_value", "exit_cost")}
-    w["nav"] = int(m["wealth"]) if m else 0
+    m = conn.execute("SELECT * FROM vault_nav WHERE ts <= to_timestamp(%s) ORDER BY ts DESC LIMIT 1", (now - PUBLIC_DELAY_S,)).fetchone()
+    w = {"native": int(m["native"]) if m else 0, "nav": int(m["wealth"]) if m else 0}
     cost, _mints = settle.open_positions(conn)
-    w["open_cost"] = cost
     f = settle.flow_totals(conn, 2**62)
     if settle.paper():                                     # a paper book: R is its closed-trade profit since the vault started
         start = int(state.get("vault_started_at", conn=conn) or 0)
@@ -50,7 +52,7 @@ def stats(conn, wallet: str, now: float | None = None) -> dict:
         r_now = int(round(float(rs) * LAMPORTS))
         f["deposits"] = int(round(config.CAPITAL_SOL * LAMPORTS))
     else:
-        r_now = settle.realized(w["native"], w["token_acct"], cost, f["deposits"], f["withdrawals"], f["payouts"])
+        r_now = settle.realized(live_native(conn), 0, cost, f["deposits"], f["withdrawals"], f["payouts"])
     a = settle.allocated_total(conn)
     booked = conn.execute("SELECT COALESCE(sum(realized_sol), 0) AS s FROM positions WHERE book = %s AND status = 'closed'", (config.VAULT_BOOK,)).fetchone()["s"]
     c = rails.load_circuit(conn)
@@ -61,18 +63,9 @@ def stats(conn, wallet: str, now: float | None = None) -> dict:
     ix = rh_index.index_state()
     tot = rh_index.totals(conn)
     last = conn.execute("SELECT * FROM vault_settlements WHERE status = 'allocated' ORDER BY period_end DESC LIMIT 1").fetchone()
-    from ..execution import ledger
-    opens = ledger.open_positions(conn, config.VAULT_BOOK)           # the same rows, decimals and holds the live book trades on
-    positions = []
-    for p in opens:
-        px = float(p["last_mark_price"] or p["entry_price"] or 0.0)
-        positions.append({"mint": p["mint"], "symbol": _symbol(conn, p["mint"]), "opened_at": _t(p["opened_at"]),
-                          "cost": int(round(float(p["cost_sol"]) * LAMPORTS)),
-                          "value": int(round(int(p["qty"]) / 10 ** int(p["decimals"] or 6) * px * LAMPORTS)),
-                          "entry_price": float(p["entry_price"] or 0.0), "mark_price": px, "hold_min": int((p["hold_s"] or 0) // 60)})
     up = (ix.get("upgrade_scheduled") or {}).get("next")
     return {
-        "v": 1, "ts": int(now), "book": config.VAULT_BOOK, "cluster": "mainnet" if config.VAULT_CLUSTER == "mainnet-beta" else config.VAULT_CLUSTER,
+        "v": 1, "ts": int(now) // 3600 * 3600, "book": config.VAULT_BOOK, "cluster": "mainnet" if config.VAULT_CLUSTER == "mainnet-beta" else config.VAULT_CLUSTER,
         "fly": {"state": fly_state, "wallet": wallet, "handover": bool(ho), "kill_switch": bool(c.kill_switch),
                 "entries_paused": bool(c.entries_paused),
                 "model": {"fly": fs.get("bootstrap"), "selector": (_ui(conn, "pinned_selector_snapshot") or {}).get("id"),
@@ -85,11 +78,14 @@ def stats(conn, wallet: str, now: float | None = None) -> dict:
         "vault": {"address": config.VAULT_ADDRESS, "chain_id": config.RH_CHAIN_ID, "total_locked": str(tot["total_locked"]),
                   "total_pending": str(tot["total_pending"]), "earners": tot["earners"], "finalized_block": ix["through_block"],
                   "paused": ix["paused"], "impl": ix["impl"], "upgrade_scheduled": {"eta": up["eta"], "id": up["id"]} if up else None},
-        "settlement": {"next_at": settle.period_end_at_or_before(now) + int(config.VAULT_PERIOD_S),
-                       "last": settlement_item(last) if last else None},
-        "positions": positions,
-        "index": nav.status(conn, since=rails.kill_rebase_at(conn)),
+        "settlement": {"last": settlement_item(last) if last else None},
     }
+
+
+def live_native(conn) -> int:
+    """The newest mark's SOL, for R only (R moves when a trade closes, which the trades history shows anyway)."""
+    m = conn.execute("SELECT native FROM vault_nav ORDER BY ts DESC LIMIT 1").fetchone()
+    return int(m["native"]) if m else 0
 
 
 def _symbol(conn, mint: str) -> str:
@@ -101,14 +97,14 @@ def history(conn, cur: dict) -> tuple[dict, dict]:
     """New history items since the cursors in ``cur``; returns (history, new cursors)."""
     out: dict = {}
     nav_since = float(cur.get("nav", 0))
-    rows = conn.execute("SELECT ts, wealth FROM vault_nav WHERE extract(epoch FROM ts) >= %s AND consistent ORDER BY ts", (nav_since + NAV_EVERY_S,)).fetchall()
-    series = dict(nav.load(conn))
+    rows = conn.execute("SELECT ts, wealth FROM vault_nav WHERE extract(epoch FROM ts) >= %s AND ts <= now() - make_interval(secs => %s) "
+                        "AND consistent ORDER BY ts", (nav_since + NAV_EVERY_S, PUBLIC_DELAY_S)).fetchall()
     sol = prices.sol_usd()[0]
     pts, last = [], nav_since
     for r in rows:
         t = r["ts"].timestamp()
         if t - last >= NAV_EVERY_S:
-            pts.append({"ts": int(t), "nav": int(r["wealth"]), "index": series.get(t, 1.0), "sol_usd": sol}); last = t
+            pts.append({"ts": int(t), "nav": int(r["wealth"]), "sol_usd": sol}); last = t
     if pts:
         out["nav"] = pts
     trades = conn.execute("SELECT id, mint, opened_at, closed_at, cost_sol, realized_sol, forced_exit_kind FROM positions "

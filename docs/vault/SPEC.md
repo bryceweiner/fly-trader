@@ -188,18 +188,18 @@ Relay config: `relay.json`, kept next to `wsgi.py` and never inside `site/`:
  "v": 1, "ts": 0, "book": "live", "cluster": "mainnet",
  "fly": {"state": "starting|paper|live|halted", "wallet": "<base58>", "handover": false, "kill_switch": false,
          "entries_paused": false, "model": {"fly": 62, "selector": 59, "release": 3}},
- "wallet": {"native": 0, "token_accounts": 0, "open_cost": 0, "positions_value": 0, "exit_cost": 0, "nav": 0},
+ "wallet": {"native": 0, "nav": 0},
  "ledger": {"deposits": 0, "withdrawals": 0, "claims_paid": 0, "realized": 0, "booked_realized": 0,
             "allocated": 0, "reserved": 0, "pot": 0},
  "prices": {"sol_usd": 0.0, "fly_usd": 0.0, "ts": 0},
  "vault": {"address": "0x…", "chain_id": 4663, "total_locked": "0", "total_pending": "0", "earners": 0,
            "finalized_block": 0, "paused": false, "impl": "0x…", "upgrade_scheduled": null},
- "settlement": {"next_at": 0, "last": null},
- "positions": [{"mint": "", "symbol": "", "opened_at": 0, "cost": 0, "value": 0, "entry_price": 0.0, "mark_price": 0.0, "hold_min": 0}],
- "index": {"value": 1.0, "peak": 1.0, "drawdown": 0.0}
+ "settlement": {"last": null}
 }
 ```
-- `wallet.nav` = native + token_accounts + positions_value − exit_cost.
+- **Nothing that helps trade ahead of the fly.** `ts` is rounded down to the hour; `wallet` (native SOL and marked NAV) is
+  the newest mark at least 1 hour old; NAV history points are at least 1 hour old; open positions, the performance
+  index and the next settlement time are not published. A trade appears in `trades` history once it closes.
 - `ledger.realized` is R. `pot` = max(0, R − allocated). `reserved` = allocated − claims_paid.
 - `settlement.last` is a settlements item (§4.2) or null.
 - `vault.upgrade_scheduled` is `{"eta": ts, "id": "0x…"}` or null: the soonest pending timelock operation whose target is the
@@ -207,7 +207,7 @@ Relay config: `relay.json`, kept next to `wsgi.py` and never inside `site/`:
   `CallScheduled` plus its `delay`.
 
 ### 4.2 History items
-- `nav`: `{"ts", "nav", "index", "sol_usd"}`
+- `nav`: `{"ts", "nav", "sol_usd"}` (points at least 1 hour old)
 - `trades`: `{"id", "mint", "symbol", "opened_at", "closed_at", "cost", "proceeds", "realized", "exit_kind"}`
 - `flows`: `{"id", "ts", "signature", "direction": "in|out", "kind": "deposit|profit|withdrawal|claim", "counterparty", "lamports"}`
 - `settlements`: `{"id", "period_start", "period_end", "realized", "pot", "allocated", "carried", "earners", "total_weight": "<str>", "status"}`

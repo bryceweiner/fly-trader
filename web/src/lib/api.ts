@@ -39,7 +39,8 @@ export interface Stats {
     entries_paused: boolean
     model: Record<string, number>
   }
-  wallet: { native: number; token_accounts: number; open_cost: number; positions_value: number; exit_cost: number; nav: number }
+  /** as of an hour ago (the fly publishes nothing that would let anyone trade ahead of it) */
+  wallet: { native: number; nav: number }
   ledger: {
     deposits: number
     withdrawals: number
@@ -62,15 +63,12 @@ export interface Stats {
     impl: string
     upgrade_scheduled: { eta: number; id: string } | null
   }
-  settlement: { next_at: number; last: Settlement | null }
-  positions: Position[]
-  index: { value: number; peak: number; drawdown: number }
+  settlement: { last: Settlement | null }
 }
 
 export interface NavItem {
   ts: number
   nav: number
-  index: number
   sol_usd: number
 }
 
