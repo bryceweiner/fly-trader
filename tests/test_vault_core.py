@@ -232,3 +232,9 @@ def test_timelock_ops_read_the_delay_word_and_watch_both_targets(monkeypatch):
     done = {"topics": [rh_index.T_EXECUTED, a, "0x" + _word(0)], "data": "0x", "blockNumber": hex(8), "blockTimestamp": hex(1_001)}
     gone = {"topics": [rh_index.T_TL_CANCELLED, b], "data": "0x", "blockNumber": hex(9), "blockTimestamp": hex(1_002)}
     assert rh_index._timelock_ops(Rpc([done, gone]), 11, 12, dict(ops), {}) == {}
+
+
+def test_public_wallet_figures_are_coarse():
+    from fly_trader.vault import publish
+    assert publish.coarse(1_234_567_890) == 1_200_000_000 and publish.coarse(1_250_000_001) == 1_300_000_000
+    assert publish.coarse(0) == 0

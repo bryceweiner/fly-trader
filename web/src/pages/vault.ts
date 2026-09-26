@@ -139,18 +139,22 @@ setInterval(tick, 1000)
 
 /** What changes when the fly settles or pays: when it moves, the tables and your position refresh at once. */
 let ledgerKey = ''
+let navKey = 0
 
 async function refreshStats() {
   try {
     state.stats = await api.stats()
     state.statsError = null
     const s = state.stats
-    const key = [s.settlement.last?.id ?? '', s.ledger.allocated, s.ledger.claims_paid, s.ledger.deposits, s.ledger.withdrawals].join('/')
+    const key = [s.settlement.last?.id ?? '', s.ledger.allocated, s.ledger.claims_paid, s.ledger.deposits, s.ledger.withdrawals,
+                 s.ledger.booked_realized, s.ledger.realized].join('/')
     if (ledgerKey && key !== ledgerKey) {
       void Promise.all(tables.map((t) => t.load(null)))
       if (state.evm && !state.claimRunning && !txRunning) void refreshPosition()
     }
     ledgerKey = key
+    if (navKey && s.wallet.nav !== navKey && nav.points.size) void loadNav(null, 1)   // a new 5-minute NAV point
+    navKey = s.wallet.nav
   } catch (e) {
     state.statsError =
       e instanceof ApiError && e.status === 503
@@ -612,11 +616,11 @@ function onWallet(s: WalletState, w: Wallets) {
 /* ---------- start ---------- */
 
 tick()
-poll(refreshStats, 15_000)
+poll(refreshStats, 5_000)
 poll(refreshTotals, 10_000)
-poll(() => Promise.all(tables.map((t) => t.load(null))), 30_000)
+poll(() => Promise.all(tables.map((t) => t.load(null))), 15_000)
 void loadNav(null, 2)
-poll(() => (nav.points.size ? loadNav(null, 1) : undefined), 60_000)
+poll(() => (nav.points.size ? loadNav(null, 1) : undefined), 30_000)
 // not while a transaction is in flight: a re-render would bring back enabled buttons mid-transaction
 poll(() => (state.evm && !state.claimRunning && !txRunning ? refreshPosition() : undefined), 10_000)
 renderPosition()

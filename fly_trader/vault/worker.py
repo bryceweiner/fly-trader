@@ -1,7 +1,7 @@
 """The ``vault`` worker: one thread inside the console (ops/supervisor.py) that runs the vault's periodic jobs.
 
-Every loop (~10 s): pull and pay claims. Every minute: scan the wallet's flows, index Robinhood Chain, mark NAV when
-the live book is not doing it (paper warm-up), advance settlement, push the public stats. Hourly: close empty token
+Every loop (~10 s): pull and pay claims, push the public stats. Every minute: scan the wallet's flows, index Robinhood
+Chain, mark NAV when the live book is not doing it (paper warm-up), advance settlement. Hourly: close empty token
 accounts. Each job is isolated: one failing never stops the others, and nothing here can raise into trading.
 """
 from __future__ import annotations
@@ -86,7 +86,7 @@ class Jobs:
             return
         with transaction() as conn:
             r = conn.execute("SELECT max(ts) AS t FROM vault_nav").fetchone()
-        if r["t"] and (datetime.now(timezone.utc) - r["t"]).total_seconds() < 150:
+        if r["t"] and (datetime.now(timezone.utc) - r["t"]).total_seconds() < 50:
             return
         with walletlock.try_shared() as consistent:
             native = self.rpc.get_balance(self.wallet) + payout.cached_balance()     # both wallets are one book
@@ -148,8 +148,9 @@ def main(stop_event: threading.Event | None = None) -> None:
     log.info("vault worker: wallet %s, relay %s, vault %s on chain %s", jobs.wallet, config.RELAY_URL, config.VAULT_ADDRESS, config.RH_CHAIN_ID)
     while not stop_event.is_set():
         jobs.run("claims", jobs.claims)
+        jobs.run("publish", jobs.publish)                        # every loop (10 s): the site is live
         if jobs.due("minute", MINUTE_S):
-            for name in ("scan", "index", "sweep", "mark", "settle", "sweep", "publish"):
+            for name in ("scan", "index", "sweep", "mark", "settle", "sweep"):
                 if stop_event.is_set():
                     break
                 jobs.run(name, getattr(jobs, name))

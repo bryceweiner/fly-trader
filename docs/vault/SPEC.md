@@ -204,11 +204,12 @@ Relay config: `relay.json`, kept next to `wsgi.py` and never inside `site/`:
  "settlement": {"last": null}
 }
 ```
-- **Nothing that helps trade ahead of the fly.** `ts` is rounded down to the hour; `wallet` (native SOL and marked NAV) is
-  the newest mark at least 1 hour old; NAV history points are at least 1 hour old; open positions, the performance
-  index and the next settlement time are not published. A trade appears in `trades` history once it closes. The
-  fly's wallet address is never published, nor anything that leads to it: no transaction signatures (flows, claim
-  payouts: `tx` is always empty) and no deposit senders.
+- **Nothing that helps trade ahead of the fly.** The snapshot is pushed every 10 s. `ts` is rounded down to the hour;
+  `wallet.native` and `wallet.nav` come from the last 5-minute mark and are rounded to 0.1 SOL (NAV history points
+  likewise), so one buy cannot be matched to an on-chain trade; `ledger.realized` is R at that same mark. Open
+  positions, the performance index and the next settlement time are not published; a trade appears in `trades`
+  history once it closes. The fly's wallet address is never published, nor anything that leads to it: no
+  transaction signatures (flows, claim payouts: `tx` is always empty) and no deposit senders.
 - `ledger.realized` is R. `pot` = max(0, R − allocated). `reserved` = allocated − claims_paid.
 - `settlement.last` is a settlements item (§4.2) or null.
 - `vault.upgrade_scheduled` is `{"eta": ts, "id": "0x…"}` or null: the soonest pending timelock operation whose target is the
@@ -216,7 +217,7 @@ Relay config: `relay.json`, kept next to `wsgi.py` and never inside `site/`:
   `CallScheduled` plus its `delay`.
 
 ### 4.2 History items
-- `nav`: `{"ts", "nav", "sol_usd"}` (points at least 1 hour old)
+- `nav`: `{"ts", "nav", "sol_usd"}` (5-minute marks, nav rounded to 0.1 SOL)
 - `trades`: `{"id", "mint", "symbol", "opened_at", "closed_at", "cost", "proceeds", "realized", "exit_kind"}`
 - `flows`: `{"id", "ts", "direction": "in|out", "kind": "deposit|profit|withdrawal|claim", "lamports"}`
 - `settlements`: `{"id", "period_start", "period_end", "realized", "pot", "allocated", "carried", "earners", "total_weight": "<str>", "status"}`
