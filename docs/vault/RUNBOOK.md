@@ -72,8 +72,15 @@ handles your keys.
    This value becomes `VAULT_IMPL_CODEHASHES` in step 3.
 
 ## 3. Server (Netcup RS 2000 G12, Ubuntu 24.04)
-1. Put your SSH key on the server. Then copy the `deploy/` folder from the distribution branch and run:
-   `sudo bash deploy/bootstrap-host.sh "$(cat ~/.ssh/fly_release.pub)"`
+1. Order the server with your SSH key (root login). Copy the `deploy/` folder from the distribution branch to it and
+   run, as root:
+   `ADMIN_USER=fly-admin bash deploy/bootstrap-host.sh "$(cat ~/.ssh/fly_release.pub)"`
+   It hardens the box (roughly CIS level 1 for a single-purpose host): SSH only for `fly-admin`, key only, root login
+   off; firewall in and out (outgoing only HTTPS, HTTP for apt, DNS, NTP; containers only HTTPS and DNS); kernel and
+   Docker hardening (user namespaces, no new privileges); fail2ban, an audit log of every read of the wallet keys, a
+   file-integrity baseline (AIDE), automatic security updates with a 04:00 UTC reboot when needed.
+   **Before closing the root session, log in from a second terminal as `ssh fly-admin@<server>`.** Then run
+   `sudo /usr/local/lib/fly/check-host.sh`: every control must pass (tested on Ubuntu 24.04: all pass, Lynis index 74).
    It prints two addresses: the **trading wallet** and the **payout wallet**. Both keys are made on the server and stay
    there. Keep both addresses private: the site never shows them, so nobody can watch the fly trade. Only ever fund the
    trading wallet; the fly moves owed SOL to the payout wallet after each settlement and pays every claim from there.
