@@ -6,6 +6,15 @@
                                                      # trades and closed-trade profit, just no real SOL
     .venv/bin/python tools/vault_demo.py status
     .venv/bin/python tools/vault_demo.py down
+    .venv/bin/python tools/vault_demo.py fund-evm 0xYourMetaMaskAddress   # 100 local ETH + 1M test $FLY
+    .venv/bin/python tools/vault_demo.py fund-sol YourPhantomAddress      # 2 local SOL (not needed to claim)
+    .venv/bin/python tools/vault_demo.py profit 0.2                       # live-style only: 0.2 SOL of outside profit
+
+Wallets for hands-on testing (use fresh test accounts, never your real ones):
+  MetaMask  add network  RPC http://127.0.0.1:8545  chain id 46630  currency ETH
+  Phantom   Settings > Developer settings > Testnet mode, then a custom RPC http://127.0.0.1:8899
+  The site  needs a Reown project id for its Connect button: VITE_REOWN_PROJECT_ID=<id> in the environment when you run
+            `up`, or the id in .vault-demo/reown_project_id (allowlist localhost:5173 in the Reown dashboard)
 
 What runs (state and logs in .vault-demo/, gitignored):
   anvil        chain id 46630 on :8545 (stands in for Robinhood testnet), Multicall3 at its canonical address
@@ -137,6 +146,34 @@ def fly_env(dep: dict, keys: dict) -> dict:
             "GAS_RESERVE_SOL": "0.01", "TELEGRAM_BOT_TOKEN": "", "LOG_DIR": str(D / "fly-logs")}
 
 
+def reown_id() -> str:
+    f = D / "reown_project_id"
+    return (os.environ.get("VITE_REOWN_PROJECT_ID") or (f.read_text().strip() if f.exists() else "")).strip()
+
+
+def fund_evm(addr: str) -> None:
+    dep = json.loads((D / "deployment.json").read_text())
+    sh("cast", "rpc", "anvil_setBalance", addr, hex(100 * 10**18), "--rpc-url", ANVIL)
+    sh("cast", "send", dep["fly"], "mint(address,uint256)", addr, "1000000000000000000000000", "--rpc-url", ANVIL, "--private-key", ACCTS[0])
+    print(f"{addr}: 100 ETH and 1,000,000 mFLY on the local chain (46630). MockFLY is {dep['fly']}; the vault is {dep['vault']}")
+
+
+def fund_sol(addr: str) -> None:
+    print(f"{addr}: airdrop {'ok' if airdrop(addr, 2) else 'FAILED'} (2 local SOL)")
+
+
+def profit(sol: float) -> None:
+    if paper_mode():
+        raise SystemExit("paper mode: profit comes from the running fly's closed trades; use `up` without --paper to inject it")
+    from solders.keypair import Keypair
+    import base58
+    kp = Keypair()
+    airdrop(str(kp.pubkey()), sol + 0.01)
+    time.sleep(3)
+    keys = sol_keys()
+    print("gift tx:", transfer(base58.b58encode(bytes(kp)).decode(), keys["fly"]["pubkey"], int(sol * 1e9))[:16], "… (counted as profit; settles within 5 min)")
+
+
 def up(paper: bool = False) -> None:
     D.mkdir(exist_ok=True)
     (D / "paper").unlink(missing_ok=True)
@@ -200,7 +237,7 @@ def up(paper: bool = False) -> None:
     # 7. the site
     web_env = {"VITE_NETWORK": "testnet", "VITE_EVM_RPC": ANVIL, "VITE_VAULT_ADDRESS": dep["vault"], "VITE_TIMELOCK_ADDRESS": dep["timelock"],
                "VITE_FLY_ADDRESS": dep["fly"], "VITE_RELAY_PROXY": f"http://127.0.0.1:{RELAY_PORT}",
-               "VITE_REOWN_PROJECT_ID": os.environ.get("VITE_REOWN_PROJECT_ID", "")}
+               "VITE_REOWN_PROJECT_ID": reown_id()}
     spawn("site", ["npx", "vite", "--port", "5173", "--strictPort", "--host", "localhost"], env=web_env, cwd=REPO / "web")
     wait_http("http://localhost:5173/vault.html", "site")
     print(json.dumps({"site": "http://localhost:5173/vault.html", "trading": "http://localhost:5173/trading.html",
@@ -241,5 +278,11 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "up":
         up(paper="--paper" in sys.argv)
+    elif cmd == "fund-evm":
+        fund_evm(sys.argv[2])
+    elif cmd == "fund-sol":
+        fund_sol(sys.argv[2])
+    elif cmd == "profit":
+        profit(float(sys.argv[2]))
     else:
         {"down": down, "status": status}.get(cmd, lambda: print(__doc__))()
