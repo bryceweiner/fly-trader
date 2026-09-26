@@ -120,10 +120,41 @@ def test_the_exchange_walk_resumes_from_its_saved_page_and_later_rounds_cover_on
     with transaction() as c:
         assert c.execute("SELECT count(*) AS n FROM kalshi_corpus WHERE ticker LIKE 'TSTH-W%'").fetchone()["n"] == 16
     # the next round: only the live tier, only markets closing since the completed walk began (less the recovery margin)
-    rest3 = FakeRest(live + [_mk(50, t0 + timedelta(days=1))], hist)
+    rest3 = FakeRest([_mk(50, datetime.now(timezone.utc).replace(microsecond=0))] + live, hist)     # settled after the walk began: newest first
     n = H.refresh_markets(rest3)
-    assert n == 1 and all(c[0] != "page" or True for c in rest3.calls) and not any(c[1] for c in rest3.calls if c[0] == "event" and "E100" in c[1])
+    assert n == 1
     assert [c for c in rest3.calls if c[0] == "page"] == [("page", 0)]                   # one live page, the archive untouched
     with transaction() as c:
         assert c.execute("SELECT count(*) AS n FROM kalshi_corpus WHERE ticker = 'TSTH-W50'").fetchone()["n"] == 1
     _clean_walk()
+
+
+def test_parallel_fill_finishes_markets_and_leaves_network_failures_pending(tmp_path, monkeypatch):
+    import threading, time as _t
+    _clean(); monkeypatch.setattr(H.D, "CANDLES_DIR", tmp_path / "c"); monkeypatch.setattr(H.D, "TRADES_DIR", tmp_path / "t"); monkeypatch.setattr(H, "TRANSIENT_WAIT_S", 0.0)
+    close = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    with transaction() as c:
+        for i in range(12):
+            c.execute("INSERT INTO kalshi_corpus (ticker, status, close_time, open_time, settled_ts) VALUES (%s, 'pending', %s, %s, %s)",
+                      (f"TSTH-F{i}", close - timedelta(minutes=i), close - timedelta(days=2), close))
+    live = {"n": 0, "max": 0}; lock = threading.Lock()
+
+    def candles(rest, tk, series, o, cl, st):
+        with lock:
+            live["n"] += 1; live["max"] = max(live["max"], live["n"])
+        _t.sleep(0.05)
+        with lock:
+            live["n"] -= 1
+        if tk == "TSTH-F3":
+            raise TimeoutError("network")
+        return [{"end_ts": 60, **{k: 50.0 for k in ("yes_bid_open", "yes_bid_high", "yes_bid_low", "yes_bid_close", "yes_ask_open", "yes_ask_high", "yes_ask_low", "yes_ask_close",
+                                                    "price_open", "price_high", "price_low", "price_close", "price_mean")}, "volume": 1.0, "open_interest": 1.0}]
+    monkeypatch.setattr(H, "pull_candles", candles); monkeypatch.setattr(H, "pull_trades", lambda *a: [])
+    n = H.fill(object(), threads=4, limit=50)
+    assert n == 11 and live["max"] > 1                                     # markets overlapped
+    with transaction() as c:
+        st = {r["ticker"]: (r["status"], r["last_error"]) for r in c.execute("SELECT ticker, status, last_error FROM kalshi_corpus WHERE ticker LIKE 'TSTH-F%'").fetchall()}
+    assert st["TSTH-F3"][0] == "pending" and st["TSTH-F3"][1].startswith("retrying") and sum(1 for s, _ in st.values() if s == "done") == 11
+    monkeypatch.setattr(H, "pull_candles", lambda *a: (_ for _ in ()).throw(TimeoutError("down")))
+    assert H.fill(object(), threads=4, limit=50) == -1                     # everything left failed on the network
+    _clean()

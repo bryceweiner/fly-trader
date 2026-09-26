@@ -302,7 +302,7 @@ def fetch_markets(tickers: list[str], rest=None) -> int:
         known_e, known_s = _known_events(conn), _known_series(conn)
     for tk in tickers:
         try:
-            m = (rest.market(tk) or {}).get("market") or {}
+            m = rest.market(tk) or {}                       # KalshiRest.market already unwraps {"market": ...}
         except KalshiApiError as e:
             log.warning("market %s: %s", tk, e); continue
         if not m.get("ticker"):

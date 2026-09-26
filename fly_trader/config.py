@@ -232,6 +232,7 @@ KALSHI_MINUTES_KEEP_DAYS = env_int("KALSHI_MINUTES_KEEP_DAYS", 7)
 KALSHI_MIN_MARKET_VOLUME = env_float("KALSHI_MIN_MARKET_VOLUME", 1000.0)   # contracts over a market's life: below it the corpus skips the market (6.8 M settled since 2025 are mostly dead ladders)
 KALSHI_MARKETS_PER_DAY = env_int("KALSHI_MARKETS_PER_DAY", 150)           # the corpus keeps at most this many settled markets per close day (the most traded); ~1.3 s of API per market
 KALSHI_DIR = DATA_DIR / "kalshi"
+KALSHI_FILL_THREADS = env_int("KALSHI_FILL_THREADS", 8)                   # markets filled at once by the history worker, all under the one KALSHI_RPS bucket
 KALSHI_RPS = env_float("KALSHI_RPS", 12.0)                                 # REST pacing under the Basic tier (200 read tokens/s, 10 per call)
 
 

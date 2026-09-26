@@ -283,15 +283,18 @@ def memecoin_strip() -> None:
         text, color = TRADING_BADGE[s["trading"]]
         st.badge(text, icon=":material/candlestick_chart:", color=color, help=s["trading_why"])
         m, latest, dep = s["model"], s["latest"], s["deployable"]
-        st.badge(f"Model #{m['id']}" if m else "No model at work", icon=":material/psychology:", color="violet" if m else "gray",
+        st.badge(f"Selector #{m['id']}" if m else "No selector at work", icon=":material/psychology:", color="violet" if m else "gray",
                  help=backtest_line(m["meta"]) if m else ("No model has been trained on the current data yet." if not latest
                                                          else "No model has earned a place yet: " + (latest["meta"].get("deploy_reason") or "none qualified") if not dep
                                                          else "The trading engine is stopped, so no model is in use."))
         if latest and not is_deployable(latest["meta"]) and (not m or latest["id"] > m["id"]):
-            st.badge(f"Model #{latest['id']} not put to work", icon=":material/block:", color="orange", help=backtest_line(latest["meta"]))
+            st.badge(f"Selector #{latest['id']} not put to work", icon=":material/block:", color="orange", help=backtest_line(latest["meta"]))
         if m and dep and dep["id"] > m["id"]:
-            st.badge(f"Switching to model #{dep['id']}", icon=":material/upgrade:", color="blue", help="The trading engine picks it up within 10 minutes.")
+            st.badge(f"Switching to selector #{dep['id']}", icon=":material/upgrade:", color="blue", help="The trading engine picks it up within 10 minutes.")
         fly = s["fly"]
+        if fly.get("bootstrap"):          # the fly's own model, beside the selector's: they are separate snapshots
+            st.badge(f"Fly #{fly['bootstrap']}", icon=":material/neurology:", color="violet",
+                     help="The fly bootstrap trading the fly book (taught once by the selector, then learning on its own).")
         if fly.get("stage") and fly.get("stage") != "not trading":
             st.badge(f"Fly learning · drift {float(fly.get('drift') or 0):.1%}" if not fly.get("learning_frozen") else "Fly: learning frozen", icon=":material/neurology:",
                      color="violet" if not fly.get("learning_frozen") else "orange",

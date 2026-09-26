@@ -19,6 +19,7 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -267,13 +268,26 @@ def pull_candles(rest: KalshiRest, ticker: str, series: str, open_time: datetime
     return sorted(uniq, key=lambda c: c["end_ts"])
 
 
+_CUTOFF: dict = {"at": 0.0, "value": None}
+_CUTOFF_LOCK = threading.Lock()
+CUTOFF_TTL_S = 3600.0
+
+
+def trades_cutoff(rest: KalshiRest) -> datetime | None:
+    """The exchange's historical cutoff for trades, fetched at most hourly (it moves daily; every market used to ask for it)."""
+    with _CUTOFF_LOCK:
+        if time.time() - _CUTOFF["at"] < CUTOFF_TTL_S:
+            return _CUTOFF["value"]
+        try:
+            _CUTOFF["value"] = D.ts((rest.historical_cutoff() or {}).get("trades_created_ts")); _CUTOFF["at"] = time.time()
+        except KalshiApiError:
+            pass
+        return _CUTOFF["value"]
+
+
 def pull_trades(rest: KalshiRest, ticker: str, close_time: datetime, settled: datetime | None) -> list[dict]:
     lo = int((close_time - timedelta(days=CANDLE_DAYS)).timestamp()); hi = int((settled or close_time).timestamp()) + 60
-    cutoff = None
-    try:
-        cutoff = D.ts((rest.historical_cutoff() or {}).get("trades_created_ts"))
-    except KalshiApiError:
-        pass
+    cutoff = trades_cutoff(rest)
     historical = bool(cutoff and close_time < cutoff)
     rows: list[dict] = []
     for page in rest.trades(ticker, min_ts=lo, max_ts=hi, historical=historical):
@@ -281,35 +295,66 @@ def pull_trades(rest: KalshiRest, ticker: str, close_time: datetime, settled: da
     return sorted(rows, key=lambda r: r["ts"])
 
 
-def fill(rest: KalshiRest, stop: threading.Event | None = None, limit: int = 200) -> int:
-    """Candles (and trades where missing) for pending corpus rows, newest first; returns markets attempted."""
+TRANSIENT_WAIT_S = 60.0
+
+
+def fill(rest: KalshiRest, stop: threading.Event | None = None, limit: int | None = None, threads: int | None = None) -> int:
+    """Candles (and trades where missing) for pending corpus rows, newest first, ``threads`` markets at a time; every call
+    still passes the client's one rate bucket (KALSHI_RPS), so the threads only overlap the calls' latency. A market whose
+    fetch failed on the network stays pending (retried next batch); a batch that failed entirely waits ``TRANSIENT_WAIT_S``.
+    Returns the markets finished (done, empty or error)."""
+    threads = max(1, int(threads or config.KALSHI_FILL_THREADS)); limit = limit or max(200, threads * 25)
     with transaction() as conn:
         todo = conn.execute("SELECT c.ticker, c.open_time, c.close_time, c.settled_ts, c.candle_path, c.trade_path FROM kalshi_corpus c "
                             "WHERE c.status = 'pending' AND c.close_time IS NOT NULL ORDER BY c.close_time DESC LIMIT %s", (limit,)).fetchall()
         series = {r["ticker"]: _series_for(conn, r["ticker"]) for r in todo}
-    n = 0
-    for r in todo:
-        if stop is not None and stop.is_set():
-            break
-        tk = r["ticker"]; upd = {"status": "done", "last_error": None}
-        try:
-            if not r["candle_path"]:
-                cs = pull_candles(rest, tk, series[tk], r["open_time"], r["close_time"], r["settled_ts"])
-                if cs:
-                    p = D.CANDLES_DIR / f"{tk}.parquet"; D.write_parquet(cs, D.CANDLE_SCHEMA, p); upd.update(candle_path=str(p), candles_1m=len(cs))
-                else:
-                    upd["status"] = "empty"
-            if not r["trade_path"]:
-                tr = pull_trades(rest, tk, r["close_time"], r["settled_ts"])
-                p = D.TRADES_DIR / f"{tk}.parquet"; D.write_parquet(tr, D.TRADE_SCHEMA, p); upd.update(trade_path=str(p), trades=len(tr))
-        except KalshiApiError as e:
-            upd = {"status": "error" if e.status not in (404,) else "empty", "last_error": str(e)[:300]}
-        except Exception as e:
-            log.exception("candles %s failed", tk); upd = {"status": "error", "last_error": f"{type(e).__name__}: {e}"[:300]}
+    if not todo:
+        return 0
+    with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="kalshi-fill") as pool:
+        results = list(pool.map(lambda r: _fill_one(rest, r, series[r["ticker"]], stop), todo))
+    n = sum(1 for x in results if x == "finished")
+    if n == 0 and any(x == "transient" for x in results):
+        log.warning("kalshi fill: every market of the batch failed on the network; waiting %.0f s", TRANSIENT_WAIT_S)
+        _sleep(TRANSIENT_WAIT_S, stop)
+    return n if n else (0 if not any(x == "transient" for x in results) else -1)
+
+
+def _fill_one(rest: KalshiRest, r: dict, series: str, stop: threading.Event | None) -> str:
+    """One market's candles and trades; 'finished' (row updated), 'transient' (left pending) or 'stopped'."""
+    if stop is not None and stop.is_set():
+        return "stopped"
+    tk = r["ticker"]; upd = {"status": "done", "last_error": None}
+    try:
+        if not r["candle_path"]:
+            cs = pull_candles(rest, tk, series, r["open_time"], r["close_time"], r["settled_ts"])
+            if cs:
+                p = D.CANDLES_DIR / f"{tk}.parquet"; D.write_parquet(cs, D.CANDLE_SCHEMA, p); upd.update(candle_path=str(p), candles_1m=len(cs))
+            else:
+                upd["status"] = "empty"
+        if not r["trade_path"]:
+            tr = pull_trades(rest, tk, r["close_time"], r["settled_ts"])
+            p = D.TRADES_DIR / f"{tk}.parquet"; D.write_parquet(tr, D.TRADE_SCHEMA, p); upd.update(trade_path=str(p), trades=len(tr))
+    except KalshiApiError as e:
+        if e.status is not None and (e.status == 429 or e.status >= 500):         # the exchange is busy or down: retry later
+            _mark_transient(tk, str(e)); return "transient"
+        upd = {"status": "error" if e.status not in (404,) else "empty", "last_error": str(e)[:300]}
+    except (OSError, TimeoutError, ConnectionError) as e:                           # the network: the market stays pending
+        _mark_transient(tk, f"{type(e).__name__}: {e}"); return "transient"
+    except Exception as e:
+        if type(e).__module__.startswith(("aiohttp", "asyncio", "concurrent")) or "Timeout" in type(e).__name__:
+            _mark_transient(tk, f"{type(e).__name__}: {e}"); return "transient"
+        log.exception("candles %s failed", tk); upd = {"status": "error", "last_error": f"{type(e).__name__}: {e}"[:300]}
+    with transaction() as conn:
+        conn.execute("UPDATE kalshi_corpus SET " + ", ".join(f"{k} = %s" for k in upd) + ", updated_at = now() WHERE ticker = %s", (*upd.values(), tk))
+    return "finished"
+
+
+def _mark_transient(tk: str, err: str) -> None:
+    try:
         with transaction() as conn:
-            conn.execute("UPDATE kalshi_corpus SET " + ", ".join(f"{k} = %s" for k in upd) + ", updated_at = now() WHERE ticker = %s", (*upd.values(), tk))
-        n += 1
-    return n
+            conn.execute("UPDATE kalshi_corpus SET last_error = %s, updated_at = now() WHERE ticker = %s", (f"retrying: {err}"[:300], tk))
+    except Exception:
+        log.warning("could not note the transient failure of %s", tk)
 
 
 def counts() -> dict:
@@ -333,8 +378,10 @@ def main(stop_event: threading.Event | None = None) -> None:
                 t0 = time.time(); done = 0
                 while not (stop is not None and stop.is_set()):
                     k = fill(rest, stop)
-                    if not k:
+                    if k == 0:
                         break
+                    if k < 0:                                   # the whole batch failed on the network: fill() already waited
+                        continue
                     done += k; c = counts()
                     rate = done / max(time.time() - t0, 1e-9)
                     _status(stage="filling candles", filled_this_run=done, markets_per_h=rate * 3600, eta_h=(c.get("pending", 0) / rate / 3600) if rate else None, **c)

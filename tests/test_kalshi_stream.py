@@ -68,3 +68,19 @@ def test_subscriptions_and_private_channels():
     assert [c["params"]["channels"][0] for c in pub] == ["ticker", "trade", "market_lifecycle_v2"]
     assert [c["params"]["channels"][0] for c in prv][-2:] == ["fill", "user_orders"] and all(c["cmd"] == "subscribe" for c in prv)
     assert KS._cents("0.4600") == 46.0 and math.isnan(KS._cents(None)) and KS._num("19.39") == 19.39
+
+
+def test_lifecycle_fetch_catalogues_the_market_it_asked_for(monkeypatch):
+    """KalshiRest.market returns the market object itself; the fetch must upsert it (it used to look one level too deep)."""
+    _clean()
+    from fly_trader.kalshi import history as H
+    class Rest:
+        def __init__(self):
+            self.calls = []
+        def market(self, tk):
+            self.calls.append(tk); return {"ticker": tk, "event_ticker": None, "status": "active", "close_time": "2026-10-01T00:00:00Z", "title": "t"}
+    rest = Rest()
+    assert KS.fetch_markets(["TST-L1", "TST-L2"], rest=rest) == 2 and rest.calls == ["TST-L1", "TST-L2"]
+    with transaction() as c:
+        assert {r["ticker"] for r in c.execute("SELECT ticker FROM kalshi_markets WHERE ticker LIKE 'TST-L%'").fetchall()} == {"TST-L1", "TST-L2"}
+    _clean()
