@@ -15,11 +15,29 @@ from . import prices, rh_index, settle, state
 log = logging.getLogger(__name__)
 LAMPORTS = config.LAMPORTS_PER_SOL
 NAV_EVERY_S = 300                       # history points: one NAV mark per 5 min is plenty for a chart
-# Nothing public may help anyone front-run the fly: wallet figures and NAV points are published only once they are at
-# least this old, open positions are never published (a trade appears when it closes), and neither is the performance
-# index (it shows how close the kill switch is) nor the next settlement time; the snapshot's time is the hour. The fly's
-# wallet address is never published either, nor anything that leads to it (transaction signatures, deposit senders).
-PUBLIC_DELAY_S = 3600
+# Nothing public may help anyone front-run the fly. Wallet SOL and NAV are live but coarse: taken at the last 5-minute
+# mark and rounded to 0.1 SOL, so a single buy cannot be matched to an on-chain trade by its size and minute (which
+# would reveal the hidden wallet). Realized profit is taken at that same mark, so it cannot flicker when a buy lands.
+# Open positions, the performance index (how close the kill switch is) and the next settlement time are never
+# published; a trade appears when it closes. The wallet address is never published, nor anything that leads to it
+# (transaction signatures, deposit senders).
+STEP_S = 300
+ROUND_LAMPORTS = 100_000_000
+
+
+def coarse(lamports: int) -> int:
+    return int(round(int(lamports) / ROUND_LAMPORTS)) * ROUND_LAMPORTS
+
+
+def realized_at(conn, ts, native: int) -> int:
+    """R at a past mark: its SOL, the cost of positions open at that moment, and the flows before it."""
+    cost = conn.execute("SELECT COALESCE(sum(cost_sol), 0) AS c FROM positions WHERE book = %s AND opened_at <= %s "
+                        "AND (closed_at IS NULL OR closed_at > %s)", (config.VAULT_BOOK, ts, ts)).fetchone()["c"]
+    f = conn.execute(
+        "SELECT COALESCE(sum(lamports) FILTER (WHERE kind = 'deposit'), 0) AS d, "
+        "COALESCE(sum(lamports + fee_lamports) FILTER (WHERE kind = 'withdrawal'), 0) AS wd, "
+        "COALESCE(sum(lamports) FILTER (WHERE kind = 'claim'), 0) AS p FROM vault_flows WHERE block_time <= %s", (ts,)).fetchone()
+    return settle.realized(native, 0, int(round(float(cost) * LAMPORTS)), int(f["d"]), int(f["wd"]), int(f["p"]))
 
 
 def _ui(conn, key: str):
@@ -42,9 +60,8 @@ def settlement_item(r) -> dict:
 
 def stats(conn, wallet: str, now: float | None = None) -> dict:
     now = time.time() if now is None else now
-    m = conn.execute("SELECT * FROM vault_nav WHERE ts <= to_timestamp(%s) ORDER BY ts DESC LIMIT 1", (now - PUBLIC_DELAY_S,)).fetchone()
-    w = {"native": int(m["native"]) if m else 0, "nav": int(m["wealth"]) if m else 0}
-    cost, _mints = settle.open_positions(conn)
+    m = conn.execute("SELECT * FROM vault_nav WHERE ts <= to_timestamp(%s) ORDER BY ts DESC LIMIT 1", (int(now) // STEP_S * STEP_S,)).fetchone()
+    w = {"native": coarse(m["native"]) if m else 0, "nav": coarse(m["wealth"]) if m else 0}
     f = settle.flow_totals(conn, 2**62)
     if settle.paper():                                     # a paper book: R is its closed-trade profit since the vault started
         start = int(state.get("vault_started_at", conn=conn) or 0)
@@ -53,7 +70,7 @@ def stats(conn, wallet: str, now: float | None = None) -> dict:
         r_now = int(round(float(rs) * LAMPORTS))
         f["deposits"] = int(round(config.CAPITAL_SOL * LAMPORTS))
     else:
-        r_now = settle.realized(live_native(conn), 0, cost, f["deposits"], f["withdrawals"], f["payouts"])
+        r_now = realized_at(conn, m["ts"], int(m["native"])) if m else 0
     a = settle.allocated_total(conn)
     booked = conn.execute("SELECT COALESCE(sum(realized_sol), 0) AS s FROM positions WHERE book = %s AND status = 'closed'", (config.VAULT_BOOK,)).fetchone()["s"]
     c = rails.load_circuit(conn)
@@ -83,10 +100,7 @@ def stats(conn, wallet: str, now: float | None = None) -> dict:
     }
 
 
-def live_native(conn) -> int:
-    """The newest mark's SOL, for R only (R moves when a trade closes, which the trades history shows anyway)."""
-    m = conn.execute("SELECT native FROM vault_nav ORDER BY ts DESC LIMIT 1").fetchone()
-    return int(m["native"]) if m else 0
+
 
 
 def _symbol(conn, mint: str) -> str:
@@ -98,14 +112,18 @@ def history(conn, cur: dict) -> tuple[dict, dict]:
     """New history items since the cursors in ``cur``; returns (history, new cursors)."""
     out: dict = {}
     nav_since = float(cur.get("nav", 0))
-    rows = conn.execute("SELECT ts, wealth FROM vault_nav WHERE extract(epoch FROM ts) >= %s AND ts <= now() - make_interval(secs => %s) "
-                        "AND consistent ORDER BY ts", (nav_since + NAV_EVERY_S, PUBLIC_DELAY_S)).fetchall()
+    # one point per 5-minute boundary: the newest consistent mark at or before it
+    rows = conn.execute(
+        "SELECT DISTINCT ON (b) to_timestamp(b) AS ts, wealth FROM ("
+        "  SELECT (ceil(extract(epoch FROM ts) / %(s)s) * %(s)s)::bigint AS b, ts AS mark_ts, wealth FROM vault_nav WHERE consistent"
+        ") x WHERE b > %(since)s AND b <= %(now)s ORDER BY b, mark_ts DESC",
+        {"s": STEP_S, "since": int(nav_since), "now": int(time.time()) // STEP_S * STEP_S}).fetchall()
     sol = prices.sol_usd()[0]
     pts, last = [], nav_since
     for r in rows:
         t = r["ts"].timestamp()
-        if t - last >= NAV_EVERY_S:
-            pts.append({"ts": int(t), "nav": int(r["wealth"]), "sol_usd": sol}); last = t
+        if t - last >= NAV_EVERY_S:            # boundaries are STEP_S apart, so every one qualifies
+            pts.append({"ts": int(t), "nav": coarse(r["wealth"]), "sol_usd": sol}); last = t
     if pts:
         out["nav"] = pts
     trades = conn.execute("SELECT id, mint, opened_at, closed_at, cost_sol, realized_sol, forced_exit_kind FROM positions "
