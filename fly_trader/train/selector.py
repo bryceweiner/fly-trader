@@ -103,6 +103,10 @@ class SelectorModel:
     metrics: dict = field(default_factory=dict)
     sizing: list = field(default_factory=list)  # agent/sizing.py table from the backtest's out-of-sample trades
     stack: dict = field(default_factory=dict)   # train/strategies.final_models: strategies, veto, combination rule (empty: single ev model)
+    # The same stack refit without its holdout days (the models the holdout is scored with): {"models", "fit_through",
+    # "holdout_days"}. The fly's bootstrap distils these, so the week it calibrates its line and sizing on is one its
+    # teacher never saw (train/fly_selector.deployed_teacher). Empty: no holdout, or saved before 2026-09-25.
+    blind: dict = field(default_factory=dict)
 
     def score(self, X: np.ndarray) -> np.ndarray:
         """Predicted net return over the hold."""
@@ -278,7 +282,8 @@ def main(days: int | None = None, horizon_min: int = HOLD_MIN, stop_event: threa
     prog.update("selector: fitting the deployable models on every day", 0, 1, force=True)
     models = strategies.final_models(ds, stack) if stack.fits else {"strategies": {}}
     # scored with models refit without the holdout: the deployed ones above have seen those days and would score themselves
-    holdout = strategies.score_holdout(ds, strategies.final_models(ds, stack, exclude_days=stack.holdout_days), stack.holdout_days) if stack.holdout_days else {}
+    blind = strategies.final_models(ds, stack, exclude_days=stack.holdout_days) if stack.holdout_days else None
+    holdout = strategies.score_holdout(ds, blind, stack.holdout_days) if blind is not None else {}
     if holdout.get("n"):
         log.info("holdout %s..%s (no fit ever saw these days): %d trades, %s winners, PF %s, %s per trade vs random %s",
                  holdout["days"][0], holdout["days"][1], holdout["n"],
@@ -295,6 +300,9 @@ def main(days: int | None = None, horizon_min: int = HOLD_MIN, stop_event: threa
         final = SelectorModel(gbm=ev["gbm"], scaler=ev["scaler"], cols=ev["cols"], threshold=ev["line"], horizon_min=ev["hold_min"], trained_through=str(ds.days[-1]),
                               sizing=ev["sizing"])
     final.stack = models
+    if blind is not None and blind["strategies"]:          # kept, not thrown away: the fly's honest teacher for its calibration week
+        hd = sorted(stack.holdout_days)
+        final.blind = {"models": blind, "fit_through": str(hd[0] - timedelta(days=1)), "holdout_days": [str(hd[0]), str(hd[-1])]}
     final.metrics = {"walk_forward": {**stack.evaluation, "days": None}, "selection": stack.selection, "random_baseline": {"mean": stack.evaluation.get("random_mean")},
                      "components": stack.components, "strategies": {k: {x: v[x] for x in ("line", "hold_min", "thr", "high", "hours", "regimes", "sizing", "selection", "evaluation")}
                                                                     for k, v in models["strategies"].items()},

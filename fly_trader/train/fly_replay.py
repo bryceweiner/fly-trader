@@ -34,6 +34,7 @@ from datetime import date, datetime, timezone
 import numpy as np
 import torch
 
+from .. import config
 from ..brain import device as brain_device, plastic
 from ..db.apilog import record_event
 from ..db.connection import transaction
@@ -49,6 +50,7 @@ CHUNK = 2048
 CONFIGS = [(0.0, math.inf)] + [(a, h) for a in (1e-4, 3e-4, 1e-3, 3e-3) for h in (1.0, 3.0, 7.0, 30.0)]
 LABEL_LAG_S = 60.0           # a label is known once the exit minute has closed
 HOUR_S, DAY_S = 3600.0, 86400.0
+TRADES_DIR = config.BRAIN_DIR / "replay"      # the chosen book's trades, for studies of sizing on the fly's own out-of-sample trades
 
 
 def _day_start(t: float) -> float:
@@ -60,8 +62,9 @@ def _labels(ds: DecisionSet, hold_min: int) -> np.ndarray:
 
 
 def run(days: int | None = None, start_day: int = START_DAY, configs: list | None = None, stop: threading.Event | None = None, device=None,
-        ds: DecisionSet | None = None, fly=None, boot: dict | None = None, graph=None, save_verdict: bool = True) -> dict:
-    """The replay; ``ds``/``fly``/``boot`` may be given (tests, or a bootstrap already run)."""
+        ds: DecisionSet | None = None, fly=None, boot: dict | None = None, graph=None, save_verdict: bool = True, dump_trades: bool | None = None) -> dict:
+    """The replay; ``ds``/``fly``/``boot`` may be given (tests, or a bootstrap already run). ``dump_trades`` (default: as
+    ``save_verdict``) writes the chosen book's trades to ``TRADES_DIR``; a study passes it without saving a verdict."""
     from .strategies import HOLDS_MIN
     configs = [(float(a), float(h)) for a, h in (configs or CONFIGS)]
     if configs[0][0] != 0.0:
@@ -94,7 +97,7 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
     C = bank.C
     scores = np.full((C, NS, n), np.nan, np.float32)
     lines = np.array([[fly.lines[k] for k in names]] * C, dtype=np.float64); sizings = [[list(fly.sizings[k]) for k in names] for _ in range(C)]
-    line_log: dict = {}
+    line_log: dict = {}; size_log: dict = {k: [(-math.inf, list(fly.sizings[k]))] for k in names}
     pending = plastic.PendingTags(fly.net.n_kc, fly.net.k_active)
     labels = [torch.tensor(_labels(ds, h), dtype=torch.float32) for h in holds_min]
     starts = np.flatnonzero(np.r_[True, ts_o[1:] != ts_o[:-1]]); ends = np.r_[starts[1:], n]
@@ -123,7 +126,7 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
                     _learn_add(learn, now, bank.update(tags, r, now)); n_updates += len(tags)
                 if day_done is not None and _day_start(now) > day_done:
                     day_done = _day_start(now)
-                    _recalibrate(ds, order, ts_o, scores, lines, sizings, now, lags, holds_min, line_log)
+                    _recalibrate(ds, order, ts_o, scores, lines, sizings, now, lags, holds_min, line_log, size_log=size_log, names=names)
                 if next_gov is not None and now >= next_gov:
                     next_gov = now + HOUR_S
                     _governance(ds, order, ts_o, scores, lines, line_log, bank, now, lags, holds_min, gov_counts)
@@ -146,7 +149,8 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
             prog.update("fly replay: learning from the market", int(b), n, day=str(datetime.fromtimestamp(float(ts_o[b - 1]), timezone.utc).date()),
                         updates=n_updates, pending=len(pending), drift=[round(float(x), 4) for x in bank.drift()], eta_s=(n - b) * (time.time() - t0) / max(b, 1))
         g = g1
-    return _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_counts, boot, S, save_verdict, time.time() - t0, fly, names, holds_min, lines, learn)
+    return _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_counts, boot, S, save_verdict, time.time() - t0, fly, names, holds_min, lines, learn,
+                    size_log=size_log if (save_verdict if dump_trades is None else dump_trades) else None)
 
 
 def _learn_add(learn: dict, now: float, st: dict) -> None:
@@ -193,7 +197,7 @@ def _line_at(line_log: dict, key, ts: np.ndarray, default: float) -> np.ndarray:
     return np.where(i >= 0, vals[np.clip(i, 0, None)], default)
 
 
-def _recalibrate(ds, order, ts_o, scores, lines, sizings, now, lags, holds_min, line_log) -> None:
+def _recalibrate(ds, order, ts_o, scores, lines, sizings, now, lags, holds_min, line_log, size_log: dict | None = None, names=None) -> None:
     """One line and sizing per strategy, calibrated on the frozen fly's scores and shared by every configuration.
 
     Until 2026-09-22 each configuration calibrated its own. With the plastic and frozen weights no more than 5 % apart,
@@ -211,6 +215,8 @@ def _recalibrate(ds, order, ts_o, scores, lines, sizings, now, lags, holds_min, 
                 line_log[key] = [(-math.inf, float(lines[c, s_]))]
             lines[c, s_] = cal.line; sizings[c][s_] = cal.sizing
             line_log[key].append((now, float(cal.line)))
+        if size_log is not None and names is not None:       # shared by every configuration, like the line
+            size_log.setdefault(names[s_], []).append((now, list(cal.sizing)))
 
 
 def _governance(ds, order, ts_o, scores, lines, line_log, bank, now, lags, holds_min, counts) -> None:
@@ -241,21 +247,60 @@ def _arm(ds, order, ts_o, scores_cs, line_log, key, default_line, mask_pos) -> t
     return S_full, L_full
 
 
-def _book(ds, order, ts_o, scores, line_log, choice: list[int], boot_lines: list[float], holds_min, mask_pos):
+def _book(ds, order, ts_o, scores, line_log, choice: list[int], boot_lines: list[float], holds_min, mask_pos, detail: bool = False):
     """The combined book of the per-strategy choices: per row, among the strategies at/above their line in force, the one
-    with the largest margin; returns (pick, per-row hold s, per-row return)."""
-    N = len(ds.y); key = np.full(N, -np.inf); pick = np.zeros(N, bool); hold = np.zeros(N); ret = np.full(N, np.nan, np.float32)
+    with the largest margin; returns (pick, per-row hold s, per-row return), and with ``detail`` also (per-row strategy index
+    or -1, per-row margin over its line)."""
+    N = len(ds.y); key = np.full(N, -np.inf); pick = np.zeros(N, bool); hold = np.zeros(N); ret = np.full(N, np.nan, np.float32); who = np.full(N, -1)
     for s_, c in enumerate(choice):
         Sf, Lf = _arm(ds, order, ts_o, scores[c, s_], line_log, (c, s_), boot_lines[s_], mask_pos)
         lab = _labels(ds, holds_min[s_])
         ok = (Sf >= Lf) & np.isfinite(lab)          # a row whose hold runs past the corpus has no label: not a trade
         m = np.where(ok, Sf - Lf, -np.inf); take = ok & (m > key)
-        key = np.where(take, m, key); pick |= ok
+        key = np.where(take, m, key); pick |= ok; who = np.where(take, s_, who)
         hold = np.where(take, holds_min[s_] * 60.0, hold); ret = np.where(take, lab, ret)
-    return pick, hold, ret
+    return (pick, hold, ret, who, key) if detail else (pick, hold, ret)
 
 
-def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_counts, boot, S, save_verdict, secs, fly, names, holds_min, lines, learn=None) -> dict:
+def _table_at(log_s: list, t: float) -> list:
+    """The sizing table in force at ``t`` (the last recalibration at or before it)."""
+    cur = log_s[0][1] if log_s else []
+    for t0, tab in log_s:
+        if t0 <= t:
+            cur = tab
+    return cur
+
+
+def _dump_trades(ds, order, ts_o, scores, line_log, size_log, choice, boot_lines, holds_min, names, mask_pos, day_o, sel_days) -> str | None:
+    """The chosen book's trades over the replay's live days (one position per token, as ``evaluate`` counts them): entry
+    time, token, strategy, margin over the line in force, hold, net return (at the label size), the pool's quote reserve,
+    the half, and the sizing table in force — what ``agent/sizing.simulate_bankroll`` needs to replay a sizing rule on the
+    fly's own out-of-sample trades. Written next to the verdict as ``data/brain/replay/trades_<S>.json``."""
+    pick, hold, ret, who, margin = _book(ds, order, ts_o, scores, line_log, choice, boot_lines, holds_min, mask_pos, detail=True)
+    rows = np.flatnonzero(who >= 0)
+    if not len(rows):
+        return None
+    tr = np.sort(taken_idx(ds.ts, ds.mint, np.where(hold > 0, hold, 60.0), rows))
+    tr = tr[np.argsort(ds.ts[tr], kind="stable")]
+    resq = np.expm1(ds.X[tr, ds.cols.index("log_liquidity_sol")].astype(np.float64)) / 2.0 if "log_liquidity_sol" in ds.cols else np.full(len(tr), np.nan)
+    tables: list = []; tix: dict = {}
+    def tab_id(tab):
+        k = json.dumps(tab, sort_keys=True, default=str)
+        if k not in tix:
+            tix[k] = len(tables); tables.append(tab)
+        return tix[k]
+    sel = set(sel_days)
+    trades = [{"ts": float(ds.ts[i]), "mint": str(ds.mint[i]), "strategy": names[int(who[i])], "margin": float(margin[i]), "hold_s": float(hold[i]),
+               "ret": float(ret[i]), "resq": float(resq[k]), "half": "selection" if ds.day[i] in sel else "evaluation",
+               "table": tab_id(_table_at(size_log.get(names[int(who[i])], []), float(ds.ts[i])))} for k, i in enumerate(tr)]
+    TRADES_DIR.mkdir(parents=True, exist_ok=True)
+    path = TRADES_DIR / f"trades_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    tmp = path.with_suffix(".tmp"); tmp.write_text(json.dumps(prog._finite({"strategies": names, "tables": tables, "trades": trades}), default=str)); tmp.replace(path)
+    return str(path)
+
+
+def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_counts, boot, S, save_verdict, secs, fly, names, holds_min, lines, learn=None,
+             size_log: dict | None = None) -> dict:
     days_r = sorted(set(ds.day[order[live_from:]].tolist()))
     sel_days, ev_days = days_r[: len(days_r) // 2], days_r[len(days_r) // 2:]
     day_o = ds.day[order]
@@ -297,6 +342,11 @@ def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_co
         out.update(passed=bool(passed), reason=why, chosen=per_strategy[names[0]]["chosen"], evaluation=ev["pooled"], random=rnd, per_day=ev["per_day"],
                    alpha=per_strategy[names[0]]["alpha"], half_life_days=per_strategy[names[0]]["half_life_days"],
                    plastic_beats_frozen=bool((ev["pooled"]["mean"] or -1) > (ev0["pooled"]["mean"] or -1)))
+    if size_log is not None and any(v["plastic"] for v in per_strategy.values()):
+        try:
+            out["trades_file"] = _dump_trades(ds, order, ts_o, scores, line_log, size_log, choice, boot_lines, holds_min, names, live_pos, day_o, sel_days)
+        except Exception:
+            log.exception("could not write the replay's trades (the verdict is unaffected)")
     log.info("fly replay from %s: %s — %s | frozen %s", S, "PASSED" if out.get("passed") else "FAILED", out.get("reason"), out["frozen"])
     log.info("fly replay verdict: %s", {k: out.get(k) for k in ("passed", "reason", "evaluation", "frozen", "random")})
     if save_verdict:

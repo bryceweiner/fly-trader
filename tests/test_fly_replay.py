@@ -83,6 +83,28 @@ def test_unresolved_rows_are_not_trades_and_a_nan_verdict_still_stores():
     assert json.loads(json.dumps(prog._finite({"frozen": {"n": 3195, "mean": float("nan")}})))["frozen"]["mean"] is None
 
 
+def test_the_replay_writes_its_trades_with_the_sizing_table_in_force(monkeypatch, tmp_path):
+    """Sizing rules are judged on the fly's own out-of-sample trades: the replay keeps them, one position per token,
+    each with its margin over the line in force, its return, its pool's reserve and the table the book sized it with."""
+    import json
+    ds = _market_ds(days=14, per_day=400); ds.cols = list(ds.cols) + ["log_liquidity_sol"]
+    ds.X = np.c_[ds.X, np.full(len(ds.y), np.log1p(200.0))].astype(ds.X.dtype)
+    ds.fwd_h = {30: ds.fwd_pess.copy()}
+    order = np.argsort(ds.ts, kind="stable"); ts_o = ds.ts[order]
+    scores = np.linspace(-1, 1, len(order), dtype=np.float32)[None, None, :]
+    t_mid = float(np.median(ds.ts)); old, new = [{"lo": 0.0, "kelly": 0.1}], [{"lo": 0.0, "kelly": 0.4}]
+    monkeypatch.setattr(fly_replay, "TRADES_DIR", tmp_path)
+    path = fly_replay._dump_trades(ds, order, ts_o, scores, {}, {"s": [(-math.inf, old), (t_mid, new)]}, [0], [0.0], [30], ["s"],
+                                   np.ones(len(order), bool), ds.day[order], list(ds.days[:7]))
+    d = json.loads(open(path).read()); tr = d["trades"]
+    assert tr and all(t["margin"] >= 0 and t["strategy"] == "s" and t["hold_s"] == 1800 for t in tr)
+    assert [t["ts"] for t in tr] == sorted(t["ts"] for t in tr) and all(abs(t["resq"] - 100.0) < 1e-3 for t in tr)
+    assert all(d["tables"][t["table"]] == (new if t["ts"] >= t_mid else old) for t in tr)
+    by = {}
+    for t in tr:                                                        # one position per token until its hold has passed
+        assert t["ts"] >= by.get(t["mint"], -math.inf); by[t["mint"]] = t["ts"] + t["hold_s"]
+
+
 def test_every_configuration_shares_the_frozen_flys_line(monkeypatch):
     """Per-configuration lines let the frozen arm take 4,216 selection-half trades to the chosen arm's 2,609 with the
     weights no more than 5 % apart: the arms traded different slices because of their lines, not their weights. One line,

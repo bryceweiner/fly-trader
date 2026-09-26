@@ -17,8 +17,9 @@ weights at that last step (``D`` = None is the frozen fly). The descending neuro
 the previous step, so ``D`` reaches the output only through the MBON readout.
 
 Bootstrap (``bootstrap``, the one time the selector teaches): the teacher is the selector the live book trades
-(``deployed_teacher``); only when none is deployed is a stack refit on the days before ``S − 8`` (one purge day before
-the calibration week), which is also what the replay uses, since there the refit is the honest out-of-sample teacher.
+(``deployed_teacher``) as refit without its holdout days, so the calibration week is one it never saw; only when none is
+deployed, or it has no such fit, is a stack refit on the days before ``S − 8`` (one purge day before the calibration
+week), which is also what the replay uses, since there the refit is the honest out-of-sample teacher.
 The fly imitates it on the tradable minutes of those days (the teacher's top ``DISTIL_TOP`` plus a random
 ``DISTIL_SAMPLE``; squared error weighted ``TOP_WEIGHT`` × on the teacher's top 1 %; passes stop when a held-out
 slice stops improving by more than its own standard error, so the epoch count comes from the data), both
@@ -494,7 +495,7 @@ def _stack_teacher(ds: DecisionSet, train: np.ndarray, stop=None):
     return StackTeacher(strategies.final_models(sub, stack), RobustScaler.fit(sub.X, seed=7), ds.cols), stack
 
 
-def deployed_teacher(ds: DecisionSet, train: np.ndarray) -> tuple[StackTeacher | None, str, int | None]:
+def deployed_teacher(ds: DecisionSet, train: np.ndarray, calib_start: date | None = None) -> tuple[StackTeacher | None, str, int | None]:
     """The selector the live book actually trades, wrapped as the fly's teacher, with the reason and the snapshot id.
 
     Until 2026-09-21 the bootstrap always refit its own stack on the days before ``S − 8`` and distilled that instead.
@@ -503,8 +504,12 @@ def deployed_teacher(ds: DecisionSet, train: np.ndarray) -> tuple[StackTeacher |
     traded ``capitulation`` at 0.010 over 240 — five of eight components flipped by one extra week of corpus. The fly
     was never a copy of the selector it was being judged against. None (with the reason) falls back to that refit.
 
-    The deployed selector is fit on the whole corpus, the fly's calibration week included, so that week is not
-    out-of-sample for the teacher; the fly's own line is still calibrated on realised labels, never on the teacher's."""
+    ``calib_start``: the first day of the fly's calibration week. The deployed selector is fit on the whole corpus, that
+    week included, so distilling it let the teacher's in-sample fit flatter the fly's line and sizing bands there (fly
+    #107: 474 calibration trades at +2.79 %, then its biggest bets lost live). Given ``calib_start``, the teacher is the
+    same stack refit without its holdout days (``SelectorModel.blind``: same strategies, settings and lines), used only
+    when that fit ends at least ``PURGE_DAYS`` before the week; a selector whose own fit already ends there is used as
+    is; otherwise None with the reason, and the bootstrap refits a stack on its training days."""
     from ..agent.selector_session import pinned_snapshot
     sid = pinned_snapshot()
     if sid is None:
@@ -519,11 +524,24 @@ def deployed_teacher(ds: DecisionSet, train: np.ndarray) -> tuple[StackTeacher |
     st = getattr(m, "stack", None) or {}
     if not st.get("strategies"):
         return None, f"selector #{sid} has no strategy stack; {TEACHER_NOTE}", None
+    seen = ""
+    if calib_start is not None:
+        last_ok = calib_start - timedelta(days=PURGE_DAYS + 1)          # the last day a fit may reach, labels spilling over included
+        blind = getattr(m, "blind", None) or {}
+        through = str(getattr(m, "trained_through", "") or "")
+        if blind.get("models", {}).get("strategies") and date.fromisoformat(blind["fit_through"]) <= last_ok:
+            st = blind["models"]; seen = f", refit through {blind['fit_through']} (blind to the calibration week from {calib_start})"
+        elif through and date.fromisoformat(through) <= last_ok:
+            seen = f", fit through {through} (before the calibration week from {calib_start})"
+        else:
+            fit = blind.get("fit_through") or through or "an unknown day"
+            return None, (f"selector #{sid} saw the calibration week from {calib_start} (its fit reaches {fit}"
+                          f"{'' if blind else ', and it has no blind models'}); {TEACHER_NOTE}"), None
     missing = sorted({c for v in st["strategies"].values() for c in v["cols"]} - set(ds.cols))
     if missing:
         return None, f"selector #{sid} wants columns the corpus lacks ({', '.join(missing[:4])}); {TEACHER_NOTE}", None
     names = ", ".join(f"{k} (line {v['line']:.4f}, {v['hold_min']} min)" for k, v in st["strategies"].items())
-    return StackTeacher(st, RobustScaler.fit(ds.X[np.flatnonzero(train)], seed=7), list(ds.cols)), f"deployed selector #{sid}: {names}", sid
+    return StackTeacher(st, RobustScaler.fit(ds.X[np.flatnonzero(train)], seed=7), list(ds.cols)), f"deployed selector #{sid}: {names}{seen}", sid
 
 
 def fly_decide(fly: FlyModel, X: np.ndarray, cols: list[str], values: np.ndarray | None = None) -> dict:
@@ -683,7 +701,7 @@ def main(days: int | None = None, epochs: int | None = None, stop_event: threadi
     prog.update("fly: building decision points", 0, 1, force=True)
     from .strategies import HOLDS_MIN
     ds = build(days=days, horizon_min=HOLD_MIN, holds=HOLDS_MIN); S = ds.days[-1] + timedelta(days=1)
-    teacher, note, taught_by = deployed_teacher(ds, ds.day < S - timedelta(days=CALIB_DAYS + PURGE_DAYS))
+    teacher, note, taught_by = deployed_teacher(ds, ds.day < S - timedelta(days=CALIB_DAYS + PURGE_DAYS), calib_start=S - timedelta(days=CALIB_DAYS))
     log.info("fly bootstrap teacher: %s", note)
     fly, info = bootstrap(ds, S, epochs=EPOCHS if epochs is None else epochs, stop=stop_event, teacher=teacher, teacher_note=note)
     if fly is None:
