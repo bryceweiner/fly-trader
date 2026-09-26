@@ -183,6 +183,8 @@ def up(paper: bool = False) -> None:
     spawn("solana", [str(Path.home() / ".local/share/solana/install/active_release/bin/solana-test-validator"),
                      "--reset", "--quiet", "--ledger", str(D / "ledger"), "--rpc-port", "8899"])
     wait_http(DEVNET, "solana validator", method="POST", body={"jsonrpc": "2.0", "id": 1, "method": "getHealth"}, tries=90)
+    # Phantom's "Solana Localnet" uses localhost, which browsers often resolve to ::1; the validator listens on IPv4 only
+    spawn("ipv6", [PY, str(REPO / "tools" / "ipv6_forward.py"), "8899", "8900"])
     spawn("anvil", ["anvil", "--chain-id", "46630", "--port", "8545", "--block-time", "1", "--silent"])
     wait_http(ANVIL, "anvil", method="POST", body={"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []})
     mc = "0xcA11bde05977b3631167028862bE2a173976CA11"
