@@ -441,9 +441,10 @@ function renderPosition() {
 }
 
 function sharePct(p: vault.Position | null): string {
-  const total = state.totals?.totalLocked ?? (state.stats ? BigInt(state.stats.vault.total_locked || '0') : 0n)
-  if (!p || total === 0n) return '—'
-  return pct(Number((p.locked * 1_000_000n) / total) / 1_000_000, true)
+  let total = state.totals?.totalLocked ?? (state.stats ? BigInt(state.stats.vault.total_locked || '0') : 0n)
+  if (!p || p.locked === 0n) return p ? '0.00 %' : '—'
+  if (total < p.locked) total = p.locked          // the total was read before your latest lock: never above 100 %
+  return `${((Number((p.locked * 1_000_000n) / total) / 1_000_000) * 100).toFixed(2)} %`
 }
 
 async function refreshPosition() {
@@ -452,6 +453,7 @@ async function refreshPosition() {
   const [pos, acct] = await Promise.all([
     config.vault ? vault.readPosition(evm).catch(() => state.position) : Promise.resolve(null),
     api.account(evm).catch(() => state.account),
+    refreshTotals(),                                  // same moment as the position, so the share adds up
   ])
   if (evm !== state.evm) return
   state.position = pos

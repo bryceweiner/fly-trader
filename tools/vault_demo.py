@@ -1,6 +1,7 @@
 """A local dry run of the whole $FLY vault on this Mac: chain, contracts, relay, the fly's vault worker, and the site.
 
-    .venv/bin/python tools/vault_demo.py up        # start everything (about a minute)
+    .venv/bin/python tools/vault_demo.py up        # start everything with an empty vault (about a minute)
+                                                   # --seed-holders: two test holders lock 300k and 100k at start
     .venv/bin/python tools/vault_demo.py up --paper   # the same, but the vault shares the RUNNING fly's paper book
                                                      # (paper_fly in the fly_trader database): its real NAV, positions,
                                                      # trades and closed-trade profit, just no real SOL
@@ -18,7 +19,7 @@ Wallets for hands-on testing (use fresh test accounts, never your real ones):
 
 What runs (state and logs in .vault-demo/, gitignored):
   anvil        chain id 46630 on :8545 (stands in for Robinhood testnet), Multicall3 at its canonical address
-  contracts    MockFLY + FlyVault + timelock (withdraw delay 5 min); two test holders lock at different times
+  contracts    MockFLY + FlyVault + timelock (withdraw delay 5 min); empty unless --seed-holders
   relay        web/wsgi.py on :8612 (claim domain localhost:5173, devnet)
   vault fly    fly_trader.vault.worker against the chain above and Solana DEVNET with throwaway keys; its own database
                fly_vault_demo; settlement every 5 minutes; no trading (the Mac's paper fly is untouched)
@@ -174,7 +175,7 @@ def profit(sol: float) -> None:
     print("gift tx:", transfer(base58.b58encode(bytes(kp)).decode(), keys["fly"]["pubkey"], int(sol * 1e9))[:16], "… (counted as profit; settles within 5 min)")
 
 
-def up(paper: bool = False) -> None:
+def up(paper: bool = False, seed_holders: bool = False) -> None:
     D.mkdir(exist_ok=True)
     (D / "paper").unlink(missing_ok=True)
     if paper:
@@ -197,7 +198,7 @@ def up(paper: bool = False) -> None:
     dep = {"vault": dep["vault"], "timelock": dep["timelock"], "fly": dep.get("token") or dep.get("fly")}
     (D / "deployment.json").write_text(json.dumps(dep, indent=1))
     holders = []
-    for i, (pk, amt) in enumerate(zip(ACCTS[1:], ("300000", "100000"))):
+    for i, (pk, amt) in enumerate(zip(ACCTS[1:], ("300000", "100000") if seed_holders else ())):
         a = sh("cast", "wallet", "address", pk); holders.append(a)
         sh("cast", "send", dep["fly"], "mint(address,uint256)", a, "1000000000000000000000000", "--rpc-url", ANVIL, "--private-key", pk)
         sh("cast", "send", dep["fly"], "approve(address,uint256)", dep["vault"], "1000000000000000000000000", "--rpc-url", ANVIL, "--private-key", pk)
@@ -279,7 +280,7 @@ def status() -> None:
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "up":
-        up(paper="--paper" in sys.argv)
+        up(paper="--paper" in sys.argv, seed_holders="--seed-holders" in sys.argv)
     elif cmd == "fund-evm":
         fund_evm(sys.argv[2])
     elif cmd == "fund-sol":
