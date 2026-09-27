@@ -6,31 +6,26 @@ received -> verified -> (waiting_liquidity) -> sending -> paid | rejected | fail
 * One claim in flight per holder (partial unique index); the amount is fixed when the claim moves to ``sending``.
 * The payment row (signature, blockhash, last valid height) is written BEFORE broadcast; after a crash the claim is
   re-checked on chain and re-signed only once its blockhash can no longer land, so a holder is never paid twice.
-* Claims are paid from the payout wallet (vault/payout.py), topped up after every settlement; a claim it cannot cover
-  waits (``waiting_liquidity``) until the next top-up, which the vault worker runs every minute.
+* Claims are paid from the Squads treasury under its weekly spending limit L2, which only the payout key may use; the
+  signer (fly_trader/signer) builds and signs the payment and keeps its own once-per-claim ledger. A claim the
+  treasury or this week's L2 cannot cover waits (``waiting_liquidity``) and alerts, never fails.
 """
 from __future__ import annotations
 
-import base64
 import logging
 import time
 
 from psycopg.types.json import Jsonb
-from solders.hash import Hash
-from solders.instruction import Instruction
-from solders.message import MessageV0
-from solders.pubkey import Pubkey
-from solders.system_program import TransferParams, transfer
-from solders.transaction import VersionedTransaction
 
 from .. import config
 from ..chain.cluster_guard import assert_vault_signing_allowed
+from ..signer.client import SignerUnavailable
+from ..signer.policy import PolicyError
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from . import alerts, claim_message as cm, evm, sigs, state, walletlock
 
 log = logging.getLogger(__name__)
-MEMO_PROGRAM = Pubkey.from_string("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
 MAX_ATTEMPTS = 4
 STALE_AFTER_S = 3600          # a claim first seen more than an hour after its expiry is refused (signed long ago)
 TERMINAL = ("paid", "rejected", "failed")
@@ -83,11 +78,10 @@ def _owed(conn, evm_addr: str) -> int:
     return int(r["owed"]) if r else 0
 
 
-def _build(keypair, dest: str, lamports: int, claim_id: int, blockhash: str) -> VersionedTransaction:
-    payer = keypair.pubkey()
-    ixs = [transfer(TransferParams(from_pubkey=payer, to_pubkey=Pubkey.from_string(dest), lamports=int(lamports))),
-           Instruction(MEMO_PROGRAM, f"fly-vault-claim:{claim_id}".encode(), [])]
-    return VersionedTransaction(MessageV0.try_compile(payer, ixs, [], Hash.from_string(blockhash)), [keypair])
+def signer_claim_id(row: dict) -> str:
+    """The claim's key in the signer's own ledger: our id plus the holder's signed nonce, so a rebuilt database that
+    reuses an id can never make the signer pay a different claim under it."""
+    return f"{int(row['id'])}:{row['nonce']}"
 
 
 def _record_paid(conn, cid: int, row: dict, sig: str, slot: int, fee: int) -> None:
@@ -97,7 +91,7 @@ def _record_paid(conn, cid: int, row: dict, sig: str, slot: int, fee: int) -> No
                  (sig, slot, row["sol"], int(row["lamports"]), fee, f"claim {cid} for {row['evm']}"))
 
 
-def pay(cid: int, rpc, keypair, wait=None) -> str:
+def pay(cid: int, rpc, signer, wait=None) -> str:
     """Send (or resume) the payment of a claim in ``sending``. Returns the resulting status."""
     from ..execution.broker_live import await_confirmation
     assert_vault_signing_allowed()
@@ -132,26 +126,36 @@ def pay(cid: int, rpc, keypair, wait=None) -> str:
                 _set(conn, cid, "failed", reason="payment did not land after several attempts")
             alerts.send(f"claim {cid} failed after {MAX_ATTEMPTS} attempts ({row['lamports']} lamports to {row['sol']})")
             return "failed"
-        native = rpc.get_balance(str(keypair.pubkey()))
-        # claims are paid from the payout wallet (vault/payout.py), which holds only what is owed plus a fee buffer:
-        # it keeps just enough for this transaction's fee, not the trading wallet's gas reserve
-        gas = 0
-        if native - int(row["lamports"]) - 10_000 < gas:
+        try:
+            built = signer.call("pay_claim", claim_id=signer_claim_id(row), dest=row["sol"], lamports=int(row["lamports"]))
+        except PolicyError as e:
+            if e.code in ("cap", "liquidity"):
+                with transaction() as conn:
+                    _set(conn, cid, "waiting_liquidity", reason=str(e))
+                what = ("this week's payout limit (L2) is used up: raise it from the owner wallet in the Squads app"
+                        if e.code == "cap" else "the treasury holds too little")
+                alerts.send(f"claim {cid} waiting ({int(row['lamports']) / config.LAMPORTS_PER_SOL:.4f} SOL): {what}", key="claim_liquidity")
+                return "waiting_liquidity"
+            if e.code == "in_flight":
+                return "sending"
+            if e.code == "paid" and row.get("tx_signature"):      # the signer saw it land; our resume check will record it
+                return "sending"
             with transaction() as conn:
-                _set(conn, cid, "waiting_liquidity", reason="wallet below the gas reserve after this payment")
-            alerts.send(f"claim {cid} waiting: wallet {native} lamports cannot pay {row['lamports']} above the gas reserve", key="claim_liquidity")
-            return "waiting_liquidity"
-        bh = rpc.get_latest_blockhash()
-        tx = _build(keypair, row["sol"], int(row["lamports"]), cid, bh["blockhash"])
-        sig = str(tx.signatures[0])
+                _set(conn, cid, "failed", reason=f"the signer refused: {e}")
+            alerts.send(f"claim {cid}: the signer refused the payment: {e}")
+            return "failed"
+        except SignerUnavailable as e:
+            log.warning("claim %d: signer unavailable: %s", cid, e)
+            return "sending"
+        sig, lvbh = built["signature"], int(built["last_valid_block_height"])
         with transaction() as conn:                              # persisted before it can land
             conn.execute("UPDATE vault_claims SET tx_signature = %s, blockhash = %s, last_valid_block_height = %s, attempts = attempts + 1, "
-                         "updated_at = now() WHERE id = %s", (sig, bh["blockhash"], bh["last_valid_block_height"], cid))
+                         "updated_at = now() WHERE id = %s", (sig, built.get("blockhash"), lvbh, cid))
         try:
-            rpc.send_transaction(base64.b64encode(bytes(tx)).decode())
+            rpc.send_transaction(built["tx"])
         except Exception as e:
             log.warning("claim %d send failed: %s", cid, type(e).__name__)
-        status, info = wait(rpc, sig, bh["last_valid_block_height"])
+        status, info = wait(rpc, sig, lvbh)
         with transaction() as conn:
             if status == "confirmed":
                 _record_paid(conn, cid, row, sig, int((info or {}).get("slot") or 0), 5000)
@@ -163,7 +167,7 @@ def pay(cid: int, rpc, keypair, wait=None) -> str:
         return "sending"                                         # expired unlanded: the next round re-signs
 
 
-def process(relay, rpc, keypair, rh_rpc=None, now: float | None = None) -> dict:
+def process(relay, rpc, signer, rh_rpc=None, now: float | None = None) -> dict:
     """One round: ingest new relay claims, verify, pay, report. Never raises into the worker loop."""
     out = {"ingested": 0, "paid": 0, "rejected": 0}
     after = int(state.get("relay_claims_after") or 0)
@@ -208,7 +212,7 @@ def process(relay, rpc, keypair, rh_rpc=None, now: float | None = None) -> dict:
                         _set(conn, cid, "rejected", reason=f"nothing to claim (owed {owed} lamports)"); out["rejected"] += 1
                         continue
                     _set(conn, cid, "sending", lamports=owed)
-            if pay(cid, rpc, keypair) == "paid":
+            if pay(cid, rpc, signer) == "paid":
                 out["paid"] += 1
         except Exception as e:
             log.exception("claim %d", cid)

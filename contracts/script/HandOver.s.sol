@@ -11,7 +11,10 @@ import {FlyVault} from "../src/FlyVault.sol";
 ///           timelock PROPOSER + CANCELLER -> NEW_OWNER, then revoked from OLD_OWNER
 ///           vault PAUSER_ROLE             -> NEW_OWNER, then revoked from OLD_OWNER
 ///         One batch. MODE=schedule (signed by OLD_OWNER, a proposer) now; MODE=execute (anyone) once the delay passed.
-/// Env: VAULT, TIMELOCK, OLD_OWNER, NEW_OWNER, MODE (schedule|execute), SALT (optional, default 0).
+///         MODE=calldata broadcasts nothing: it prints the timelock address and the exact calldata of scheduleBatch
+///         and executeBatch, for an owner that signs in a browser wallet (MetaMask on Blockscout's "Write contract"
+///         or any "send raw data" screen) instead of forge.
+/// Env: VAULT, TIMELOCK, OLD_OWNER, NEW_OWNER, MODE (schedule|execute|calldata), SALT (optional, default 0).
 contract HandOver is Script {
     function run() external {
         address vault = vm.envAddress("VAULT");
@@ -22,6 +25,15 @@ contract HandOver is Script {
         string memory mode = vm.envString("MODE");
         (address[] memory targets, uint256[] memory values, bytes[] memory payloads) = batch(vault, address(tl), oldOwner, newOwner);
         bytes32 id = tl.hashOperationBatch(targets, values, payloads, bytes32(0), salt);
+        if (keccak256(bytes(mode)) == keccak256("calldata")) {
+            console2.log("send to the timelock", address(tl));
+            console2.log("schedule (from OLD_OWNER, now):");
+            console2.logBytes(abi.encodeCall(TimelockController.scheduleBatch, (targets, values, payloads, bytes32(0), salt, tl.getMinDelay())));
+            console2.log("execute (from anyone, after the delay):");
+            console2.logBytes(abi.encodeCall(TimelockController.executeBatch, (targets, values, payloads, bytes32(0), salt)));
+            console2.logBytes32(id);
+            return;
+        }
         vm.startBroadcast();
         if (keccak256(bytes(mode)) == keccak256("schedule")) {
             tl.scheduleBatch(targets, values, payloads, bytes32(0), salt, tl.getMinDelay());

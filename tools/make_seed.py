@@ -6,7 +6,7 @@ Run on the machine that trained them (a master checkout with its database), afte
     .venv/bin/python tools/make_seed.py --out dist
 
 Outputs, under ``--out``:
-  models/policies/<fly>.pt, models/selectors/<selector>.joblib, models/connectome/{current.txt, <npz>, scale.json}
+  models/policies/<fly>.pt, models/selectors/<selector>.skops, models/connectome/{current.txt, <npz>, scale.json}
   seed/seed.sql  -- brain_snapshots rows (ids kept, so the pin still points at its selector), ui_settings: the replay
                     verdict the fly session requires, the selector pin, and autostart for the two trading workers.
                     Idempotent: every statement is ON CONFLICT DO NOTHING, so a running install is never overwritten.
@@ -105,6 +105,10 @@ def main(out: Path) -> None:
     # docker/entrypoint.sh copies them into the console's static directory.
     from fly_trader.brain.geometry import build_geometry
     build_geometry(models / "geometry")
+    from fly_trader.train import model_io
+    for f in sorted(models.rglob("*")):             # the server's apply-release refuses anything that could run code
+        if f.is_file():
+            model_io.check_file(f)
     print(f"seed written to {out}/: fly #{fly['id']} ({Path(rows[int(fly['id'])]['path']).name}), selector #{sel_id}, connectome {current}, skill table {tables[-1].name}")
     print(f"  fly taught by: {fly['meta'].get('teacher')}")
     print(f"  replay verdict: {v.get('reason')}")

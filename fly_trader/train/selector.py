@@ -15,7 +15,7 @@ Walk-forward protocol (the strategy gate): every day after a 21-day warm-up is a
 every eligible minute of the days at least two days earlier (refit every 7 days). A model goes to work only if the
 evaluation half made money after costs, beat random picks from the same universe and has at least 100 trades. The
 deployed model is then fit on every day and saved with its line, scaler and sizing table
-(``data/brain/selectors/selector_<ts>.joblib`` + ``brain_snapshots`` kind 'selector'). Runs inside the training
+(``data/brain/selectors/selector_<ts>.skops`` + ``brain_snapshots`` kind 'selector'). Runs inside the training
 pipeline (``train/pipeline.py``) and as ``fly-trader train-selector``.
 """
 from __future__ import annotations
@@ -29,7 +29,6 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
-import joblib
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingRegressor
 
@@ -38,7 +37,7 @@ from ..agent import sizing
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..market.features import FEATURE_VERSION
-from . import progress as prog
+from . import model_io, progress as prog
 from .decisions import HOLD_MIN, MIN_RESQ_SOL, MIN_VOL_15M_SOL, X_COLS, DecisionSet, build, evaluate, random_trades, rank_corr, summarize, taken_rows
 from .mature import AGG_VERSION
 from .scaling import RobustScaler
@@ -230,8 +229,8 @@ def walk_forward(ds: DecisionSet, warmup_days: int = WARMUP_DAYS, block_days: in
 
 def save(m: SelectorModel, run_id: str | None = None) -> tuple[Path, int]:
     SELECTOR_DIR.mkdir(parents=True, exist_ok=True)
-    path = SELECTOR_DIR / f"selector_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.joblib"
-    joblib.dump(m, path); sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    path = SELECTOR_DIR / f"selector_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.skops"
+    model_io.save_selector(m, path); sha = hashlib.sha256(path.read_bytes()).hexdigest()
     with transaction() as conn:
         row = conn.execute("INSERT INTO brain_snapshots (run_id, path, sha256, kind, note) VALUES (%s,%s,%s,'selector',%s) RETURNING id",
                            (run_id, str(path), sha, json.dumps({"threshold": m.threshold, "horizon_min": m.horizon_min, "trained_through": m.trained_through,
@@ -255,13 +254,13 @@ def load_snapshot(snapshot_id: int) -> SelectorModel | None:
     """One named selector snapshot, whatever has been deployed since (agent/selector_session.py's pin)."""
     with transaction() as conn:
         row = conn.execute("SELECT path FROM brain_snapshots WHERE id = %s AND kind = 'selector'", (snapshot_id,)).fetchone()
-    return joblib.load(row["path"]) if row and Path(row["path"]).exists() else None
+    return model_io.load_selector(row["path"]) if row and Path(row["path"]).exists() else None
 
 
 def load_latest() -> SelectorModel | None:
     with transaction() as conn:
         r = latest_current(conn)
-    return joblib.load(r["path"]) if r else None
+    return model_io.load_selector(r["path"]) if r else None
 
 
 def main(days: int | None = None, horizon_min: int = HOLD_MIN, stop_event: threading.Event | None = None) -> dict:

@@ -1,4 +1,4 @@
-"""Encrypted off-box backups: the wallet key (once) and the vault ledger (nightly), encrypted with ``age`` to Bryce's
+"""Encrypted off-box backups: the two hot keys (once, encrypted by the signer) and the vault ledger (nightly), with ``age`` to Bryce's
 public key (``VAULT_BACKUP_RECIPIENT``: an age1… or ssh-ed25519 key) and uploaded to a private HF storage bucket with a
 token scoped to that bucket. Plaintext never leaves the server; only the holder of the private key can decrypt:
 
@@ -40,23 +40,23 @@ def _upload(files: list[tuple[Path, str]]) -> None:
     batch_bucket_files(config.VAULT_BACKUP_BUCKET, add=[(str(p), remote) for p, remote in files], token=config.VAULT_BACKUP_HF_TOKEN)
 
 
-def key_once() -> bool:
-    """Back up the wallet key the first time only; later runs are no-ops."""
+def key_once(signer) -> bool:
+    """Back up both hot keys the first time only; later runs are no-ops. The signer encrypts them to the operator's
+    public key itself, so the plaintext never leaves the signer; this process only uploads ciphertext."""
     if state.get("backup_key_done") or not configured():
         return False
-    from ..chain.keys import load_keypair
-    from . import payout
-    import base58
-    kp = load_keypair()
+    import base64
+    blobs = signer.call("backup_keys")
     with tempfile.TemporaryDirectory() as d:
         files = []
-        for name, k in (("trading", kp), ("payout", payout.load_keypair())):
-            out = Path(d) / f"{name}-key.age"
-            _encrypt(base58.b58encode(bytes(k)), out)
-            files.append((out, f"keys/{name}-{k.pubkey()}.age"))
+        for b in blobs:
+            out = Path(d) / f"{b['name']}-key.age"
+            out.write_bytes(base64.b64decode(b["age_b64"]))
+            files.append((out, f"keys/{b['name']}-{b['pubkey']}.age"))
         _upload(files)
-    state.put("backup_key_done", {"ts": int(time.time()), "pubkey": str(kp.pubkey())})
-    alerts.send(f"wallet key backup written (encrypted) for {kp.pubkey()}")
+    trading = next((b["pubkey"] for b in blobs if b["name"] == "trading"), None)
+    state.put("backup_key_done", {"ts": int(time.time()), "pubkey": trading})
+    alerts.send(f"hot-key backups written (encrypted) for {', '.join(b['name'] for b in blobs)}")
     return True
 
 

@@ -240,3 +240,32 @@ Relay config: `relay.json`, kept next to `wsgi.py` and never inside `site/`:
 | Solana | mainnet-beta | devnet |
 | Kyber | `https://aggregator-api.kyberswap.com/robinhood/api/v1/`, router `0x6131B5fae19EA4f9D964eAc0408E4408b66337b5` | — |
 | Chart | GeckoTerminal network `robinhood`, pool `0xe6925f7bdedf22c2714c749d0ff208ce9e4bc1540938fa2b9ab2379486322edd` | fixtures |
+
+## 6. Custody (Solana)
+
+The fly's SOL is one book in two accounts:
+- **The treasury** is vault 0 of a Squads v4 multisig (`SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf`). Its members are
+  the owner's wallets only.
+- **The trading wallet** is a hot key that keeps a float of at most `TREASURY_FLOAT_SOL`.
+
+| Spending limit | Member | Destinations | Period | Used for |
+|---|---|---|---|---|
+| L1 | trading key | the trading wallet only | Day | refilling the float (`topup` flows) |
+| L2 | payout key | any | Week | claims (`spendingLimitUse` from the treasury, memo `fly-vault-claim:<id>:<nonce>`) |
+
+- **Flows.** A trading → treasury transfer is a `sweep`, a treasury → trading one a `topup`. Both are internal: they
+  count as neither deposits, withdrawals nor profit. A treasury outflow signed by a multisig member is a `withdrawal`
+  (the owner's principal).
+- **Accounting.** R, NAV and the performance index count both accounts together. Kelly sizing uses trading free SOL +
+  open positions + (treasury − owed); buys spend only the trading wallet's own SOL.
+- **The signer** (`fly_trader/signer`, its own container) is the only holder of the two hot keys. It signs:
+  - Jupiter swaps: Metis route only, static instruction rules, a simulation of every trading-owned balance, a value
+    floor, and per-trade, per-minute and per-day caps
+  - top-ups under L1 and sweeps to the treasury
+  - claims under L2, once per claim id
+  - closes of empty token accounts
+  - age-encrypted key backups
+
+  The brain reaches it over a Unix socket and never sees a key.
+- **The owner** changes the limits from `owner.html` (`web/src/lib/squads.ts`). A limit's amount is changed by removing
+  it and adding a new one, in two config transactions: the program rejects both in one.

@@ -311,6 +311,8 @@ def build_parser() -> argparse.ArgumentParser:
     ar.add_argument("dir"); ar.add_argument("--bootstrap", action="store_true"); ar.set_defaults(fn=_cmd_apply_release)
     sub.add_parser("health", help="exit 0 when the database answers and workers run (container HEALTHCHECK)").set_defaults(fn=_cmd_health)
     sub.add_parser("ready-for-restart", help="exit 0 when no order, claim payment or settlement is in flight").set_defaults(fn=_cmd_ready)
+    mc = sub.add_parser("models", help="convert: rewrite this machine's own .joblib selectors as .skops (pickles can run code)")
+    mc.add_argument("action", choices=["convert"]); mc.set_defaults(fn=_cmd_models)
     from .vault import cli as vault_cli
     vault_cli.add(sub)
     wk = sub.add_parser("worker"); wk.add_argument("action", choices=["start", "stop", "status"]); wk.add_argument("name", nargs="?"); wk.set_defaults(fn=_cmd_worker)
@@ -349,6 +351,12 @@ def _cmd_health(args) -> None:
     from .ops import release
     ok, why = release.health(); print(why)
     raise SystemExit(0 if ok else 1)
+
+
+def _cmd_models(args) -> None:
+    from .train import model_io
+    for r in model_io.convert_legacy():
+        print(f"selector #{r['id']} -> {r['path']}")
 
 
 def _cmd_ready(args) -> None:

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <!-- @include head -->
+  <title>Treasury owner — fly-trader</title>
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="description" content="For the treasury's owner: create and change the fly's spending limits, or revoke them.">
+</head>
+<body>
+<!-- @include header -->
+
+<main id="main">
+<section class="section page">
+  <div class="shell">
+    <div class="section-head">
+      <span class="micro accent">Owner</span>
+      <h1 class="page-title">Treasury owner</h1>
+      <p class="lede">The fly's SOL lives in a Squads multisig that only your wallet controls. The server holds two keys that may take SOL out of it only through two spending limits: <strong>L1</strong> refills the trading wallet itself (per day), <strong>L2</strong> pays holders' claims (per week). Revoke both and the server can move nothing out of the treasury, whatever it runs.</p>
+    </div>
+
+    <div class="notice danger" id="revoke-box" hidden>
+      <span class="micro">Emergency</span>
+      <p>If you think the server is compromised: revoke both limits now. Trading keeps only what is already in its float; claims wait until you add L2 again.</p>
+      <button class="btn danger" type="button" id="revoke">Revoke L1 and L2 now</button>
+    </div>
+
+    <div id="wallet-bar" class="wallet-bar"></div>
+
+    <div class="sub">
+      <h2 class="sub-title">Setup</h2>
+      <p class="note">Paste the lines <code>fly-trader vault squads-setup</code> prints on the server. Nothing here is sent anywhere but the Solana network; the values stay in this browser.</p>
+      <div class="form-grid">
+        <label>Multisig <input type="text" id="f-ms" class="mono" autocomplete="off" spellcheck="false" placeholder="empty: create one below"></label>
+        <label>Trading key (L1's member and only destination) <input type="text" id="f-trading" class="mono" autocomplete="off" spellcheck="false"></label>
+        <label>Payout key (L2's member) <input type="text" id="f-payout" class="mono" autocomplete="off" spellcheck="false"></label>
+        <label>L1 address <input type="text" id="f-l1" class="mono" autocomplete="off" spellcheck="false" placeholder="after you create it"></label>
+        <label>L2 address <input type="text" id="f-l2" class="mono" autocomplete="off" spellcheck="false" placeholder="after you create it"></label>
+      </div>
+      <button class="btn" type="button" id="load">Read the treasury</button>
+      <button class="btn primary" type="button" id="create-ms" hidden>Create the treasury multisig</button>
+    </div>
+
+    <div class="sub" id="state-box" hidden>
+      <h2 class="sub-title">The treasury now</h2>
+      <div class="kv" id="state"></div>
+      <ul class="risk-list" id="problems"></ul>
+    </div>
+
+    <div class="sub" id="actions" hidden>
+      <h2 class="sub-title">Change the limits</h2>
+      <div class="form-grid">
+        <label>L1 per day (SOL) <input type="text" id="a-l1" inputmode="decimal" value="2"></label>
+        <label>L2 per week (SOL) <input type="text" id="a-l2" inputmode="decimal" value="1"></label>
+      </div>
+      <button class="btn primary" type="button" id="add-l1">Create L1</button>
+      <button class="btn primary" type="button" id="add-l2">Create L2</button>
+      <button class="btn" type="button" id="set-l2">Set L2 to this amount</button>
+      <p class="note">Changing an amount removes the old limit and adds a new one: two approvals in your wallet. Claims wait the few seconds in between.</p>
+    </div>
+
+    <p class="status-line" id="status" role="status" aria-live="polite" hidden></p>
+    <pre class="mono env-out" id="env-out" hidden></pre>
+  </div>
+</section>
+</main>
+
+<!-- @include footer -->
+<script type="module" src="/src/pages/owner.ts"></script>
+</body>
+</html>

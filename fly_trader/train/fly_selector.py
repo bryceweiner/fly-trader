@@ -51,7 +51,7 @@ from ..brain.connectome import AFFERENT_POPS, EFFERENT_POP, Connectome, SubConne
 from ..brain.plastic import assign_channels
 from ..db.apilog import record_event
 from ..db.connection import transaction
-from . import fly_calibrate
+from . import fly_calibrate, model_io
 from . import progress as prog
 from . import selector
 from .decisions import HOLD_MIN, DecisionSet, build, rank_corr, taken_idx
@@ -631,7 +631,7 @@ def save(fly: FlyModel, metrics: dict, run_id: str | None = None, kind: str = "f
     root = config.BRAIN_DIR / subdir; root.mkdir(parents=True, exist_ok=True)
     path = root / f"{prefix}_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.pt"
     n = fly.net
-    torch.save({"state_dict": n.state_dict(), "scaler": fly.scaler.state(), "cols": fly.cols, "threshold": fly.threshold, "sizing": fly.sizing,
+    model_io.torch_save({"state_dict": n.state_dict(), "scaler": fly.scaler.state(), "cols": fly.cols, "threshold": fly.threshold, "sizing": fly.sizing,
                 "horizon_min": fly.horizon_min, "rules": fly.rules, "lines": fly.lines, "sizings": fly.sizings, "combine": fly.combine,
                 "config": {"k_steps": n.k_steps, "leak": n.leak, "hidden": n.hidden, "obs_dim": n.obs_dim, "kc_active": n.kc_active, "scale": n.scale,
                            "n_strategies": n.n_strategies, "aff_rows": n.aff_rows.cpu().tolist() if kind != "fly_selector" else None}, "metrics": metrics}, path)
@@ -643,7 +643,7 @@ def save(fly: FlyModel, metrics: dict, run_id: str | None = None, kind: str = "f
 
 
 def load(path: str | Path, graph=None, device=None, model_cls=None) -> FlyModel:
-    d = torch.load(path, map_location="cpu", weights_only=False); c = d["config"]
+    d = model_io.torch_load(path); c = d["config"]
     net = FlyNet(graph if graph is not None else _graph(), obs_dim=c["obs_dim"], k_steps=c["k_steps"], leak=c["leak"], hidden=c["hidden"],
                  kc_active=c["kc_active"], device=device or _device(), n_strategies=c.get("n_strategies", 1), aff_rows=c.get("aff_rows"), scale=c.get("scale", SCALE))
     net.load_state_dict(d["state_dict"]); net.eval()

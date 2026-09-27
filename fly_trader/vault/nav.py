@@ -19,9 +19,16 @@ LAMPORTS = config.LAMPORTS_PER_SOL
 
 
 def reserved_in_trading(conn) -> int:
-    """What the TRADING wallet must hold back: owed SOL not yet swept to the payout wallet (vault/payout.py)."""
+    """What the TRADING wallet must hold back: owed SOL the treasury does not hold (vault/payout.py returns it)."""
     from . import payout
     return max(0, reserved_lamports(conn) - payout.cached_balance())
+
+
+def treasury_free(conn) -> int:
+    """The treasury's idle bankroll: its SOL beyond what it owes. Part of the bankroll trades are sized on, though the
+    trading wallet can only spend its own float (refilled from here through L1)."""
+    from . import payout
+    return max(0, payout.cached_balance() - reserved_lamports(conn))
 
 
 def reserved_lamports(conn) -> int:

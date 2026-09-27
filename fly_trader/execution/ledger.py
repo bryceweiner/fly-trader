@@ -127,11 +127,11 @@ def mark_positions(conn, book: str, prices: dict[str, float], last_swaps: dict[s
 
 def verify_fills() -> None:
     """Reconcile live positions against on-chain token balances; prints mismatches, writes wallet_events."""
-    from ..chain import keys
     from ..chain.rpc import HttpSolanaRpc
     from ..db.connection import transaction
+    from ..signer import client
     rpc = HttpSolanaRpc()
-    pub = keys.bot_pubkey()
+    pub = client.get().call("pubkeys")["trading"]
     accounts = rpc.get_token_accounts_by_owner(pub)
     onchain = {a["mint"]: int(a["amount"]) for a in accounts}
     with transaction() as conn:

@@ -144,7 +144,7 @@
       <ul class="risk-list">
         <li><strong>The fly can lose money.</strong> Profit is not guaranteed. Weeks with losses pay nothing, and a drawdown can last many weeks.</li>
         <li><strong>Smart-contract risk.</strong> The vault and the timelock are code. Bugs, however unlikely, can lock or lose tokens.</li>
-        <li><strong>Operational risk.</strong> The fly runs on one server with one hot wallet. Outages delay claims; a compromised key could lose the SOL waiting to be claimed.</li>
+        <li><strong>Operational risk.</strong> The fly runs on one server. Outages delay claims. The SOL itself sits in a multisig treasury the server cannot empty: its keys may only refill a small trading float (per day) and pay claims up to a weekly cap, so a compromised server could lose at most the float and what is left of that week's cap before the operator revokes them.</li>
         <li><strong>Wallet risk.</strong> Anyone with your wallet keys can withdraw your $FLY or claim your SOL. Check what you sign: this page only ever asks you to approve the vault or the KyberSwap router, and to sign claim texts that start with this site's domain.</li>
         <li><strong>Price risk.</strong> $FLY and SOL prices move. What you are paid is SOL; its dollar value can fall.</li>
       </ul>

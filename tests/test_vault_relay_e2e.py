@@ -11,6 +11,7 @@ from wsgiref.simple_server import WSGIRequestHandler, make_server
 import pytest
 from solders.keypair import Keypair
 
+from test_signer import vault_signer
 from fly_trader import config
 from fly_trader.db.connection import transaction
 from fly_trader.vault import claim_message as cm, claims, publish, sigs
@@ -98,7 +99,7 @@ def test_push_claim_pay_report_roundtrip(relay, monkeypatch):
                                                 "evm_sig": sigs.sign_evm(cm.evm_text(f), evm_key),
                                                 "sol_sig": str(kp.sign_message(cm.sol_text(f).encode()))})
     assert status == 202
-    out = claims.process(client, Rpc(), Keypair.from_seed(bytes([7]) * 32))
+    out = claims.process(client, Rpc(), vault_signer())
     assert out["paid"] == 1, out
     got = _get(f"{base}/api/claim/{body['id']}")
     assert got["status"] == "paid" and got["lamports"] == 25_000_000 and not got.get("tx")   # the payout tx would name the fly

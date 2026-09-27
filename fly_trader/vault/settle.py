@@ -98,7 +98,7 @@ def open_positions(conn) -> tuple[int, set[str]]:
 
 def last_own_slot(conn) -> int:
     r = conn.execute("SELECT GREATEST((SELECT max(slot) FROM fills WHERE book = 'live'), "
-                     "(SELECT max(slot) FROM vault_flows WHERE kind IN ('claim', 'withdrawal', 'sweep')), "
+                     "(SELECT max(slot) FROM vault_flows WHERE kind IN ('claim', 'withdrawal', 'sweep', 'topup')), "
                      "(SELECT max((detail->>'slot')::bigint) FROM wallet_events WHERE kind = 'ata_closed' AND detail ? 'slot')) AS s").fetchone()
     return int(r["s"] or 0)
 
@@ -113,7 +113,37 @@ def flow_totals(conn, through_slot: int) -> dict:
     return {"deposits": int(r["d"]), "withdrawals": int(r["wd"]), "payouts": int(r["p"]), "gifts": int(r["gifts"])}
 
 
-def snapshot(rpc, wallet: str, wait_s: float = FINALITY_WAIT_S, payout_wallet: str | None = None) -> dict:
+class RpcDisagree(RuntimeError):
+    pass
+
+
+def agree_with_check_rpc(accounts: list[str], native: int, slot: int, tries: int = 3) -> None:
+    """The second provider (SOLANA_CHECK_RPC_URL) must see the same lamports at the same finalized slot: a lying or
+    lagging primary could otherwise inflate (or shrink) what a settlement allocates. Raises RpcDisagree (and alerts)."""
+    from ..chain.rpc import check_rpc
+    chk = check_rpc()
+    if chk is None:
+        return
+    seen = None
+    for i in range(tries):
+        try:
+            total = 0
+            for a in accounts:
+                v, s = chk.get_balance_ctx(a, commitment="finalized", min_context_slot=slot)
+                total += v
+            if total == native:
+                return
+            seen = total
+        except Exception as e:                            # a check node behind the slot refuses (minContextSlot)
+            seen = f"{type(e).__name__}"
+        time.sleep(2.0 * (i + 1))
+    from . import alerts
+    alerts.send(f"settlement paused: the RPC providers disagree on the book's balance at slot {slot} ({native} vs {seen})",
+                key="rpc_disagree", cooldown_s=1800)
+    raise RpcDisagree(f"providers disagree at slot {slot}: {native} vs {seen}")
+
+
+def snapshot(rpc, wallet: str, wait_s: float = FINALITY_WAIT_S, treasury: str | None = None, our_keys: set[str] | None = None) -> dict:
     """The wallet at a finalized slot S that already contains every transaction our own code sent, read while no
     swap, claim or withdrawal can run, plus every flow up to S."""
     from . import flows, walletlock
@@ -129,8 +159,9 @@ def snapshot(rpc, wallet: str, wait_s: float = FINALITY_WAIT_S, payout_wallet: s
                         continue                                  # a fill landed while we waited for the lock
                     cost, mints = open_positions(conn)
                 native, slot = rpc.get_balance_ctx(wallet, commitment="finalized", min_context_slot=max(last, 1))
-                if payout_wallet:                         # the payout wallet is part of the same book (vault/payout.py)
-                    native += rpc.get_balance_ctx(payout_wallet, commitment="finalized", min_context_slot=max(last, 1))[0]
+                if treasury:                              # the treasury is part of the same book (vault/payout.py)
+                    native += rpc.get_balance_ctx(treasury, commitment="finalized", min_context_slot=max(last, 1))[0]
+                agree_with_check_rpc([a for a in (wallet, treasury) if a], native, slot)
                 accts = rpc.get_token_accounts_by_owner(wallet, commitment="finalized")
             break
         if time.monotonic() > deadline:
@@ -140,7 +171,7 @@ def snapshot(rpc, wallet: str, wait_s: float = FINALITY_WAIT_S, payout_wallet: s
     while flows.scanned_through() < slot:
         if time.monotonic() > deadline + wait_s:
             raise TimeoutError(f"flow scan has not reached slot {slot}")
-        flows.scan(rpc, wallet)
+        flows.scan_all(rpc, wallet, our_keys or {wallet})
         if flows.scanned_through() < slot:
             time.sleep(3.0)
     with transaction() as conn:
@@ -195,8 +226,8 @@ def paper_snapshot() -> dict:
             "payouts": paid, "realized_override": realized_}
 
 
-def take_snapshot(rpc, wallet: str, t0: int, t1: int, payout_wallet: str | None = None) -> int:
-    snap = paper_snapshot() if paper() else snapshot(rpc, wallet, payout_wallet=payout_wallet)
+def take_snapshot(rpc, wallet: str, t0: int, t1: int, treasury: str | None = None, our_keys: set[str] | None = None) -> int:
+    snap = paper_snapshot() if paper() else snapshot(rpc, wallet, treasury=treasury, our_keys=our_keys)
     r = snap["realized_override"] if "realized_override" in snap else \
         realized(snap["native"], snap["token_acct"], snap["open_cost"], snap["deposits"], snap["withdrawals"], snap["payouts"])
     with transaction() as conn:
@@ -263,14 +294,15 @@ def allocate_settlement(sid: int, index_state: dict) -> dict:
     return {"allocated": total, "pot": p["pot"], "earners": len(alloc), "carried": p["pot"] - total, "sha256": digest}
 
 
-def run_once(rpc, wallet: str, index_state: dict, now: float | None = None, payout_wallet: str | None = None) -> dict:
+def run_once(rpc, wallet: str, index_state: dict, now: float | None = None, treasury: str | None = None,
+             our_keys: set[str] | None = None) -> dict:
     """Advance settlement by at most one step per phase; safe to call every minute."""
     if state.halted():
         return {"halted": True}
     out: dict = {}
     d = due(now)
     if d:
-        sid = take_snapshot(rpc, wallet, *d, payout_wallet=payout_wallet)
+        sid = take_snapshot(rpc, wallet, *d, treasury=treasury, our_keys=our_keys)
         out["snapshot"] = sid
     with transaction() as conn:
         pend = conn.execute("SELECT id FROM vault_settlements WHERE status = 'snapshotted' ORDER BY period_end").fetchall()

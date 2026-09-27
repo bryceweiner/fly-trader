@@ -25,10 +25,11 @@ VAULT_DDL: list[str] = [
         created_at timestamptz NOT NULL DEFAULT now(),
         UNIQUE (signature, direction, kind))""",
     "CREATE INDEX IF NOT EXISTS vault_flows_slot ON vault_flows (slot)",
-    # 'sweep': owed SOL moved from the trading wallet to the payout wallet (internal: counted in neither direction)
+    # internal moves between the trading wallet and the Squads treasury (vault/payout.py), counted in neither direction:
+    # 'sweep' trading -> treasury (the float's excess), 'topup' treasury -> trading (spending limit L1)
     "ALTER TABLE vault_flows DROP CONSTRAINT IF EXISTS vault_flows_kind_check",
     "ALTER TABLE vault_flows ADD CONSTRAINT vault_flows_kind_check CHECK (kind IN "
-    "('deposit', 'profit', 'withdrawal', 'claim', 'sweep', 'unknown_outbound', 'anomaly'))",
+    "('deposit', 'profit', 'withdrawal', 'claim', 'sweep', 'topup', 'unknown_outbound', 'anomaly'))",
     """CREATE TABLE IF NOT EXISTS vault_scan (
         name text PRIMARY KEY,
         cursor text,

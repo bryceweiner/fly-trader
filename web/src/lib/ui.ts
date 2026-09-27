@@ -67,7 +67,7 @@ export function txLink(hash: string): Node {
  * Renders the wallet bar into #wallet-bar and loads AppKit (dynamic import). Resolves to null when this build
  * has no Reown project id, or AppKit fails to load; the page stays fully readable either way.
  */
-export async function mountWalletBar(opts: { solana: boolean; onChange: (s: WalletState, w: Wallets) => void }): Promise<Wallets | null> {
+export async function mountWalletBar(opts: { solana: boolean; evm?: boolean; onChange: (s: WalletState, w: Wallets) => void }): Promise<Wallets | null> {
   const bar = $('wallet-bar')
   if (!config.reownProjectId) {
     bar.replaceChildren(
@@ -94,7 +94,7 @@ export async function mountWalletBar(opts: { solana: boolean; onChange: (s: Wall
       ? h('button', { class: 'btn small', type: 'button', onclick: () => void wallets.disconnect('eip155') }, 'Disconnect')
       : h('button', { class: 'btn small primary', type: 'button', onclick: () => void wallets.connect('eip155') }, 'Connect')
     const wrongChain = s.evm && s.evmChainId !== config.evm.chainId
-    const rows = [
+    const rows = opts.evm === false ? [] : [
       row(
         `EVM · ${config.evm.name}`,
         s.evm ? link(explorer.evmAddress(s.evm), short(s.evm)) : 'not connected',
@@ -108,10 +108,10 @@ export async function mountWalletBar(opts: { solana: boolean; onChange: (s: Wall
         : h('button', { class: 'btn small primary', type: 'button', onclick: () => void wallets.connect('solana') }, 'Connect')
       rows.push(row(`Solana · ${config.solana.cluster}`, s.sol ? link(explorer.solAccount(s.sol), short(s.sol)) : 'not connected', solBtn))
     }
-    bar.replaceChildren(
-      h('div', { class: 'wallet-rows' }, ...rows),
-      h('p', { class: 'wallet-note' }, `Some mobile wallets cannot add ${config.evm.name} (chain ${config.evm.chainId}); they can still connect and sign claims.`),
-    )
+    const note = opts.evm === false ? null : h('p', { class: 'wallet-note' }, `Some mobile wallets cannot add ${config.evm.name} (chain ${config.evm.chainId}); they can still connect and sign claims.`)
+    const parts: Node[] = [h('div', { class: 'wallet-rows' }, ...rows)]
+    if (note) parts.push(note)
+    bar.replaceChildren(...parts)
   }
   wallets.subscribe((s) => {
     render(s)

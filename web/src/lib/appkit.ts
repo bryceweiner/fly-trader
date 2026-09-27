@@ -24,10 +24,13 @@ export interface Wallets {
   disconnect(ns: 'eip155' | 'solana'): Promise<void>
   signEvm(text: string): Promise<Hex>
   signSol(message: Uint8Array): Promise<unknown>
+  /** The connected Solana wallet signs a transaction (the owner page: treasury changes). */
+  signSolTransaction<T>(tx: T): Promise<T>
 }
 
 interface SolanaProvider {
   signMessage(message: Uint8Array): Promise<Uint8Array>
+  signTransaction<T>(transaction: T): Promise<T>
 }
 
 let instance: Wallets | null = null
@@ -126,6 +129,11 @@ export function initWallets(): Wallets {
       const provider = modal.getProvider<SolanaProvider>('solana')
       if (!provider) throw new Error('Connect a Solana wallet first.')
       return provider.signMessage(message)
+    },
+    async signSolTransaction(tx) {
+      const provider = modal.getProvider<SolanaProvider>('solana')
+      if (!provider) throw new Error('Connect a Solana wallet first.')
+      return provider.signTransaction(tx)
     },
   }
   return instance

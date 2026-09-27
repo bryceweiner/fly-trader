@@ -48,6 +48,10 @@ export const config = {
   evm,
   solana: {
     cluster: (mainnet ? 'mainnet' : 'devnet') as 'mainnet' | 'devnet',
+    /** JSON-RPC for the owner page's reads and sends: WalletConnect's (already allowed by the CSP) unless
+     *  VITE_SOLANA_RPC points elsewhere (a local validator for the dry run). */
+    rpcUrl: (env.VITE_SOLANA_RPC || '').trim() ||
+      `https://rpc.walletconnect.org/v1/?chainId=solana:${mainnet ? '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp' : 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1'}&projectId=${(env.VITE_REOWN_PROJECT_ID || '').trim()}`,
     /** appended to Solscan links */
     solscanSuffix: mainnet ? '' : '?cluster=devnet',
   },

@@ -67,6 +67,14 @@ def check_drawdown(conn, wealth: float, peak: float, circuit_id: int = SOLANA_CI
                      (f"wealth {wealth:.4f} {unit} <= {1 - dd:.2f} x peak {peak:.4f} {unit}", peak, circuit_id))
         _event(conn, "kill_switch", {"wealth": wealth, "peak": peak}, circuit_id)
         record_event("error", "rails", "kill switch tripped: entries blocked", {"wealth": wealth, "peak": peak, "circuit": circuit_id})
+        if config.VAULT_ENABLED:                         # the hosted fly: tell the operator at once
+            try:
+                from ..vault import alerts
+                alerts.send(f"KILL SWITCH tripped: {wealth:.4f} {unit} <= {1 - dd:.2f} x peak {peak:.4f} {unit}. Entries blocked"
+                            + (", open positions are being liquidated" if config.KILL_SWITCH_LIQUIDATE else "")
+                            + ". Clear it with `fly-trader reset-circuit --kill` once you know why.")
+            except Exception:
+                pass
         return True
     return False
 

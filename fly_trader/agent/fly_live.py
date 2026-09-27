@@ -79,11 +79,13 @@ class LiveMirror:
         opens = ledger.open_positions(conn, BOOK); held_mints = {p["mint"] for p in opens} | set(inflight)
         c = rails.load_circuit(conn)
         blocked = "kill switch" if c.kill_switch else "circuit tripped" if c.tripped else "paused" if c.entries_paused else None
-        reserved = 0.0
-        if config.VAULT_ENABLED:                     # SOL owed to vault lockers stays in the wallet but is never traded
+        reserved = treasury = 0.0
+        if config.VAULT_ENABLED:                     # SOL owed to vault lockers is never traded; the treasury's idle SOL is bankroll
             from ..vault import nav as vault_nav
             reserved = vault_nav.reserved_in_trading(conn) / config.LAMPORTS_PER_SOL
-        bankroll = sol_free + sum(float(p["cost_sol"]) for p in opens) - reserved; cash = sol_free - reserved; n_enter = 0; skipped = []
+            treasury = vault_nav.treasury_free(conn) / config.LAMPORTS_PER_SOL
+        # sized on the whole book, spent only from the trading wallet's own float (cash)
+        bankroll = sol_free + sum(float(p["cost_sol"]) for p in opens) - reserved + treasury; cash = sol_free - reserved; n_enter = 0; skipped = []
         for e in entries:
             if e["mint"] in held_mints:
                 skipped.append((e["mint"], "held")); continue
@@ -109,14 +111,18 @@ class LiveMirror:
                      "ON CONFLICT (beat_id, book) DO NOTHING",
                      (beat_id, BOOK, m1, sol_free, gross_v - exit_cost, exit_cost, wealth, peak, (1.0 - wealth / peak) if peak > 0 else 0.0, exposure, len(opens)))
         if config.VAULT_ENABLED:                     # deposits, withdrawals and payouts are not performance
-            from ..vault import payout as vault_payout      # both wallets are one book: a sweep is not a loss
+            from ..vault import payout as vault_payout      # trading wallet + treasury are one book: a top-up or sweep is no loss
             vault_nav.mark(conn, m1, snap.lamports + vault_payout.cached_balance(), int(round(gross_v * config.LAMPORTS_PER_SOL)),
                            int(round(exit_cost * config.LAMPORTS_PER_SOL)))
             ix = vault_nav.status(conn, since=rebase)
             killed = rails.check_drawdown(conn, ix["value"], ix["peak"], unit="index")
         else:
             killed = rails.check_drawdown(conn, wealth, peak)
-        n_liq = self.liquidate(conn, ctx, run_id, beat_id) if killed and config.KILL_SWITCH_LIQUIDATE else 0
+        panic = False
+        if config.VAULT_ENABLED:                     # Telegram /panic: sell everything whatever KILL_SWITCH_LIQUIDATE says
+            from ..vault import state as vault_state
+            panic = bool(vault_state.get("panic"))
+        n_liq = self.liquidate(conn, ctx, run_id, beat_id) if killed and (config.KILL_SWITCH_LIQUIDATE or panic) else 0
         gap = self.gap(conn)
         if ctx.m1_epoch - self.last_sweep >= SWEEP_S:
             self.last_sweep = ctx.m1_epoch; self.sweep(conn, snap, inflight, m1)

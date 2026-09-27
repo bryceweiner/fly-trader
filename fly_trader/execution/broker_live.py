@@ -23,7 +23,6 @@ Every write is committed immediately so a crash mid-poll leaves an auditable row
 """
 from __future__ import annotations
 
-import base64
 import logging
 import re
 import threading
@@ -31,20 +30,16 @@ import time
 from dataclasses import dataclass
 
 from psycopg.types.json import Jsonb
-from solders.hash import Hash
-from solders.instruction import AccountMeta, Instruction
-from solders.message import MessageV0
-from solders.pubkey import Pubkey
-from solders.transaction import VersionedTransaction
-
 from .. import config
 from ..chain.balances import tx_deltas, Snapshot, compute_delta, snapshot_balances
 from ..chain.cluster_guard import assert_signing_allowed
 from ..chain.jupiter_swap import JupiterError, JupiterSwap
 from ..db.connection import transaction
-from ..chain.keys import load_keypair
 from ..chain.rpc import TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, HttpSolanaRpc
-from ..chain.signing import NotASigner, n_lookup_programs, sign_transaction_b64, static_program_ids, transaction_id
+from ..chain.signing import n_lookup_programs, static_program_ids
+from ..signer import client as signer_client
+from ..signer.client import SignerUnavailable
+from ..signer.policy import EXCLUDE_ROUTERS, PolicyError
 from ..db.apilog import record_event
 from ..db.connection import connect, transaction
 from ..logging_setup import scrub
@@ -110,10 +105,14 @@ def await_confirmation(rpc, signature: str | None, last_valid_block_height: int 
 
 
 class LiveBroker:
-    def __init__(self, rpc=None, jup=None, keypair=None):
+    """Swaps through Jupiter; the trading key never enters this process: ``signer`` (fly_trader/signer, the signer
+    container's socket on the vault server) checks and signs each transaction."""
+
+    def __init__(self, rpc=None, jup=None, signer=None):
         self._rpc = rpc
         self._jup = jup
-        self._keypair = keypair
+        self._signer = signer
+        self._pubkey: str | None = None
         self._labels: dict[str, str] | None = None
 
     @property
@@ -129,14 +128,16 @@ class LiveBroker:
         return self._jup
 
     @property
-    def keypair(self):
-        if self._keypair is None:
-            self._keypair = load_keypair()
-        return self._keypair
+    def signer(self):
+        if self._signer is None:
+            self._signer = signer_client.get()
+        return self._signer
 
     @property
     def pubkey(self) -> str:
-        return str(self.keypair.pubkey())
+        if self._pubkey is None:
+            self._pubkey = self.signer.call("pubkeys")["trading"]
+        return self._pubkey
 
     @property
     def labels(self) -> dict[str, str]:
@@ -185,7 +186,7 @@ class LiveBroker:
         taker = self.pubkey
         pre = snapshot_balances(self.rpc, taker)
         request = {"inputMint": input_mint, "outputMint": output_mint, "amount": str(amount_in), "taker": taker,
-                   "slippageBps": slippage_bps, "excludeRouters": "jupiterz"}
+                   "slippageBps": slippage_bps, "excludeRouters": EXCLUDE_ROUTERS}
         base = dict(decision_id=decision_id, book=book, attempt=attempt, side=side, input_mint=input_mint,
                     output_mint=output_mint, amount_in=amount_in, slippage_bps=slippage_bps, request=request)
 
@@ -200,7 +201,7 @@ class LiveBroker:
 
         # 1. order
         try:
-            order = self.jup.order(input_mint, output_mint, amount_in, taker=taker, slippage_bps=slippage_bps)
+            order = self.jup.order(input_mint, output_mint, amount_in, taker=taker, slippage_bps=slippage_bps, exclude_routers=EXCLUDE_ROUTERS)
         except JupiterError as e:
             return fail("order_error", scrub(str(e)))
         err_code = _int_or_none(order.get("errorCode"))
@@ -223,14 +224,18 @@ class LiveBroker:
             conn, **base, order_response=order, request_id=order.get("requestId"), router=order.get("router"),
             fee_bps=_int_or_none(order.get("feeBps")), program_ids=program_ids, lvbh=lvbh, status="ordered")
 
-        # 2. sign (our slot only)
+        # 2. sign: the signer checks the transaction (programs, roles, a simulation of our balances) and signs our slot
         try:
-            signed_b64, _idx = sign_transaction_b64(tx_b64, self.keypair)
-        except (NotASigner, ValueError) as e:
-            return fail("sign_error", f"{type(e).__name__}: {scrub(str(e))}", None, order_id=order_id)
-        if _idx != 0 and not order.get("gasless"):
-            return fail("sign_error", f"our key is signer {_idx}, but a non-gasless order must have the taker as fee payer", None, order_id=order_id)
-        tx_sig = transaction_id(signed_b64)
+            signed = self.signer.call("sign_swap", tx=tx_b64, in_mint=input_mint, out_mint=output_mint, in_amount=amount_in,
+                                      min_out=max(1, int(_int_or_none(order.get("otherAmountThreshold")) or 1)))
+        except PolicyError as e:
+            r = fail("sign_refused", f"{e.code}: {scrub(str(e))}", None, order_id=order_id)
+            if e.code == "policy":
+                record_event("error", "signer", f"swap refused: {e}", {"order_id": order_id, "side": side, "mint": mint})
+            return r[0], e.code == "in_flight"          # a simulation that failed (slippage, stale route): retry with a new order
+        except SignerUnavailable as e:
+            return fail("sign_error", scrub(str(e)), None, order_id=order_id)
+        signed_b64, tx_sig = signed["tx"], signed["signature"]
 
         # 3. execute
         exec_req = {"requestId": order.get("requestId"), "lastValidBlockHeight": lvbh, "signedTransaction": signed_b64}
@@ -419,14 +424,13 @@ def swap_smoke(sol: float) -> None:
     print(f"net lamports delta: {net} ({net / config.LAMPORTS_PER_SOL:.9f} SOL)")
 
 
-def close_empty_atas(rpc=None, keypair=None, url: str | None = None, batch: int = CLOSE_ATA_BATCH, skip_mints: set | None = None) -> dict:
-    """Close every zero-balance token account owned by the bot (rent back to the wallet).
-    SPL Token / Token-2022 CloseAccount = instruction index 9, accounts [account, destination, owner].
-    One v0 transaction per ``batch`` accounts; each is recorded as wallet_events(kind='ata_closed')."""
+def close_empty_atas(rpc=None, signer=None, url: str | None = None, batch: int = CLOSE_ATA_BATCH, skip_mints: set | None = None) -> dict:
+    """Close every zero-balance token account owned by the bot (rent back to the wallet). The signer builds and signs
+    the CloseAccount transactions (it re-checks that each account is ours and empty); each is recorded as
+    wallet_events(kind='ata_closed')."""
     assert_signing_allowed()
-    kp = keypair or load_keypair()
-    owner = kp.pubkey()
-    owner_s = str(owner)
+    signer = signer or signer_client.get()
+    owner_s = signer.call("pubkeys")["trading"]
     rpc = rpc or HttpSolanaRpc()
     skip = set(skip_mints or ())
     empties = [a for a in rpc.get_token_accounts_by_owner(owner_s) if int(a["amount"]) == 0 and a["mint"] not in skip and not a.get("is_native")]
@@ -436,16 +440,17 @@ def close_empty_atas(rpc=None, keypair=None, url: str | None = None, batch: int 
     for i in range(0, len(empties), batch):
         chunk = empties[i:i + batch]
         accounts = [a["address"] for a in chunk]
-        ixs = [Instruction(Pubkey.from_string(a["program"]), bytes([9]),
-                           [AccountMeta(Pubkey.from_string(a["address"]), False, True),
-                            AccountMeta(owner, False, True),
-                            AccountMeta(owner, True, False)]) for a in chunk]
-        bh = rpc.get_latest_blockhash()
-        msg = MessageV0.try_compile(owner, ixs, [], Hash.from_string(bh["blockhash"]))
-        tx = VersionedTransaction(msg, [kp])
-        tx_b64 = base64.b64encode(bytes(tx)).decode()
         try:
-            sig = rpc.send_transaction(tx_b64)
+            built = signer.call("close_atas", accounts=accounts)
+        except (PolicyError, SignerUnavailable) as e:
+            result["failed"].append({"accounts": accounts, "error": str(e)})
+            record_event("error", "close_empty_atas", "the signer refused", {"accounts": accounts, "error": str(e)})
+            continue
+        if not built:
+            continue
+        bh = {"last_valid_block_height": built[0]["last_valid_block_height"]}
+        try:
+            sig = rpc.send_transaction(built[0]["tx"])
         except Exception as e:
             err = f"{type(e).__name__}: {scrub(str(e))}"
             result["failed"].append({"accounts": accounts, "error": err})

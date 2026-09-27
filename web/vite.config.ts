@@ -5,7 +5,7 @@ import { defineConfig, loadEnv, type Plugin } from 'vite'
 import { devApi } from './dev/mock-api.ts'
 
 const root = import.meta.dirname
-const PAGES = ['index', 'trading', 'vault', 'terms', 'privacy']
+const PAGES = ['index', 'trading', 'vault', 'terms', 'privacy', 'owner']
 
 /** Replaces `<!-- @include name -->` with partials/name.html. On index.html the in-page anchors stay
  *  bare (`#about`), elsewhere they point back to index.html; the current page's nav link gets aria-current. */

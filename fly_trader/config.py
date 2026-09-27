@@ -15,7 +15,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env", override=False)
 
 SECRET_ENV_NAMES = ("HELIUS_API_KEY", "JUPITER_API_KEY", "BOT_PRIVATE_KEY", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH",
-                    "RELAY_SECRET", "TELEGRAM_BOT_TOKEN", "VAULT_BACKUP_HF_TOKEN", "VAULT_SOLANA_RPC_URL")
+                    "RELAY_SECRET", "TELEGRAM_BOT_TOKEN", "VAULT_BACKUP_HF_TOKEN", "VAULT_SOLANA_RPC_URL", "SIGNER_RPC_URL",
+                    "SOLANA_CHECK_RPC_URL", "HEALTHCHECK_URL")
 
 
 def utcnow() -> datetime:
@@ -168,9 +169,7 @@ def live_prerequisites_missing() -> list[str]:
 
 # ---- the $FLY vault (fly_trader/vault, docs/vault/SPEC.md): only the hosted vault fly sets VAULT_ENABLED ----
 VAULT_ENABLED = env_bool("VAULT_ENABLED", False)
-PAYOUT_PRIVATE_KEY_FILE = env_str("PAYOUT_PRIVATE_KEY_FILE")      # the second wallet claims are paid from (vault/payout.py)
-PAYOUT_FEE_BUFFER_LAMPORTS = env_int("PAYOUT_FEE_BUFFER_LAMPORTS", 10_000_000)   # kept in the payout wallet for claim fees
-PAYOUT_MIN_SWEEP_LAMPORTS = env_int("PAYOUT_MIN_SWEEP_LAMPORTS", 1_000_000)
+PAYOUT_PRIVATE_KEY_FILE = env_str("PAYOUT_PRIVATE_KEY_FILE")      # the key that pays claims from the treasury (spending limit L2); read by the signer only
 VAULT_BOOK = env_str("VAULT_BOOK", "live")                         # the book the vault shares: live; a paper book (e.g. paper_fly) for a dry run on real decisions without real SOL
 VAULT_CLUSTER = env_str("VAULT_CLUSTER", "mainnet-beta")           # devnet only for the rehearsal (trading off, claims on devnet)
 VAULT_SOLANA_RPC_URL = env_str("VAULT_SOLANA_RPC_URL")             # overrides Helius for the vault's reads/claims (the devnet rehearsal)
@@ -197,10 +196,28 @@ TELEGRAM_CHAT_ID = env_str("TELEGRAM_CHAT_ID")
 VAULT_BACKUP_RECIPIENT = env_str("VAULT_BACKUP_RECIPIENT")          # age / ssh-ed25519 public key the backups are encrypted to
 VAULT_BACKUP_BUCKET = env_str("VAULT_BACKUP_BUCKET")                # private HF storage bucket, e.g. bryceweiner/fly-vault-backups
 VAULT_BACKUP_HF_TOKEN = env_str("VAULT_BACKUP_HF_TOKEN")            # scoped to that bucket only
+# custody (docs/vault/SPEC.md "Custody"): a Squads v4 treasury the hot keys draw on only through its spending limits
+VAULT_MULTISIG = env_str("VAULT_MULTISIG")                          # the Squads multisig; the treasury is its vault 0
+VAULT_LIMIT_TRADING = env_str("VAULT_LIMIT_TRADING")                # L1: trading key -> the trading wallet only, per day
+VAULT_LIMIT_PAYOUT = env_str("VAULT_LIMIT_PAYOUT")                  # L2: payout key -> any holder, per week
+TREASURY_FLOAT_SOL = env_float("TREASURY_FLOAT_SOL", 2.0)           # the most the trading wallet keeps idle; the rest goes back
+TOPUP_MIN_SOL = env_float("TOPUP_MIN_SOL", 0.1)                     # smaller refills and returns are skipped
+SIGNER_SOCKET = env_str("SIGNER_SOCKET")                            # the signer container's socket; unset: an in-process signer
+SIGNER_RPC_URL = env_str("SIGNER_RPC_URL")                          # the signer's own RPC (a second provider)
+SOLANA_CHECK_RPC_URL = env_str("SOLANA_CHECK_RPC_URL")              # a second provider money-moving reads must agree with
+TELEGRAM_ADMIN_USER_ID = env_str("TELEGRAM_ADMIN_USER_ID")          # the only Telegram user whose /panic and /status count
+HEALTHCHECK_URL = env_str("HEALTHCHECK_URL")                        # dead-man ping (healthchecks.io) every 5 min
 
 
 def vault_solana_rpc_url() -> str:
     return VAULT_SOLANA_RPC_URL or helius_http_url()
+
+
+def signer_env() -> dict:
+    """What an in-process signer reads (fly_trader/signer; the signer container has its own environment)."""
+    return {k: str(v) for k, v in {"VAULT_MULTISIG": VAULT_MULTISIG, "VAULT_LIMIT_TRADING": VAULT_LIMIT_TRADING,
+                                   "VAULT_LIMIT_PAYOUT": VAULT_LIMIT_PAYOUT, "MAX_POSITION_SOL": MAX_POSITION_SOL,
+                                   "TREASURY_FLOAT_SOL": TREASURY_FLOAT_SOL, "VAULT_BACKUP_RECIPIENT": VAULT_BACKUP_RECIPIENT}.items() if v}
 
 # ---- Kalshi prediction markets (fly_trader/kalshi; the same key names as better_bot, whose client is vendored) ----
 KALSHI_API_KEY_ID = env_str("KALSHI_API_KEY_ID")

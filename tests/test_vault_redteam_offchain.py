@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from solders.keypair import Keypair
 
+from test_signer import vault_signer
 from fly_trader import config
 from fly_trader.db.connection import transaction
 from fly_trader.execution.broker_live import await_confirmation as REAL_AWAIT
@@ -17,7 +18,7 @@ from fly_trader.vault import claim_message as cm, claims, settle, sigs, state
 
 V = json.loads((Path(__file__).parent / "vectors" / "claim_v1.json").read_text())["vectors"][1]   # rehearsal: devnet/46630
 V_MAIN = json.loads((Path(__file__).parent / "vectors" / "claim_v1.json").read_text())["vectors"][0]
-PAYER = Keypair.from_seed(bytes([9]) * 32)
+PAYER = vault_signer()                          # the real signer over a fake chain (tests/test_signer.py)
 VICTIM_EVM_KEY = bytes.fromhex(V["test_keys"]["evm_private_key"][2:])
 VICTIM_SOL = Keypair.from_seed(bytes.fromhex(V["test_keys"]["sol_seed"]))
 ATTACKER_EVM_KEY = bytes([7]) * 32
