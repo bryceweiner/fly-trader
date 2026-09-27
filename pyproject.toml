@@ -13,6 +13,8 @@ dependencies = [
   "scikit-learn>=1.5",
   "scipy",
   "joblib",
+  "skops>=0.16",
+  "zstandard",
   "solders>=0.21",
   "base58",
   "websockets>=12",

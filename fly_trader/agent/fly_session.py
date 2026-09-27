@@ -169,7 +169,7 @@ class FlyBook:
         if not self.state_path.exists():
             return None
         try:
-            return torch.load(self.state_path, map_location="cpu", weights_only=False)
+            return torch.load(self.state_path, map_location="cpu", weights_only=True)
         except Exception:
             log.exception("fly state unreadable; starting from the bootstrap")
             return None
@@ -480,7 +480,7 @@ class FlyBook:
                 target = r; break
         if target is not None:
             snap = plastic.PlasticBank(self.fly.net, [(0.0, math.inf)], fly_selector.SCALE, learn=self.bank.learn.cpu().numpy(), read=self.bank.read.cpu().numpy())
-            st = torch.load(target["path"], map_location="cpu", weights_only=False)["bank"]
+            st = torch.load(target["path"], map_location="cpu", weights_only=True)["bank"]
             snap.D = torch.zeros_like(snap.D); snap.D[:, snap.mask.bool()] = st["D"].to(snap.dev).float()
             self.bank.D[0][:, cols] = snap.D[0][:, cols]
         else:

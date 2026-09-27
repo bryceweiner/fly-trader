@@ -18,19 +18,20 @@ for sub in policies selectors connectome; do
   done
 done
 
-# The wallet-skill inputs: the fitted config (in git) and the newest table (~300 MB: kept on Hugging Face, fetched once).
+# The wallet-skill inputs: the fitted config and the newest table, both from the release (verified by the updater's
+# hashes). Nothing is downloaded here: an unverified file from the network never reaches the engine.
 mkdir -p data/corpus/wallet_skill
 for f in models/wallet_skill/*; do
   [ -e "$f" ] || continue
   [ -e "data/corpus/wallet_skill/$(basename "$f")" ] || cp "$f" data/corpus/wallet_skill/
 done
 T=$(cat models/wallet_skill/TABLE 2>/dev/null || true)
-if [ -n "$T" ] && [ ! -e "data/corpus/wallet_skill/$T" ]; then
-  echo "fly-trader: fetching the wallet-skill table $T (~300 MB, once)"
-  curl -fsSL --retry 5 -o "data/corpus/wallet_skill/$T.part" "https://huggingface.co/bryceweiner/fly-trader/resolve/main/models/wallet_skill/$T" \
-    && mv "data/corpus/wallet_skill/$T.part" "data/corpus/wallet_skill/$T" \
-    || echo "fly-trader: WARNING could not fetch the wallet-skill table; the paper selector will not trade and the fly's skill inputs read as zero until it is present"
+if [ -n "$T" ] && [ ! -e "data/corpus/wallet_skill/$T" ] && [ -e "/releases" ]; then
+  src=$(ls -d /releases/*/models/wallet_skill/"$T" 2>/dev/null | tail -1)
+  [ -n "$src" ] && cp "$src" "data/corpus/wallet_skill/$T"
 fi
+[ -z "$T" ] || [ -e "data/corpus/wallet_skill/$T" ] || \
+  echo "fly-trader: WARNING the wallet-skill table $T is not in this image or a verified release; the paper selector will not trade and the fly's skill inputs read as zero until it is present"
 
 # The console's 3D brain view: each neuron's position, built once per connectome on the training machine and shipped
 # (this image has no FlyWire annotations to build it from). The console serves it from its static directory.

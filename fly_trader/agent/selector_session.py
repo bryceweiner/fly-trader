@@ -74,8 +74,7 @@ class SelectorBook:
         """Switch to a newer deployable model without a restart (the paper book and open positions carry on). While a
         snapshot is pinned (``ui_settings['pinned_selector_snapshot']``) the book stays on it, so a forward test measures
         one model instead of a blend of every retrain that lands during it."""
-        import joblib
-        from ..train import selector as sel
+        from ..train import model_io, selector as sel
         pin = pinned_snapshot()
         with transaction() as conn:
             if pin is not None:                        # a pin freezes the book, but a NEW pin (a release) switches to it
@@ -86,7 +85,7 @@ class SelectorBook:
                 r = sel.latest_current(conn)
         if not r or r["id"] == self.snapshot_id:
             return False
-        m = joblib.load(r["path"])
+        m = model_io.load_selector(r["path"])
         try:
             idx = _columns(m)
         except RuntimeError as e:

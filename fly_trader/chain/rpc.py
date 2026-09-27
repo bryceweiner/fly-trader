@@ -224,3 +224,9 @@ class HttpSolanaRpc:
         sig = self.call("sendTransaction", [tx_b64, {"encoding": "base64", "skipPreflight": bool(skip_preflight),
                                                      "preflightCommitment": COMMITMENT, "maxRetries": int(max_retries)}])
         return str(sig)
+
+
+def check_rpc() -> "HttpSolanaRpc | None":
+    """A client for the second, independent provider (``SOLANA_CHECK_RPC_URL``) that money-moving reads must agree with,
+    or None when none is configured."""
+    return HttpSolanaRpc(config.SOLANA_CHECK_RPC_URL) if config.SOLANA_CHECK_RPC_URL else None

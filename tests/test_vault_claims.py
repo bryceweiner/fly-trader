@@ -3,14 +3,14 @@ import json
 from pathlib import Path
 
 import pytest
-from solders.keypair import Keypair
 
 from fly_trader import config
 from fly_trader.db.connection import transaction
 from fly_trader.vault import claims, state
 
+from test_signer import L2, PAYOUT, limit, vault_signer
+
 V = json.loads((Path(__file__).parent / "vectors" / "claim_v1.json").read_text())["vectors"][1]   # rehearsal: devnet/46630
-KP = Keypair.from_seed(bytes([9]) * 32)
 
 
 @pytest.fixture(autouse=True)
@@ -69,15 +69,15 @@ def _now():
 
 def test_valid_claim_pays_all_owed_once(monkeypatch):
     _confirm(monkeypatch)
-    relay, rpc = Relay([_claim()]), Rpc()
-    out = claims.process(relay, rpc, KP, now=_now())
+    relay, rpc, sg = Relay([_claim()]), Rpc(), vault_signer()
+    out = claims.process(relay, rpc, sg, now=_now())
     assert out["paid"] == 1 and len(rpc.sent) == 1
     with transaction() as c:
         acct = c.execute("SELECT * FROM vault_accounts WHERE evm = %s", (V["evm_checksummed"],)).fetchone()
         flow = c.execute("SELECT * FROM vault_flows WHERE kind = 'claim'").fetchone()
     assert acct["owed"] == 0 and acct["claimed"] == 30_000_000 and flow["lamports"] == 30_000_000
     assert relay.reports[-1]["status"] == "paid"
-    out = claims.process(Relay([_claim(), _claim(2)]), rpc, KP, now=_now())       # replayed nonce and nothing owed
+    out = claims.process(Relay([_claim(), _claim(2)]), rpc, sg, now=_now())       # replayed nonce and nothing owed
     assert out["paid"] == 0 and len(rpc.sent) == 1
 
 
@@ -85,35 +85,37 @@ def test_tampered_or_foreign_claims_are_rejected(monkeypatch):
     _confirm(monkeypatch)
     bad = [_claim(1, sol_sig=V["sol_sig"][:-2] + "11"), _claim(2, nonce="a" * 32, sol="11111111111111111111111111111112"), _claim(3, nonce="b" * 32, domain="evil.app")]
     relay, rpc = Relay(bad), Rpc()
-    out = claims.process(relay, rpc, KP, now=_now())
+    out = claims.process(relay, rpc, vault_signer(), now=_now())
     assert out["rejected"] == 3 and not rpc.sent
     assert {r["status"] for r in relay.reports} == {"rejected"}
 
 
-def test_gas_reserve_makes_claim_wait_and_halt_stops_everything(monkeypatch):
+def test_weekly_cap_makes_claim_wait_and_halt_stops_everything(monkeypatch):
     _confirm(monkeypatch)
-    rpc = Rpc(balance=15_000_000)                                               # 0.015 SOL, reserve 0.01, owed 0.03
-    claims.process(Relay([_claim()]), rpc, KP, now=_now())
+    rpc, s = Rpc(), vault_signer(l2_remaining=10_000_000)                            # L2 has 0.01 SOL left this week, owed 0.03
+    claims.process(Relay([_claim()]), rpc, s, now=_now())
     with transaction() as c:
-        assert c.execute("SELECT status FROM vault_claims").fetchone()["status"] == "waiting_liquidity"
+        row = c.execute("SELECT status, reason FROM vault_claims").fetchone()
+    assert row["status"] == "waiting_liquidity" and "this week" in row["reason"]
     state.put("halt", {"reasons": ["test"]})
-    rpc.balance = 5_000_000_000
-    assert claims.process(Relay([]), rpc, KP, now=_now()).get("halted")
+    s.chain.acc[L2] = limit(PAYOUT.pubkey(), [], amount=10**9, remaining=10**9, period="Week")    # the owner raised L2
+    assert claims.process(Relay([]), rpc, s, now=_now()).get("halted")
     assert not rpc.sent
     state.resume()
-    assert claims.process(Relay([]), rpc, KP, now=_now())["paid"] == 1
+    assert claims.process(Relay([]), rpc, s, now=_now())["paid"] == 1
 
 
 def test_expired_unlanded_payment_is_resigned_not_doubled(monkeypatch):
     _confirm(monkeypatch, "expired")
-    rpc = Rpc()
-    claims.process(Relay([_claim()]), rpc, KP, now=_now())
+    rpc, s = Rpc(), vault_signer()
+    claims.process(Relay([_claim()]), rpc, s, now=_now())
     assert len(rpc.sent) == 1
     with transaction() as c:
         assert c.execute("SELECT status FROM vault_claims").fetchone()["status"] == "sending"
     rpc.get_block_height = lambda: 500                                          # blockhash now dead
+    s.chain.height = 500
     _confirm(monkeypatch)
-    assert claims.process(Relay([]), rpc, KP, now=_now())["paid"] == 1
+    assert claims.process(Relay([]), rpc, s, now=_now())["paid"] == 1
     assert len(rpc.sent) == 2
     with transaction() as c:
         assert c.execute("SELECT count(*) AS n FROM vault_flows WHERE kind = 'claim'").fetchone()["n"] == 1

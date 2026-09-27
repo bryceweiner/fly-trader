@@ -61,3 +61,4 @@ def halted() -> dict | None:
 
 def resume() -> None:
     put("halt", None)
+    put("panic", None)

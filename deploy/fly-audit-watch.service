@@ -1,0 +1,8 @@
+[Unit]
+Description=fly-trader vault: alert when anything but the signer reads a wallet key
+After=auditd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/fly/fly_audit_watch.py run
+TimeoutStartSec=120

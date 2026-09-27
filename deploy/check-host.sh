@@ -19,6 +19,13 @@ check "X11 / agent forwarding off"      sh -c "sshd -T | grep -qix 'x11forwardin
 check "only local TCP forwarding"       sshd_is allowtcpforwarding local
 check "no weak ciphers"                 sh -c "! sshd -T | grep -i '^ciphers' | grep -Eqi 'cbc|3des|arcfour'"
 check "fail2ban guards sshd"            sh -c "fail2ban-client status sshd"
+check "client keys: ed25519/P-256/FIDO only" sh -c "sshd -T | grep -i '^pubkeyacceptedalgorithms' | grep -vqi rsa"
+check "admin not in the docker group"   sh -c "! id -nG \"\$(sshd -T | awk 'tolower(\$1)==\"allowusers\"{print \$2}')\" | grep -qw docker"
+
+echo "Tailscale"
+check "tailscaled up"                   sh -c "tailscale status >/dev/null"
+check "Tailnet Lock enabled"            sh -c "tailscale lock status 2>/dev/null | grep -qi 'lock is enabled'"
+check "no public SSH (tailnet only)"    sh -c "! ufw status | grep -E '^22/tcp' | grep -v tailscale0 | grep -q ."
 
 echo "Firewall"
 check "ufw active"                      sh -c "ufw status | grep -q 'Status: active'"
@@ -54,11 +61,24 @@ check "secrets dir only root"           sh -c "[ \"\$(stat -c %a /srv/fly/secret
 check "the two wallets differ"          sh -c "! cmp -s /srv/fly/secrets/bot_key /srv/fly/secrets/payout_key"
 check "release signer pinned"           sh -c "[ -s /etc/fly/allowed_signers ] && [ \"\$(stat -c %U /etc/fly/allowed_signers)\" = root ]"
 check "updater owned by root"           sh -c "[ \"\$(stat -c %U /usr/local/lib/fly/fly_update.py)\" = root ] && ! [ -w /usr/local/lib/fly/fly_update.py -a \"\$(stat -c %a /usr/local/lib/fly/fly_update.py)\" != 755 ]"
-check "vault.env mode 600"              sh -c "[ \"\$(stat -c %a /srv/fly/vault.env)\" = 600 ]"
+for e in vault custody signer db; do
+  check "$e.env mode 600"                sh -c "[ \"\$(stat -c %a /srv/fly/$e.env)\" = 600 ]"
+done
+check "no default database password"    sh -c "! grep -qE 'POSTGRES_PASSWORD(:|=) *fly\$' /srv/fly/docker-compose.yml /srv/fly/db.env"
+check "release signers namespaced"      sh -c "! grep -v 'namespaces=\"fly-trader-release\"' /etc/fly/allowed_signers | grep -q ."
+check "first release pinned (no TOFU)"  sh -c "grep -q expect_manifest_sha256 /etc/fly/update.json || [ -s /srv/fly/state.json ]"
+
+echo "Key isolation"
+check "keys mounted into the signer only" sh -c "! docker inspect fly-fly-1 --format '{{range .Mounts}}{{.Source}} {{end}}' | grep -q /srv/fly/secrets"
+check "signer has the keys"             sh -c "docker inspect fly-fly-signer-1 --format '{{range .Mounts}}{{.Source}} {{end}}' | grep -q /srv/fly/secrets/bot_key"
+check "signer filesystem read-only"     sh -c "docker inspect fly-fly-signer-1 --format '{{.HostConfig.ReadonlyRootfs}}' | grep -q true"
+check "brain runs as uid 10001"         sh -c "docker inspect fly-fly-1 --format '{{.Config.User}}' | grep -q '^10001'"
+check "database has no route out"       sh -c "docker network inspect fly_internal --format '{{.Internal}}' | grep -q true"
 
 echo "Monitoring"
 check "auditd running"                  systemctl is-active auditd
 check "key reads audited"               sh -c "auditctl -l | grep -q fly_keys"
+check "key-read watcher running"        systemctl is-active fly-audit-watch.timer
 check "AIDE baseline present"           test -f /var/lib/aide/aide.db
 check "journal persistent"              test -d /var/log/journal
 check "automatic security updates"      sh -c "systemctl is-enabled unattended-upgrades && grep -q 'Automatic-Reboot \"true\"' /etc/apt/apt.conf.d/52fly-unattended"

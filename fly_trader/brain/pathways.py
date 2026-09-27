@@ -13,7 +13,8 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import torch
+
+from ..train import model_io
 
 TOP_K = 200
 
@@ -27,7 +28,7 @@ def km_pairs(connectome_path: str | Path) -> tuple[np.ndarray, np.ndarray, int, 
 
 def bootstrap_weights(boot_path: str | Path) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """(base weight per pair, learn [S, J], strategy names) from a fly bootstrap checkpoint (``fly_selector.save``)."""
-    d = torch.load(boot_path, map_location="cpu", weights_only=False); sd = d["state_dict"]
+    d = model_io.torch_load(boot_path); sd = d["state_dict"]
     w0 = np.logaddexp(0.0, sd["theta_km"].detach().float().numpy()).astype(np.float32)      # softplus
     n_mbon = int(sd["c_sign"].numel()) if "c_sign" in sd else int(sd["mask"].shape[1])
     learn = sd["learn"].numpy().astype(bool) if "learn" in sd else np.ones((1, n_mbon), dtype=bool)
@@ -37,7 +38,7 @@ def bootstrap_weights(boot_path: str | Path) -> tuple[np.ndarray, np.ndarray, li
 
 def bank_D(path: str | Path) -> tuple[np.ndarray, int | None]:
     """The learned change per pair from ``state.pt`` or a ``snap_*.pt`` (both carry ``bank`` and ``bootstrap_id``)."""
-    s = torch.load(path, map_location="cpu", weights_only=False)
+    s = model_io.torch_load(path)
     D = s["bank"]["D"]; D = D[0] if D.ndim == 2 else D
     bid = s.get("bootstrap_id")
     return D.detach().float().numpy(), (int(bid) if bid is not None else None)

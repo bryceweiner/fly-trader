@@ -63,6 +63,14 @@ def check_drawdown(conn, wealth: float, peak: float) -> bool:
                      (f"wealth {wealth:.4f} SOL <= {1 - config.KILL_SWITCH_DRAWDOWN:.2f} x peak {peak:.4f} SOL", peak))
         _event(conn, "kill_switch", {"wealth": wealth, "peak": peak})
         record_event("error", "rails", "kill switch tripped: entries blocked", {"wealth": wealth, "peak": peak})
+        if config.VAULT_ENABLED:                         # the hosted fly: tell the operator at once
+            try:
+                from ..vault import alerts
+                alerts.send(f"KILL SWITCH tripped: {wealth:.4f} <= {1 - config.KILL_SWITCH_DRAWDOWN:.2f} x peak {peak:.4f}. Entries blocked"
+                            + (", open positions are being liquidated" if config.KILL_SWITCH_LIQUIDATE else "")
+                            + ". Clear it with `fly-trader reset-circuit --kill` once you know why.")
+            except Exception:
+                pass
         return True
     return False
 

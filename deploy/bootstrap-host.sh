@@ -1,18 +1,33 @@
 #!/usr/bin/env bash
 # One-time setup of the vault fly's server (Ubuntu 24.04, e.g. Netcup RS 2000 G12), hardened along the lines of the
-# CIS Ubuntu 24.04 benchmark for a single-purpose host that holds a hot wallet. Run as root:
+# CIS Ubuntu 24.04 benchmark for a single-purpose host that holds a hot wallet. Run as root, in two passes:
 #
-#   ADMIN_USER=fly-admin bash bootstrap-host.sh "<your ssh-ed25519 RELEASE public key line>"
+#   1. TS_AUTHKEY=tskey-auth-... RECOVERY_PUBKEY="ssh-ed25519 AAAA... recovery" EXPECT_MANIFEST=<sha256 of release.json> \
+#        ADMIN_USER=fly-admin bash bootstrap-host.sh "<release public key line: Secretive's ecdsa-sha2-nistp256 ...>"
+#      then, from your Mac, log in over Tailscale:  ssh fly-admin@fly-vault   (MagicDNS name or the 100.x address)
+#   2. CLOSE_PUBLIC_SSH=1 bash bootstrap-host.sh "<same release key>"
+#      removes the public SSH rule: after it the server has no open port on the internet at all.
 #
 # ADMIN_USER (default fly-admin) becomes the only account that can log in over SSH (key only, sudo without a
 # password; root login is switched off). If it has no ~/.ssh/authorized_keys yet, root's are copied to it first, and
 # the script stops before touching SSH if neither exists. Keep this root session open until you have logged in as
 # ADMIN_USER from a second terminal. deploy/check-host.sh verifies every setting afterwards.
 #
+# RELEASE_PUBKEY / RECOVERY_PUBKEY: the two keys whose signatures the updater accepts (principals bryce and
+# bryce-recovery), valid for the release namespace only. EXPECT_MANIFEST pins the first release the updater may
+# install (tools/publish_release.py prints it); until it is set the updater installs nothing.
+# TS_AUTHKEY: a one-off, pre-authorised key tagged tag:fly from the Tailscale admin console; used once, not stored.
+#
 # Idempotent: safe to run again (keys and edited config files are never overwritten).
 set -euo pipefail
-RELEASE_PUBKEY="${1:?usage: ADMIN_USER=fly-admin bootstrap-host.sh \"ssh-ed25519 AAAA... release-key\"}"
+RELEASE_PUBKEY="${1:?usage: ADMIN_USER=fly-admin bootstrap-host.sh \"ecdsa-sha2-nistp256 AAAA... release-key\"}"
+RECOVERY_PUBKEY="${RECOVERY_PUBKEY:-}"
+EXPECT_MANIFEST="${EXPECT_MANIFEST:-}"
+TS_AUTHKEY="${TS_AUTHKEY:-}"
+CLOSE_PUBLIC_SSH="${CLOSE_PUBLIC_SSH:-0}"
 ADMIN_USER="${ADMIN_USER:-fly-admin}"
+# container users (the images' USER lines); with userns-remap each is REMAP_UID + id on the host
+BRAIN_UID=10001; SIGNER_UID=10002; FLY_GID=10000
 HERE="$(cd "$(dirname "$0")" && pwd)"
 export DEBIAN_FRONTEND=noninteractive
 step() { printf '\n== %s\n' "$*"; }
@@ -28,6 +43,11 @@ curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/doc
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
 apt-get update -q
 apt-get install -y -q docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+# Tailscale: SSH reaches this box only over your tailnet (WireGuard); its repo key is pinned like Docker's
+curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/$(. /etc/os-release && echo "$VERSION_CODENAME").noarmor.gpg" -o /etc/apt/keyrings/tailscale.gpg
+echo "deb [signed-by=/etc/apt/keyrings/tailscale.gpg] https://pkgs.tailscale.com/stable/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") main" > /etc/apt/sources.list.d/tailscale.list
+apt-get update -q
+apt-get install -y -q tailscale
 # nothing on this box needs snaps; fewer daemons, fewer holes
 if dpkg -l snapd >/dev/null 2>&1; then apt-get purge -y -q snapd; fi
 # no mail server: nothing here sends mail (alerts go to Telegram), and an MTA is one more listening daemon
@@ -65,7 +85,8 @@ fi
 echo "$ADMIN_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-fly-admin
 chmod 0440 /etc/sudoers.d/90-fly-admin
 visudo -cf /etc/sudoers.d/90-fly-admin >/dev/null
-usermod -aG docker "$ADMIN_USER"
+# NOT in the docker group: that group is root without sudo's log line; docker runs through sudo
+gpasswd -d "$ADMIN_USER" docker >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------- 4. SSH
 step "SSH: $ADMIN_USER only, key only, modern crypto"
@@ -97,6 +118,8 @@ KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sh
 Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
 HostKeyAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
+# client keys: ed25519, FIDO/hardware-backed keys, and P-256 (Secure Enclave keys from Secretive; the Ledger later)
+PubkeyAcceptedAlgorithms sk-ssh-ed25519@openssh.com,ssh-ed25519,sk-ecdsa-sha2-nistp256@openssh.com,ecdsa-sha2-nistp256
 EOF
 # older lines in the main file must not win: Include is at the top, and first match wins in sshd
 sed -i 's/^\(PermitRootLogin\|PasswordAuthentication\|KbdInteractiveAuthentication\|X11Forwarding\)/# fly: see sshd_config.d\/10-fly-hardening.conf\n#&/' /etc/ssh/sshd_config
@@ -117,17 +140,33 @@ EOF
 systemctl enable --now fail2ban
 systemctl restart fail2ban
 
-# ---------------------------------------------------------------- 5. firewall
-step "firewall: SSH in; out only HTTPS, HTTP (apt), DNS, NTP"
+# ---------------------------------------------------------------- 5. Tailscale + firewall
+step "Tailscale"
+systemctl enable --now tailscaled
+if [ -n "$TS_AUTHKEY" ] && ! tailscale status >/dev/null 2>&1; then
+  tailscale up --auth-key="$TS_AUTHKEY" --hostname=fly-vault --advertise-tags=tag:fly --ssh=false --accept-dns=false
+fi
+unset TS_AUTHKEY
+TS_UP=0; tailscale status >/dev/null 2>&1 && TS_UP=1
+
+step "firewall: SSH over Tailscale only (plus public SSH until CLOSE_PUBLIC_SSH=1); out: HTTPS, HTTP (apt), DNS, NTP, WireGuard"
 ufw --force reset >/dev/null
 ufw default deny incoming
 ufw default deny outgoing
 ufw default deny routed
-ufw limit in 22/tcp comment 'ssh (rate limited)'
-ufw allow out 443/tcp comment 'https: RPCs, relay, HF, Telegram, apt'
+ufw allow in on tailscale0 to any port 22 proto tcp comment 'ssh over the tailnet'
+if [ "$CLOSE_PUBLIC_SSH" = 1 ]; then
+  [ "$TS_UP" = 1 ] || { echo "STOP: Tailscale is not up; closing public SSH now would lock you out" >&2; exit 1; }
+  echo "public SSH closed: log in with ssh $ADMIN_USER@fly-vault (Tailscale)"
+else
+  ufw limit in 22/tcp comment 'ssh (rate limited) -- removed by CLOSE_PUBLIC_SSH=1'
+fi
+ufw allow out 443/tcp comment 'https: RPCs, relay, HF, Telegram, apt, Tailscale control'
 ufw allow out 80/tcp comment 'http: apt mirrors'
 ufw allow out 53 comment 'dns'
 ufw allow out 123/udp comment 'ntp'
+ufw allow out 41641/udp comment 'tailscale wireguard'
+ufw allow out 3478/udp comment 'tailscale stun'
 ufw logging low
 ufw --force enable
 
@@ -244,11 +283,26 @@ REMAP_UID="$(awk -F: '$1=="dockremap"{print $2; exit}' /etc/subuid)"
 step "fly layout and wallets"
 install -d -m 0750 /srv/fly
 install -d -m 0755 /srv/fly/releases                  # public release files (from HF); the remapped container root reads them
-install -d -m 0750 -o "$REMAP_UID" -g "$REMAP_UID" /srv/fly/data /srv/fly/logs
+H_BRAIN=$((REMAP_UID + BRAIN_UID)); H_SIGNER=$((REMAP_UID + SIGNER_UID)); H_FLY=$((REMAP_UID + FLY_GID))
+install -d -m 0750 -o "$H_BRAIN" -g "$H_FLY" /srv/fly/data /srv/fly/logs
+install -d -m 0700 -o "$H_SIGNER" -g "$H_SIGNER" /srv/fly/signer        # the signer's own ledger (policy state)
+install -d -m 0750 -o "$H_SIGNER" -g "$H_FLY" /srv/fly/run              # its socket: the brain may connect, nothing else
 install -d -m 0700 /srv/fly/secrets
 install -d -m 0755 /etc/fly /usr/local/lib/fly
-echo "bryce ${RELEASE_PUBKEY}" > /etc/fly/allowed_signers
+# release signers: valid for the release namespace only, so these keys sign nothing else this box would accept
+{
+  echo "bryce namespaces=\"fly-trader-release\" ${RELEASE_PUBKEY}"
+  if [ -n "$RECOVERY_PUBKEY" ]; then echo "bryce-recovery namespaces=\"fly-trader-release\" ${RECOVERY_PUBKEY}"; fi
+} > /etc/fly/allowed_signers
 chmod 0644 /etc/fly/allowed_signers
+[ -n "$RECOVERY_PUBKEY" ] || echo "WARNING: no RECOVERY_PUBKEY: losing the release key would mean re-bootstrapping the updater"
+# the database password: made here, root-only, handed to both database and brain by compose
+if [ ! -s /srv/fly/db.env ]; then
+  pw="$(openssl rand -hex 24)"
+  ( umask 077; printf 'POSTGRES_PASSWORD=%s\nDATABASE_URL=postgresql://fly:%s@db:5432/fly_trader\n' "$pw" "$pw" > /srv/fly/db.env )
+  unset pw
+fi
+chmod 0600 /srv/fly/db.env
 # two wallets, each an ed25519 seed made HERE and never copied off this box in plaintext (the fly's backup job writes
 # age-encrypted copies for you): the trading wallet, and the payout wallet claims are paid from, so holders never see
 # the trading wallet. fly_trader.chain.keys accepts a base58 32-byte seed.
@@ -273,20 +327,36 @@ print(f"{name}: {b58(pub)}")
 PY
     shred -u "/srv/fly/secrets/$name.pem"
   fi
-  # readable only by the container's root (the remapped uid), not by any other account on the host
-  chown "$REMAP_UID:$REMAP_UID" "/srv/fly/secrets/$name"
+  # readable only by the signer container's user (remapped), not by the brain container or any host account
+  chown "$H_SIGNER:$H_SIGNER" "/srv/fly/secrets/$name"
   chmod 0400 "/srv/fly/secrets/$name"
 }
-make_key bot_key        # the trading wallet: fund it from a FUNDING_ADDRESSES address
-make_key payout_key     # the payout wallet: never fund it yourself; the fly tops it up after each settlement
+make_key bot_key        # the trading hot key: holds at most the float; refills itself from the Squads treasury (L1)
+make_key payout_key     # the payout key: holds nothing; pays claims from the treasury within its weekly cap (L2)
 install -m 0755 "$HERE/fly_update.py" /usr/local/lib/fly/fly_update.py
 install -m 0755 "$HERE/check-host.sh" /usr/local/lib/fly/check-host.sh
 [ -f /etc/fly/update.json ] || install -m 0600 "$HERE/update.json.example" /etc/fly/update.json
+if [ -n "$EXPECT_MANIFEST" ]; then        # pin the first release: the updater refuses anything else until one is installed
+  python3 - "$EXPECT_MANIFEST" <<'PY'
+import json, re, sys
+pin = sys.argv[1].strip().lower()
+if not re.fullmatch(r"[0-9a-f]{64}", pin):
+    raise SystemExit("EXPECT_MANIFEST must be a sha256 hex digest")
+p = "/etc/fly/update.json"; c = json.load(open(p)); c["expect_manifest_sha256"] = pin
+open(p, "w").write(json.dumps(c, indent=1) + "\n")
+PY
+fi
 [ -f /srv/fly/vault.env ] || install -m 0600 "$HERE/vault.env.example" /srv/fly/vault.env
+[ -f /srv/fly/custody.env ] || install -m 0600 "$HERE/custody.env.example" /srv/fly/custody.env
+[ -f /srv/fly/signer.env ] || install -m 0600 "$HERE/signer.env.example" /srv/fly/signer.env
 install -m 0644 "$HERE/docker-compose.vault.yml" /srv/fly/docker-compose.yml
 install -m 0644 "$HERE/fly-update.service" /etc/systemd/system/fly-update.service
 install -m 0644 "$HERE/fly-update.timer" /etc/systemd/system/fly-update.timer
+install -m 0755 "$HERE/fly_audit_watch.py" /usr/local/lib/fly/fly_audit_watch.py
+install -m 0644 "$HERE/fly-audit-watch.service" /etc/systemd/system/fly-audit-watch.service
+install -m 0644 "$HERE/fly-audit-watch.timer" /etc/systemd/system/fly-audit-watch.timer
 systemctl daemon-reload
+systemctl enable --now fly-audit-watch.timer    # a key read by anything but the signer goes to Telegram within a minute
 
 # ---------------------------------------------------------------- 9. audit and integrity
 step "audit log: key reads and config changes"
@@ -294,6 +364,10 @@ cat > /etc/audit/rules.d/60-fly.rules <<'EOF'
 -w /srv/fly/secrets -p rwa -k fly_keys
 -w /etc/fly -p wa -k fly_conf
 -w /srv/fly/vault.env -p rwa -k fly_conf
+-w /srv/fly/db.env -p rwa -k fly_conf
+-w /srv/fly/custody.env -p wa -k fly_conf
+-w /srv/fly/signer.env -p rwa -k fly_conf
+-w /srv/fly/signer -p wa -k fly_signer
 -w /usr/local/lib/fly -p wa -k fly_updater
 -w /etc/ssh/sshd_config -p wa -k sshd
 -w /etc/ssh/sshd_config.d -p wa -k sshd
@@ -326,10 +400,15 @@ printf '[Journal]\nStorage=persistent\nSystemMaxUse=2G\n' > /etc/systemd/journal
 systemctl restart systemd-journald
 
 step "done"
+if [ "$CLOSE_PUBLIC_SSH" = 1 ]; then
+  next="Verify:   sudo /usr/local/lib/fly/check-host.sh   (every control should pass now)"
+else
+  next="From your Mac, BEFORE closing this session:   ssh $ADMIN_USER@fly-vault   (over Tailscale; root login is now off)
+Then run this script again with CLOSE_PUBLIC_SSH=1 to remove public SSH."
+fi
 cat <<EOF
-Verify:   sudo /usr/local/lib/fly/check-host.sh
-From your Mac, BEFORE closing this session:   ssh $ADMIN_USER@<server>   (root login is now off)
+$next
 Next (docs/vault/RUNBOOK.md, section 3):
-  1. edit /srv/fly/vault.env and /etc/fly/update.json (Telegram)
-  2. sudo systemctl enable --now fly-update.timer   # pulls, verifies and starts the first signed release
+  1. edit /srv/fly/{vault,custody,signer}.env and /etc/fly/update.json (Telegram)
+  2. sudo systemctl enable --now fly-update.timer   # pulls, verifies and starts the pinned first release
 EOF

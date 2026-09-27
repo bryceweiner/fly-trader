@@ -55,6 +55,14 @@ def apply_release(release_dir: Path, bootstrap: bool = False) -> dict:
         seed.setdefault("seq", man.get("seq")); seed.setdefault("git_commit", man.get("git_commit"))
     models = rel / "models"
     brain = config.BRAIN_DIR
+    # 0. nothing in models/ may run code when loaded: a model release installs without a human step
+    from ..train import model_io
+    for f in sorted(models.rglob("*")):
+        if f.is_file():
+            try:
+                model_io.check_file(f)
+            except model_io.UnsafeModel as e:
+                raise ReleaseError(str(e)) from e
     # 1. files (copy only what is missing or different; the hashes were verified by the updater, re-checked here)
     placed: dict[str, Path] = {}
     for snap in seed["snapshots"]:
@@ -136,4 +144,10 @@ def health() -> tuple[bool, str]:
         return False, f"database: {type(e).__name__}"
     if not w:
         return False, "no worker threads running"
+    if config.SIGNER_SOCKET:                     # the vault server: a brain that cannot reach its signer cannot trade or pay
+        try:
+            from ..signer.client import SocketSigner
+            SocketSigner(config.SIGNER_SOCKET, timeout=5).call("pubkeys")
+        except Exception as e:
+            return False, f"signer: {type(e).__name__}"
     return True, f"{w} worker threads; last event {r['t']}"

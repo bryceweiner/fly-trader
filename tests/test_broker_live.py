@@ -126,11 +126,27 @@ def gate_open(monkeypatch):
     monkeypatch.setattr(broker_live.time, "sleep", lambda s: None)
 
 
+class RawSigner:
+    """Stands in for fly_trader/signer here: signs our slot of whatever the fake /order built (the signer's own
+    policy has its own tests, tests/test_signer.py)."""
+
+    def __init__(self, kp):
+        self.kp = kp
+
+    def call(self, method, **p):
+        from fly_trader.chain.signing import sign_transaction_b64, transaction_id
+        if method == "pubkeys":
+            return {"trading": str(self.kp.pubkey())}
+        assert method == "sign_swap" and p["in_amount"] > 0 and p["min_out"] > 0
+        signed, _ = sign_transaction_b64(p["tx"], self.kp)
+        return {"tx": signed, "signature": transaction_id(signed)}
+
+
 def _broker(outcomes, lamports=1_000_000_000, tokens=None):
     kp = Keypair()
     rpc = FakeRpc(lamports, tokens, {MINT: 6})
     jup = FakeJup(kp, rpc, outcomes)
-    return LiveBroker(rpc=rpc, jup=jup, keypair=kp), rpc, jup
+    return LiveBroker(rpc=rpc, jup=jup, signer=RawSigner(kp)), rpc, jup
 
 
 def _swap(broker, conn, decision_id, side="buy", amount=BUY_LAMPORTS, max_slippage=300):
@@ -153,7 +169,7 @@ def test_verified_buy_lands_orders_and_fills_rows(db_conn, gate_open):
     assert res.ok and res.attempts == 1 and res.status == "confirmed" and res.code == 0 and res.error is None
     assert res.token_delta == BUY_TOKENS and res.lamports_delta == -(BUY_LAMPORTS + BUY_FEES)
     assert res.price_sol == pytest.approx(((BUY_LAMPORTS + BUY_FEES) / 1e9) / (BUY_TOKENS / 1e6))
-    assert jup.orders[0]["exclude_routers"] == "jupiterz" and jup.orders[0]["slippage_bps"] == 150
+    assert jup.orders[0]["exclude_routers"] == "jupiterz,dflow,okx" and jup.orders[0]["slippage_bps"] == 150
     assert jup.orders[0]["input_mint"] == config.WSOL_MINT and jup.orders[0]["output_mint"] == MINT
 
     orders = _orders(db_conn, did)

@@ -1,8 +1,11 @@
 """The ``vault`` worker: one thread inside the console (ops/supervisor.py) that runs the vault's periodic jobs.
 
-Every loop (~10 s): pull and pay claims, push the public stats. Every minute: scan the wallet's flows, index Robinhood
-Chain, mark NAV when the live book is not doing it (paper warm-up), advance settlement. Hourly: close empty token
-accounts. Each job is isolated: one failing never stops the others, and nothing here can raise into trading.
+Every loop (~10 s): pull and pay claims, push the public stats. Every minute: check the treasury's on-chain setup,
+scan the trading wallet's and the treasury's flows, index Robinhood Chain, keep the trading float (top-up / sweep),
+mark NAV when the live book is not doing it (paper warm-up), advance settlement. Hourly: close empty token accounts,
+backups. Each job is isolated: one failing never stops the others, and nothing here can raise into trading.
+
+No key is loaded here: every signature comes from the signer (fly_trader/signer; its own container on the server).
 """
 from __future__ import annotations
 
@@ -15,7 +18,7 @@ from .. import config
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..logging_setup import setup
-from . import alerts, backup, claims, flows, nav, payout, publish, rh_index, settle, state, walletlock
+from . import alerts, backup, claims, custody, flows, nav, payout, publish, rh_index, settle, state, telegram_cmd, walletlock
 
 log = logging.getLogger(__name__)
 LOOP_S = 10.0
@@ -24,17 +27,18 @@ HOUR_S = 3600.0
 
 
 class Jobs:
-    def __init__(self):
-        from ..chain.keys import load_keypair
+    def __init__(self, signer=None):
         from ..chain.rpc import HttpSolanaRpc
+        from ..signer import client as signer_client
         from .evm import EvmRpc
         from .relay_client import RelayClient
-        self.keypair = load_keypair()
-        self.wallet = str(self.keypair.pubkey())
-        self.payout_kp = payout.load_keypair()               # claims are paid from here, never from the trading wallet
-        self.payout_wallet = str(self.payout_kp.pubkey())
-        if self.payout_wallet == self.wallet:
-            raise RuntimeError("the payout wallet must be a different key from the trading wallet")
+        self.signer = signer or signer_client.get()
+        keys = self.signer.call("pubkeys")
+        self.wallet, self.payout_key = keys["trading"], keys.get("payout")
+        if not self.payout_key or self.payout_key == self.wallet:
+            raise RuntimeError("the payout key must exist and differ from the trading key")
+        self.our_keys = {self.wallet, self.payout_key}
+        self.treasury = custody.treasury_address()
         self.rpc = HttpSolanaRpc(config.vault_solana_rpc_url())
         self.rh = EvmRpc(config.RH_RPC_URL, config.RH_CHAIN_ID)
         self.relay = RelayClient()
@@ -64,11 +68,15 @@ class Jobs:
 
     # ---- jobs ----
     def claims(self):
-        claims.process(self.relay, self.rpc, self.payout_kp, self.rh)
+        claims.process(self.relay, self.rpc, self.signer, self.rh)
+
+    def custody(self):
+        if not settle.paper() and self.treasury:
+            custody.check(self.rpc, self.wallet, self.payout_key)
 
     def scan(self):
         if not settle.paper():                                   # a paper book has no wallet to scan
-            flows.scan(self.rpc, self.wallet)
+            flows.scan_all(self.rpc, self.wallet, self.our_keys)
 
     def index(self):
         self.index_state = rh_index.run_once(self.rh)
@@ -89,39 +97,45 @@ class Jobs:
         if r["t"] and (datetime.now(timezone.utc) - r["t"]).total_seconds() < 50:
             return
         with walletlock.try_shared() as consistent:
-            native = self.rpc.get_balance(self.wallet) + payout.cached_balance()     # both wallets are one book
+            native = self.rpc.get_balance(self.wallet) + payout.cached_balance()     # trading wallet + treasury: one book
             with transaction() as conn:
                 cost, _ = settle.open_positions(conn)
                 m1 = datetime.fromtimestamp(int(time.time() // 60 * 60), timezone.utc)
                 nav.mark(conn, m1, native, cost, 0, consistent=consistent)
-        if native < int(config.GAS_RESERVE_SOL * config.LAMPORTS_PER_SOL):
-            alerts.send(f"wallet {native / config.LAMPORTS_PER_SOL:.4f} SOL is below the gas reserve", key="low_gas", cooldown_s=6 * 3600)
+        trading = self.rpc.get_balance(self.wallet)
+        if trading < int(config.GAS_RESERVE_SOL * config.LAMPORTS_PER_SOL):
+            alerts.send(f"trading wallet {trading / config.LAMPORTS_PER_SOL:.4f} SOL is below the gas reserve", key="low_gas", cooldown_s=6 * 3600)
 
     def settle(self):
         st = getattr(self, "index_state", None) or rh_index.index_state()
-        settle.run_once(self.rpc, self.wallet, st, payout_wallet=None if settle.paper() else self.payout_wallet)
+        settle.run_once(self.rpc, self.wallet, st, treasury=None if settle.paper() else self.treasury, our_keys=self.our_keys)
 
-    def sweep(self):
-        """Keep the payout wallet able to pay everything owed (after a settlement, or when a claim waits)."""
-        bal = payout.refresh_balance(self.rpc, self.payout_wallet)
-        if settle.paper():
+    def rebalance(self):
+        """Keep the trading float near TREASURY_FLOAT_SOL and the treasury able to pay everything owed."""
+        if settle.paper() or not self.treasury:
             return
-        with transaction() as conn:
-            owed = payout.owed_total(conn)
-        if bal < owed + int(config.PAYOUT_FEE_BUFFER_LAMPORTS) // 2:
-            payout.sweep(self.rpc, self.keypair, self.payout_wallet)
+        payout.rebalance(self.rpc, self.signer, self.wallet, self.treasury)
 
     def publish(self):
         publish.push(self.relay, self.wallet)
+
+    def telegram(self):
+        telegram_cmd.poll(self.signer)
+
+    def heartbeat(self):
+        telegram_cmd.heartbeat(self.signer)
+
+    def deadman(self):
+        telegram_cmd.deadman_ping()
 
     def backup(self):
         if settle.paper():
             return
         if not backup.configured():
-            alerts.send("encrypted backups are not configured (VAULT_BACKUP_*): losing the server would lose the wallet",
+            alerts.send("encrypted backups are not configured (VAULT_BACKUP_*): losing the server would lose the ledger and the float's keys",
                         key="backup_missing", cooldown_s=24 * 3600)
             return
-        backup.key_once()
+        backup.key_once(self.signer)
         backup.ledger_nightly()
 
     def close_atas(self):
@@ -133,7 +147,7 @@ class Jobs:
         with walletlock.exclusive(timeout_s=120):
             with transaction() as conn:
                 _, mints = settle.open_positions(conn)
-            res = close_empty_atas(rpc=self.rpc, keypair=self.keypair, skip_mints=mints | {config.WSOL_MINT})
+            res = close_empty_atas(rpc=self.rpc, signer=self.signer, skip_mints=mints | {config.WSOL_MINT})
         if res.get("closed"):
             log.info("closed %d empty token accounts", res["closed"])
 
@@ -149,8 +163,11 @@ def main(stop_event: threading.Event | None = None) -> None:
     while not stop_event.is_set():
         jobs.run("claims", jobs.claims)
         jobs.run("publish", jobs.publish)                        # every loop (10 s): the site is live
+        jobs.run("telegram", jobs.telegram)                      # /panic answers within a loop
+        if jobs.due("deadman", 300.0):
+            jobs.run("deadman", jobs.deadman)
         if jobs.due("minute", MINUTE_S):
-            for name in ("scan", "index", "sweep", "mark", "settle", "sweep"):
+            for name in ("custody", "scan", "index", "rebalance", "mark", "settle", "rebalance", "heartbeat"):
                 if stop_event.is_set():
                     break
                 jobs.run(name, getattr(jobs, name))
