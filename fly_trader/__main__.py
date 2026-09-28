@@ -245,6 +245,11 @@ def _cmd_kalshi_fund(args):
     print(json.dumps(client.fund(args.usd), indent=1, default=str))
 
 
+def _cmd_rh_probe(args):
+    from .rh import probe
+    print(json.dumps(probe.run(sample=args.sample), indent=1, default=str))
+
+
 def _cmd_kalshi_status(args):
     from .kalshi import client
     print(json.dumps(client.status(), indent=1, default=str))
@@ -320,6 +325,8 @@ def build_parser() -> argparse.ArgumentParser:
     ks = sub.add_parser("kalshi-subaccount", help="create the fly's dedicated Kalshi subaccount (writes KALSHI_SUBACCOUNT to .env) or list balances")
     ks.add_argument("action", choices=["create", "list"]); ks.set_defaults(fn=_cmd_kalshi_subaccount)
     kf = sub.add_parser("kalshi-fund", help="move dollars from the primary Kalshi account into the fly's subaccount"); kf.add_argument("--usd", type=float, required=True); kf.set_defaults(fn=_cmd_kalshi_fund)
+    rp = sub.add_parser("rh-probe", help="read-only check of the Robinhood Chain path: contracts, Kyber / v4 routability and gas on recent Pons graduates")
+    rp.add_argument("--sample", type=int, default=12); rp.set_defaults(fn=_cmd_rh_probe)
     sub.add_parser("kalshi-status", help="exchange status, subaccount balance, resting orders, positions, settlements").set_defaults(fn=_cmd_kalshi_status)
     sub.add_parser("kalshi-history", help="the Kalshi corpus worker: dataset seed, settled markets, candles, trades").set_defaults(fn=_cmd_kalshi_history)
     sub.add_parser("kalshi-build", help="build the Kalshi feature parts from the corpus").set_defaults(fn=_cmd_kalshi_build)
