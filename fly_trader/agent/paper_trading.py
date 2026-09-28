@@ -20,10 +20,11 @@ from ..market.exit_cost import exit_cost_fraction
 
 def trade_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str, mints: list, infos: list, scores, threshold,
                  table: list | None, horizon_s: float, block: str | None = None, holds=None, strategies=None, allow=None, reasons=None,
-                 tables: list | None = None) -> dict:
+                 tables: list | None = None, flat: bool = False) -> dict:
     """Optional per-row arguments (the selector's strategy stack, train/strategies.decide): ``threshold`` may be per row,
     ``holds`` (s), ``strategies``, ``tables`` (sizing) and ``allow`` / ``reasons`` (a blocked row is recorded with its reason).
-    Left out, the call behaves exactly as the single-strategy engine."""
+    Left out, the call behaves exactly as the single-strategy engine. ``flat``: every buy the same share of the bankroll
+    (agent/sizing.size_position), the fly's rule (``config.FLY_SIZING``)."""
     conn, m1 = ctx.conn, ctx.m1
     beat = conn.execute("INSERT INTO beats (run_id, ts, beat_no, n_slots_active, notes) VALUES (%s,%s,%s,%s,%s) RETURNING id",
                         (run_id, m1, beat_no, len(mints), json.dumps({"minute": m1.isoformat(), "mints_traded": len(ctx.agg), "book": book}))).fetchone()["id"]
@@ -51,7 +52,7 @@ def trade_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str
             continue
         picks.append((m, float(sc)))
         tab_k = tables[k] if tables is not None else table
-        size, why = sizing.size_position(float(sc), thr_k, tab_k or [], bankroll, cash, i["resq"])
+        size, why = sizing.size_position(float(sc), thr_k, tab_k or [], bankroll, cash, i["resq"], flat=flat)
         denied = allow is not None and not bool(allow[k])
         if m in open_mints or blocked or denied or size <= 0:
             rail = blocked or ("held" if m in open_mints else (str(reasons[k]) if denied and reasons is not None else "filtered") if denied else "sizing")

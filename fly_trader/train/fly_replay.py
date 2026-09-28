@@ -50,7 +50,12 @@ CHUNK = 2048
 CONFIGS = [(0.0, math.inf)] + [(a, h) for a in (1e-4, 3e-4, 1e-3, 3e-3) for h in (1.0, 3.0, 7.0, 30.0)]
 LABEL_LAG_S = 60.0           # a label is known once the exit minute has closed
 HOUR_S, DAY_S = 3600.0, 86400.0
-TRADES_DIR = config.BRAIN_DIR / "replay"      # the chosen book's trades, for studies of sizing on the fly's own out-of-sample trades
+TRADES_DIR = config.BRAIN_DIR / "replay"
+# The fly's gate asks whether its edge is real, not whether it traded a lot: selector.deploy_decision's 100-trade floor
+# failed the teacher-matched fly (92 trades at +10.1 %, 58 % winners, PF 1.92) and passed the hungry one (1,607 at +2.0 %).
+MIN_TRADES = 30              # enough trades for a mean to be judged at all (and for a configuration to be chosen)
+EDGE_P = 0.05                # at most this chance, resampling whole days, that the mean per trade is zero or less
+EDGE_RESAMPLES = 2000      # the chosen book's trades, for studies of sizing on the fly's own out-of-sample trades
 
 
 def _day_start(t: float) -> float:
@@ -98,6 +103,12 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
     scores = np.full((C, NS, n), np.nan, np.float32)
     lines = np.array([[fly.lines[k] for k in names]] * C, dtype=np.float64); sizings = [[list(fly.sizings[k]) for k in names] for _ in range(C)]
     line_log: dict = {}; size_log: dict = {k: [(-math.inf, list(fly.sizings[k]))] for k in names}
+    allowed = None
+    if fly_calibrate.RULE == "match":           # the teacher's own decisions over every row, for the window's trade budget
+        if getattr(fly, "teacher", None) is None:
+            raise RuntimeError("the match calibration rule needs the bootstrap's teacher (fly.teacher)")
+        prog.update("fly replay: the teacher's decisions for the match rule", 0, 1, force=True)
+        allowed = fly_selector.teacher_allowed(fly.teacher, ds.X[order], ds.ts[order], names)
     pending = plastic.PendingTags(fly.net.n_kc, fly.net.k_active)
     labels = [torch.tensor(_labels(ds, h), dtype=torch.float32) for h in holds_min]
     starts = np.flatnonzero(np.r_[True, ts_o[1:] != ts_o[:-1]]); ends = np.r_[starts[1:], n]
@@ -126,7 +137,7 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
                     _learn_add(learn, now, bank.update(tags, r, now)); n_updates += len(tags)
                 if day_done is not None and _day_start(now) > day_done:
                     day_done = _day_start(now)
-                    _recalibrate(ds, order, ts_o, scores, lines, sizings, now, lags, holds_min, line_log, size_log=size_log, names=names)
+                    _recalibrate(ds, order, ts_o, scores, lines, sizings, now, lags, holds_min, line_log, size_log=size_log, names=names, allowed=allowed)
                 if next_gov is not None and now >= next_gov:
                     next_gov = now + HOUR_S
                     _governance(ds, order, ts_o, scores, lines, line_log, bank, now, lags, holds_min, gov_counts)
@@ -197,7 +208,8 @@ def _line_at(line_log: dict, key, ts: np.ndarray, default: float) -> np.ndarray:
     return np.where(i >= 0, vals[np.clip(i, 0, None)], default)
 
 
-def _recalibrate(ds, order, ts_o, scores, lines, sizings, now, lags, holds_min, line_log, size_log: dict | None = None, names=None) -> None:
+def _recalibrate(ds, order, ts_o, scores, lines, sizings, now, lags, holds_min, line_log, size_log: dict | None = None, names=None,
+                 allowed: np.ndarray | None = None) -> None:
     """One line and sizing per strategy, calibrated on the frozen fly's scores and shared by every configuration.
 
     Until 2026-09-22 each configuration calibrated its own. With the plastic and frozen weights no more than 5 % apart,
@@ -208,7 +220,12 @@ def _recalibrate(ds, order, ts_o, scores, lines, sizings, now, lags, holds_min, 
         a, b = _window(ts_o, now, lag, fly_calibrate.WINDOW_DAYS * DAY_S)
         rows = order[a:b]; y = _labels(ds, H)[rows]
         sc = scores[0, s_, a:b]; has = np.isfinite(sc)
-        cal = fly_calibrate.calibrate(ds.ts[rows[has]], ds.mint[rows[has]], H * 60.0, sc[has], y[has], prev_line=float(lines[0, s_]), prev_sizing=sizings[0][s_])
+        target = None
+        if allowed is not None:                  # the teacher's trades over the same window: the match rule's budget
+            al = allowed[a:b, s_][has] & np.isfinite(y[has])
+            target = len(taken_idx(ds.ts[rows[has]], ds.mint[rows[has]], H * 60.0, np.flatnonzero(al)))
+        cal = fly_calibrate.calibrate(ds.ts[rows[has]], ds.mint[rows[has]], H * 60.0, sc[has], y[has], prev_line=float(lines[0, s_]), prev_sizing=sizings[0][s_],
+                                      rule=fly_calibrate.RULE, target_trades=target)
         for c in range(lines.shape[0]):
             key = (c, s_)
             if key not in line_log:
@@ -315,7 +332,7 @@ def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_co
             tr = taken_idx(ds.ts, ds.mint, holds_min[s_] * 60.0, np.flatnonzero(Sf >= Lf)); r = y[tr]
             table.append({"config": c, "alpha": alpha, "half_life_days": hl if math.isfinite(hl) else None, "trades": int(len(r)), "total": float(np.nansum(r)),
                           "mean": float(np.nanmean(r)) if len(r) else None, "governance": gov_counts.get((c, s_))})
-        ok = [t for t in table if t["alpha"] > 0 and t["trades"] >= selector.MIN_LINE_TRADES]
+        ok = [t for t in table if t["alpha"] > 0 and t["trades"] >= MIN_TRADES]
         best = max(ok, key=lambda t: t["total"])["config"] if ok else 0
         choice.append(best)
         per_strategy[name] = {"configs": table, "chosen": table[best] if ok else None, "alpha": table[best]["alpha"], "half_life_days": table[best]["half_life_days"],
@@ -326,6 +343,8 @@ def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_co
         test = np.zeros(len(ds.y), bool); test[order[ev_pos]] = True
         ev = evaluate(ds, np.where(pick, 1.0, np.nan), test & pick, 0.5, "fly", hold_s=hold, returns=ret)
         rnd = summarize(random_trades(ds, test, max(1, int(ev["pooled"]["n"] or 1))))
+        tr = taken_idx(ds.ts, ds.mint, np.where(hold > 0, hold, 60.0), np.flatnonzero(test & pick & np.isfinite(ret)))
+        ev["edge_p"] = edge_p(ret[tr], ds.day[tr])
         return ev, rnd
 
     out = {"S": str(S), "selection_days": [str(sel_days[0]), str(sel_days[-1])] if sel_days else None, "evaluation_days": [str(ev_days[0]), str(ev_days[-1])] if ev_days else None,
@@ -335,10 +354,10 @@ def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_co
     ev0, rnd0 = judge([0] * len(names))
     out["frozen"] = {**ev0["pooled"], "random": rnd0}
     if not any(v["plastic"] for v in per_strategy.values()):
-        out.update(passed=False, reason="no strategy's plastic configuration made 100 trades on the selection half")
+        out.update(passed=False, reason=f"no strategy's plastic configuration made {MIN_TRADES} trades on the selection half")
     else:
         ev, rnd = judge(choice)
-        passed, why = selector.deploy_decision(ev["pooled"], rnd)
+        passed, why = gate(ev["pooled"], rnd, ev["edge_p"])
         out.update(passed=bool(passed), reason=why, chosen=per_strategy[names[0]]["chosen"], evaluation=ev["pooled"], random=rnd, per_day=ev["per_day"],
                    alpha=per_strategy[names[0]]["alpha"], half_life_days=per_strategy[names[0]]["half_life_days"],
                    plastic_beats_frozen=bool((ev["pooled"]["mean"] or -1) > (ev0["pooled"]["mean"] or -1)))
@@ -373,6 +392,35 @@ def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_co
             log.exception("could not store the replay's learning statistics (the verdict is stored)")
     prog.update("fly replay: done", 1, 1, force=True, passed=out.get("passed"), reason=out.get("reason"))
     return out
+
+
+def edge_p(r: np.ndarray, days: np.ndarray, reps: int = EDGE_RESAMPLES, seed: int = 0) -> float | None:
+    """The chance that the mean per trade is zero or less, resampling whole days with replacement (a day's trades move
+    together, and one +400 % token must not carry a verdict by itself). None without two days of trades."""
+    r = np.asarray(r, dtype=np.float64); ok = np.isfinite(r); r, days = r[ok], np.asarray(days)[ok]
+    keys = sorted(set(days.tolist()))
+    if len(keys) < 2:
+        return None
+    sums = np.array([r[days == k].sum() for k in keys]); cnts = np.array([(days == k).sum() for k in keys], dtype=np.float64)
+    pick = np.random.default_rng(seed).integers(0, len(keys), size=(reps, len(keys)))
+    means = sums[pick].sum(1) / np.maximum(cnts[pick].sum(1), 1.0)
+    return float((means <= 0).mean())
+
+
+def gate(p: dict, rb: dict, p_edge: float | None) -> tuple[bool, str]:
+    """The fly's verdict: at least ``MIN_TRADES``, a positive mean that beats random picks, and a day-resampled chance of
+    no edge of at most ``EDGE_P``."""
+    n = int(p.get("n") or 0)
+    if n < MIN_TRADES:
+        return False, f"too few backtest trades to judge ({n} < {MIN_TRADES})"
+    if p.get("mean") is None or p["mean"] <= 0:
+        return False, f"its backtest lost money ({(p.get('mean') or 0) * 100:+.2f}% per trade after costs)"
+    if rb.get("mean") is not None and p["mean"] <= rb["mean"]:
+        return False, "it did not beat random picks"
+    if p_edge is None or p_edge > EDGE_P:
+        return False, f"its edge is not distinguishable from none ({'-' if p_edge is None else f'{p_edge:.1%}'} of day resamples at or below zero)"
+    return True, (f"its backtest made {p['mean'] * 100:+.2f}% per trade after costs over {n} trades (random {(rb.get('mean') or 0) * 100:+.2f}%; "
+                  f"{p_edge:.1%} of day resamples at or below zero)")
 
 
 def verdict() -> dict | None:

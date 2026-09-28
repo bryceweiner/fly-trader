@@ -77,9 +77,12 @@ KELLY_FRACTION = env_float("KELLY_FRACTION", 0.25)                 # quarter Kel
 MAX_POSITION_FRACTION = env_float("MAX_POSITION_FRACTION", 0.10)   # of the deployable bankroll (wealth minus the gas reserve)
 MAX_POOL_SHARE = env_float("MAX_POOL_SHARE", 0.02)                 # of the pool's quote reserve (bounds price impact)
 # The training label charges what an exit really costs at the size the book takes. market/features.py prices
-# exit_cost_0p1 for a fixed 0.1 SOL, but positions are Kelly-sized up to MAX_POSITION_FRACTION of the bankroll, and
-# impact = value/(value + reserves) grows with size. 0 = the sizing rule's own ceiling (train/decisions.py).
-LABEL_SIZE_SOL = env_float("LABEL_SIZE_SOL", 0.0)
+# exit_cost_0p1 for a fixed 0.1 SOL, but impact = value/(value + reserves) grows with size. Labels are priced at
+# min(LABEL_SIZE_SOL, MAX_POOL_SHARE of the pool) -- the "label size" -- and no position is ever bigger (agent/sizing.py):
+# every edge the models show was measured at that size. A fixed reference, never a share of the bankroll: derived from
+# CAPITAL_SOL it made the labels, and the sizes, grow with the bankroll, and in the 2026-09-26 replay a 500 SOL book
+# sized past it lost 426 SOL over 60 days where one capped at it made the same +13 SOL as a 5 or 50 SOL book.
+LABEL_SIZE_SOL = env_float("LABEL_SIZE_SOL", 0.5)
 MIN_POSITION_SOL = env_float("MIN_POSITION_SOL", 0.02)             # smaller sizes are skipped
 KILL_SWITCH_DRAWDOWN = env_float("KILL_SWITCH_DRAWDOWN", 0.30)
 KILL_SWITCH_LIQUIDATE = env_bool("KILL_SWITCH_LIQUIDATE", False)   # a tripped kill switch also sells every open live position (agent/fly_live.py)
@@ -104,6 +107,13 @@ LAMPORTS_PER_SOL = 1_000_000_000
 STATS_REFRESH_S = env_float("STATS_REFRESH_S", 600.0)
 
 # ---- connectome (the fly) ----
+# How the fly picks its buy line (train/fly_calibrate.py): total | selector | match. match = its teacher's selectivity:
+# in the 2026-09-26 replays it took 92 trades at +10.1 % (58 % winners, PF 1.92) where total took 1,607 at +2.0 %.
+FLY_CALIB_RULE = env_str("FLY_CALIB_RULE", "match")
+# How the fly sizes a buy (agent/sizing.py): flat = MAX_POSITION_FRACTION of the deployable bankroll on every buy | kelly
+# = its calibrated bands. A selective fly resolves too few trades a week for bands: they flipped between Kelly 0.97, 0 and
+# 0.15, and flat sizing beat them in 98 % of resampled replays.
+FLY_SIZING = env_str("FLY_SIZING", "flat")
 DEVICE = env_str("DEVICE", "auto")          # auto (CUDA, else MPS, else CPU) | cpu | cuda | cuda:N | mps  — brain/device.py
 NT_SIGN_MODE = env_str("NT_SIGN_MODE", "shiu")  # shiu | flybrain
 CELL_TYPES_SOURCE = env_str("CELL_TYPES_SOURCE", "annotations")  # annotations | flybrain

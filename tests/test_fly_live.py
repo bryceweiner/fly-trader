@@ -149,3 +149,44 @@ def test_the_handover_gate_reads_its_thresholds_from_config(db_conn, monkeypatch
             assert st and st["fly_trades"] == 20 and st["days"] == 0 and st["beat_selector"] is False
         finally:
             conn.execute("DELETE FROM ui_settings WHERE key = %s", (handover.KEY,)); conn.execute("DELETE FROM positions WHERE mint LIKE 'HAND_%%'")
+
+
+def test_live_calibration_spends_the_teachers_trade_budget(monkeypatch):
+    """Live, the match rule sizes each day's line to the trades the teacher would have taken over the same resolved rows;
+    rows scored before the teacher's decision was recorded cannot count."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    import numpy as np
+    from fly_trader.agent import fly_session as fs
+    rng = np.random.default_rng(0); n = 400; t0 = 1_790_000_000.0
+    rows = [{"ts": datetime.fromtimestamp(t0 + 60.0 * i, timezone.utc), "mint": f"m{i % 150}", "score": float(s), "frozen_score": float(s),
+             "label": float(rng.normal(0, 0.1)), "teacher_allow": (None if i < 50 else bool(s > 1.5))} for i, s in enumerate(rng.normal(size=n))]
+    calls = []
+    real = fs.fly_calibrate.calibrate
+    monkeypatch.setattr(fs.fly_calibrate, "RULE", "match")
+    monkeypatch.setattr(fs.fly_calibrate, "calibrate", lambda *a, **kw: calls.append((len(a[0]), kw)) or real(*a, **kw))
+    monkeypatch.setattr(fs, "record_event", lambda *a, **k: None)
+    conn = SimpleNamespace(execute=lambda *a, **k: None)
+    me = SimpleNamespace(names=["capitulation"], holds={"capitulation": 4 * 3600.0}, lines={"plastic": {"capitulation": 0.02}, "frozen": {"capitulation": 0.02}},
+                         sizing={"plastic": {"capitulation": []}, "frozen": {"capitulation": []}}, _resolved=lambda conn, since, cols, name: rows)
+    fs.FlyBook._calibrate(me, conn, t0 + 86400.0)
+    known = [r for r in rows if r["teacher_allow"] is not None]
+    ts = np.array([r["ts"].timestamp() for r in known]); mint = np.array([r["mint"] for r in known])
+    want = len(fs.fly_calibrate.taken_idx(ts, mint, 4 * 3600.0, np.flatnonzero([r["teacher_allow"] for r in known])))
+    assert calls and all(c[0] == len(known) and c[1]["rule"] == "match" and c[1]["target_trades"] == want for c in calls)
+    assert me.lines["plastic"]["capitulation"] > 1.0                                    # as selective as the teacher (scores above 1.5)
+
+
+def test_the_live_fly_reads_the_stack_that_taught_it(monkeypatch):
+    from types import SimpleNamespace
+
+    from fly_trader.agent import fly_session as fs
+    ev = {"cols": ["age_h"] if "age_h" in fs.X_COLS else [fs.X_COLS[0]], "line": 0.1, "hold_min": 240, "thr": {}, "high": None}
+    deployed, blind = {"strategies": {"capitulation": ev}}, {"strategies": {"capitulation": {**ev, "line": 0.2}}}
+    monkeypatch.setattr(fs.selector, "load_snapshot", lambda i: SimpleNamespace(stack=deployed, blind={"models": blind}))
+    me = SimpleNamespace(boot_id=133)
+    pick = lambda note, sid=129: fs.FlyBook._teacher_models(me, {"meta": {"teacher": note, "teacher_snapshot": sid}})
+    assert pick("deployed selector #129: capitulation, refit through 2026-09-03 (blind to the calibration week from 2026-09-18)") is blind
+    assert pick("deployed selector #100: capitulation (line 0.1157, 240 min)") is deployed
+    assert pick("a stack refit on the fly's training days", None) is None

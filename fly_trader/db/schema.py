@@ -223,6 +223,8 @@ BASE_DDL: list[str] = [
         label real, state text NOT NULL DEFAULT 'pending', resolved_at timestamptz, bootstrap_id bigint,
         PRIMARY KEY (ts, mint))""",
     "CREATE INDEX IF NOT EXISTS fly_scored_state_ts_idx ON fly_scored (state, ts)",
+    # would the fly's teacher have traded this row (its final decision)? the match calibration rule's budget (train/fly_calibrate.py)
+    "ALTER TABLE fly_scored ADD COLUMN IF NOT EXISTS teacher_allow boolean",
     """CREATE TABLE IF NOT EXISTS fly_calibrations (
         day date NOT NULL, arm text NOT NULL, line real, sizing jsonb, trades int, total real, mean real, window_days int,
         created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (day, arm))""",

@@ -23,7 +23,7 @@ def test_bands_rank_by_margin_and_higher_certainty_bets_more(monkeypatch):
     assert len(table) == sizing.N_BANDS and table[0]["lo"] == 0.0 and [b["lo"] for b in table] == sorted(b["lo"] for b in table)
     assert table[-1]["kelly"] > table[0]["kelly"]
     monkeypatch.setattr(config, "GAS_RESERVE_SOL", 0.3); monkeypatch.setattr(config, "KELLY_FRACTION", 0.25); monkeypatch.setattr(config, "MAX_POSITION_FRACTION", 1.0)
-    monkeypatch.setattr(config, "MAX_POOL_SHARE", 1.0); monkeypatch.setattr(config, "MIN_POSITION_SOL", 0.0)
+    monkeypatch.setattr(config, "MAX_POOL_SHARE", 1.0); monkeypatch.setattr(config, "MIN_POSITION_SOL", 0.0); monkeypatch.setattr(config, "LABEL_SIZE_SOL", 1e9)
     lo, _ = sizing.size_position(0.5 + 0.001, 0.5, table, 10.3, 10.3, 1000.0)
     hi, _ = sizing.size_position(0.5 + 0.099, 0.5, table, 10.3, 10.3, 1000.0)
     assert hi > lo >= 0 and hi > 0                                                           # the weakest band may have no edge at all
@@ -33,10 +33,11 @@ def test_caps_minimum_and_fallback(monkeypatch):
     table = [{"lo": 0.0, "n": 100, "mean": 0.05, "win": 0.7, "kelly": 0.8}]
     monkeypatch.setattr(config, "GAS_RESERVE_SOL", 0.3); monkeypatch.setattr(config, "KELLY_FRACTION", 0.25); monkeypatch.setattr(config, "MAX_POSITION_FRACTION", 0.10)
     monkeypatch.setattr(config, "MAX_POOL_SHARE", 0.02); monkeypatch.setattr(config, "MIN_POSITION_SOL", 0.02); monkeypatch.setattr(config, "MAX_POSITION_SOL", 0.1)
+    monkeypatch.setattr(config, "LABEL_SIZE_SOL", 0.5)
     s, why = sizing.size_position(0.9, 0.8, table, 5.3, 5.3, 1000.0)
     assert s == pytest.approx(0.5) and "bankroll cap" in why                                 # 0.25*0.8*5 = 1.0 -> 10 % of 5 = 0.5
     s, why = sizing.size_position(0.9, 0.8, table, 5.3, 5.3, 10.0)
-    assert s == pytest.approx(0.2) and "pool depth" in why                                   # 2 % of a 10 SOL pool
+    assert s == pytest.approx(0.2) and "label size" in why                                   # 2 % of a 10 SOL pool: the size its labels were priced at
     s, why = sizing.size_position(0.9, 0.8, table, 5.3, 0.31, 1000.0)
     assert s == 0.0 and "minimum" in why                                                     # only 0.01 SOL free above the reserve
     assert sizing.size_position(0.7, 0.8, table, 5.3, 5.3, 1000.0)[0] == 0.0                 # below the line: no band
@@ -53,3 +54,35 @@ def test_bankroll_replay_enforces_cash_and_compounds(monkeypatch):
     monkeypatch.setattr(config, "MAX_POOL_SHARE", 0.02)
     shallow = sizing.simulate_bankroll(ts, 1800.0, m, r, table, start_sol=5.0, res_quote=np.full(200, 1.0))   # 1 SOL pools: 0.02 SOL cap
     assert shallow["final_sol"] < sized["final_sol"] and shallow["trades"] == 200                            # the pool-depth cap binds, as live
+
+
+def test_flat_sizing_ignores_the_bands(monkeypatch):
+    """A selective fly resolves too few trades a week for bands (they flipped between Kelly 0.97, 0 and 0.15): every buy
+    that cleared the line gets the same share of the bankroll."""
+    monkeypatch.setattr(config, "GAS_RESERVE_SOL", 0.3); monkeypatch.setattr(config, "MAX_POSITION_FRACTION", 0.10); monkeypatch.setattr(config, "MIN_POSITION_SOL", 0.02)
+    monkeypatch.setattr(config, "LABEL_SIZE_SOL", 0.5); monkeypatch.setattr(config, "MAX_POOL_SHARE", 0.02)
+    dead = [{"lo": 0.0, "n": 52, "mean": -0.01, "win": 0.4, "kelly": 0.0}]
+    assert sizing.size_position(0.9, 0.8, dead, 3.3, 3.3, 1000.0)[0] == 0.0                   # the band says no edge
+    s, why = sizing.size_position(0.9, 0.8, dead, 3.3, 3.3, 1000.0, flat=True)
+    assert s == pytest.approx(0.3) and why.startswith("flat")                                # 10 % of 3 SOL deployable
+
+
+@pytest.mark.parametrize("flat", [True, False])
+def test_a_bigger_bankroll_never_buys_bigger_than_the_labels(monkeypatch, flat):
+    """In the 2026-09-26 replay a 500 SOL book sized past the label size lost 426 SOL over 60 days; capped at it, it made
+    the same +13 SOL as a 5 or 50 SOL book. From 5 SOL up, the same pool gets the same buy."""
+    monkeypatch.setattr(config, "GAS_RESERVE_SOL", 0.3); monkeypatch.setattr(config, "MAX_POSITION_FRACTION", 0.10); monkeypatch.setattr(config, "MIN_POSITION_SOL", 0.02)
+    monkeypatch.setattr(config, "KELLY_FRACTION", 1.0); monkeypatch.setattr(config, "LABEL_SIZE_SOL", 0.5); monkeypatch.setattr(config, "MAX_POOL_SHARE", 0.02)
+    table = [{"lo": 0.0, "n": 500, "mean": 0.2, "win": 0.9, "kelly": 0.99}]
+    for pool, want in ((10.0, 0.2), (100.0, 0.5), (10_000.0, 0.5)):
+        sizes = {b: sizing.size_position(0.9, 0.8, table, b, b, pool, flat=flat)[0] for b in (5.3, 50.3, 500.3, 5000.3)}
+        assert all(v == pytest.approx(want) for v in sizes.values()), (pool, sizes)
+
+
+def test_labels_are_priced_at_a_fixed_size_not_a_share_of_the_bankroll(monkeypatch):
+    from fly_trader.market import exit_cost
+    monkeypatch.setattr(config, "LABEL_SIZE_SOL", 0.5); monkeypatch.setattr(config, "MAX_POOL_SHARE", 0.02)
+    a = exit_cost.cost_at_size(0.02, 200.0)
+    monkeypatch.setattr(config, "CAPITAL_SOL", 500.0)
+    assert exit_cost.cost_at_size(0.02, 200.0) == pytest.approx(a)                          # a bigger bankroll does not change the labels
+    assert exit_cost.label_size(200.0) == pytest.approx(0.5) and exit_cost.label_size(10.0) == pytest.approx(0.2) and exit_cost.label_size(None) == 0.5

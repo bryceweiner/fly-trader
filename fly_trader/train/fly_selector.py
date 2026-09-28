@@ -76,7 +76,8 @@ DIAG_ROWS = 50_000
 GATES = {"mbon_share_min": 0.10, "mbon_saturated_max": 0.20, "slope_min": 0.6, "slope_max": 1.4}
 TEACHER_NOTE = "a stack refit on the fly's training days (no deployed selector to copy)"
 # the definitions a fly was trained on (the selector's, as its teacher, + the fly's network and plasticity design)
-FLY_VERSION = {**selector.DATA_VERSION, "fly": "flynet-3-ch", "plastic": "mb4-ch", "teacher": "deployed-1"}
+# "calib": how its buy line is picked (config.FLY_CALIB_RULE): a verdict or fly calibrated under another rule is not this one
+FLY_VERSION = {**selector.DATA_VERSION, "fly": "flynet-3-ch", "plastic": "mb4-ch", "teacher": "deployed-1", "calib": config.FLY_CALIB_RULE}
 
 
 def _inv_softplus(x: torch.Tensor) -> torch.Tensor:
@@ -349,6 +350,21 @@ class StackTeacher:
         return T, A
 
 
+def teacher_allowed(teacher, X: np.ndarray, ts: np.ndarray, names: list[str], chunk: int = 200_000) -> np.ndarray:
+    """[B, S]: where the teacher itself would trade each of the fly's strategies (its final decision: trigger, line and
+    every filter) — the selectivity ``fly_calibrate``'s ``match`` rule copies."""
+    A = np.zeros((len(X), len(names)), bool)
+    for i in range(0, len(X), chunk):
+        if isinstance(teacher, StackTeacher):
+            _, a = teacher.targets(X[i:i + chunk], ts[i:i + chunk])
+            for j, k in enumerate(names):
+                if k in teacher.strategies:
+                    A[i:i + chunk, j] = a[:, teacher.strategies.index(k)]
+        else:
+            A[i:i + chunk, :] = (teacher.score(X[i:i + chunk]) >= teacher.threshold)[:, None]
+    return A
+
+
 def _teacher_targets(teacher, ds: DecisionSet, idx: np.ndarray, clip: tuple = (-1.0, 1.0)) -> tuple[np.ndarray, np.ndarray]:
     """[n, S] targets (NaN: not a candidate of that strategy) and loss weights for the rows ``idx``."""
     if isinstance(teacher, StackTeacher):
@@ -590,14 +606,16 @@ def bootstrap(ds: DecisionSet, S: date, epochs: int = EPOCHS, stop: threading.Ev
     week = (ds.day >= S - timedelta(days=CALIB_DAYS)) & (ds.day < S) & uni
     prog.update("fly: calibrating its own buy lines", 0, 1, force=True)
     wi = np.flatnonzero(week); V = fly.score_all(ds.X[wi]) if len(wi) else np.zeros((0, len(fly.strategies))); trig = fly.triggers(ds.X[wi], ds.cols)
+    A = teacher_allowed(teacher, ds.X[wi], ds.ts[wi], fly.strategies) if fly_calibrate.RULE == "match" else None
     per = {}
     for j, name in enumerate(fly.strategies):
         H = fly.rules[name]["hold_min"]; y = ds.fwd_h.get(H, ds.fwd_pess)
         known = trig[:, j] & (ds.ts[wi] + H * 60.0 + 60.0 <= s_epoch)        # labels known at S
         ci = wi[known]
-        cal = fly_calibrate.calibrate(ds.ts[ci], ds.mint[ci], H * 60.0, V[known, j], y[ci])
+        target = (len(taken_idx(ds.ts[ci], ds.mint[ci], H * 60.0, np.flatnonzero(A[known, j] & np.isfinite(y[ci])))) if A is not None else None)
+        cal = fly_calibrate.calibrate(ds.ts[ci], ds.mint[ci], H * 60.0, V[known, j], y[ci], rule=fly_calibrate.RULE, target_trades=target)
         fly.lines[name], fly.sizings[name] = cal.line, cal.sizing
-        per[name] = {"line": cal.line, "trades": cal.trades, "mean": cal.mean, "total": cal.total, "hold_min": H}
+        per[name] = {"line": cal.line, "trades": cal.trades, "mean": cal.mean, "total": cal.total, "hold_min": H, "rule": fly_calibrate.RULE, "teacher_trades": target}
     d = fly_decide(fly, ds.X[wi], ds.cols, V) if len(wi) else {"strategy": np.array([], dtype=object), "hold_s": np.array([])}
     picked = np.array([x is not None for x in d["strategy"]], bool)
     ret = np.array([ds.fwd_h.get(fly.rules[x]["hold_min"], ds.fwd_pess)[i] if x is not None else np.nan for i, x in zip(wi, d["strategy"])])
@@ -611,6 +629,7 @@ def bootstrap(ds: DecisionSet, S: date, epochs: int = EPOCHS, stop: threading.Ev
         ok_t = np.isfinite(t_sc); di, t_sc = di[ok_t], t_sc[ok_t]
     diag = diagnose(fly, ds.X[di], t_sc) if len(di) else {"mbon_share": 0.0, "mbon_saturated": 1.0, "kc_active": 0.0, "rows": 0}
     ok, why = gate_check(diag)
+    fly.teacher = teacher          # not saved: the replay's match rule reads the teacher's own decisions over its rows
     info = {"S": str(S), "train_through": str(train_end - timedelta(days=1)), "calibration_days": [str(S - timedelta(days=CALIB_DAYS)), str(S - timedelta(days=1))],
             "line": fly.threshold, "sizing": fly.sizing, "lines": fly.lines, "calibration": comb, "strategies": fly.strategies, "rules": fly.rules,
             "diagnostics": diag, "gates_ok": ok, "gate_failures": why, "fit": fit_info, "teacher": teacher_note or TEACHER_NOTE, "teacher_line": getattr(teacher, "threshold", None),

@@ -4,16 +4,20 @@ Certainty is measured, not assumed. During training the backtest's out-of-sample
 score cleared the buy line (``build_table``: equal-count bands of ``score − threshold``). For each band the growth-optimal
 (Kelly) fraction is found on the band's actual net returns — the bet f that maximises the average of log(1 + f·r), so the
 rare −100 % rugs count in full; a band with no edge gets 0. Live (``size_position``): the current score's band →
-``KELLY_FRACTION`` of that fraction of the deployable bankroll (wealth at cost minus the gas reserve), capped at
-``MAX_POSITION_FRACTION`` of it, ``MAX_POOL_SHARE`` of the pool's quote reserve (bigger buys pay more price impact than
-the 0.1 SOL the backtest measured) and the free cash above the reserve; below ``MIN_POSITION_SOL`` the buy is skipped.
-A model without a table (trained before sizing) trades the fixed ``MAX_POSITION_SOL``.
+``KELLY_FRACTION`` of that fraction of the deployable bankroll (wealth at cost minus the gas reserve); ``flat`` (the
+fly, ``config.FLY_SIZING``): ``MAX_POSITION_FRACTION`` of it on every buy that cleared the line, no bands. Either way
+capped at ``MAX_POSITION_FRACTION`` of the deployable bankroll, the free cash above the reserve, and the label size
+(``market/exit_cost.label_size``: ``LABEL_SIZE_SOL`` or ``MAX_POOL_SHARE`` of the pool) -- the size every edge was
+measured at, so the book behaves the same with 5 SOL or 500: a bigger bankroll buys no bigger than the backtest did,
+it only runs out of cash later. Below ``MIN_POSITION_SOL`` the buy is skipped. A model without a table (trained
+before sizing) trades the fixed ``MAX_POSITION_SOL``, under the same caps.
 """
 from __future__ import annotations
 
 import numpy as np
 
 from .. import config
+from ..market.exit_cost import label_size
 
 N_BANDS = 4
 MIN_BAND_TRADES = 50
@@ -57,26 +61,28 @@ def band_for(table: list[dict], margin: float) -> dict | None:
 
 
 def size_position(score: float, threshold: float, table: list[dict] | None, bankroll_sol: float, cash_sol: float,
-                  res_quote_sol: float | None) -> tuple[float, str]:
-    """(size in SOL, why). Size 0 means skip the buy."""
+                  res_quote_sol: float | None, flat: bool = False) -> tuple[float, str]:
+    """(size in SOL, why). Size 0 means skip the buy. ``flat``: ``MAX_POSITION_FRACTION`` of the deployable bankroll on
+    every buy that cleared the line (the fly); otherwise the Kelly band of ``table``."""
     reserve = config.GAS_RESERVE_SOL; free = cash_sol - reserve
-    if not table:
-        size = config.MAX_POSITION_SOL
-        return (size, f"fixed {size:g} SOL (model has no sizing table)") if free >= size else (0.0, "not enough free cash")
-    b = band_for(table, score - threshold)
-    if b is None or b["kelly"] <= 0:
-        return 0.0, "no edge in this score band"
     deployable = max(0.0, bankroll_sol - reserve)
-    size = config.KELLY_FRACTION * b["kelly"] * deployable
-    caps = {"bankroll cap": config.MAX_POSITION_FRACTION * deployable, "free cash": free}
-    if res_quote_sol:
-        caps["pool depth"] = config.MAX_POOL_SHARE * res_quote_sol
+    if flat:
+        size = config.MAX_POSITION_FRACTION * deployable; why = f"flat {config.MAX_POSITION_FRACTION:g} of {deployable:.2f} SOL"
+    elif not table:
+        size = config.MAX_POSITION_SOL; why = f"fixed {size:g} SOL (model has no sizing table)"
+    else:
+        b = band_for(table, score - threshold)
+        if b is None or b["kelly"] <= 0:
+            return 0.0, "no edge in this score band"
+        size = config.KELLY_FRACTION * b["kelly"] * deployable
+        why = f"band from +{b['lo']:.3f} over the line: Kelly {b['kelly']:.2f} × {config.KELLY_FRACTION:g} of {deployable:.2f} SOL"
+    # the label size is the largest buy any backtest measured: past it the edge is an extrapolation that impact eats
+    caps = {"bankroll cap": config.MAX_POSITION_FRACTION * deployable, "free cash": free, "label size": label_size(res_quote_sol)}
     limit = min(caps, key=caps.get)
-    why = f"band from +{b['lo']:.3f} over the line: Kelly {b['kelly']:.2f} × {config.KELLY_FRACTION:g} of {deployable:.2f} SOL"
     if caps[limit] < size:
         size = caps[limit]; why += f", capped by {limit}"
     if size < config.MIN_POSITION_SOL:
-        return 0.0, why + f" → {size:.3f} SOL is below the {config.MIN_POSITION_SOL:g} SOL minimum"
+        return 0.0, why + f" → {max(size, 0.0):.3f} SOL is below the {config.MIN_POSITION_SOL:g} SOL minimum"
     return float(size), why + f" → {size:.3f} SOL"
 
 
