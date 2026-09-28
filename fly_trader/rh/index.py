@@ -59,16 +59,16 @@ def ensure_asset(conn, rpc, asset: str) -> dict:
     return row
 
 
-def find_deploy_block(rpc, address: str) -> int:
-    """The first block at which ``address`` carries code (binary search over getCode)."""
+def block_at(rpc, ts: float) -> int:
+    """The first block whose timestamp is at or after ``ts`` (binary search over block headers: the public RPC keeps every
+    header and log but no historical state, so a getCode search for the factory's deployment cannot run)."""
     lo, hi = 0, rpc.block_number()
     while lo < hi:
         mid = (lo + hi) // 2
-        if len(rpc.code(address, hex(mid))) > 2:
+        if int(rpc.block(mid)["timestamp"], 16) >= ts:
             hi = mid
         else:
             lo = mid + 1
-        scan.pause()
     return lo
 
 
@@ -265,7 +265,11 @@ def step(conn, rpc, lo: int, hi: int) -> dict:
 
 
 def start_block(rpc) -> int:
-    return config.RH_START_BLOCK or find_deploy_block(rpc, config.PONS_FACTORY)
+    """``RH_START_BLOCK``, else the first block of ``RH_START_DAY`` (Pons V2 went live 2026-08-04)."""
+    if config.RH_START_BLOCK:
+        return config.RH_START_BLOCK
+    from datetime import datetime, timezone
+    return block_at(rpc, datetime.fromisoformat(config.RH_START_DAY).replace(tzinfo=timezone.utc).timestamp())
 
 
 def run_once(rpc: RhRpc | None = None, *, head_margin: int | None = None, max_ranges: int = 1) -> dict:
