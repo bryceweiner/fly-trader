@@ -24,6 +24,7 @@ WORKERS: dict[str, list[str]] = {
     "replay": ["replay-pull"],
     "pumpstream": ["pumpstream"],
     "kalshi_stream": ["kalshi-stream"],
+    "rh_stream": ["rh-backfill"],
     "kalshi_runner": ["kalshi-run"],
     "kalshi_history": ["kalshi-history"],
     "kalshi_train": ["kalshi-train"],

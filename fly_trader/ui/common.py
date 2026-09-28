@@ -23,14 +23,15 @@ WORKER_INFO = {   # name → (title, icon, what it does, role)
     "replay": ("History archive", ":material/history:", "Downloads the hourly trade archive and builds the training feature set.", "train"),
     "discover": ("Token stats", ":material/query_stats:", "Records Jupiter stats (holders, organic score, top-holder share) every 10 minutes for every token the selector can trade: history for future model inputs.", "optional"),
     "kalshi_runner": ("Kalshi trading engine", ":material/candlestick_chart:", "Scores every quoted Kalshi market once a minute with the visual fly, trades its taker and maker paper books (and the subaccount when live) and lets it learn from settlements.", "trade"),
+    "rh_stream": ("Robinhood Chain feed", ":material/sensors:", "Indexes Pons launches, graduations and Uniswap v4 swaps from Robinhood Chain into 1-minute rows in ETH (backfill from Pons V2, then live). The engine's Robinhood books read these.", "trade"),
     "kalshi_stream": ("Kalshi market feed", ":material/sensors:", "Streams every Kalshi quote, trade and market lifecycle event into 1-minute rows. The Kalshi engine reads these.", "trade"),
     "kalshi_train": ("Kalshi trainer", ":material/model_training:", "Fits the Kalshi strategy stack walk-forward by settlement day and bootstraps the visual fly when none exists.", "train"),
     "kalshi_history": ("Kalshi history", ":material/history:", "Seeds settled markets and trades from the open dataset, fills 1-minute candles from the API and builds the feature rows.", "train"),
 }
 WORKER_TYPE = {"runner": "memecoins", "pumpstream": "memecoins", "train": "memecoins", "replay": "memecoins", "discover": "memecoins",
-               "kalshi_runner": "prediction markets", "kalshi_stream": "prediction markets", "kalshi_train": "prediction markets", "kalshi_history": "prediction markets"}
+               "rh_stream": "memecoins", "kalshi_runner": "prediction markets", "kalshi_stream": "prediction markets", "kalshi_train": "prediction markets", "kalshi_history": "prediction markets"}
 ROLE_LABEL = {"trade": "needed to trade", "train": "needed to train", "optional": "optional"}
-ORDER = [n for n in ("runner", "pumpstream", "train", "replay", "discover", "kalshi_runner", "kalshi_stream", "kalshi_train", "kalshi_history") if n in WORKERS]
+ORDER = [n for n in ("runner", "pumpstream", "rh_stream", "train", "replay", "discover", "kalshi_runner", "kalshi_stream", "kalshi_train", "kalshi_history") if n in WORKERS]
 KALSHI_BOOKS = {"paper_kalshi_taker": "Taker · paper", "paper_kalshi_maker": "Maker · paper", "live_kalshi_taker": "Taker · live", "live_kalshi_maker": "Maker · live"}
 
 
