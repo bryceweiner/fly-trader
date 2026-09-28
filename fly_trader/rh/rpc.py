@@ -12,13 +12,43 @@ from ..db.apilog import record_api_call
 from ..vault.evm import EvmRpc, EvmRpcError
 
 
+RATE_LIMIT_TRIES = 6                # 1, 2, 4, 8, 16 s: the public endpoint's 429s clear within seconds
+
+
+def _rate_limited(e: Exception) -> bool:
+    s = str(e)
+    return "429" in s or "Too Many" in s or "rate limit" in s.lower()
+
+
 class RhRpc(EvmRpc):
     def __init__(self, url: str | None = None, chain_id: int | None = None, service: str = "rh_rpc", timeout: float = 20.0):
         super().__init__(url or config.RH_RPC_URL, chain_id if chain_id is not None else config.RH_EXPECTED_CHAIN_ID, service, timeout)
 
+    def call(self, method: str, params: list | None = None) -> Any:
+        """``EvmRpc.call`` that waits out a rate limit (429) with exponential backoff; any other error raises at once.
+        Never retried: eth_sendRawTransaction (the wallet decides what a failed broadcast means)."""
+        for i in range(RATE_LIMIT_TRIES):
+            try:
+                return super().call(method, params)
+            except EvmRpcError as e:
+                if method == "eth_sendRawTransaction" or not _rate_limited(e) or i == RATE_LIMIT_TRIES - 1:
+                    raise
+                time.sleep(2 ** i)
+
     # ---- batching: many reads in one POST (tx lookups while indexing, balances while reconciling)
     def batch(self, calls: list[tuple[str, list]]) -> list[Any]:
-        """Results in call order; an individual error comes back as an ``EvmRpcError`` instance (not raised)."""
+        """Results in call order; an individual error comes back as an ``EvmRpcError`` instance (not raised). A rate-limited
+        batch waits and retries like ``call``."""
+        for i in range(RATE_LIMIT_TRIES):
+            try:
+                return self._batch(calls)
+            except EvmRpcError as e:
+                if not _rate_limited(e) or i == RATE_LIMIT_TRIES - 1:
+                    raise
+                time.sleep(2 ** i)
+        return []
+
+    def _batch(self, calls: list[tuple[str, list]]) -> list[Any]:
         if not calls:
             return []
         with self._lock:

@@ -22,9 +22,10 @@ WORKER_INFO = {   # name → (title, icon, what it does, role)
     "train": ("Trainer", ":material/model_training:", "On demand: builds decision points from the archive, backtests day by day and saves a new model.", "train"),
     "replay": ("History archive", ":material/history:", "Downloads the hourly trade archive and builds the training feature set.", "train"),
     "discover": ("Token stats", ":material/query_stats:", "Records Jupiter stats (holders, organic score, top-holder share) every 10 minutes for every token the selector can trade: history for future model inputs.", "optional"),
+    "rh_stream": ("Robinhood Chain feed", ":material/sensors:", "Indexes Pons launches, graduations and Uniswap v4 swaps from Robinhood Chain into 1-minute rows in ETH (backfill from Pons V2, then live). The engine's Robinhood books read these.", "trade"),
 }
 ROLE_LABEL = {"trade": "needed to trade", "train": "needed to train", "optional": "optional"}
-ORDER = [n for n in ("runner", "pumpstream", "train", "replay", "discover") if n in WORKERS]
+ORDER = [n for n in ("runner", "pumpstream", "rh_stream", "train", "replay", "discover") if n in WORKERS]
 
 
 # ---------------------------------------------------------------- formatting

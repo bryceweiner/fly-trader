@@ -41,10 +41,13 @@ def _entry(name: str):
     if name == "vault":                        # the $FLY vault: flows, settlement, claims, public stats (fly_trader/vault)
         from ..vault import worker
         return worker.main
+    if name == "rh_stream":                    # Robinhood Chain: the Pons / Uniswap v4 index, marks and minutes (rh/stream.py)
+        from ..rh import stream as rh_stream
+        return rh_stream.main
     raise KeyError(name)
 
 
-WORKERS = ("discover", "runner", "train", "replay", "pumpstream", "vault")
+WORKERS = ("discover", "runner", "train", "replay", "pumpstream", "rh_stream", "vault")
 REPLACE_WAIT_S = 20.0        # how long a new console waits for the one it replaces to finish winding down (its workers flush on stop)
 
 

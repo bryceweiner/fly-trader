@@ -78,9 +78,13 @@ class Kyber:
         finally:
             record_api_call("kyber", path.split("?")[0], method, status, int((time.monotonic() - t0) * 1000), ok, err)
 
-    def get_route(self, token_in: str, token_out: str, amount_in: int) -> dict:
-        """{routeSummary, routerAddress} for exactly this swap, or KyberError (incl. 'no route')."""
-        d = self._req("GET", "/routes", params={"tokenIn": token_in, "tokenOut": token_out, "amountIn": str(int(amount_in)), "gasInclude": "true"})
+    def get_route(self, token_in: str, token_out: str, amount_in: int, included_sources: str | None = None) -> dict:
+        """{routeSummary, routerAddress} for exactly this swap, or KyberError (incl. 'no route'). ``included_sources``: only
+        these venues (a comma list of KyberSwap source ids)."""
+        params = {"tokenIn": token_in, "tokenOut": token_out, "amountIn": str(int(amount_in)), "gasInclude": "true"}
+        if included_sources:
+            params["includedSources"] = included_sources
+        d = self._req("GET", "/routes", params=params)
         router = _allowed_router(d.get("routerAddress"))
         rs = d.get("routeSummary") or {}
         if not _same(rs.get("tokenIn"), token_in) or not _same(rs.get("tokenOut"), token_out) or _big(rs.get("amountIn")) != int(amount_in) \
