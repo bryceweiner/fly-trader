@@ -16,7 +16,7 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 
 SECRET_ENV_NAMES = ("HELIUS_API_KEY", "JUPITER_API_KEY", "BOT_PRIVATE_KEY", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH",
                     "RELAY_SECRET", "TELEGRAM_BOT_TOKEN", "VAULT_BACKUP_HF_TOKEN", "VAULT_SOLANA_RPC_URL", "SIGNER_RPC_URL",
-                    "SOLANA_CHECK_RPC_URL", "HEALTHCHECK_URL")
+                    "SOLANA_CHECK_RPC_URL", "HEALTHCHECK_URL", "RH_BOT_PRIVATE_KEY", "RH_RPC_URL_LOGS")
 
 
 def utcnow() -> datetime:
@@ -228,6 +228,65 @@ def signer_env() -> dict:
     return {k: str(v) for k, v in {"VAULT_MULTISIG": VAULT_MULTISIG, "VAULT_LIMIT_TRADING": VAULT_LIMIT_TRADING,
                                    "VAULT_LIMIT_PAYOUT": VAULT_LIMIT_PAYOUT,
                                    "TREASURY_FLOAT_SOL": TREASURY_FLOAT_SOL, "VAULT_BACKUP_RECIPIENT": VAULT_BACKUP_RECIPIENT}.items() if v}
+
+# ---- Robinhood Chain memecoins (fly_trader/rh; Pons launches graduated into Uniswap v4; branch rh-memecoins) ----
+# The same selector and fly as Solana, trained on both chains' rows (a chain input tells them apart); RH books keep their
+# money in native ETH. Amounts on RH rows are ETH (non-ETH-quoted pools converted at the minute's base/ETH price).
+RH_ENABLED = env_bool("RH_ENABLED", True)                           # index RH and paper-trade it
+RH_LIVE_ENABLED = env_bool("RH_LIVE_ENABLED", False)                # sign and send real RH transactions (live_rh)
+RH_TESTNET = env_bool("RH_TESTNET", False)                          # chain 46630 (the rehearsal); the guard refuses a mismatch
+RH_EXPECTED_CHAIN_ID = 46630 if RH_TESTNET else RH_CHAIN_ID
+RH_RPC_URL_LOGS = env_str("RH_RPC_URL_LOGS")                        # optional better endpoint for eth_getLogs / tx lookups (else RH_RPC_URL)
+RH_BOT_ADDRESS = env_str("RH_BOT_ADDRESS")                          # the address RH_BOT_PRIVATE_KEY must derive to (a guard, not a secret)
+RH_CONFIRMATIONS = env_int("RH_CONFIRMATIONS", 3)                   # blocks before a live receipt or a live log is applied
+RH_START_BLOCK = env_int("RH_START_BLOCK", 0)                       # the indexer's first block (0: the Pons V2 factory's deployment block)
+RH_START_DAY = env_str("RH_START_DAY", "2026-08-04")                # Pons V2 went live: the first RH corpus day
+# Fixed at build time by tools/rh_constants.py (2026-09-28 13:12 UTC: SOL/USD 119.51, ETH/USD 2682.05): the Solana sizes in ETH.
+# Never derived live: they set the size every RH label is priced at (see LABEL_SIZE_SOL).
+RH_ETH_PER_SOL = env_float("RH_ETH_PER_SOL", 0.0445583)                   # K: converts fixed-unit thresholds (eligibility, triggers) for RH rows
+RH_CAPITAL_ETH = env_float("RH_CAPITAL_ETH", 0.222791)                   # the RH paper books' bankroll (5 SOL at build time)
+RH_LABEL_SIZE_ETH = env_float("RH_LABEL_SIZE_ETH", 0.0222791)             # 0.5 SOL at build time: RH labels are priced at it; no RH buy is bigger
+RH_MIN_POSITION_ETH = env_float("RH_MIN_POSITION_ETH", 0.000891166)         # 0.02 SOL at build time
+RH_GAS_RESERVE_ETH = env_float("RH_GAS_RESERVE_ETH", 0.002)         # kept for gas; sized from measured RH gas (rh-probe)
+RH_MAX_FEE_GWEI = env_float("RH_MAX_FEE_GWEI", 5.0)                 # a transaction never offers more per gas
+RH_KILL_SWITCH_DRAWDOWN = env_float("RH_KILL_SWITCH_DRAWDOWN", 0.30)
+RH_MIN_SWEEP_ETH = env_float("RH_MIN_SWEEP_ETH", 0.0002)           # base-asset or dead-bag balances worth less are dust
+RH_STREAM_POLL_S = env_float("RH_STREAM_POLL_S", 2.0)
+RH_MINUTES_KEEP_DAYS = env_int("RH_MINUTES_KEEP_DAYS", 14)
+RH_DIR_NAME = "rh"                                                  # data/corpus/rh/... (the RH corpus beside the Solana one)
+# contracts on Robinhood Chain (mainnet; verified to carry code 2026-09-28)
+PONS_FACTORY = env_str("PONS_FACTORY", "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e")
+PONS_ROUTER = env_str("PONS_ROUTER", "0xe33e9e479df8802cb0866d5d05258bec4cf62948")
+PONS_HOOK = env_str("PONS_HOOK", "0xe5e702641ea86f4ae6cc3cdaed2b886f976be044")
+PONS_LOCKER = env_str("PONS_LOCKER", "0x267444d099b10fb5ed7c3cc7b7c767adca574952")
+PONS_GRAD_EXECUTOR = env_str("PONS_GRAD_EXECUTOR", "0xc7819b64a1daecd7ec19856d026cb14efbd89046")
+V4_POOL_MANAGER = env_str("V4_POOL_MANAGER", "0x8366a39cc670b4001a1121b8f6a443a643e40951")
+V4_QUOTER = env_str("V4_QUOTER", "0x8dc178efb8111bb0973dd9d722ebeff267c98f94")
+V4_STATE_VIEW = env_str("V4_STATE_VIEW", "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b")
+UNIVERSAL_ROUTER = env_str("UNIVERSAL_ROUTER", "0x8876789976decbfcbbbe364623c63652db8c0904")
+PERMIT2 = env_str("PERMIT2", "0x000000000022D473030F116dDEE9F6B43aC78BA3")
+V3_FACTORY = env_str("V3_FACTORY", "0x1f7d7550b1b028f7571e69a784071f0205fd2efa")
+V3_QUOTER_V2 = env_str("V3_QUOTER_V2", "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7")
+RH_WETH = env_str("RH_WETH", "0x0bd7d308f8e1639fab988df18a8011f41eacad73")      # SwapRouter02.WETH9()
+RH_USDG = env_str("RH_USDG", "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168")
+KYBER_API = env_str("KYBER_API", "https://aggregator-api.kyberswap.com/robinhood/api/v1")
+KYBER_ROUTER = env_str("KYBER_ROUTER", "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5")  # MetaAggregationRouterV2: the only router a built Kyber tx may call
+KYBER_CLIENT_ID = env_str("KYBER_CLIENT_ID", "fly-trader")
+
+
+def rh_live_prerequisites_missing() -> list[str]:
+    missing = []
+    if not RH_LIVE_ENABLED:
+        missing.append("RH_LIVE_ENABLED=1")
+    if not env_str("RH_BOT_PRIVATE_KEY"):
+        missing.append("RH_BOT_PRIVATE_KEY")
+    if not RH_BOT_ADDRESS:
+        missing.append("RH_BOT_ADDRESS")
+    for name in ("RH_CAPITAL_ETH", "RH_LABEL_SIZE_ETH", "RH_MIN_POSITION_ETH", "RH_ETH_PER_SOL", "RH_GAS_RESERVE_ETH"):
+        if globals()[name] <= 0:
+            missing.append(name)
+    return missing
+
 
 # ---- Kalshi prediction markets (fly_trader/kalshi; the same key names as better_bot, whose client is vendored) ----
 KALSHI_API_KEY_ID = env_str("KALSHI_API_KEY_ID")
