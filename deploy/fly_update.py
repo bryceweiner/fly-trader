@@ -23,7 +23,9 @@ One round:
       infra            -> held until ``approve`` (compose/Dockerfile/entrypoint can grant host access, so a human
                           looks first)
 
-    fly_update.py run | approve <seq> | veto <seq> | status | verify <dir> <allowed_signers> [principal ...]
+    fly_update.py run | approve <seq> | veto <seq> | status | restart | verify <dir> <allowed_signers> [principal ...]
+
+``restart`` recreates the containers on the installed release (after you edit /srv/fly/*.env).
 """
 from __future__ import annotations
 
@@ -43,7 +45,7 @@ CONF = Path(os.environ.get("FLY_UPDATE_CONF", "/etc/fly/update.json"))
 PATH_RE = re.compile(r"^(?!.*\.\.)(?!/)[A-Za-z0-9_.\-/]+$")
 INFRA = ("Dockerfile", "docker-compose.yml", "docker-compose.cuda.yml", ".dockerignore", "docker/", "deploy/")
 # what models/ and seed/ may hold: nothing a loader could execute (fly_trader/train/model_io.SAFE_SUFFIXES)
-MODEL_SUFFIXES = {".pt", ".skops", ".npz", ".json", ".bin", ".parquet", ".txt", ""}
+MODEL_SUFFIXES = {".pt", ".skops", ".npz", ".json", ".bin", ".parquet", ".txt", ".sha256", ""}
 SEED_SUFFIXES = {".json", ".sql"}
 
 
@@ -163,7 +165,9 @@ def save_state(c: dict, st: dict) -> None:
 
 
 def compose(c: dict, *args: str, check: bool = True, env: dict | None = None) -> subprocess.CompletedProcess:
-    e = {**os.environ, **(env or {})}
+    """docker compose on the installed release (FLY_RELEASE = the image tag this host runs, unless ``env`` says otherwise)."""
+    installed_tag = load_state(c).get("image")
+    e = {**os.environ, "FLY_RELEASE": str(installed_tag) if installed_tag is not None else "none", **(env or {})}
     return subprocess.run(["docker", "compose", "-p", c["project"], "-f", str(Path(c["root"]) / "docker-compose.yml"), *args],
                           cwd=c["root"], check=check, capture_output=True, text=True, env=e)
 
@@ -245,7 +249,7 @@ def deploy_code(c: dict, st: dict, m: dict, d: Path, infra: bool) -> str:
     except subprocess.CalledProcessError as e:
         alert(c, f"release {m['seq']}: image build failed: {(e.stderr or b'').decode(errors='replace')[-300:]}")
         return "failed"
-    if not wait_ready(c):
+    if st.get("image") is not None and not wait_ready(c):     # the first install has nothing running to wait for
         alert(c, f"release {m['seq']}: the fly never became ready for a restart (orders/claims/settlement in flight); will retry")
         return "busy"
     if infra:                                   # approved: the release's compose file becomes the running one
@@ -374,6 +378,12 @@ def main(argv: list[str]) -> None:
         run(int(argv[2]))
     elif cmd == "veto":
         veto(int(argv[2]))
+    elif cmd == "restart":
+        c = conf()
+        if load_state(c).get("image") is None:
+            raise SystemExit("nothing installed yet")
+        r = compose(c, "up", "-d", "--force-recreate", check=False, env={"FLY_RELEASES": str(Path(c["root"]) / "releases")})
+        print((r.stdout or "") + (r.stderr or ""))
     elif cmd == "status":
         print(json.dumps(load_state(conf()), indent=1))
     elif cmd == "verify":                       # used by tools/publish_release.py on the Mac before uploading

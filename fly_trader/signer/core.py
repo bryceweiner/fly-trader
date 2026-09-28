@@ -47,7 +47,7 @@ class SignerConfig:
     multisig: str | None = None                  # the Squads multisig (the treasury is its vault 0)
     limit_trading: str | None = None             # L1 spending-limit account
     limit_payout: str | None = None              # L2 spending-limit account
-    max_buy_lamports: int = int(0.5 * LAMPORTS)
+    max_buy_lamports: int = int(1.0 * LAMPORTS)
     daily_buy_lamports: int = int(10 * LAMPORTS)
     swaps_per_min: int = 6
     max_priority_lamports: int = 5_000_000
@@ -61,7 +61,7 @@ class SignerConfig:
         f = lambda k, d: float(env.get(k) or d)                                    # noqa: E731
         return cls(multisig=env.get("VAULT_MULTISIG") or None, limit_trading=env.get("VAULT_LIMIT_TRADING") or None,
                    limit_payout=env.get("VAULT_LIMIT_PAYOUT") or None,
-                   max_buy_lamports=int(f("SIGNER_MAX_BUY_SOL", env.get("MAX_POSITION_SOL") or 0.5) * LAMPORTS),
+                   max_buy_lamports=int(f("SIGNER_MAX_BUY_SOL", 1.0) * LAMPORTS),   # a safety bound, not sizing
                    daily_buy_lamports=int(f("SIGNER_DAILY_BUY_SOL", 10) * LAMPORTS), swaps_per_min=int(f("SIGNER_SWAPS_PER_MIN", 6)),
                    max_priority_lamports=int(f("SIGNER_MAX_PRIORITY_SOL", 0.005) * LAMPORTS), min_value_ratio=f("SIGNER_MIN_VALUE_RATIO", 0.6),
                    topup_max_lamports=int(f("TREASURY_FLOAT_SOL", 2.0) * LAMPORTS), backup_recipient=env.get("VAULT_BACKUP_RECIPIENT") or None)

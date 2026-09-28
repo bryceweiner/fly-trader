@@ -93,6 +93,10 @@ def rebalance(rpc, signer, trading: str, treasury: str, wait=None) -> dict:
         except SignerUnavailable as e:
             log.warning("treasury %s: signer unavailable: %s", action, e)
             return {"action": action, "refused": str(e), "code": "error"}
+        if native < 2 * FEE:                             # the trading wallet pays its own top-up's fee
+            alerts.send("the trading wallet has no SOL for fees, so it cannot refill itself from the treasury: send it 0.05 SOL "
+                        "(from a funding address)", key="trading_no_fee", cooldown_s=6 * 3600)
+            return {"action": action, "refused": "no SOL for the fee", "code": "liquidity"}
         sig = built["signature"]
         direction, counterparty, note = (("in", treasury, "float refill from the treasury (L1)") if action == "topup"
                                          else ("out", treasury, "float excess to the treasury"))

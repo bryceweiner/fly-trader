@@ -30,7 +30,7 @@ vhosts/default/            deploy tree (what wsgi.py lives in)
  "min_lamports": 2000000, "client_ip_header": null}
 ```
 
-- Generate a key: `python -c "import secrets;print(secrets.token_hex(32))"`. The HMAC key is that string's
+- Generate a key: `python3 -c "import secrets;print(secrets.token_hex(32))"`. The HMAC key is that string's
   UTF-8 bytes (not the decoded 32 bytes). Put the same id and secret in the fly's environment.
 - Rotation: add `"k2"`, switch the fly to k2, then remove k1.
 - Keep `claim_ttl_s` at 900: the fly refuses claims whose expiry is not issue + 900 s.
@@ -42,7 +42,7 @@ vhosts/default/            deploy tree (what wsgi.py lives in)
 Call the HMAC-protected probe from any machine that has the secret:
 
 ```sh
-FLY_RELAY_SECRET=<hex> python web/relay/hmacauth.py https://fly-trader.app/api/fly/probe k1
+FLY_RELAY_SECRET=<hex> python3 web/relay/hmacauth.py https://fly-trader.app/api/fly/probe k1   # from the repo root
 ```
 
 It prints the status, response headers and
@@ -55,11 +55,12 @@ It prints the status, response headers and
    all shared state is in SQLite, but it confirms the setup.
 5. **Client IP**: compare `remote_addr` with your own public IP. If it is a proxy address (e.g. 10.x or
    127.0.0.1), find the header in `headers` that carries your IP (`HTTP_X_FORWARDED_FOR`, `HTTP_X_REAL_IP`, ...)
-   and set `client_ip_header` to it. Its first comma-separated entry is used. Then check it cannot be spoofed:
-   send `-H 'X-Forwarded-For: 1.2.3.4'` (e.g. with curl on `/api/claim/challenge`, or by adding the header in
-   hmacauth.py) and look at `client_ip` in the probe. If it becomes 1.2.3.4, the proxy appends rather than replaces,
-   the first entry is client-controlled, and the per-IP limits can be dodged. Prefer a single-value header set by
-   the proxy (X-Real-IP) if there is one. Without this, every visitor shares one set of rate limits.
+   and set `client_ip_header` to it. Its last (rightmost) comma-separated entry is used: a proxy appends the
+   address it saw, so the rightmost entry is the one the client cannot choose. Then check it cannot be spoofed:
+   send `-H 'X-Forwarded-For: 1.2.3.4'` (e.g. by adding the header in hmacauth.py) and look at `client_ip` in the
+   probe. If it becomes 1.2.3.4, the proxy passes the client's header through instead of appending to it, and the
+   per-IP limits can be dodged; use a header the proxy sets itself (X-Real-IP) instead. Without a working header,
+   every visitor shares one set of rate limits.
 6. **No proxy caching of /api**: the probe's `time` and `pid` must change between calls, and the response must not
    carry `Age > 0` or `X-Cache: HIT`/`X-Varnish` with two ids. Do the same with `curl -i .../api/stats` twice.
    Every `/api` response sends `Cache-Control: no-store`, which Varnish's default rules respect.
@@ -68,7 +69,9 @@ It prints the status, response headers and
 
 ## Behaviour notes
 
-- Rate limits (token buckets in SQLite): challenge 30/h/IP; claim 10/h/IP and 5/h/EVM; reads 600/h/IP. IPv6
-  clients are bucketed per /64. The per-EVM bucket is only spent by claims that pass every other check.
+- Rate limits (token buckets in SQLite): challenge 30/h/IP; claim 10/h/IP and 5/h per (EVM address, IP); reads
+  600/h/IP. IPv6 clients are bucketed per /64. The per-address bucket is keyed on the address and the client together
+  (strangers cannot drain a holder's) and is only spent by claims that pass every other check. The fly's HMAC routes
+  are not rate-limited.
 - The relay checks only syntax, nonces, owed and limits. The fly re-renders the texts and verifies both signatures.
-- Tests: `.venv/bin/python -m pytest web/relay/tests -q` and `uvx --python 3.8 --with pytest pytest web/relay/tests -q`.
+- Tests (from the repo root): `uv run pytest web/relay/tests -q` and `uvx --python 3.8 --with pytest pytest web/relay/tests -q`.

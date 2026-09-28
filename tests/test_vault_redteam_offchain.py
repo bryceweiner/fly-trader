@@ -35,6 +35,9 @@ def fly(monkeypatch):
         monkeypatch.setattr(config, k, v)
     import fly_trader.execution.broker_live as bl
     monkeypatch.setattr(bl, "await_confirmation", lambda rpc, sig, lvbh: ("confirmed", {"slot": 123}))
+    # the vector claims carry fixed dates but are stored at the real clock: the stale-claim rule would reject them from
+    # a day after the vectors' date. test_refused_expired_or_future_dated_claims turns it back on.
+    monkeypatch.setattr(claims, "STALE_AFTER_S", 10**12)
     with transaction() as c:
         for t in ("vault_allocations", "vault_settlements", "vault_claims", "vault_flows", "vault_kv"):
             c.execute(f"DELETE FROM {t}")
@@ -166,8 +169,9 @@ def test_refused_inflight_unique_index_blocks_a_second_verified_claim(fly):
 
 
 @pytest.mark.parametrize("issued_ago,ok", [(3 * 3600, False), (60, True), (-2 * 3600, False)])
-def test_refused_expired_or_future_dated_claims(fly, issued_ago, ok):
+def test_refused_expired_or_future_dated_claims(fly, issued_ago, ok, monkeypatch):
     """Staleness is judged by the fly's own ingest time (created_at = DB clock), not by anything the relay says."""
+    monkeypatch.setattr(claims, "STALE_AFTER_S", 3600)
     import time
     now = int(time.time())
     iss = now - issued_ago

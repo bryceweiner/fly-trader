@@ -92,11 +92,15 @@ def squads_setup(k: dict) -> str:
     """Step by step, for the owner's wallet in the Squads app. Prints; signs nothing."""
     from .. import config
     ms = config.VAULT_MULTISIG
-    lines = ["Treasury setup in the Squads app (app.squads.so), signed by your owner wallet (Solflare now, the Ledger later).",
-             "The server's keys must NEVER be members of the multisig; they only get the two spending limits below.", ""]
+    lines = ["Treasury setup, signed by your owner wallet (Solflare now, the Ledger later). The easy way: open",
+             "https://fly-trader.app/owner.html, paste the two keys below, and use its buttons. The Squads app (app.squads.so)",
+             "may not let a spending limit name a key that is not a member; the owner page builds the transactions itself.",
+             "The server's keys must NEVER be members of the multisig; they only get the two spending limits below.", "",
+             f"trading key (bot_key): {k.get('trading')}", f"payout key (payout_key): {k.get('payout')}", ""]
     if not ms:
         lines += ["1. Create a multisig: members = your owner wallet only, threshold 1, time lock 0.",
-                  "   Then set VAULT_MULTISIG=<its address> in /srv/fly/vault.env and run this again.", ""]
+                  "   Then set VAULT_MULTISIG=<its address> in /srv/fly/custody.env, run sudo python3 /usr/local/lib/fly/fly_update.py restart,",
+                  "   and run this again.", ""]
     else:
         from . import custody
         lines += [f"Multisig {ms}; treasury (vault 0) {custody.treasury_address()} -- fund the treasury, not the trading wallet.", ""]
@@ -105,13 +109,13 @@ def squads_setup(k: dict) -> str:
               f"{config.TREASURY_FLOAT_SOL:g} SOL,",
               f"     member (who may use it): {k.get('trading')}   <- the trading key",
               f"     destination (ONLY this): {k.get('trading')}   <- the trading wallet itself",
-              "   Put its address in VAULT_LIMIT_TRADING.",
+              "   Put its address in VAULT_LIMIT_TRADING (/srv/fly/custody.env).",
               "3. Add another (L2: claims):",
               "     token SOL, vault 0, period Weekly, amount 1 SOL (raise it when a settlement alert says owed > cap),",
               f"     member: {k.get('payout')}   <- the payout key",
               "     destinations: none (any holder)",
-              "   Put its address in VAULT_LIMIT_PAYOUT.",
-              "4. Restart the fly, then: fly-trader vault custody   (every check must pass).",
+              "   Put its address in VAULT_LIMIT_PAYOUT (/srv/fly/custody.env).",
+              "4. sudo python3 /usr/local/lib/fly/fly_update.py restart, then: sudo fly vault custody   (every check must pass).",
               "",
               "Emergency: in the Squads app remove L1 and L2 (Settings -> Spending limits -> Remove). The server can then move",
               "nothing out of the treasury, whatever it runs; the trading wallet keeps only its float."]

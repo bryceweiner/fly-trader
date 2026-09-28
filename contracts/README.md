@@ -13,6 +13,8 @@ takes two steps. `requestWithdrawal` stops the tokens earning at once, and `with
 | `script/Deploy.s.sol` | Mainnet or any chain. Deploys TimelockController, the implementation, and an ERC1967Proxy that is initialized in its constructor. |
 | `script/DeployTestnet.s.sol` | Deploys MockFLY plus the same stack with short delays. Runs only on chain 46630 or anvil. |
 | `script/ScheduleUpgrade.s.sol`, `script/ExecuteUpgrade.s.sol` | Upgrades through the timelock. |
+| `script/HandOver.s.sol` | Moves the timelock's PROPOSER + CANCELLER and the vault's PAUSER from `OLD_OWNER` to `NEW_OWNER` in one timelocked batch. `MODE=schedule\|execute\|calldata` (calldata prints the `scheduleBatch`/`executeBatch` data for a browser wallet). |
+| `script/VaultScript.sol` | Shared helpers for the deploy and upgrade scripts (writes `deployments/<chainid>.json`). |
 | `abi/FlyVault.json`, `abi/TimelockController.json` | ABIs for the indexer and the site. |
 | `storage-layout.json`, `storage-layout.namespaced.json` | Storage layouts to diff before upgrades (see below). |
 | `deployments/<chainid>.json` | Address summary written by the deploy scripts. |
@@ -58,21 +60,27 @@ verified on this chain, so the contracts use the storage-based `ReentrancyGuard`
 
 ## Deploy (mainnet, chain 4663)
 
-The owner is the hardware wallet. It becomes the timelock's proposer and canceller, and by default also the
-vault's pauser. Set `PAUSER` to use a different account. The script refuses to run on chain 4663 unless
+`OWNER` becomes the timelock's proposer and canceller, and by default also the vault's pauser (set `PAUSER` to use a
+different account). It can be a browser wallet now (MetaMask) and the hardware wallet later: `script/HandOver.s.sol`
+moves the roles through the timelock (8 days). The deployer only pays the gas and holds no role afterwards, so it can
+be a throwaway keystore (`docs/vault/RUNBOOK.md` §2). The script refuses to run on chain 4663 unless
 `FLY_TOKEN` is `0x2fC7f9E2911f20b2C4660d2AEf808aa91bDdb3D3`, `TIMELOCK_DELAY` is 8 days and `WITHDRAW_DELAY` is
 7 days. Leave the two delays unset, since the defaults are already 8 and 7 days.
 
 ```sh
 export FLY_TOKEN=0x2fC7f9E2911f20b2C4660d2AEf808aa91bDdb3D3
-export OWNER=0x...your-ledger-address
+export OWNER=0x...the-owner-address                     # MetaMask now; see HandOver.s.sol for the Ledger later
+cast wallet new ~/.foundry/keystores deployer            # a throwaway that pays the gas; fund it with a little ETH
+export DEPLOYER=$(cast wallet address --account deployer)
 # 1. dry run (simulates against the live chain; writes deployments/4663.dry-run.json, sends nothing)
-forge script script/Deploy.s.sol --rpc-url robinhood --sender $OWNER
-# 2. real deploy, signed on the Ledger (3 transactions), verified on Blockscout
-forge script script/Deploy.s.sol --rpc-url robinhood --ledger --sender $OWNER \
-  --mnemonic-indexes 0 --broadcast \
+forge script script/Deploy.s.sol --rpc-url robinhood --sender $DEPLOYER
+# 2. real deploy (3 transactions), verified on Blockscout
+forge script script/Deploy.s.sol --rpc-url robinhood --account deployer --sender $DEPLOYER --broadcast \
   --verify --verifier blockscout --verifier-url https://robinhoodchain.blockscout.com/api/
 ```
+
+With the hardware wallet as the deployer instead: `--ledger --mnemonic-indexes 0 --sender <its address>` in place of
+`--account deployer`.
 
 After deploying:
 - The script checks every role, both delays, the token and the proxy's implementation slot. The deployer ends up
@@ -169,6 +177,25 @@ before execution.
 Other timelock-governed actions work the same way via `cast` (`schedule` → wait 8 days → `execute`). Examples:
 rotating the pauser (`vault.grantRole/revokeRole(PAUSER_ROLE, …)`) and changing the delay
 (`timelock.updateDelay`, which itself waits the current delay).
+
+## Hand the owner roles over (e.g. MetaMask → Ledger)
+
+One timelock batch grants PROPOSER, CANCELLER and PAUSER to the new owner and revokes them from the old one. It is as
+public and as delayed as an upgrade (8 days). With a forge-capable old owner:
+
+```sh
+export VAULT=... TIMELOCK=... OLD_OWNER=... NEW_OWNER=...
+MODE=schedule forge script script/HandOver.s.sol --rpc-url robinhood --account <old owner> --sender $OLD_OWNER --broadcast
+# 8 days later, from any funded key:
+MODE=execute forge script script/HandOver.s.sol --rpc-url robinhood --account <any> --sender <its address> --broadcast
+```
+
+With a browser-wallet old owner, print the calldata and send it from the wallet (Blockscout "Write contract" on the
+timelock, `scheduleBatch`, later `executeBatch`, or any raw-data send):
+
+```sh
+MODE=calldata forge script script/HandOver.s.sol --rpc-url robinhood
+```
 
 ## Pause
 

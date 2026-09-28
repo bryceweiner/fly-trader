@@ -58,7 +58,7 @@ JUPITER_EXECUTE_RPS = config.JUPITER_RPS  # separate bucket, same rate
 JUPITER_LABELS_URL = "https://api.jup.ag/swap/v2/program-id-to-label"
 JUPITER_LABELS_CACHE = config.DATA_DIR / "jupiter_program_labels.json"
 JUPITER_LABELS_MAX_AGE_S = 86400.0
-DEFAULT_EXCLUDE_ROUTERS = "jupiterz"
+DEFAULT_EXCLUDE_ROUTERS = "jupiterz,dflow,okx"   # Metis only: the signer refuses other routers' programs (signer/policy.py)
 
 
 class JupiterError(RuntimeError):

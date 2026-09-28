@@ -19,6 +19,7 @@
     "@reown/appkit": "1.8.24",
     "@reown/appkit-adapter-solana": "1.8.24",
     "@reown/appkit-adapter-wagmi": "1.8.24",
+    "@solana/web3.js": "1.98.4",
     "@sqds/multisig": "2.1.4",
     "@wagmi/connectors": "6.2.0",
     "@wagmi/core": "2.22.1",

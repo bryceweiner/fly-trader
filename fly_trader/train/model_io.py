@@ -23,7 +23,7 @@ TRUSTED_SELECTOR_TYPES = [
 ]
 # what a release's models/ may hold (connectome .npz loads with allow_pickle=False, wallet skill is parquet, geometry
 # is raw floats + JSON); TABLE and current.txt are plain text
-SAFE_SUFFIXES = {".pt", ".skops", ".npz", ".json", ".bin", ".parquet", ".txt", ""}
+SAFE_SUFFIXES = {".pt", ".skops", ".npz", ".json", ".bin", ".parquet", ".txt", ".sha256", ""}
 
 
 class UnsafeModel(RuntimeError):

@@ -1,17 +1,6 @@
 /** Relay client (docs/vault/SPEC.md §3, payloads §4). Lamports are numbers, $FLY amounts are wei strings. */
 import { config } from '../config'
 
-export interface Position {
-  mint: string
-  symbol: string
-  opened_at: number
-  cost: number
-  value: number
-  entry_price: number
-  mark_price: number
-  hold_min: number
-}
-
 export interface Settlement {
   id: number | string
   period_start: number
@@ -36,9 +25,9 @@ export interface Stats {
     handover: boolean
     kill_switch: boolean
     entries_paused: boolean
-    model: Record<string, number>
+    model: Record<string, number | null>
   }
-  /** as of an hour ago (the fly publishes nothing that would let anyone trade ahead of it) */
+  /** trading wallet + treasury, from the last 5-minute mark, rounded to 0.1 SOL (nothing to trade ahead of the fly with) */
   wallet: { native: number; nav: number }
   ledger: {
     deposits: number

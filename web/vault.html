@@ -3,7 +3,7 @@
 <head>
   <!-- @include head -->
   <title>$FLY Vault — fly-trader</title>
-  <meta name="description" content="Lock $FLY on Robinhood Chain and receive a weekly share of the fly's closed-trade profit in SOL. Live wallet, positions, trades and settlements.">
+  <meta name="description" content="Lock $FLY on Robinhood Chain and receive a weekly share of the fly's closed-trade profit in SOL. Live NAV, trades, flows and settlements.">
   <link rel="canonical" href="https://fly-trader.app/vault.html">
   <meta property="og:type" content="website">
   <meta property="og:title" content="$FLY Vault — fly-trader">
@@ -54,7 +54,7 @@
         <div><span class="micro">Pot for the next settlement</span><div class="v lime-text" id="w-pot">—</div></div>
         <div><span class="micro">Last settlement</span><div class="v" id="w-last">—</div></div>
       </div>
-      <p class="hint mt-12">R is measured from the wallet itself: SOL + token-account rent + open positions at cost − deposits + withdrawals + claims paid. Booked P&amp;L is the sum of the fly's own closed-trade records; the two should match up to fees and rent the trade records do not see.</p>
+      <p class="hint mt-12">R is measured from the fly's accounts themselves (its trading wallet and its treasury): SOL + token-account rent + open positions at cost − deposits + withdrawals + claims paid. Booked P&amp;L is the sum of the fly's own closed-trade records; the two should match up to fees and rent the trade records do not see.</p>
     </div>
 
     <!-- NAV history -->

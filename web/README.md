@@ -7,19 +7,22 @@ Static site (Vite multi-page, vanilla TypeScript) plus the relay API under `rela
 |---|---|
 | `index.html` | Project page. Loads only `src/site.ts` (~8 KB gzip). |
 | `trading.html` | $FLY market strip + candles (GeckoTerminal), buy/sell with ETH or USDG through KyberSwap, balances. |
-| `vault.html` | The fly's live stats, NAV chart, settlements/positions/trades/flows, your position (lock, request, cancel, withdraw), SOL claims. |
+| `vault.html` | The fly's live stats, NAV chart, settlements/trades/flows, your position (lock, request, cancel, withdraw), SOL claims. |
+| `owner.html` | For the treasury's owner only (noindex, not linked from the nav): reads the Squads v4 multisig, creates it and the spending limits L1 (trading float, daily) and L2 (claims, weekly), changes L2, revokes both. The connected Solana wallet signs; nothing goes to the relay. |
 | `terms.html`, `privacy.html` | Legal pages. |
 
 Header, footer and common `<head>` live in `partials/` and are included with `<!-- @include name -->`
-(see `vite.config.ts`). Wallet support (Reown AppKit, EVM + Solana) is a dynamic import on the Trading and Vault
-pages only.
+(see `vite.config.ts`). Wallet support (Reown AppKit, EVM + Solana) is a dynamic import on the Trading, Vault and
+Owner pages only.
 
 ## Develop
 
 ```sh
-npm install
+npm ci
 npm run dev          # http://localhost:5173 — /api is served from dev/fixtures, no backend needed
-npm test             # vitest: claim-text vectors (tests/vectors/claim_v1.json), formatting, Kyber allowlist
+npm test             # vitest: claim-text vectors (tests/vectors/claim_v1.json), formatting, Kyber allowlist, audit cases;
+                     # the Squads chain tests (squads.int/setup.test.ts) skip unless tools/custody_e2e.sh or vault_demo runs them
+npm run typecheck    # tsc --noEmit only
 npm run build        # tsc --noEmit, then vite build -> dist/
 npm run preview      # serve dist/
 ```
@@ -50,7 +53,11 @@ The page marks such a quote as suspicious and its pre-flight `eth_call` reports 
 The sell test walks the page's slippage ladder (0.2 %, then 0.5 % steps to 10 %) and prints the first step the real
 pools honour; a step above the default is a finding worth reading.
 
-They are not part of `npm test`. The vault suite is rerunnable (fresh keys each run; it funds a new settlement for
+The treasury custody has its own end-to-end run against the real Squads program (from the repo root):
+`tools/custody_e2e.sh <mainnet RPC URL>`. The owner page's builders (`src/lib/squads.ts`) create the treasury and both
+limits on a local validator, then `tests/test_custody_e2e.py` drives the signer against it.
+
+None of these are part of `npm test`. The vault suite is rerunnable (fresh keys each run; it funds a new settlement for
 the claim section and waits up to 12 minutes for it). The trading suite talks to the public KyberSwap API, which
 throttles bursts; it backs off for minutes rather than skip. The slippage ladder is measured with `eth_call` on
 the real chain (state overrides give the test wallet its balance; nothing is sent). The swap is then also sent on
@@ -68,6 +75,8 @@ from the chain and KyberSwap's executor refuses it early (reported as "fork drif
 | `VITE_FLY_ADDRESS` | mainnet $FLY | Token override; required on testnet (MockFLY). |
 | `VITE_RELAY_BASE` | `/api` | Relay base URL. |
 | `VITE_RELAY_PROXY` | — | Dev only: proxy `/api` to this origin instead of the fixtures. |
+| `VITE_EVM_RPC` | the chain's public RPC | Robinhood Chain RPC override (e.g. anvil); the chain id must match. |
+| `VITE_SOLANA_RPC` | WalletConnect's RPC (needs `VITE_REOWN_PROJECT_ID`) | Solana JSON-RPC for the owner page (e.g. a local validator). A production host other than WalletConnect's must also go into `site-headers.json`'s `connect-src`. |
 
 The claim domain check: the Vault page refuses a claim challenge whose `domain` is not the host it is served
 from, so a staging relay must be configured with the staging host (e.g. `localhost:5173`).
@@ -95,19 +104,20 @@ Operator checklist:
 - Reown dashboard: create the project, allow the domain `fly-trader.app` (and any staging origin), put the id in
   `VITE_REOWN_PROJECT_ID`.
 - After deploying the vault: set `VITE_VAULT_ADDRESS` and `VITE_TIMELOCK_ADDRESS` and rebuild.
+- The owner page needs `VITE_REOWN_PROJECT_ID` (its Solana RPC is WalletConnect's) unless `VITE_SOLANA_RPC` is set.
 - If a page starts calling a new host (a new AppKit version, say), add it to `site-headers.json` or the CSP will
   block it. The CSP deliberately leaves out `pulse.walletconnect.org` (WalletConnect telemetry).
 
 ## Layout
 
 ```
-index.html trading.html vault.html terms.html privacy.html
+index.html trading.html vault.html owner.html terms.html privacy.html
 partials/        head.html header.html footer.html
 public/          copied as-is: favicon.svg robots.txt sitemap.xml assets/
 src/site.ts      shared behaviour (links, CA copy, burger menu, hero headline/video, year)
 src/config.ts    network constants (SPEC §5) + env overrides; no viem, it ships on every page
-src/pages/       trading.ts vault.ts
-src/lib/         api claim vault kyber chart chains appkit evm format ui (+ *.test.ts)
+src/pages/       trading.ts vault.ts owner.ts
+src/lib/         api claim vault kyber squads chart chains appkit evm format ui (+ *.test.ts)
 dev/             mock-api.ts (dev /api), make-fixtures.mjs, fixtures/*.json
 scripts/         bundle_gandi.sh
 ```

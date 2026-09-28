@@ -159,8 +159,8 @@ def live_prerequisites_missing() -> list[str]:
         missing.append("MAX_POSITION_SOL")
     if GAS_RESERVE_SOL <= 0:
         missing.append("GAS_RESERVE_SOL")
-    if not env_str("BOT_PRIVATE_KEY") and not env_str("BOT_PRIVATE_KEY_FILE"):
-        missing.append("BOT_PRIVATE_KEY")
+    if not SIGNER_SOCKET and not env_str("BOT_PRIVATE_KEY") and not env_str("BOT_PRIVATE_KEY_FILE"):
+        missing.append("BOT_PRIVATE_KEY")                          # the vault server's brain has no key: its signer does
     if not JUPITER_API_KEY:
         missing.append("JUPITER_API_KEY")
     if not HELIUS_API_KEY:
@@ -216,7 +216,7 @@ def vault_solana_rpc_url() -> str:
 def signer_env() -> dict:
     """What an in-process signer reads (fly_trader/signer; the signer container has its own environment)."""
     return {k: str(v) for k, v in {"VAULT_MULTISIG": VAULT_MULTISIG, "VAULT_LIMIT_TRADING": VAULT_LIMIT_TRADING,
-                                   "VAULT_LIMIT_PAYOUT": VAULT_LIMIT_PAYOUT, "MAX_POSITION_SOL": MAX_POSITION_SOL,
+                                   "VAULT_LIMIT_PAYOUT": VAULT_LIMIT_PAYOUT,
                                    "TREASURY_FLOAT_SOL": TREASURY_FLOAT_SOL, "VAULT_BACKUP_RECIPIENT": VAULT_BACKUP_RECIPIENT}.items() if v}
 
 # ---- Kalshi prediction markets (fly_trader/kalshi; the same key names as better_bot, whose client is vendored) ----
