@@ -41,13 +41,11 @@ def one_pass(rpc, skill=None) -> dict:
     ix = index.run_once(rpc, max_ranges=BACKFILL_RANGES if behind > LIVE_LAG_BLOCKS else 1)
     px = prices.run_once(max_ranges=BACKFILL_RANGES if behind > LIVE_LAG_BLOCKS else 2)
     mn = minutes.run_once(rpc, skill)
-    try:
-        from . import meta
-        mt = meta.run_once()
-    except ImportError:
-        mt = {}
+    from . import corpus, meta
+    mt = meta.run_once()
+    cp = corpus.run_once(max_days=1) if behind <= LIVE_LAG_BLOCKS * 20 else {}          # the training corpus follows once near the head
     out = {"head": head, "index_through": ix.get("through"), "behind_blocks": head - (ix.get("through") or 0), "index": ix.get("counts"), "prices": px,
-           "minutes": mn, "meta": mt, "mode": "backfill" if behind > LIVE_LAG_BLOCKS else "live"}
+           "minutes": mn, "meta": mt, "corpus": cp, "mode": "backfill" if behind > LIVE_LAG_BLOCKS else "live"}
     _status(**{k: v for k, v in out.items() if k != "minutes"}, minutes_through=mn.get("through"))
     return out
 

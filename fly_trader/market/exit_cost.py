@@ -40,6 +40,13 @@ def pool_fee_rate(mcap_sol):
     return float(out) if out.ndim == 0 else out
 
 
+PONS_LABEL = "Pons v4"          # a graduated Pons launch on Robinhood Chain (fly_trader/markets.RH): amounts in ETH
+
+
+def is_pons(program_label: str | None) -> bool:
+    return program_label == PONS_LABEL
+
+
 def impact_fraction(value_sol: float, res_quote_sol: float | None, program_label: str | None = None) -> float:
     if value_sol <= 0:
         return 0.0
@@ -50,10 +57,15 @@ def impact_fraction(value_sol: float, res_quote_sol: float | None, program_label
     return value_sol / (value_sol + res_quote_sol)
 
 
-def fee_fraction(value_sol: float, mcap_sol: float | None, pool_fee: float | None = None) -> float:
-    """Fees of one swap of ``value_sol`` as a fraction of it: pool fee + Jupiter's platform fee + the network fee."""
+def fee_fraction(value_sol: float, mcap_sol: float | None, pool_fee: float | None = None, program_label: str | None = None) -> float:
+    """Fees of one swap of ``value_sol`` as a fraction of it: pool fee + Jupiter's platform fee + the network fee.
+    A Pons pool (Robinhood Chain, amounts in ETH): the hook's fee + tax (``pool_fee``, measured per minute; else
+    ``RH_HOOK_FEE``) + the gas of one swap (``RH_TX_FEE_ETH``); KyberSwap charges nothing (rh/kyber.check_build)."""
     if value_sol <= 0:
         return 0.0
+    if is_pons(program_label):
+        hf = pool_fee if pool_fee is not None and math.isfinite(pool_fee) and pool_fee > 0 else config.RH_HOOK_FEE
+        return hf + config.RH_TX_FEE_ETH / value_sol
     pf = pool_fee if pool_fee is not None and math.isfinite(pool_fee) and pool_fee > 0 else pool_fee_rate(mcap_sol)
     return pf + JUPITER_FEE_BPS / 1e4 + TX_FEE_LAMPORTS / config.LAMPORTS_PER_SOL / value_sol
 
@@ -63,32 +75,37 @@ def exit_cost_fraction(value_sol: float, res_quote_sol: float | None, mcap_sol: 
     """Everything a swap of ``value_sol`` loses, as a fraction of it: fees plus price impact."""
     if value_sol <= 0:
         return 0.0
-    return min(1.0, fee_fraction(value_sol, mcap_sol, pool_fee) + impact_fraction(value_sol, res_quote_sol, program_label))
+    return min(1.0, fee_fraction(value_sol, mcap_sol, pool_fee, program_label) + impact_fraction(value_sol, res_quote_sol, program_label))
 
 
-def label_size(res_quote_sol) -> float:
+def label_size(res_quote_sol, market=None) -> float:
     """The size every label is priced at (``cost_at_size``'s default) and so the largest position any edge was measured
-    at: ``LABEL_SIZE_SOL``, or ``MAX_POOL_SHARE`` of a shallower pool. Unknown liquidity: ``LABEL_SIZE_SOL``."""
+    at: the market's label size (``LABEL_SIZE_SOL``; RH ``RH_LABEL_SIZE_ETH``), or ``MAX_POOL_SHARE`` of a shallower pool.
+    Unknown liquidity: the label size."""
+    ls = float(config.LABEL_SIZE_SOL) if market is None else market.label_size()
     r = float(res_quote_sol) if res_quote_sol is not None and math.isfinite(float(res_quote_sol)) and float(res_quote_sol) > 0 else None
-    return float(config.LABEL_SIZE_SOL) if r is None else float(min(config.LABEL_SIZE_SOL, config.MAX_POOL_SHARE * r))
+    return ls if r is None else float(min(ls, config.MAX_POOL_SHARE * r))
 
 
-def cost_at_size(ec_0p1, res_quote_sol, size_sol: float | None = None):
+def cost_at_size(ec_0p1, res_quote_sol, size_sol: float | None = None, market=None):
     """``exit_cost_0p1`` (priced for a fixed 0.1 SOL in market/features.py) repriced for the size the book actually
     trades, as a fraction of one side.
 
     Impact is ``value/(value+reserves)``, so the stored feature understates a real exit. The fee part (pool, platform,
     network) is recovered from the stored value and only impact recomputed, so a feature part never has to be rebuilt.
     ``size_sol`` defaults to ``LABEL_SIZE_SOL`` and is capped by ``MAX_POOL_SHARE`` of the pool (``label_size``), which
-    is also the largest buy agent/sizing.py makes.
+    is also the largest buy agent/sizing.py makes. ``market`` (fly_trader/markets.RH): the stored value was priced at
+    0.1 SOL's worth of ETH (0.1·K) with one swap's gas ``RH_TX_FEE_ETH``, and the label size is ``RH_LABEL_SIZE_ETH``.
     Unknown liquidity costs 1.0: a position that cannot be exited. Takes scalars or arrays."""
     ec = np.clip(np.asarray(ec_0p1, dtype=float), 0.0, 1.0)
     r = np.asarray(res_quote_sol, dtype=float)
     ok = np.isfinite(r) & (r > 0)
-    want = size_sol if size_sol is not None else config.LABEL_SIZE_SOL
+    rh = market is not None and market.chain == "rh"
+    want = size_sol if size_sol is not None else (market.label_size() if rh else config.LABEL_SIZE_SOL)
     sz = np.maximum(np.minimum(want, config.MAX_POOL_SHARE * np.where(ok, r, 0.0)), 1e-9)
-    tx = TX_FEE_LAMPORTS / config.LAMPORTS_PER_SOL
-    fees01 = np.clip(ec - np.where(ok, 0.1 / (0.1 + r), 1.0), 0.0, 1.0)      # the stored value minus its own impact term
-    fees = np.clip(fees01 - tx / 0.1 + tx / sz, 0.0, 1.0)                    # the network fee is per trade, not per SOL
+    tx = config.RH_TX_FEE_ETH if rh else TX_FEE_LAMPORTS / config.LAMPORTS_PER_SOL
+    ref = 0.1 * market.k() if rh else 0.1                                     # the size the stored feature was priced at
+    fees01 = np.clip(ec - np.where(ok, ref / (ref + r), 1.0), 0.0, 1.0)      # the stored value minus its own impact term
+    fees = np.clip(fees01 - tx / ref + tx / sz, 0.0, 1.0)                    # the network fee is per trade, not per unit
     out = np.where(ok, np.clip(fees + np.where(ok, sz / (sz + r), 1.0), 0.0, 1.0), 1.0)
     return float(out) if np.ndim(ec_0p1) == 0 else out

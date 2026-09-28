@@ -140,7 +140,10 @@ def run_once(max_ranges: int = 1) -> dict:
                 hops = a["ref_path"] if a["ref_path"] else discover(conn, rpc, a["asset"], int(a["decimals"]))
                 if isinstance(hops, str):
                     hops = json.loads(hops)
-                at, rng = scan.cursor(conn, f"price:{a['asset']}", start - 1)
+                # marks are needed from the first graduation quoted in the asset (a day of history before it for the carry-forward)
+                fg = conn.execute("SELECT min(grad_block) AS b FROM rh_tokens WHERE quote_asset = %s AND grad_block IS NOT NULL", (a["asset"],)).fetchone()["b"]
+                first = max(start, int(fg) - 800_000) if fg is not None else through
+                at, rng = scan.cursor(conn, f"price:{a['asset']}", first - 1)
                 r = conn.execute("SELECT detail FROM rh_scan WHERE name = %s", (f"price:{a['asset']}",)).fetchone()
                 state = ((r["detail"] or {}) if r else {}).get("state", {})
             for _ in range(max_ranges):

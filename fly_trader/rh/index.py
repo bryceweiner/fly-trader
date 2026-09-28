@@ -78,7 +78,8 @@ def _get_logs(rpc, addresses, lo, hi, topics):
     try:
         out = rpc.get_logs_multi(addresses, lo, hi, topics)
     except Exception as e:
-        if ("exceeds limit" in str(e) or "too many" in str(e).lower()) and hi > lo:
+        msg = str(e).lower()
+        if ("exceeds limit" in msg or "too many" in msg or "timed out" in msg or "timeout" in msg) and hi > lo:      # too big a query: halve it
             mid = (lo + hi) // 2
             return _get_logs(rpc, addresses, lo, mid, topics) + _get_logs(rpc, addresses, mid + 1, hi, topics)
         raise

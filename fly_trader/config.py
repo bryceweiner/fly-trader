@@ -237,6 +237,9 @@ RH_LIVE_ENABLED = env_bool("RH_LIVE_ENABLED", False)                # sign and s
 RH_TESTNET = env_bool("RH_TESTNET", False)                          # chain 46630 (the rehearsal); the guard refuses a mismatch
 RH_EXPECTED_CHAIN_ID = 46630 if RH_TESTNET else RH_CHAIN_ID
 RH_RPC_URL_LOGS = env_str("RH_RPC_URL_LOGS")                        # optional better endpoint for eth_getLogs / tx lookups (else RH_RPC_URL)
+# block headers for timing the index (rh/blocktime.py): PublicNode serves header batches fast but refuses eth_getLogs (403),
+# the official RPC serves logs but rate-limits at ~20 requests/min (measured 2026-09-28) — so each does what it does well
+RH_RPC_URL_BLOCKS = env_str("RH_RPC_URL_BLOCKS", "https://robinhood-rpc.publicnode.com")
 RH_BOT_ADDRESS = env_str("RH_BOT_ADDRESS")                          # the address RH_BOT_PRIVATE_KEY must derive to (a guard, not a secret)
 RH_CONFIRMATIONS = env_int("RH_CONFIRMATIONS", 3)                   # blocks before a live receipt or a live log is applied
 RH_START_BLOCK = env_int("RH_START_BLOCK", 0)                       # the indexer's first block (0: the Pons V2 factory's deployment block)
@@ -248,7 +251,9 @@ RH_CAPITAL_ETH = env_float("RH_CAPITAL_ETH", 0.222791)                   # the R
 RH_LABEL_SIZE_ETH = env_float("RH_LABEL_SIZE_ETH", 0.0222791)             # 0.5 SOL at build time: RH labels are priced at it; no RH buy is bigger
 RH_MIN_POSITION_ETH = env_float("RH_MIN_POSITION_ETH", 0.000891166)         # 0.02 SOL at build time
 RH_GAS_RESERVE_ETH = env_float("RH_GAS_RESERVE_ETH", 0.0029)        # 200 round trips at 2x the gas rh-probe measured (356k gas, 0.02 gwei, 2026-09-28)
-RH_MAX_FEE_GWEI = env_float("RH_MAX_FEE_GWEI", 5.0)                 # a transaction never offers more per gas
+RH_MAX_FEE_GWEI = env_float("RH_MAX_FEE_GWEI", 5.0)
+RH_TX_FEE_ETH = env_float("RH_TX_FEE_ETH", 7.2e-6)                 # one swap's gas in ETH (rh-probe 2026-09-28: 356k gas × 0.02 gwei); fixed like the SOL fee
+RH_HOOK_FEE = env_float("RH_HOOK_FEE", 0.029126)                    # Pons hook fee + tax per side (3 % of the net = 2.9126 % of gross, measured) when a minute has none                 # a transaction never offers more per gas
 RH_KILL_SWITCH_DRAWDOWN = env_float("RH_KILL_SWITCH_DRAWDOWN", 0.30)
 RH_MIN_SWEEP_ETH = env_float("RH_MIN_SWEEP_ETH", 0.0002)           # base-asset or dead-bag balances worth less are dust
 RH_STREAM_POLL_S = env_float("RH_STREAM_POLL_S", 2.0)

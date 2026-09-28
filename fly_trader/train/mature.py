@@ -300,13 +300,17 @@ def _supplies() -> dict:
         return {r["mint"]: float(r["supply"]) for r in conn.execute("SELECT mint, supply FROM corpus_meta WHERE supply > 0").fetchall()}
 
 
-def build_day(d: date, lookback_days: int = 1, grads: dict | None = None, supplies: dict | None = None) -> int:
+def build_day(d: date, lookback_days: int = 1, grads: dict | None = None, supplies: dict | None = None, *, src_dir: Path | None = None,
+              out_dir: Path | None = None, program_label: str = "Pump.fun Amm", meta_extra: dict | None = None, extra_md: dict | None = None) -> int:
     """Feature rows for every minute of day D, warmed up on the previous day's candles. ``grads``: mint → graduated_at
-    (default: read from ``corpus_meta``); the part records how many of its mints had one (metadata ``fly_known``)."""
+    (default: read from ``corpus_meta``); the part records how many of its mints had one (metadata ``fly_known``).
+    The keyword arguments build another market's parts from its own aggregates (rh/corpus.py: Robinhood Chain, whose
+    ``*_sol`` columns hold ETH): ``meta_extra`` = mint → extra TokenMeta fields (a Pons pool's fee, the exit-cost size)."""
+    src_dir = src_dir or MATURE_DIR; out_dir = out_dir or MATURE_FEAT_DIR
     t0 = time.time()
     frames = []
     for k in range(lookback_days, -1, -1):
-        f = MATURE_DIR / f"{(d - timedelta(days=k)).isoformat()}.parquet"
+        f = src_dir / f"{(d - timedelta(days=k)).isoformat()}.parquet"
         if f.exists():
             frames.append(pq.read_table(f).to_pandas())
     if not frames:
@@ -324,7 +328,8 @@ def build_day(d: date, lookback_days: int = 1, grads: dict | None = None, suppli
         n_mints += 1
         g = grads[mint].timestamp() if grads.get(mint) else None
         n_known += g is not None
-        st = TokenState(mint); tm = TokenMeta(mint=mint, program_label="Pump.fun Amm", graduated_at=g, supply=supplies.get(mint) or PUMP_SUPPLY)
+        st = TokenState(mint); tm = TokenMeta(mint=mint, program_label=program_label, graduated_at=g, supply=supplies.get(mint) or PUMP_SUPPLY,
+                                              **((meta_extra or {}).get(mint) or {}))
         pre = {k: float("nan") for k in PRE_COLS}
         o, h, l, c = x["open"].to_numpy(), x["high"].to_numpy(), x["low"].to_numpy(), x["close"].to_numpy()
         bs, ss, nb, ns, nt, rq = x["buy_sol"].to_numpy(), x["sell_sol"].to_numpy(), x["n_buys"].to_numpy(), x["n_sells"].to_numpy(), x["n_traders"].to_numpy(), x["resq_sol"].to_numpy()
@@ -358,7 +363,8 @@ def build_day(d: date, lookback_days: int = 1, grads: dict | None = None, suppli
             out.append(row)
     if not out:
         return 0
-    write_part(pa.Table.from_pylist(out, schema=SCHEMA), MATURE_FEAT_DIR / d.isoformat() / "part.parquet", FEATURE_VERSION, {"fly_known": n_known, "fly_agg": AGG_VERSION})
+    write_part(pa.Table.from_pylist(out, schema=SCHEMA), out_dir / d.isoformat() / "part.parquet", FEATURE_VERSION,
+               {"fly_known": n_known, "fly_agg": AGG_VERSION, **(extra_md or {})})
     log.info("mature features %s: %d mints (%d with graduation), %d rows in %.0fs", d, n_mints, n_known, len(out), time.time() - t0)
     return len(out)
 

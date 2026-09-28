@@ -54,6 +54,8 @@ class TokenMeta:
     token2022: bool = False
     stats: dict | None = None  # latest token_stats row (dict) or None
     supply: float = PUMP_SUPPLY  # token supply: market cap = price × supply sets the pool fee tier
+    pool_fee: float | None = None      # the fee a Pons pool charged this minute (rh_minutes.fee_rate); Solana: None (tier by market cap)
+    ec_size: float = 0.1               # exit_cost_0p1's size in the market's unit: 0.1 SOL, or 0.1 SOL's worth of ETH on RH (0.1·K)
 
 
 @dataclass
@@ -250,7 +252,7 @@ class TokenState:
         f[FIDX["vol_divergence"]] = math.log1p((self.cum_vol[-1] - self.cum_vol[idx["5m"]]) / 5.0) - \
             math.log1p((self.cum_vol[-1] - self.cum_vol[idx["1h"]]) / 60.0)
         mask |= (1 << FIDX["mom_decel"]) | (1 << FIDX["vol_divergence"])
-        f[FIDX["exit_cost_0p1"]] = exit_cost_fraction(EXIT_COST_SIZE_SOL, liq, p_now * meta.supply, meta.program_label)   # real fees at this market cap
+        f[FIDX["exit_cost_0p1"]] = exit_cost_fraction(meta.ec_size, liq, p_now * meta.supply, meta.program_label, pool_fee=meta.pool_fee)   # real fees at this market cap
         mask |= 1 << FIDX["exit_cost_0p1"]
         # Jupiter token stats
         st = meta.stats
