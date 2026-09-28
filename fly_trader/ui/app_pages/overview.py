@@ -9,19 +9,21 @@ from fly_trader.agent.selector_session import pinned_snapshot
 from fly_trader.db.queries import q, q1
 from fly_trader.ui import brain3d
 from fly_trader.ui.brain3d import feed
-from fly_trader.ui.common import BOOK, ago, backtest_line, labels, pct, sol, system_state
+from fly_trader.ui.common import ago, amount, backtest_line, chain_picker, labels, pct, system_state
 
 
 def narrative(s: dict) -> str:
-    m = s["model"]; lines = []
+    m = s["model"]; lines = []; mk = s["market"]; u = mk.unit; rh = mk.chain != "sol"
     if m:
-        run = m.get("run") or {}; meta = m["meta"]
-        money = "No real money is at risk." if not s["live_money"] else "Trades spend real SOL from the bot wallet."
+        run = m.get("run") or {}; meta = m["meta"]; mm = meta.get("model") or {}
+        money = "No real money is at risk." if not s["live_money"] else f"Trades spend real {u} from the bot wallet."
+        what = "graduated Pons pool on Robinhood Chain (prices in ETH, a non-ETH quote converted at the minute's base price)" if rh else "PumpSwap token"
+        resq = f"{mk.min_resq():.3g}" if rh else mm.get("min_resq_sol", "—"); vol = f"{mk.min_vol_15m():.3g}" if rh else mm.get("min_vol_15m_sol", "—")
         lines.append(f"**{s['trading_why']}** The selector is paper trading with model **#{m['id']}** (trained through {meta.get('trained_through', '—')}). "
-                     f"Every minute it predicts the net {meta.get('horizon_min', '—')}-minute return of each PumpSwap token that traded, at least {(meta.get('model') or {}).get('min_age_h', '—')} hours "
-                     f"past graduation, with a pool of at least {(meta.get('model') or {}).get('min_resq_sol', '—')} SOL and {(meta.get('model') or {}).get('min_vol_15m_sol', '—')} SOL traded in the last 15 minutes, and buys those predicted to make at least "
+                     f"Every minute it predicts the net {meta.get('horizon_min', '—')}-minute return of each {what} that traded, at least {mm.get('min_age_h', '—')} hours "
+                     f"past graduation, with a pool of at least {resq} {u} and {vol} {u} traded in the last 15 minutes, and buys those predicted to make at least "
                      f"**{pct(float(run.get('threshold') or meta.get('threshold') or 0), 1)}** — sized by how certain the "
-                     f"model is (up to {config.MAX_POSITION_FRACTION:.0%} of the bankroll, never the {config.GAS_RESERVE_SOL:g} SOL gas reserve) — "
+                     f"model is (up to {config.MAX_POSITION_FRACTION:.0%} of the bankroll, never the {mk.gas_reserve():g} {u} gas reserve) — "
                      f"and sells it **{run.get('horizon_min') or meta.get('horizon_min') or 30} minutes** later. {money}")
         lines.append(backtest_line(meta))
         if pinned_snapshot() == m["id"]:
@@ -68,8 +70,8 @@ def brain() -> None:
 
 
 @st.fragment(run_every="5s")
-def summary() -> None:
-    s = system_state()
+def summary(mk) -> None:
+    s = system_state(mk); BOOK = mk.selector_book; u = mk.unit; cap = mk.capital()
     with st.container(border=True):
         st.markdown(narrative(s))
     w = q1("SELECT wealth, exposure, n_open, drawdown FROM wealth_marks WHERE book = %s ORDER BY ts DESC LIMIT 1", (BOOK,)) or {}
@@ -77,11 +79,11 @@ def summary() -> None:
     spark = [float(r["wealth"]) for r in q("SELECT wealth FROM wealth_marks WHERE book = %s ORDER BY ts DESC LIMIT 180", (BOOK,))][::-1]
     n = int(c.get("n") or 0)
     with st.container(horizontal=True):
-        st.metric("Paper wealth", sol(w.get("wealth")), delta=(f"{float(w['wealth']) - config.CAPITAL_SOL:+.4f} SOL since start" if w.get("wealth") is not None else None),
-                  border=True, chart_data=spark or None, help=f"Started at {config.CAPITAL_SOL:g} SOL; open positions valued net of exit costs.")
-        st.metric("Realized P&L", sol(c.get("pnl"), signed=True), border=True, help="Closed trades, after fees and price impact.")
+        st.metric("Paper wealth", amount(w.get("wealth"), u), delta=(f"{float(w['wealth']) - cap:+.4f} {u} since start" if w.get("wealth") is not None else None),
+                  border=True, chart_data=spark or None, help=f"Started at {cap:g} {u}; open positions valued net of exit costs.")
+        st.metric("Realized P&L", amount(c.get("pnl"), u, signed=True), border=True, help="Closed trades, after fees and price impact.")
         st.metric("Closed trades", n, delta=(f"{int(c.get('wins') or 0) / n:.0%} winners" if n else None), delta_color="off", border=True)
-        st.metric("Open positions", int(w.get("n_open") or 0), delta=(f"{float(w.get('exposure') or 0):.2f} SOL at cost" if w else None), delta_color="off", border=True)
+        st.metric("Open positions", int(w.get("n_open") or 0), delta=(f"{float(w.get('exposure') or 0):.3g} {u} at cost" if w else None), delta_color="off", border=True)
         st.metric("Drawdown", pct(w.get("drawdown"), signed=False), border=True, help="Below the book's peak wealth.")
     sel = s["selector"]
     with st.container(border=True):
@@ -93,7 +95,7 @@ def summary() -> None:
             with st.container(horizontal=True):
                 st.metric("Minute (UTC)", str(sel["minute"])[11:16])
                 st.metric("Tokens traded", int(sel.get("mints_traded") or 0))
-                st.metric("Eligible", int(sel.get("eligible") or 0), help="Pool ≥ 20 SOL and ≥ 5 SOL traded in the last 15 minutes.")
+                st.metric("Eligible", int(sel.get("eligible") or 0), help=f"Pool ≥ {mk.min_resq():.3g} {u} and ≥ {mk.min_vol_15m():.3g} {u} traded in the last 15 minutes.")
                 st.metric("Best score", f"{float(sel.get('score_max') or 0):.3f}", delta=f"needs {thr:.3f}", delta_color="off")
                 st.metric("Picks", int(sel.get("picks") or 0))
                 st.metric("Bought / sold", f"{int(sel.get('entered') or 0)} / {int(sel.get('exited') or 0)}")
@@ -108,14 +110,15 @@ def summary() -> None:
 
 
 @st.fragment(run_every="15s")
-def book() -> None:
+def book(mk) -> None:
+    BOOK = mk.selector_book; u = mk.unit
     left, right = st.columns([3, 2])
     with left:
         with st.container(border=True):
             st.markdown("**Paper wealth**")
             hist = q("SELECT ts, wealth FROM wealth_marks WHERE book = %s ORDER BY ts", (BOOK,))
             if hist:
-                st.line_chart(pd.DataFrame(hist), x="ts", y="wealth", x_label="", y_label="SOL", height=240)
+                st.line_chart(pd.DataFrame(hist), x="ts", y="wealth", x_label="", y_label=u, height=240)
             else:
                 st.caption("No marks yet.")
     with right:
@@ -125,49 +128,50 @@ def book() -> None:
             if not rows:
                 st.caption("None open.")
             else:
-                hold = int((system_state().get("model") or {}).get("run", {}).get("horizon_min") or 30)
+                hold = int((system_state(mk).get("model") or {}).get("run", {}).get("horizon_min") or 30)
                 now = datetime.now(timezone.utc); names = labels([r["mint"] for r in rows])
                 df = pd.DataFrame([{"token": names.get(r["mint"], r["mint"][:6]), "strategy": r["strategy"] or "—", "held (min)": (now - r["opened_at"]).total_seconds() / 60,
                                     "exits in (min)": max(0.0, (float(r["hold_s"]) / 60 if r["hold_s"] else hold) - (now - r["opened_at"]).total_seconds() / 60),
-                                    "cost (SOL)": float(r["cost_sol"]),
+                                    f"cost ({u})": float(r["cost_sol"]),
                                     "return": (float(r["last_mark_price"]) / float(r["entry_price"]) - 1) * 100 if r["entry_price"] and r["last_mark_price"] else None}
                                    for r in rows])
                 st.dataframe(df, hide_index=True, column_config={"held (min)": st.column_config.NumberColumn(format="%.0f"),
                                                                  "exits in (min)": st.column_config.NumberColumn(format="%.0f"),
-                                                                 "cost (SOL)": st.column_config.NumberColumn(format="%.3f"),
+                                                                 f"cost ({u})": st.column_config.NumberColumn(format="%.4g"),
                                                                  "return": st.column_config.NumberColumn("return (gross)", format="%+.2f%%")})
 
 
 @st.fragment(run_every="30s")
-def race() -> None:
-    s = system_state(); ho = s["handover"]; fly = s["fly"]
-    marks = q("SELECT ts, book, wealth FROM wealth_marks WHERE book IN ('paper_selector', 'paper_fly', 'live') AND ts > now() - interval '30 days' ORDER BY ts")
+def race(mk) -> None:
+    s = system_state(mk); ho = s["handover"]; fly = s["fly"]; u = mk.unit; books = list(mk.books)
+    marks = q("SELECT ts, book, wealth FROM wealth_marks WHERE book = ANY(%s) AND ts > now() - interval '30 days' ORDER BY ts", (books,))
     if not marks and not (fly.get("stage") and fly.get("stage") != "not trading"):
         return
     since = datetime.now(timezone.utc) - timedelta(days=14)
-    pnl = {r["book"]: r for r in q("SELECT book, COALESCE(sum(realized_sol), 0) AS pnl, count(*) AS n FROM positions WHERE book IN ('paper_selector', 'paper_fly', 'live') "
-                                   "AND status = 'closed' AND closed_at >= %s GROUP BY book", (since,))}
-    start = (q1("SELECT min(ts) AS t FROM wealth_marks WHERE book = 'paper_fly'") or {}).get("t")
+    pnl = {r["book"]: r for r in q("SELECT book, COALESCE(sum(realized_sol), 0) AS pnl, count(*) AS n FROM positions WHERE book = ANY(%s) "
+                                   "AND status = 'closed' AND closed_at >= %s GROUP BY book", (books, since))}
+    start = (q1("SELECT min(ts) AS t FROM wealth_marks WHERE book = %s", (mk.fly_book,)) or {}).get("t")
     with st.container(border=True):
         st.markdown(":material/sports_score: **The race: selector vs plastic fly**")
         if ho:
-            st.success(f"The fly took the selector's seat {ago(ho.get('at'))}: {float(ho.get('fly_pnl_sol') or 0):+.3f} SOL vs {float(ho.get('selector_pnl_sol') or 0):+.3f} SOL "
+            st.success(f"The fly took the selector's seat {ago(ho.get('at'))}: {float(ho.get('fly_pnl_sol') or 0):+.4g} {u} vs {float(ho.get('selector_pnl_sol') or 0):+.4g} {u} "
                        f"over {ho.get('days')} days. " + ("It trades the bot wallet; its paper book is the mirror." if s["live_money"]
-                                                          else "Live trading waits for LIVE_ENABLED=1, the live prerequisites and a funded wallet."), icon=":material/swap_horiz:")
+                                                          else f"Live trading waits for {'RH_LIVE_ENABLED' if mk.chain != 'sol' else 'LIVE_ENABLED'}=1, the live prerequisites and a funded wallet."), icon=":material/swap_horiz:")
         else:
             days = (datetime.now(timezone.utc) - start).total_seconds() / 86400 if start else 0.0
             st.caption("The fly takes the seat when its realized P&L over the last 14 days is at least the selector's, with at least 30 trades"
                        + (f" · racing for {days:.1f} days." if start else " · the race starts when the fly first trades."))
         with st.container(horizontal=True):
-            for book, title in (("paper_selector", "Selector · 14 days"), ("paper_fly", "Fly · 14 days")) + ((("live", "Live · 14 days"),) if ho else ()):
+            for book, title in ((mk.selector_book, "Selector · 14 days"), (mk.fly_book, "Fly · 14 days")) + (((mk.live_book, "Live · 14 days"),) if ho else ()):
                 r = pnl.get(book) or {}
-                st.metric(title, sol(r.get("pnl"), signed=True), delta=f"{int(r.get('n') or 0)} trades", delta_color="off", border=True, help="Realized P&L of closed trades.")
+                st.metric(title, amount(r.get("pnl"), u, signed=True), delta=f"{int(r.get('n') or 0)} trades", delta_color="off", border=True, help="Realized P&L of closed trades.")
         if marks:
             df = pd.DataFrame(marks).pivot_table(index="ts", columns="book", values="wealth")
-            st.line_chart(df, x_label="", y_label="SOL", height=240)
+            st.line_chart(df, x_label="", y_label=u, height=240)
 
 
+mk = chain_picker()
 brain()
-summary()
-race()
-book()
+summary(mk)
+race(mk)
+book(mk)
