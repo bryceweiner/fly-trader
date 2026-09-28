@@ -52,8 +52,20 @@ def _skill_version() -> str:
     return skill_version()
 
 
+def _rh_version() -> dict:
+    """The Robinhood Chain half of the combined dataset: its aggregation, skill space and cost constants (a model trained
+    before RH rows existed, or on other RH definitions, is not current)."""
+    from .. import config
+    if not config.RH_ENABLED:
+        return {"chains": "sol"}
+    from ..rh.corpus import RH_AGG_VERSION
+    from ..rh.wallet_skill import skill_version as rh_skill
+    return {"chains": "sol+rh-1", "rh_agg": RH_AGG_VERSION, "rh_skill": rh_skill(),
+            "rh_costs": f"pons-kyber-1:{config.RH_ETH_PER_SOL:g}:{config.RH_LABEL_SIZE_ETH:g}:{config.RH_TX_FEE_ETH:g}:{config.RH_HOOK_FEE:g}"}
+
+
 DATA_VERSION = {"agg": AGG_VERSION, "features": FEATURE_VERSION, "costs": "real-fees-sized-1", "selector": "multi-1",
-                "cols": hashlib.sha1(",".join(X_COLS).encode()).hexdigest()[:8], "skill": _skill_version(), "meta": "rug-1"}
+                "cols": hashlib.sha1(",".join(X_COLS).encode()).hexdigest()[:8], "skill": _skill_version(), "meta": "rug-1", **_rh_version()}
 WARMUP_DAYS, BLOCK_DAYS = 21, 7      # walk-forward: the first 21 days only train; every later day is tested, refit every 7 days
 MIN_AGE_H = 6.0                      # trade only tokens at least this long past graduation (unknown age = graduated before the archive); fitted, see decisions.HOLD_MIN
 MIN_EV = 0.01                        # the buy line of a model before its walk-forward chose one
