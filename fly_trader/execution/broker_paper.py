@@ -32,7 +32,9 @@ class PaperFill:
 
 class PaperBroker:
     def __init__(self, book: str):
-        assert book in ("paper_selector", "paper_fly") or book.startswith("replay_"), book   # the race books; replay_* for tests
+        from ..markets import MARKETS
+        paper = {b for m in MARKETS.values() for b in m.paper_books}
+        assert book in paper or book.startswith("replay_"), book   # the race books of every market; replay_* for tests
         self.book = book
 
     def buy(self, conn, *, decision_id: int | None, mint: str, pool: str | None, size_sol: float, price: float | None,
@@ -45,7 +47,7 @@ class PaperBroker:
             return PaperFill(False, None, None, 0.0, 0.0, 0, 0.0, "no price")
         if res_quote_sol is None or res_quote_sol <= 0:
             return PaperFill(False, None, None, price, 0.0, 0, 0.0, "no liquidity estimate")
-        fee_frac = fee_fraction(size_sol, mcap_sol, pool_fee)
+        fee_frac = fee_fraction(size_sol, mcap_sol, pool_fee, program_label)
         impact = impact_fraction(size_sol, res_quote_sol, program_label)
         if impact > config.EXECUTABILITY_MAX_IMPACT:
             # a router would not fill this either; refuse like the live executability check
@@ -74,7 +76,7 @@ class PaperBroker:
         gross = qty_raw / (10 ** decimals) * price
         c = exit_cost_fraction(gross, res_quote_sol, mcap_sol, program_label, pool_fee)
         proceeds = gross * (1.0 - c)
-        fee_sol = gross * fee_fraction(gross, mcap_sol, pool_fee)
+        fee_sol = gross * fee_fraction(gross, mcap_sol, pool_fee, program_label)
         if fraction < 0.999:   # partial: shrink the position, realise the sold part
             realized = ledger.realize_partial(conn, position_id=int(position["id"]), qty_raw=qty_raw,
                                               cost_part=float(position["cost_sol"]) * fraction, proceeds_sol=proceeds,

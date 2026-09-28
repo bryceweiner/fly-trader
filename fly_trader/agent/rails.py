@@ -2,7 +2,8 @@
 (CIRCUIT_THRESHOLD consecutive execution failures), the rolling 24 h notional ledger, and PauseEntries (console
 toggle). State lives in circuit_state / circuit_events / notional_ledger; the trading engine reads it before entries.
 One circuit per trading type: ``circuit_id`` 1 is the memecoin live book (the default everywhere), 2 the Kalshi live
-books (``KALSHI_CIRCUIT``, fly_trader/kalshi); ``check_drawdown`` takes the drawdown limit of the caller's type.
+books (``KALSHI_CIRCUIT``, fly_trader/kalshi), 3 the Robinhood Chain memecoin live book (``RH_CIRCUIT``,
+fly_trader/rh); ``check_drawdown`` takes the drawdown limit of the caller's type.
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ from ..db.apilog import record_event
 from ..db.connection import transaction
 
 log = logging.getLogger(__name__)
-SOLANA_CIRCUIT, KALSHI_CIRCUIT = 1, 2
+SOLANA_CIRCUIT, KALSHI_CIRCUIT, RH_CIRCUIT = 1, 2, 3
 
 
 @dataclass
@@ -116,13 +117,14 @@ def clear_book_halt(book: str) -> None:
     record_event("info", "rails", f"{book}: drawdown halt cleared")
 
 
-def notional_24h(conn) -> float:
-    r = conn.execute("SELECT COALESCE(sum(sol), 0) AS s FROM notional_ledger WHERE ts > now() - interval '24 hours'").fetchone()
+def notional_24h(conn, market: str = "sol") -> float:
+    """The last 24 h of entries in ``market``'s unit (``sol`` holds ETH on the ``rh`` market's rows)."""
+    r = conn.execute("SELECT COALESCE(sum(sol), 0) AS s FROM notional_ledger WHERE ts > now() - interval '24 hours' AND market = %s", (market,)).fetchone()
     return float(r["s"])
 
 
-def record_notional(conn, sol: float, kind: str = "entry") -> None:
-    conn.execute("INSERT INTO notional_ledger (sol, kind) VALUES (%s, %s)", (sol, kind))
+def record_notional(conn, sol: float, kind: str = "entry", market: str = "sol") -> None:
+    conn.execute("INSERT INTO notional_ledger (sol, kind, market) VALUES (%s, %s, %s)", (sol, kind, market))
 
 
 def reset_circuit(kill: bool = False, circuit_id: int = SOLANA_CIRCUIT) -> None:

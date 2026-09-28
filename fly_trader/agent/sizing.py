@@ -61,15 +61,18 @@ def band_for(table: list[dict], margin: float) -> dict | None:
 
 
 def size_position(score: float, threshold: float, table: list[dict] | None, bankroll_sol: float, cash_sol: float,
-                  res_quote_sol: float | None, flat: bool = False) -> tuple[float, str]:
-    """(size in SOL, why). Size 0 means skip the buy. ``flat``: ``MAX_POSITION_FRACTION`` of the deployable bankroll on
-    every buy that cleared the line (the fly); otherwise the Kelly band of ``table``."""
-    reserve = config.GAS_RESERVE_SOL; free = cash_sol - reserve
+                  res_quote_sol: float | None, flat: bool = False, market=None) -> tuple[float, str]:
+    """(size in the book's unit, why). Size 0 means skip the buy. ``flat``: ``MAX_POSITION_FRACTION`` of the deployable
+    bankroll on every buy that cleared the line (the fly); otherwise the Kelly band of ``table``. ``market``
+    (fly_trader/markets; default Solana): the gas reserve, minimum position and label size of the book's own market."""
+    rh = market is not None and market.chain != "sol"
+    reserve = market.gas_reserve() if rh else config.GAS_RESERVE_SOL; free = cash_sol - reserve
+    min_pos = market.min_position() if rh else config.MIN_POSITION_SOL
     deployable = max(0.0, bankroll_sol - reserve)
     if flat:
         size = config.MAX_POSITION_FRACTION * deployable; why = f"flat {config.MAX_POSITION_FRACTION:g} of {deployable:.2f} SOL"
     elif not table:
-        size = config.MAX_POSITION_SOL; why = f"fixed {size:g} SOL (model has no sizing table)"
+        size = config.MAX_POSITION_SOL * (market.k() if rh else 1.0); why = f"fixed {size:g} {'ETH' if rh else 'SOL'} (model has no sizing table)"
     else:
         b = band_for(table, score - threshold)
         if b is None or b["kelly"] <= 0:
@@ -77,12 +80,12 @@ def size_position(score: float, threshold: float, table: list[dict] | None, bank
         size = config.KELLY_FRACTION * b["kelly"] * deployable
         why = f"band from +{b['lo']:.3f} over the line: Kelly {b['kelly']:.2f} × {config.KELLY_FRACTION:g} of {deployable:.2f} SOL"
     # the label size is the largest buy any backtest measured: past it the edge is an extrapolation that impact eats
-    caps = {"bankroll cap": config.MAX_POSITION_FRACTION * deployable, "free cash": free, "label size": label_size(res_quote_sol)}
+    caps = {"bankroll cap": config.MAX_POSITION_FRACTION * deployable, "free cash": free, "label size": label_size(res_quote_sol, market if rh else None)}
     limit = min(caps, key=caps.get)
     if caps[limit] < size:
         size = caps[limit]; why += f", capped by {limit}"
-    if size < config.MIN_POSITION_SOL:
-        return 0.0, why + f" → {max(size, 0.0):.3f} SOL is below the {config.MIN_POSITION_SOL:g} SOL minimum"
+    if size < min_pos:
+        return 0.0, why + f" → {max(size, 0.0):.6f} is below the {min_pos:g} minimum"
     return float(size), why + f" → {size:.3f} SOL"
 
 

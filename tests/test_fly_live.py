@@ -130,7 +130,8 @@ def test_the_handover_gate_reads_its_thresholds_from_config(db_conn, monkeypatch
     count, and HANDOVER_BEAT_SELECTOR=0 drops the race against the paper selector."""
     from fly_trader.agent import fly_session, handover
     now = datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc); race = now - timedelta(days=2)
-    stub = SimpleNamespace(race_started_at=race.timestamp(), boot_id=62)
+    from fly_trader import markets
+    stub = SimpleNamespace(race_started_at=race.timestamp(), boot_id=62, chain="sol", market=markets.SOL, BOOK="paper_fly")
     with transaction() as conn:
         conn.execute("DELETE FROM ui_settings WHERE key = %s", (handover.KEY,)); conn.execute("DELETE FROM positions WHERE mint LIKE 'HAND_%%'")
         for i in range(20):
@@ -168,7 +169,7 @@ def test_live_calibration_spends_the_teachers_trade_budget(monkeypatch):
     monkeypatch.setattr(fs.fly_calibrate, "calibrate", lambda *a, **kw: calls.append((len(a[0]), kw)) or real(*a, **kw))
     monkeypatch.setattr(fs, "record_event", lambda *a, **k: None)
     conn = SimpleNamespace(execute=lambda *a, **k: None)
-    me = SimpleNamespace(names=["capitulation"], holds={"capitulation": 4 * 3600.0}, lines={"plastic": {"capitulation": 0.02}, "frozen": {"capitulation": 0.02}},
+    me = SimpleNamespace(chain="sol", names=["capitulation"], holds={"capitulation": 4 * 3600.0}, lines={"plastic": {"capitulation": 0.02}, "frozen": {"capitulation": 0.02}},
                          sizing={"plastic": {"capitulation": []}, "frozen": {"capitulation": []}}, _resolved=lambda conn, since, cols, name: rows)
     fs.FlyBook._calibrate(me, conn, t0 + 86400.0)
     known = [r for r in rows if r["teacher_allow"] is not None]

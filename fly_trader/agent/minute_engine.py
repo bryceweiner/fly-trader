@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
+from .. import markets
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..market.exit_cost import PUMP_SUPPLY
@@ -78,6 +79,7 @@ class Minute:
     fresh: bool
     trade: bool
     engine: "MinuteEngine"
+    market: object = None     # fly_trader/markets.MarketSpec of these rows (None: Solana)
 
     @property
     def t_start(self) -> float:
@@ -91,7 +93,11 @@ class Minute:
 
 
 class MinuteEngine:
-    def __init__(self, books: list | None = None, live: bool = False):
+    """One market's minutes (``market``: Solana — pump_minutes, corpus_meta — or Robinhood Chain — rh_minutes, rh_meta,
+    amounts in ETH). The engines of both markets share one list of books; each minute goes only to its market's books."""
+
+    def __init__(self, books: list | None = None, live: bool = False, market=None):
+        self.spec = market or markets.SOL; self.rh = self.spec.chain != "sol"
         self.books = list(books or []); self.live = live
         self.states: dict[str, MintState] = {}
         self.meta_cache: dict[str, dict] = {}; self.last_sweep = time.time(); self.last_minute: float | None = None
@@ -100,21 +106,30 @@ class MinuteEngine:
     def has_book(self, name: str) -> bool:
         return any(b.name == name for b in self.books)
 
+    def my_books(self) -> list:
+        return [b for b in self.books if getattr(b, "chain", "sol") == self.spec.chain]
+
     # ---- lookups ----
     def _meta(self, conn, mint: str) -> dict | None:
         """``corpus_meta`` row (graduation time + creation/creator features), cached for 10 minutes: rows appear at
         graduation and the archive rebuild later replaces stream values, so the cache is refreshed."""
         hit = self.meta_cache.get(mint)
         if hit is None or time.time() - hit["at"] > META_TTL_S:
-            r = conn.execute("SELECT graduated_at, supply, " + ", ".join(META_COLS) + " FROM corpus_meta WHERE mint = %s", (mint,)).fetchone()
+            if self.rh:                                  # Robinhood Chain: rh_meta, the same columns (rh/meta.py), plus the quote class
+                r = conn.execute("SELECT graduated_at, supply, quote_class, " + ", ".join(META_COLS) + " FROM rh_meta WHERE mint = %s", (mint,)).fetchone()
+            else:
+                r = conn.execute("SELECT graduated_at, supply, " + ", ".join(META_COLS) + " FROM corpus_meta WHERE mint = %s", (mint,)).fetchone()
             hit = self.meta_cache[mint] = {"row": dict(r) if r else None, "at": time.time()}
         return hit["row"]
 
     def _state(self, conn, mint: str, pool: str | None, program_label: str | None) -> MintState:
         s = self.states.get(mint)
         if s is None:
-            t = conn.execute("SELECT decimals FROM tokens WHERE mint = %s", (mint,)).fetchone()
-            s = MintState(mint, int((t or {}).get("decimals") or 6), pool, program_label, None, None)
+            if self.rh:                                  # every Pons launch has 18 decimals
+                s = MintState(mint, 18, pool, program_label, None, None); s.meta.ec_size = 0.1 * self.spec.k()
+            else:
+                t = conn.execute("SELECT decimals FROM tokens WHERE mint = %s", (mint,)).fetchone()
+                s = MintState(mint, int((t or {}).get("decimals") or 6), pool, program_label, None, None)
             self.states[mint] = s
         row = self._meta(conn, mint)
         s.meta_row = row
@@ -128,8 +143,11 @@ class MinuteEngine:
         s = self.states.get(mint)
         if s is not None and s.st.last_res_quote_sol:
             return s.st.last_res_quote_sol
-        r = conn.execute("SELECT resq_sol FROM pump_minutes WHERE mint = %s AND resq_sol IS NOT NULL ORDER BY ts DESC LIMIT 1", (mint,)).fetchone()
-        return float(r["resq_sol"]) if r else None
+        if self.rh:
+            r = conn.execute("SELECT resq_eth AS q FROM rh_minutes WHERE mint = %s AND resq_eth IS NOT NULL ORDER BY ts DESC LIMIT 1", (mint,)).fetchone()
+        else:
+            r = conn.execute("SELECT resq_sol AS q FROM pump_minutes WHERE mint = %s AND resq_sol IS NOT NULL ORDER BY ts DESC LIMIT 1", (mint,)).fetchone()
+        return float(r["q"]) if r else None
 
     def _mcap(self, mint: str, price: float | None) -> float | None:
         """Market cap in SOL (price × supply), which sets the pool fee tier; None without a price."""
@@ -138,7 +156,16 @@ class MinuteEngine:
 
     # ---- one minute ----
     def _aggregate(self, conn, m0: datetime, m1: datetime) -> dict[str, dict]:
-        """PumpAPI minutes: every SOL-quoted PumpSwap pump.fun token, the same fields as the archive."""
+        """PumpAPI minutes: every SOL-quoted PumpSwap pump.fun token, the same fields as the archive. Robinhood Chain: the
+        rh_minutes of graduated Pons pools in ETH (rh/minutes.py), under the same keys."""
+        if self.rh:
+            rows = conn.execute("SELECT mint, pool_id, open, high, low, close, buy_eth, sell_eth, n_buys, n_sells, n_traders, resq_eth, fee_rate, "
+                                "n_buyers, wash_eth, wash_buy_eth, top_sell_eth, insider_sell_eth, skill_buy FROM rh_minutes WHERE ts = %s", (m0,)).fetchall()
+            return {r["mint"]: {"open": r["open"], "high": r["high"], "low": r["low"], "close": r["close"], "buy": r["buy_eth"] or 0.0, "sell": r["sell_eth"] or 0.0,
+                                "nb": r["n_buys"] or 0, "ns": r["n_sells"] or 0, "n_traders": int(r["n_traders"] or 0), "resq": r["resq_eth"],
+                                "pool": r["pool_id"], "program_label": self.spec.program_label, "fee_rate": r["fee_rate"],
+                                "n_buyers": r["n_buyers"], "wash_sol": r["wash_eth"], "wash_buy_sol": r["wash_buy_eth"], "top_sell_sol": r["top_sell_eth"],
+                                "insider_sell_sol": r["insider_sell_eth"], "skill_buy": r["skill_buy"]} for r in rows if r["close"]}
         rows = conn.execute("SELECT mint, pool_id, open, high, low, close, buy_sol, sell_sol, n_buys, n_sells, n_traders, resq_sol, fee_rate, "
                             "n_buyers, wash_sol, wash_buy_sol, top_sell_sol, insider_sell_sol, skill_buy FROM pump_minutes WHERE ts = %s", (m0,)).fetchall()
         return {r["mint"]: {"open": r["open"], "high": r["high"], "low": r["low"], "close": r["close"], "buy": r["buy_sol"] or 0.0, "sell": r["sell_sol"] or 0.0,
@@ -151,7 +178,9 @@ class MinuteEngine:
         """The full feature vector (``X_COLS``) of a mint for the minute ending ``t_end``, and what trading needs."""
         s = self._state(conn, mint, a["pool"], a["program_label"])
         st, price, resq = s.st, float(a["close"]), a["resq"]
-        if (s.prev_close and not (1 / 50 <= price / s.prev_close <= 50)) or (resq is not None and resq > 1e5):
+        if self.rh:
+            s.meta.pool_fee = a.get("fee_rate")          # the Pons hook fee this minute charged (the cost model's fee)
+        if (s.prev_close and not (1 / 50 <= price / s.prev_close <= 50)) or (resq is not None and resq > 1e5 * self.spec.k()):
             s.broken = True                          # train/decisions.py: a scale break makes the mint ineligible from that minute on
         s.prev_close = price
         if a["buy"] > 0:
@@ -175,21 +204,27 @@ class MinuteEngine:
                  "meta_known": 1.0 if meta.get("ttg_min") is not None else 0.0, **s.flow.features(t_end), "mkt_vol_1h": self.market.value(t_end)}
         by_name = {**{n: float(f[i]) for i, n in enumerate(FEATURES)}, **extra,
                    **{c: float(meta.get(c)) if meta.get(c) is not None else 0.0 for c in META_COLS}}
+        if self.rh:                                      # the chain inputs (train/decisions.CHAIN_COLS)
+            qc = meta.get("quote_class")
+            by_name.update(chain_rh=1.0, qc_stable=float(qc == "stable"), qc_btc=float(qc == "btc"), qc_stock=float(qc == "stock"))
         x = np.nan_to_num(np.asarray([by_name.get(c, 0.0) for c in X_COLS], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         info = {"price": price, "open": float(a["open"]) if a.get("open") else price, "resq": resq, "logvol_15m": f[FIDX["logvol_15m"]],
                 # "ec" is the training label's own cost model (market/exit_cost.cost_at_size), at the size the book trades
-                "ec": float(cost_at_size(f[FIDX["exit_cost_0p1"]], resq)), "age_h": (t_end - s.graduated_at) / 3600 if s.graduated_at else None,
+                "ec": float(cost_at_size(f[FIDX["exit_cost_0p1"]], resq, market=self.spec if self.rh else None)),
+                "age_h": (t_end - s.graduated_at) / 3600 if s.graduated_at else None,
                 "mcap": price * s.meta.supply, "fee_rate": a.get("fee_rate"), "decimals": s.decimals, "pool": s.pool, "program_label": s.program_label, "broken": s.broken,
-                "skill_missing": a.get("skill_buy") is None, "curve_known": bool(meta.get("curve_known"))}
+                "skill_missing": a.get("skill_buy") is None, "curve_known": bool(meta.get("curve_known")), "chain": self.spec.chain,
+                "quote_class": meta.get("quote_class")}
         return x, info
 
-    @staticmethod
-    def eligible(info: dict) -> bool:
+    def eligible(self, info: dict) -> bool:
+        if self.rh:                                      # the same gates in the chain's unit (x K), as training (train/decisions)
+            return not info["broken"] and info["resq"] is not None and info["resq"] >= self.spec.min_resq() and info["logvol_15m"] >= math.log1p(self.spec.min_vol_15m())
         return not info["broken"] and info["resq"] is not None and info["resq"] >= MIN_RESQ_SOL and info["logvol_15m"] >= math.log1p(MIN_VOL_15M_SOL)
 
     def _stream_through(self) -> float | None:
         with transaction() as conn:
-            r = conn.execute("SELECT value->>'flushed_through' AS ft FROM ui_settings WHERE key = 'pumpstream_status'").fetchone()
+            r = conn.execute("SELECT value->>'flushed_through' AS ft FROM ui_settings WHERE key = %s", (self.spec.stream_status_key,)).fetchone()
         return datetime.fromisoformat(r["ft"]).timestamp() if r and r["ft"] else None
 
     def ready_through(self, m1_epoch: float) -> float:
@@ -224,7 +259,7 @@ class MinuteEngine:
                 for mint, a in agg.items():
                     _x, info = self._features(conn, mint, a, t1); n += 1
                     bars[mint] = (t1 - 60.0, info["open"], info["price"], info["ec"])
-                for b in self.books:
+                for b in self.my_books():
                     b.on_bars(t1 - 60.0, bars)
         log.info("warm-up: %d token-minutes over the last %d minutes (%d tokens)", n, minutes, len(self.states))
         return n
@@ -247,9 +282,10 @@ class MinuteEngine:
             X, infos, mints, bars = self._minute_rows(conn, agg, m1_epoch)
             ctx = Minute(conn=conn, m0=m0, m1=m1, m1_epoch=m1_epoch, agg=agg, X=X, infos=infos, mints=mints, bars=bars,
                          prices={m: float(a["close"]) for m, a in agg.items()}, resqs={m: a["resq"] for m, a in agg.items()},
-                         fees={m: a.get("fee_rate") for m, a in agg.items()}, fresh=trade and self.stream_fresh(m1_epoch - 60), trade=trade, engine=self)
+                         fees={m: a.get("fee_rate") for m, a in agg.items()}, fresh=trade and self.stream_fresh(m1_epoch - 60), trade=trade, engine=self,
+                         market=self.spec)
             out.update(mints_traded=len(agg), eligible=len(mints)); held: set[str] = set()
-            for b in list(self.books):
+            for b in list(self.my_books()):
                 try:
                     with conn.transaction():                            # a savepoint per book
                         b.on_bars(m1_epoch - 60.0, bars)
@@ -259,7 +295,7 @@ class MinuteEngine:
                     log.exception("%s: minute %s failed", b.name, m1.isoformat())
                     record_event("error", b.name, f"minute failed: {m1.isoformat()}")
             self._sweep(m1_epoch, held)
-        for b in [b for b in self.books if b.done]:
+        for b in [b for b in self.my_books() if b.done]:
             b.finish(); self.books.remove(b)
         return out
 
@@ -288,35 +324,45 @@ def admit_books(engine: MinuteEngine, live: bool) -> list:
     from . import fly_session, handover
     from .selector_session import NoModel, SelectorBook
     new = []
-    if not engine.has_book("fly"):
-        fb, why = fly_session.try_start(live)
-        if fb is not None:
-            new.append(fb)
-        else:
-            _status("fly_status", {"stage": "not trading", "detail": why})
-    fly_on = engine.has_book("fly") or bool(new)
-    with transaction() as conn:
-        handed = handover.state(conn) is not None
-    if not engine.has_book("selector") and not (handed and fly_on):
-        try:
-            new.append(SelectorBook())
-        except NoModel as e:
-            _status("selector_status", {"stage": "waiting for a model", "detail": str(e)})
+    for m in markets.enabled():                         # Solana first: another chain's fly shares the Solana fly's brain
+        fly_name = "fly" if m.chain == "sol" else f"fly_{m.chain}"; sel_name = "selector" if m.chain == "sol" else f"selector_{m.chain}"
+        if not engine.has_book(fly_name) and not any(b.name == fly_name for b in new):
+            brain = next((b for b in engine.books + new if b.name == "fly"), None) if m.chain != "sol" else None
+            fb, why = fly_session.try_start(live, chain=m.chain, brain=brain)
+            if fb is not None:
+                new.append(fb)
+            else:
+                _status(m.fly_status_key, {"stage": "not trading", "detail": why, "chain": m.chain})
+        fly_on = engine.has_book(fly_name) or any(b.name == fly_name for b in new)
+        with transaction() as conn:
+            handed = handover.state(conn, m.chain) is not None
+        if not engine.has_book(sel_name) and not (handed and fly_on):
+            try:
+                new.append(SelectorBook(m.chain))
+            except NoModel as e:
+                _status(m.selector_status_key, {"stage": "waiting for a model", "detail": str(e), "chain": m.chain})
     return new
 
 
 def main(stop_event: threading.Event | None = None, live: bool = False) -> None:
-    engine = MinuteEngine(live=live)
+    """One engine per enabled chain (markets.enabled()), all sharing one list of books: each engine feeds its minutes, as
+    its own stream writes them, to its chain's books only — a lagging chain never holds another chain's minutes back."""
+    engines = [MinuteEngine(live=live, market=m) for m in markets.enabled()]
+    lead = engines[0]; books: list = []
+    for e in engines:
+        e.books = books                                  # the same list object: admission and removal are seen by every engine
     while not (stop_event is not None and stop_event.is_set()):
-        engine.books = admit_books(engine, live)
-        if engine.books:
+        books += admit_books(lead, live)
+        if books:
             break
         log.info("trading engine waiting: no book qualifies yet")
         (stop_event or threading.Event()).wait(MODEL_CHECK_S)
     else:
         return
     m_start = math.floor(time.time() / 60) * 60
-    engine.warm_up(m_start); engine.last_minute = m_start - 60; last_check = time.time(); n_min = 0
+    for e in engines:
+        e.warm_up(m_start); e.last_minute = m_start - 60
+    last_check = time.time(); n_min = 0
     last_release, last_stamp_check = release_stamp(), 0.0
     try:
         while not (stop_event is not None and stop_event.is_set()):
@@ -327,30 +373,34 @@ def main(stop_event: threading.Event | None = None, live: bool = False) -> None:
                     last_release, last_check = stamp, 0.0
             if now - last_check >= MODEL_CHECK_S:
                 last_check = now
-                for b in engine.books:
+                for b in books:
                     try:
                         b.maybe_reload()
                     except Exception:
                         log.exception("%s: model reload check failed", b.name)
                 try:
-                    engine.books += admit_books(engine, live)
+                    books += admit_books(lead, live)
                 except Exception:
                     log.exception("book admission failed")
-            if engine.books and m1 > engine.last_minute and now - m1 >= 4.0 and (upto := engine.ready_through(m1)) > engine.last_minute:   # only minutes the stream has written
+            for engine in engines:
+                if not engine.my_books() or m1 <= engine.last_minute or now - m1 < 4.0:
+                    continue
+                if (upto := engine.ready_through(m1)) <= engine.last_minute:        # only minutes this chain's stream has written
+                    continue
                 for minute in range(int(engine.last_minute) + 60, int(upto) + 1, 60):
                     try:
                         st = engine.run_minute(float(minute), trade=(minute == int(m1)))   # missed minutes update features (and the fly's learning) only
                         n_min += 1
                         if minute == int(m1) and n_min % 10 == 0:
-                            log.info("minute %s: traded %d eligible %d | %s", st["minute"], st.get("mints_traded", 0), st.get("eligible", 0),
+                            log.info("%s minute %s: traded %d eligible %d | %s", engine.spec.chain, st["minute"], st.get("mints_traded", 0), st.get("eligible", 0),
                                      " | ".join(f"{b.name}: picks {(st.get(b.name) or {}).get('picks')} open {(st.get(b.name) or {}).get('open')} wealth {(st.get(b.name) or {}).get('wealth')}"
-                                                for b in engine.books))
+                                                for b in engine.my_books()))
                     except Exception:
-                        log.exception("minute %s failed", minute); record_event("error", "engine", f"minute failed: {minute}")
+                        log.exception("%s minute %s failed", engine.spec.chain, minute); record_event("error", "engine", f"{engine.spec.chain} minute failed: {minute}")
                 engine.last_minute = upto
             time.sleep(0.5)
     finally:
-        for b in engine.books:
+        for b in books:
             try:
                 b.finish()
             except Exception:

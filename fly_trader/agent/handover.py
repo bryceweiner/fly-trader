@@ -11,14 +11,22 @@ import json
 KEY = "handover"
 
 
-def state(conn) -> dict | None:
-    r = conn.execute("SELECT value FROM ui_settings WHERE key = %s", (KEY,)).fetchone()
+def _key(chain: str | None) -> str:
+    """Each chain's fly takes its own chain's seat (fly_trader/markets: 'handover', 'handover_rh')."""
+    if chain in (None, "sol"):
+        return KEY
+    from ..markets import for_chain
+    return for_chain(chain).handover_key
+
+
+def state(conn, chain: str | None = "sol") -> dict | None:
+    r = conn.execute("SELECT value FROM ui_settings WHERE key = %s", (_key(chain),)).fetchone()
     if not r or r["value"] is None:
         return None
     v = r["value"] if isinstance(r["value"], dict) else json.loads(r["value"])
     return v or None
 
 
-def record(conn, detail: dict) -> None:
+def record(conn, detail: dict, chain: str | None = "sol") -> None:
     conn.execute("INSERT INTO ui_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-                 (KEY, json.dumps(detail, default=str)))
+                 (_key(chain), json.dumps(detail, default=str)))

@@ -50,23 +50,40 @@ def pinned_snapshot() -> int | None:
     return int(v) if v is not None else None
 
 
-class SelectorBook:
-    name = "selector"
+def chain_deployable(model, chain: str) -> tuple[bool, str]:
+    """Whether the selector may trade ``chain``: Solana by its own deployability (as before); another chain only when the
+    combined stack's holdout on that chain's rows showed an edge (train/strategies.score_holdout_by_chain)."""
+    if chain == "sol":
+        return True, "ok"
+    c = ((getattr(model, "metrics", None) or {}).get("chains") or {}).get(chain)
+    if not c:
+        return False, f"the selector was not judged on {chain} rows"
+    return bool(c.get("deployable")), f"{chain} holdout: {c.get('n', 0)} trades, mean {(c.get('mean') or 0) * 100:+.2f}% (random {(c.get('random_mean') or 0) * 100:+.2f}%)"
 
-    def __init__(self):
+
+class SelectorBook:
+    def __init__(self, chain: str = "sol"):
+        from .. import markets
         from ..train import selector as sel
+        self.chain = chain; self.market = markets.for_chain(chain)
+        self.name = "selector" if chain == "sol" else f"selector_{chain}"
+        self.BOOK = self.market.selector_book; self.KIND = self.name; self.status_key = self.market.selector_status_key
         pin = pinned_snapshot()
         self.model = sel.load_snapshot(pin) if pin is not None else sel.load_latest()
         if self.model is None:
             raise NoModel("no model has qualified to trade yet (trained on the current data, with a backtest that made money after costs and beat random picks)")
+        ok, why = chain_deployable(self.model, chain)
+        if not ok:
+            raise NoModel(f"the selector may not trade {self.market.name}: {why}")
         self.idx = _columns(self.model)
         self.horizon_s = self.model.horizon_min * 60
-        self.broker = PaperBroker(BOOK); self.done = False
+        self.broker = PaperBroker(self.BOOK); self.done = False
         self.run_id = str(uuid.uuid4()); self.beat_no = 0
         with transaction() as conn:
             self.snapshot_id = pin if pin is not None else sel.latest_current(conn)["id"]   # the snapshot actually loaded
             conn.execute("INSERT INTO runs (run_id, kind, config, brain_snapshot_id, status) VALUES (%s,%s,%s,%s,'running')",
-                         (self.run_id, KIND, json.dumps({"threshold": self.model.threshold, "horizon_min": self.model.horizon_min, "book": BOOK}, default=str), self.snapshot_id))
+                         (self.run_id, self.KIND, json.dumps({"threshold": self.model.threshold, "horizon_min": self.model.horizon_min, "book": self.BOOK, "chain": chain},
+                                                             default=str), self.snapshot_id))
         record_event("info", "selector", "selector session started", {"run_id": self.run_id, "snapshot": self.snapshot_id, "threshold": self.model.threshold, "horizon_min": self.model.horizon_min})
         log.info("selector session: snapshot %d threshold %.4f horizon %d min", self.snapshot_id, self.model.threshold, self.model.horizon_min)
 
@@ -94,7 +111,7 @@ class SelectorBook:
         old = self.snapshot_id; self.model, self.idx, self.snapshot_id, self.horizon_s = m, idx, r["id"], m.horizon_min * 60
         with transaction() as conn:
             conn.execute("UPDATE runs SET brain_snapshot_id = %s, config = %s WHERE run_id = %s",
-                         (r["id"], json.dumps({"threshold": m.threshold, "horizon_min": m.horizon_min, "book": BOOK}, default=str), self.run_id))
+                         (r["id"], json.dumps({"threshold": m.threshold, "horizon_min": m.horizon_min, "book": self.BOOK}, default=str), self.run_id))
         record_event("info", "selector", f"switched to model #{r['id']}", {"from": old, "to": r["id"], "threshold": m.threshold})
         log.info("switched from model #%s to #%d (threshold %.4f)", old, r["id"], m.threshold)
         return True
@@ -103,7 +120,7 @@ class SelectorBook:
         pass
 
     def open_mints(self, conn) -> set[str]:
-        return {p["mint"] for p in ledger.open_positions(conn, BOOK)}
+        return {p["mint"] for p in ledger.open_positions(conn, self.BOOK)}
 
     def _decide(self, ctx) -> dict | None:
         """The strategy stack's per-row decision (train/strategies.decide), with the live fail-closed rules: rows whose
@@ -140,10 +157,10 @@ class SelectorBook:
             status = {**summary, "stage": "stream stale: holding (no entries or exits)", "updated_at": datetime.now(timezone.utc).isoformat()}
             self._write_status(conn, status)
             return status
-        handed = handover.state(conn) is not None and ctx.engine.has_book("fly")
+        handed = handover.state(conn, self.chain) is not None and ctx.engine.has_book("fly" if self.chain == "sol" else f"fly_{self.chain}")
         self.beat_no += 1
         extra = {} if d is None else {"holds": d["hold_s"], "strategies": d["strategy"], "allow": d["allow"], "reasons": d["reason"], "tables": d["tables"]}
-        st = paper_trading.trade_minute(ctx, book=BOOK, run_id=self.run_id, beat_no=self.beat_no, broker=self.broker, kind=KIND, mints=ctx.mints, infos=ctx.infos,
+        st = paper_trading.trade_minute(ctx, book=self.BOOK, run_id=self.run_id, beat_no=self.beat_no, broker=self.broker, kind=self.KIND, mints=ctx.mints, infos=ctx.infos,
                                         scores=scores, threshold=thr, table=getattr(self.model, "sizing", None), horizon_s=self.horizon_s,
                                         block="handed over to the fly" if handed else None, **extra)
         if handed and st["open"] == 0:
@@ -154,10 +171,9 @@ class SelectorBook:
         self._write_status(conn, status)
         return status
 
-    @staticmethod
-    def _write_status(conn, status: dict) -> None:
-        conn.execute("INSERT INTO ui_settings (key, value) VALUES ('selector_status', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-                     (json.dumps(status, default=str),))
+    def _write_status(self, conn, status: dict) -> None:
+        conn.execute("INSERT INTO ui_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+                     (self.status_key, json.dumps({**status, "chain": self.chain}, default=str)))
 
     def finish(self) -> None:
         with transaction() as conn:

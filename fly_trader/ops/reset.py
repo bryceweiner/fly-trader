@@ -28,10 +28,11 @@ from ..db.connection import transaction
 
 log = logging.getLogger(__name__)
 
-PRESERVED_BOOKS = ("live", "paper_selector", "paper_fly", "paper_kalshi_taker", "paper_kalshi_maker", "live_kalshi_taker", "live_kalshi_maker")
-RACE_RUN_KINDS = ("selector", "fly", "kalshi_fly")
+PRESERVED_BOOKS = ("live", "paper_selector", "paper_fly", "live_rh", "paper_rh_selector", "paper_rh_fly", "paper_kalshi_taker", "paper_kalshi_maker", "live_kalshi_taker", "live_kalshi_maker")
+RACE_RUN_KINDS = ("selector", "fly", "kalshi_fly", "selector_rh", "fly_rh")
 MODEL_KINDS = ("selector", "fly_selector", "fly_plastic", "kalshi_selector", "kalshi_fly_selector", "kalshi_fly_plastic")
 FLY_BOOK, FLY_RUN_KIND = "paper_fly", "fly"
+FLY_BOOKS, FLY_RUN_KINDS = ("paper_fly", "paper_rh_fly"), ("fly", "fly_rh")     # one brain: both chains' fly books reset together
 FLY_TABLES = ["fly_scored", "fly_calibrations", "fly_updates", "fly_rollbacks"]
 BOOK_TABLES = ["positions", "orders", "fills"]
 TRAINING_EVENTS = {"selector": "(source = 'selector' AND (message LIKE 'walk-forward%' OR message LIKE 'selector saved%'))",   # per regimen: a fly
@@ -50,9 +51,9 @@ _KEPT_DECISIONS = (f"SELECT decision_id FROM orders WHERE book IN {_BOOKS} AND d
                    f"UNION SELECT entry_decision_id FROM positions WHERE book IN {_BOOKS} AND entry_decision_id IS NOT NULL "
                    f"UNION SELECT exit_decision_id FROM positions WHERE book IN {_BOOKS} AND exit_decision_id IS NOT NULL "
                    f"UNION SELECT id FROM decisions WHERE run_id IN ({_RACE_RUNS})")
-_LIVE_DECISIONS = ("SELECT decision_id FROM orders WHERE book = 'live' AND decision_id IS NOT NULL "
-                   "UNION SELECT entry_decision_id FROM positions WHERE book = 'live' AND entry_decision_id IS NOT NULL "
-                   "UNION SELECT exit_decision_id FROM positions WHERE book = 'live' AND exit_decision_id IS NOT NULL")
+_LIVE_DECISIONS = ("SELECT decision_id FROM orders WHERE book IN ('live', 'live_rh') AND decision_id IS NOT NULL "
+                   "UNION SELECT entry_decision_id FROM positions WHERE book IN ('live', 'live_rh') AND entry_decision_id IS NOT NULL "
+                   "UNION SELECT exit_decision_id FROM positions WHERE book IN ('live', 'live_rh') AND exit_decision_id IS NOT NULL")
 
 
 def _archive(conn, table: str, where: str, out_dir: Path) -> int:
@@ -90,7 +91,7 @@ def reset_training_state(reason: str = "runner start", archive: bool = True) -> 
         counts = _wipe(conn, plan, out_dir if archive else None)
         conn.execute(f"UPDATE brain_state SET live_snapshot_id = CASE WHEN (SELECT kind FROM brain_snapshots WHERE id = live_snapshot_id) IN {_KINDS} THEN live_snapshot_id END, "
                      f"pending_snapshot_id = CASE WHEN (SELECT kind FROM brain_snapshots WHERE id = pending_snapshot_id) IN {_KINDS} THEN pending_snapshot_id END, updated_at = now() WHERE singleton")
-        conn.execute("DELETE FROM ui_settings WHERE key = 'selector_status'")
+        conn.execute("DELETE FROM ui_settings WHERE key IN ('selector_status', 'selector_status_rh')")
         conn.execute("INSERT INTO circuit_events (kind, detail) VALUES ('training_reset', %s)", (f'{{"reason": "{reason}"}}',))
     record_event("info", "reset", f"training state reset ({reason})", {"archived_to": str(out_dir) if archive else None, "rows": counts})
     log.info("training state reset (%s): %s", reason, counts)
@@ -151,18 +152,19 @@ def reset_fly(reason: str = "operator", archive: bool = True) -> dict:
     """The plastic fly starts again from its bootstrap: its paper book, sessions, learned state and statistics are
     archived and cleared. The live book, the selector's book and the bootstrap snapshots are kept."""
     out_dir = config.PG_ARCHIVE_DIR / f"reset_fly_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
-    fly_runs = f"SELECT run_id FROM runs WHERE kind = '{FLY_RUN_KIND}'"
+    kinds, books = _sql_list(FLY_RUN_KINDS), _sql_list(FLY_BOOKS)
+    fly_runs = f"SELECT run_id FROM runs WHERE kind IN {kinds}"
     plan = [("decisions", f"WHERE run_id IN ({fly_runs}) AND id NOT IN ({_LIVE_DECISIONS})"),
             ("beats", f"WHERE run_id IN ({fly_runs})"),
-            ("wealth_marks", f"WHERE book = '{FLY_BOOK}'"),
-            *[(t, f"WHERE book = '{FLY_BOOK}'") for t in BOOK_TABLES],
+            ("wealth_marks", f"WHERE book IN {books}"),
+            *[(t, f"WHERE book IN {books}") for t in BOOK_TABLES],
             ("brain_snapshots", "WHERE kind = 'fly_plastic'"),
-            ("runs", f"WHERE kind = '{FLY_RUN_KIND}'"),
+            ("runs", f"WHERE kind IN {kinds}"),
             *[(t, "") for t in FLY_TABLES]]
     with transaction() as conn:
         counts = _wipe(conn, plan, out_dir if archive else None)
-        conn.execute("DELETE FROM book_state WHERE book = %s", (FLY_BOOK,))
-        conn.execute("DELETE FROM ui_settings WHERE key = 'fly_status'")
+        conn.execute("DELETE FROM book_state WHERE book = ANY(%s)", (list(FLY_BOOKS),))
+        conn.execute("DELETE FROM ui_settings WHERE key IN ('fly_status', 'fly_status_rh')")
     for d, name in ((fly_state_dir(), "plastic"), (activity_dir(), "activity")):     # its learned state and its recorded activity
         if d.exists():
             if archive:

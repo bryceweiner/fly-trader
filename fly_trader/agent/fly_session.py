@@ -35,7 +35,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .. import config
+from .. import config, markets
 from ..brain import activity, device as brain_device, plastic
 from ..brain.connectome import current_connectome_path
 from ..db.apilog import record_event
@@ -48,7 +48,7 @@ from ..train.decisions import X_COLS
 from . import handover, paper_trading
 
 log = logging.getLogger(__name__)
-BOOK, KIND = "paper_fly", "fly"
+BOOK, KIND = "paper_fly", "fly"            # the Solana book's names (another chain's book takes its own from fly_trader/markets)
 BAR_KEEP = 270               # minutes of bars kept per watched mint (the longest strategy hold, 240, + next-open window + margin)
 NEXT_OPEN_S = 120.0          # entry at the next traded minute's open when it comes within two minutes (decisions.build)
 JUMP = 50.0
@@ -90,37 +90,49 @@ def resolve_label(bars: list, t: float, horizon_s: float) -> float | None:
     return float(exit_px / entry * (1 - rows[0][3]) * (1 - rows[j][3]) - 1)
 
 
-def try_start(live: bool = False) -> tuple["FlyBook | None", str]:
-    """A FlyBook when the fly may trade, else (None, why)."""
+def chain_passed(v: dict, chain: str) -> tuple[bool, str]:
+    """Whether the replay lets this chain's book trade: its own per-chain verdict (a combined replay), else the one verdict
+    for Solana (a Solana-only replay says nothing about another chain)."""
+    if "chains" in v:
+        c = v["chains"].get(chain)
+        return (bool(c and c.get("passed")), (c or {}).get("reason") or f"the replay has no {chain} verdict")
+    return (bool(v.get("passed")) and chain == "sol", v.get("reason") if chain == "sol" else f"the replay judged no {chain} trades")
+
+
+def try_start(live: bool = False, chain: str = "sol", brain: "FlyBook | None" = None) -> tuple["FlyBook | None", str]:
+    """A FlyBook for ``chain`` when the fly may trade there, else (None, why). ``brain``: the Solana book whose fly and
+    plastic memory another chain's book shares (one model learns from both chains)."""
     from ..train import fly_replay
     v = fly_replay.verdict()
     if not v:
         return None, "the fly's replay has not run on the current definitions (fly-trader fly-replay)"
-    if not v.get("passed"):
-        return None, f"the fly's replay did not pass: {v.get('reason')}"
+    ok, why = chain_passed(v, chain)
+    if not ok:
+        return None, f"the fly's replay did not pass on {markets.for_chain(chain).name}: {why}"
     with transaction() as conn:
         boot = fly_selector.latest_deployable(conn)
     if boot is None:
         return None, "no deployable fly bootstrap (the training pipeline bootstraps one)"
     try:
-        return FlyBook(boot, v, live=live), "ok"
+        return FlyBook(boot, v, live=live, chain=chain, brain=brain), "ok"
     except Exception as e:
         log.exception("fly book failed to start")
         return None, f"fly book failed to start: {type(e).__name__}: {e}"
 
 
 class FlyBook:
-    name = "fly"
-
-    def __init__(self, boot: dict, verdict: dict, live: bool = False):
+    def __init__(self, boot: dict, verdict: dict, live: bool = False, chain: str = "sol", brain: "FlyBook | None" = None):
         self.live = live; self.done = False; self.mirror = None
         self.verdict = verdict
-        self.state_path = fly_state_dir() / "state.pt"
+        self.chain = chain; self.market = markets.for_chain(chain); self.brain = brain
+        self.name = "fly" if chain == "sol" else f"fly_{chain}"
+        self.BOOK = self.market.fly_book; self.KIND = self.name; self.status_key = self.market.fly_status_key
+        self.state_path = fly_state_dir() / ("state.pt" if chain == "sol" else f"state_{chain}.pt")
         self._load_bootstrap(boot)
-        self.run_id = str(uuid.uuid4()); self.beat_no = 0; self.broker = PaperBroker(BOOK)
+        self.run_id = str(uuid.uuid4()); self.beat_no = 0; self.broker = PaperBroker(self.BOOK)
         with transaction() as conn:
             conn.execute("INSERT INTO runs (run_id, kind, config, brain_snapshot_id, status) VALUES (%s,%s,%s,%s,'running')",
-                         (self.run_id, KIND, json.dumps({"channels": self.cfg, "book": BOOK}, default=str), self.boot_id))
+                         (self.run_id, self.KIND, json.dumps({"channels": self.cfg, "book": self.BOOK, "chain": chain}, default=str), self.boot_id))
             self._restore_tags(conn)
         record_event("info", "fly", "fly session started", {"run_id": self.run_id, "bootstrap": self.boot_id, "channels": self.cfg, "lines": self.lines["plastic"],
                                                             "pending": len(self.pending), "learning_frozen": self.learning_frozen})
@@ -128,43 +140,56 @@ class FlyBook:
                  self.lines["plastic"], len(self.pending))
 
     # ---- model and state ----
-    def _load_bootstrap(self, boot: dict) -> None:
-        self.boot_id = int(boot["id"])
-        self.fly = fly_selector.load(boot["path"])
-        try:
-            self.connectome_name = current_connectome_path().name       # stamped on the activity files the console draws
-        except Exception:
-            self.connectome_name = ""
-        self.capture_ok = True
-        self.teacher_models = self._teacher_models(boot)
-        self.idx = np.asarray([X_COLS.index(c) for c in self.fly.cols], dtype=int)
-        self.names = list(self.fly.strategies); self.holds = {k: float(self.fly.rules[k]["hold_min"]) * 60.0 for k in self.names}
-        self.H = max(self.holds.values())
-        per = self.verdict.get("per_strategy") or {self.names[0]: {"alpha": self.verdict.get("alpha", 0.0), "half_life_days": self.verdict.get("half_life_days")}}
-        self.cfg = {k: (float((per.get(k) or {}).get("alpha") or 0.0), (per.get(k) or {}).get("half_life_days")) for k in self.names}
-        self.alpha = self.cfg[self.names[0]][0]; self.half_life = float(self.cfg[self.names[0]][1]) if self.cfg[self.names[0]][1] is not None else math.inf
-        net = self.fly.net
-        self.bank = plastic.PlasticBank(net, [(self.alpha, self.half_life)], fly_selector.SCALE, learn=net.learn.cpu().numpy(), read=net.read.cpu().numpy())
-        for j, k in enumerate(self.names):                      # each strategy's channel learns and forgets at its own replay-chosen rate
-            a, h = self.cfg[k]; cols = self.bank.learn[j]
-            self.bank.alpha[0, cols] = a; self.bank.half_life_s[0, cols] = float(h) * 86400.0 if h is not None else float("inf")
+    def _load_bootstrap(self, boot: dict | None) -> None:
+        b = self.brain
+        if b is not None:        # another chain's book: the Solana book's fly and plastic memory, this chain's own lines and tags
+            self.boot_id = b.boot_id; self.fly = b.fly; self.connectome_name = b.connectome_name; self.capture_ok = False
+            self.teacher_models = b.teacher_models; self.idx = b.idx; self.names = b.names; self.holds = b.holds; self.H = b.H
+            self.cfg = b.cfg; self.alpha = b.alpha; self.half_life = b.half_life; self.bank = b.bank
+            net = self.fly.net
+        else:
+            self.boot_id = int(boot["id"])
+            self.fly = fly_selector.load(boot["path"])
+            try:
+                self.connectome_name = current_connectome_path().name       # stamped on the activity files the console draws
+            except Exception:
+                self.connectome_name = ""
+            self.capture_ok = True
+            self.teacher_models = self._teacher_models(boot)
+            self.idx = np.asarray([X_COLS.index(c) for c in self.fly.cols], dtype=int)
+            self.names = list(self.fly.strategies); self.holds = {k: float(self.fly.rules[k]["hold_min"]) * 60.0 for k in self.names}
+            self.H = max(self.holds.values())
+            per = self.verdict.get("per_strategy") or {self.names[0]: {"alpha": self.verdict.get("alpha", 0.0), "half_life_days": self.verdict.get("half_life_days")}}
+            self.cfg = {k: (float((per.get(k) or {}).get("alpha") or 0.0), (per.get(k) or {}).get("half_life_days")) for k in self.names}
+            self.alpha = self.cfg[self.names[0]][0]; self.half_life = float(self.cfg[self.names[0]][1]) if self.cfg[self.names[0]][1] is not None else math.inf
+            net = self.fly.net
+            self.bank = plastic.PlasticBank(net, [(self.alpha, self.half_life)], fly_selector.SCALE, learn=net.learn.cpu().numpy(), read=net.read.cpu().numpy())
+            for j, k in enumerate(self.names):                      # each strategy's channel learns and forgets at its own replay-chosen rate
+                a, h = self.cfg[k]; cols = self.bank.learn[j]
+                self.bank.alpha[0, cols] = a; self.bank.half_life_s[0, cols] = float(h) * 86400.0 if h is not None else float("inf")
         self.pending = plastic.PendingTags(net.n_kc, net.k_active)
         self.bars: dict[str, deque] = {}; self.watch: dict[str, int] = {}
-        self.lines = {"plastic": dict(self.fly.lines), "frozen": dict(self.fly.lines)}
-        self.sizing = {"plastic": {k: list(v) for k, v in self.fly.sizings.items()}, "frozen": {k: list(v) for k, v in self.fly.sizings.items()}}
+        own = {k: self.fly.line_for(k, self.chain) for k in self.names}; own_s = {k: list(self.fly.sizing_for(k, self.chain)) for k in self.names}
+        self.lines = {"plastic": dict(own), "frozen": dict(own)}
+        self.sizing = {"plastic": {k: list(v) for k, v in own_s.items()}, "frozen": {k: list(v) for k, v in own_s.items()}}
         self.applied_through = -math.inf; self.learning_frozen = False; self.checks_paused_until = {k: 0.0 for k in self.names}
         self.race_started_at: float | None = None; self.last_day: int | None = None; self.last_hour: int | None = None
         self.rollbacks: dict = {k: [] for k in self.names}; self.nu_set = False; self.hour_stats = self._empty_stats(); self.last_checks: dict = {}
         s = self._read_state()
+        if b is not None:
+            self.nu_set = True                                   # the shared memory is the Solana book's to load and save
         if s and s.get("bootstrap_id") == self.boot_id and s.get("cfg") == self.cfg:
-            self.bank.load_state(s["bank"]); self.nu_set = True
+            if b is None:
+                self.bank.load_state(s["bank"])
+            self.nu_set = True
             self.lines, self.sizing = s["lines"], s["sizing"]
             self.applied_through, self.learning_frozen, self.checks_paused_until = s["applied_through"], s["learning_frozen"], s["checks_paused_until"]
             self.race_started_at, self.last_day, self.last_hour, self.rollbacks = s["race_started_at"], s["last_day"], s["last_hour"], s["rollbacks"]
         elif s:
             self.race_started_at = s.get("race_started_at")        # a new bootstrap keeps racing the same book
             with transaction() as conn:
-                conn.execute("UPDATE fly_scored SET state = 'dropped', x = NULL WHERE state = 'pending' AND bootstrap_id IS DISTINCT FROM %s", (self.boot_id,))
+                conn.execute("UPDATE fly_scored SET state = 'dropped', x = NULL WHERE state = 'pending' AND chain = %s AND bootstrap_id IS DISTINCT FROM %s",
+                             (self.chain, self.boot_id))
 
     def _teacher_models(self, boot: dict) -> dict | None:
         """The stack that taught this fly (its snapshot's ``teacher_snapshot``: the holdout-blind copy when that is what
@@ -209,7 +234,7 @@ class FlyBook:
             return None
 
     def _state(self) -> dict:
-        return {"bootstrap_id": self.boot_id, "cfg": self.cfg, "bank": self.bank.state(), "lines": self.lines, "sizing": self.sizing,
+        return {"bootstrap_id": self.boot_id, "cfg": self.cfg, "bank": self.bank.state() if self.brain is None else None, "lines": self.lines, "sizing": self.sizing,
                 "applied_through": self.applied_through, "learning_frozen": self.learning_frozen, "checks_paused_until": self.checks_paused_until,
                 "race_started_at": self.race_started_at, "last_day": self.last_day, "last_hour": self.last_hour, "rollbacks": self.rollbacks,
                 "saved_at": time.time()}
@@ -220,7 +245,8 @@ class FlyBook:
         torch.save(self._state(), tmp); os.replace(tmp, self.state_path)
 
     def _restore_tags(self, conn) -> None:
-        rows = conn.execute("SELECT ts, mint, strategy, x, score, line FROM fly_scored WHERE state = 'pending' AND bootstrap_id = %s ORDER BY ts", (self.boot_id,)).fetchall()
+        rows = conn.execute("SELECT ts, mint, strategy, x, score, line FROM fly_scored WHERE state = 'pending' AND bootstrap_id = %s AND chain = %s ORDER BY ts",
+                            (self.boot_id, self.chain)).fetchall()
         rows = [r for r in rows if r["strategy"] in self.holds]
         applied = [(r["ts"], r["mint"], r["strategy"]) for r in rows if r["ts"].timestamp() + self.holds[r["strategy"]] + LABEL_LAG_S <= self.applied_through]
         if applied:
@@ -239,7 +265,13 @@ class FlyBook:
                 self.watch[r["mint"]] = self.watch.get(r["mint"], 0) + 1
 
     def maybe_reload(self) -> bool:
-        """A newer deployable bootstrap (a re-bootstrap) replaces this one at once: D = 0, pending tags dropped, the book carries on."""
+        """A newer deployable bootstrap (a re-bootstrap) replaces this one at once: D = 0, pending tags dropped, the book carries on.
+        Another chain's book follows its brain (the Solana book reloads first)."""
+        if self.brain is not None:
+            if self.brain.boot_id == self.boot_id:
+                return False
+            self._write_state(); self._load_bootstrap(None)
+            return True
         from ..train import fly_replay
         with transaction() as conn:
             boot = fly_selector.latest_deployable(conn)
@@ -265,7 +297,7 @@ class FlyBook:
                     q.append(b)
 
     def open_mints(self, conn) -> set[str]:
-        return {p["mint"] for p in ledger.open_positions(conn, BOOK)}
+        return {p["mint"] for p in ledger.open_positions(conn, self.BOOK)}
 
     def on_minute(self, ctx) -> dict:
         conn, t_now = ctx.conn, ctx.t_start
@@ -288,11 +320,11 @@ class FlyBook:
                 self.race_started_at = ctx.m1_epoch
             self.beat_no += 1
             d = scored["decision"]
-            st = paper_trading.trade_minute(ctx, book=BOOK, run_id=self.run_id, beat_no=self.beat_no, broker=self.broker, kind=KIND, mints=ctx.mints, infos=ctx.infos,
+            st = paper_trading.trade_minute(ctx, book=self.BOOK, run_id=self.run_id, beat_no=self.beat_no, broker=self.broker, kind=self.KIND, mints=ctx.mints, infos=ctx.infos,
                                             scores=d["score"], threshold=d["threshold"], table=None, horizon_s=self.holds[self.names[0]], holds=d["hold_s"],
                                             strategies=d["strategy"], tables=d["tables"], flat=config.FLY_SIZING == "flat")
             out.update({k: v for k, v in st.items() if k != "entries"}); out["stage"] = "trading"
-            if self.live and handover.state(conn) is not None:
+            if self.live and handover.state(conn, self.chain) is not None:
                 out["live"] = self._live(ctx, st)
         else:
             out["stage"] = "learning (not trading this minute)" if ctx.trade else "catching up"
@@ -307,12 +339,15 @@ class FlyBook:
                 cur.executemany("UPDATE fly_scored SET label = %s, state = %s, resolved_at = now(), x = NULL WHERE ts = %s AND mint = %s AND strategy = %s", learned.pop("keys"))
         learned.pop("keys", None)
         out["checks"] = self.last_checks; out["updated_at"] = datetime.now(timezone.utc).isoformat()
-        conn.execute("INSERT INTO ui_settings (key, value) VALUES ('fly_status', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-                     (json.dumps(out, default=str),))
+        conn.execute("INSERT INTO ui_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+                     (self.status_key, json.dumps({**out, "chain": self.chain}, default=str)))
         return out
 
     def _live(self, ctx, st: dict) -> dict:
         """The fly holds the seat: mirror this minute on the bot wallet (agent/fly_live.py) while signing is allowed."""
+        if self.chain != "sol":
+            from ..rh import live as rh_live                     # Robinhood Chain: the ETH wallet (rh/live.py)
+            return rh_live.minute(self, ctx, st)
         from ..chain.cluster_guard import signing_allowed
         if not signing_allowed():
             return {"stage": "live gated: signing is not allowed (LIVE_ENABLED=1 and the live prerequisites)"}
@@ -401,9 +436,12 @@ class FlyBook:
                     q_.append(b)
         if rows:
             with conn.cursor() as cur:
-                cur.executemany("INSERT INTO fly_scored (ts, mint, strategy, hold_min, x, score, frozen_score, line, frozen_line, bootstrap_id, teacher_allow) "
-                                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ts, mint, strategy) DO NOTHING", rows)
-        self.fly.lines = dict(self.lines["plastic"]); self.fly.sizings = {k: list(v) for k, v in self.sizing["plastic"].items()}
+                cur.executemany("INSERT INTO fly_scored (ts, mint, strategy, hold_min, x, score, frozen_score, line, frozen_line, bootstrap_id, teacher_allow, chain) "
+                                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ts, mint, strategy) DO NOTHING", [r + (self.chain,) for r in rows])
+        if self.chain == "sol":
+            self.fly.lines = dict(self.lines["plastic"]); self.fly.sizings = {k: list(v) for k, v in self.sizing["plastic"].items()}
+        else:                                                    # the shared model decides this chain's rows on this chain's lines
+            self.fly.chain_lines[self.chain] = dict(self.lines["plastic"]); self.fly.chain_sizings[self.chain] = {k: list(v) for k, v in self.sizing["plastic"].items()}
         d = fly_selector.fly_decide(self.fly, ctx.X, X_COLS, np.where(np.isfinite(V), V, -np.inf))
         return {"decision": d, "picks": int(sum(1 for x in d["strategy"] if x is not None))}
 
@@ -423,8 +461,9 @@ class FlyBook:
     # ---- daily and hourly ----
     def _resolved(self, conn, since_resolved: float, cols: str, name: str) -> list[dict]:
         """A strategy's resolved rows whose labels became known after ``since_resolved`` (epoch s)."""
-        return conn.execute(f"SELECT {cols} FROM fly_scored WHERE state = 'resolved' AND label IS NOT NULL AND bootstrap_id = %s AND strategy = %s AND ts >= %s ORDER BY ts",
-                            (self.boot_id, name, datetime.fromtimestamp(since_resolved - self.holds[name] - LABEL_LAG_S, timezone.utc))).fetchall()
+        return conn.execute(f"SELECT {cols} FROM fly_scored WHERE state = 'resolved' AND label IS NOT NULL AND bootstrap_id = %s AND strategy = %s AND chain = %s "
+                            "AND ts >= %s ORDER BY ts", (self.boot_id, name, self.chain,
+                                                         datetime.fromtimestamp(since_resolved - self.holds[name] - LABEL_LAG_S, timezone.utc))).fetchall()
 
     def _calibrate(self, conn, now: float) -> None:
         day = datetime.fromtimestamp(now, timezone.utc).date()
@@ -453,7 +492,8 @@ class FlyBook:
                 self.lines[arm][name], self.sizing[arm][name] = cal.line, cal.sizing
                 conn.execute("INSERT INTO fly_calibrations (day, arm, line, sizing, trades, total, mean, window_days) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
                              "ON CONFLICT (day, arm) DO UPDATE SET line = EXCLUDED.line, sizing = EXCLUDED.sizing, trades = EXCLUDED.trades, total = EXCLUDED.total, mean = EXCLUDED.mean",
-                             (day, f"{arm}:{name}", cal.line, json.dumps(cal.sizing), cal.trades, cal.total, cal.mean, fly_calibrate.WINDOW_DAYS))
+                             (day, f"{arm}:{name}" if self.chain == "sol" else f"{arm}:{self.chain}:{name}", cal.line, json.dumps(cal.sizing), cal.trades,
+                              cal.total, cal.mean, fly_calibrate.WINDOW_DAYS))
 
     def _drift(self, j: int) -> float:
         return float(self.bank.drift(j)[0]) if self.bank.learn.shape[0] > 1 else float(self.bank.drift()[0])
@@ -475,6 +515,10 @@ class FlyBook:
         return out
 
     def _hourly(self, conn, now: float) -> None:
+        if self.brain is not None:
+            # another chain's book: its own handover; the shared memory's checks, snapshots and rollbacks are the Solana book's
+            self._handover_check(conn, now)
+            return
         hour = datetime.fromtimestamp(math.floor(now / 3600) * 3600 - 3600, timezone.utc)
         checks = self._checks(conn, now); self.last_checks = checks
         h = self.hour_stats; first = checks.get(self.names[0]) or {}
@@ -567,15 +611,17 @@ class FlyBook:
         whole race), closed ``config.HANDOVER_MIN_TRADES`` paper trades and, when ``config.HANDOVER_BEAT_SELECTOR``,
         realized at least the paper selector's P&L over that window."""
         days = config.HANDOVER_DAYS
-        if handover.state(conn) is not None or self.race_started_at is None or now - self.race_started_at < days * 86400.0:
+        if handover.state(conn, self.chain) is not None or self.race_started_at is None or now - self.race_started_at < days * 86400.0:
             return
         since = datetime.fromtimestamp(self.race_started_at if days <= 0 else now - days * 86400.0, timezone.utc)
+        fb, sb = self.BOOK, self.market.selector_book                 # this chain's race: its fly book against its selector book
         pnl = {b: conn.execute("SELECT COALESCE(sum(realized_sol), 0) AS s, count(*) AS n FROM positions WHERE book = %s AND status = 'closed' AND closed_at >= %s",
-                               (b, since)).fetchone() for b in (BOOK, "paper_selector")}
-        fly_pnl, sel_pnl, n = float(pnl[BOOK]["s"]), float(pnl["paper_selector"]["s"]), int(pnl[BOOK]["n"])
+                               (b, since)).fetchone() for b in (fb, sb)}
+        fly_pnl, sel_pnl, n = float(pnl[fb]["s"]), float(pnl[sb]["s"]), int(pnl[fb]["n"])
         if n >= config.HANDOVER_MIN_TRADES and (fly_pnl >= sel_pnl or not config.HANDOVER_BEAT_SELECTOR):
             detail = {"at": datetime.fromtimestamp(now, timezone.utc).isoformat(), "fly_pnl_sol": fly_pnl, "selector_pnl_sol": sel_pnl, "fly_trades": n,
-                      "selector_trades": int(pnl["paper_selector"]["n"]), "days": days, "beat_selector": config.HANDOVER_BEAT_SELECTOR, "bootstrap": self.boot_id}
-            handover.record(conn, detail)
+                      "selector_trades": int(pnl[sb]["n"]), "days": days, "beat_selector": config.HANDOVER_BEAT_SELECTOR, "bootstrap": self.boot_id,
+                      "chain": self.chain, "unit": self.market.unit}
+            handover.record(conn, detail, self.chain)
             record_event("info", "handover", f"the fly takes the selector's seat: {fly_pnl:+.3f} SOL vs {sel_pnl:+.3f} SOL over {n} trades"
                          + (f" in {days} days" if days > 0 else ""), detail)

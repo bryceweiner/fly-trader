@@ -42,7 +42,9 @@ def trade_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str
     opens_now = ledger.open_positions(conn, book); open_mints = {p["mint"] for p in opens_now}
     cash = ledger.paper_cash(conn, book); n_enter = 0; picks = []; entries = []
     bankroll = cash + sum(float(p["cost_sol"]) for p in opens_now)         # wealth at cost: the sizing base (agent/sizing.py)
-    circuit = conn.execute("SELECT kill_switch, entries_paused FROM circuit_state WHERE id = 1").fetchone()
+    from ..markets import for_book
+    market = for_book(book)                                     # the book's market: its circuit, money settings and sizes
+    circuit = conn.execute("SELECT kill_switch, entries_paused FROM circuit_state WHERE id = %s", (market.circuit_id,)).fetchone()
     blocked = (block or ("kill switch" if circuit and circuit["kill_switch"] else None) or ("paused" if circuit and circuit["entries_paused"] else None)
                or ("book halted" if rails.book_halted(conn, book) else None))
     thr_v = np.broadcast_to(np.asarray(threshold, dtype=np.float64), (len(mints),)) if len(mints) else np.array([])
@@ -52,7 +54,7 @@ def trade_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str
             continue
         picks.append((m, float(sc)))
         tab_k = tables[k] if tables is not None else table
-        size, why = sizing.size_position(float(sc), thr_k, tab_k or [], bankroll, cash, i["resq"], flat=flat)
+        size, why = sizing.size_position(float(sc), thr_k, tab_k or [], bankroll, cash, i["resq"], flat=flat, market=market)
         denied = allow is not None and not bool(allow[k])
         if m in open_mints or blocked or denied or size <= 0:
             rail = blocked or ("held" if m in open_mints else (str(reasons[k]) if denied and reasons is not None else "filtered") if denied else "sizing")
@@ -85,6 +87,6 @@ def trade_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str
     peak_row = conn.execute("SELECT max(wealth) AS pk FROM wealth_marks WHERE book = %s", (book,)).fetchone(); peak = max(float(peak_row["pk"] or 0.0), wealth)
     conn.execute("INSERT INTO wealth_marks (beat_id, book, ts, sol_free, positions_value, exit_cost, wealth, peak, drawdown, exposure, n_open) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                  (beat, book, m1, cash, positions_net, exit_cost, wealth, peak, (1.0 - wealth / peak) if peak > 0 else 0.0, exposure, len(opens)))
-    rails.check_book_drawdown(conn, book, wealth, peak)        # the book's own kill switch: blocks its next minutes' entries
+    rails.check_book_drawdown(conn, book, wealth, peak, drawdown=market.kill_drawdown(), unit=market.unit)   # the book's own kill switch
     return {"beat_id": beat, "entries": entries, "entered": n_enter, "exited": n_exit, "open": len(opens), "cash": cash, "wealth": wealth, "picks": len(picks), "blocked": blocked,
             "top_scores": sorted(picks, key=lambda x: -x[1])[:5], "open_mints": sorted({p["mint"] for p in opens})}
