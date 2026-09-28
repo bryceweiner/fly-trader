@@ -289,8 +289,21 @@ def base_mask(name: str, X: np.ndarray, cols: list[str], high: str | None = None
     raise KeyError(name)
 
 
+# Trigger variables carried in the row's own currency (log1p of an amount): on Robinhood Chain rows (ETH) they are put in
+# SOL terms before a threshold applies, log1p(expm1(v) / K), so one fitted threshold means the same on both chains.
+UNIT_LOG_VARS = frozenset(["log_org_vol_15m"])
+
+
 def trigger_value(name: str, var: str, X: np.ndarray, cols: list[str]) -> np.ndarray:
-    return -_col(cols, X, "ret_1m") if var == "neg_ret_1m" else _col(cols, X, var)
+    if var == "neg_ret_1m":
+        return -_col(cols, X, "ret_1m")
+    v = _col(cols, X, var)
+    if var in UNIT_LOG_VARS and "chain_rh" in cols:
+        rh = X[:, cols.index("chain_rh")] > 0.5
+        if rh.any():
+            from .. import config
+            v = np.array(v, dtype=np.float64, copy=True); v[rh] = np.log1p(np.expm1(v[rh]) / config.RH_ETH_PER_SOL)
+    return v
 
 
 def trigger_mask(name: str, thr: dict, X: np.ndarray, cols: list[str], spec: "StackSpec | None" = None) -> np.ndarray:
@@ -655,6 +668,18 @@ def _without_meta(f: StrategyFit, old) -> StrategyFit:
     import copy
     g = copy.copy(f); g.meta_p, g.meta_cut, g.line = old
     return g
+
+
+def score_holdout_by_chain(ds: DecisionSet, models: dict, days: list, spec: "StackSpec | None" = None) -> dict:
+    """``score_holdout`` on each chain's rows alone (Solana, Robinhood Chain), with each chain's own random baseline, and
+    whether that chain's book may trade the stack: at least 30 holdout trades, a positive mean that beats random picks
+    (the combined stack may carry an edge on one chain and none on the other)."""
+    ch = ds.chains(); out = {}
+    for c in sorted(set(ch.tolist())):
+        h = score_holdout(ds.subset(ch == c), models, [d for d in days if d in set(ds.day[ch == c].tolist())], spec)
+        n = int(h.get("n") or 0); m = h.get("mean"); rm = h.get("random_mean")
+        out[c] = {**h, "deployable": bool(n >= 30 and m is not None and m > 0 and (rm is None or m > rm))}
+    return out
 
 
 def score_holdout(ds: DecisionSet, models: dict, days: list, spec: "StackSpec | None" = None) -> dict:

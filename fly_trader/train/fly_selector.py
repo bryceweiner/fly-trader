@@ -77,7 +77,8 @@ GATES = {"mbon_share_min": 0.10, "mbon_saturated_max": 0.20, "slope_min": 0.6, "
 TEACHER_NOTE = "a stack refit on the fly's training days (no deployed selector to copy)"
 # the definitions a fly was trained on (the selector's, as its teacher, + the fly's network and plasticity design)
 # "calib": how its buy line is picked (config.FLY_CALIB_RULE): a verdict or fly calibrated under another rule is not this one
-FLY_VERSION = {**selector.DATA_VERSION, "fly": "flynet-3-ch", "plastic": "mb4-ch", "teacher": "deployed-1", "calib": config.FLY_CALIB_RULE}
+FLY_VERSION = {**selector.DATA_VERSION, "fly": "flynet-3-ch", "plastic": "mb4-ch", "teacher": "deployed-1", "calib": config.FLY_CALIB_RULE,
+               "lines": "per-chain-1"}                    # its own line per (strategy, chain), judged per chain (train/fly_replay.Slots)
 
 
 def _inv_softplus(x: torch.Tensor) -> torch.Tensor:
@@ -217,7 +218,8 @@ class FlyModel:
     single-strategy interface of ``selector.SelectorModel`` (score, threshold, sizing, universe) is the first strategy's."""
 
     def __init__(self, net: FlyNet, scaler: RobustScaler, cols: list[str], horizon_min: int, threshold: float | None = None, sizing: list | None = None,
-                 rules: dict | None = None, lines: dict | None = None, sizings: dict | None = None, combine: str = "score"):
+                 rules: dict | None = None, lines: dict | None = None, sizings: dict | None = None, combine: str = "score",
+                 chain_lines: dict | None = None, chain_sizings: dict | None = None):
         self.net, self.scaler, self.cols, self.horizon_min = net, scaler, list(cols), horizon_min
         self.rules = dict(rules or {"ev": {"thr": {}, "high": None, "hold_min": int(horizon_min)}})
         self.strategies = list(self.rules)
@@ -225,6 +227,26 @@ class FlyModel:
         self.lines = {k: float((lines or {}).get(k, base)) for k in self.strategies}
         self.sizings = {k: list((sizings or {}).get(k, sizing or [])) for k in self.strategies}
         self.combine = combine
+        # the other chains' own lines and sizing per strategy (fly_trader/markets: 'rh'); ``lines`` / ``sizings`` are Solana's.
+        # One network scores both chains; each chain's line is calibrated on that chain's rows (its teacher budget too).
+        self.chain_lines = {ch: {k: float(v) for k, v in d.items()} for ch, d in (chain_lines or {}).items()}
+        self.chain_sizings = {ch: {k: list(v) for k, v in d.items()} for ch, d in (chain_sizings or {}).items()}
+
+    def line_for(self, name: str, chain: str | None = "sol") -> float:
+        if chain in (None, "sol"):
+            return self.lines[name]
+        return self.chain_lines.get(chain, {}).get(name, self.lines[name])
+
+    def sizing_for(self, name: str, chain: str | None = "sol") -> list:
+        if chain in (None, "sol"):
+            return self.sizings[name]
+        return self.chain_sizings.get(chain, {}).get(name, self.sizings[name])
+
+    def set_line(self, name: str, chain: str, line: float, sizing_: list) -> None:
+        if chain in (None, "sol"):
+            self.lines[name], self.sizings[name] = float(line), list(sizing_)
+        else:
+            self.chain_lines.setdefault(chain, {})[name] = float(line); self.chain_sizings.setdefault(chain, {})[name] = list(sizing_)
 
     @property
     def threshold(self) -> float:
@@ -560,20 +582,31 @@ def deployed_teacher(ds: DecisionSet, train: np.ndarray, calib_start: date | Non
     return StackTeacher(st, RobustScaler.fit(ds.X[np.flatnonzero(train)], seed=7), list(ds.cols)), f"deployed selector #{sid}: {names}{seen}", sid
 
 
+def row_chains(X: np.ndarray, cols: list[str]) -> np.ndarray:
+    """Each row's chain from its ``chain_rh`` input ('sol' where the column is absent or 0)."""
+    X = np.atleast_2d(X)
+    if "chain_rh" not in cols:
+        return np.full(len(X), "sol", dtype=object)
+    return np.where(X[:, cols.index("chain_rh")] > 0.5, "rh", "sol").astype(object)
+
+
 def fly_decide(fly: FlyModel, X: np.ndarray, cols: list[str], values: np.ndarray | None = None) -> dict:
-    """The fly's own per-row decision: among the strategies whose trigger fires and whose value clears the fly's line,
-    the one with the larger sizing-band Kelly fraction or margin (the teacher's combination rule)."""
+    """The fly's own per-row decision: among the strategies whose trigger fires and whose value clears the fly's line
+    for that row's chain, the one with the larger sizing-band Kelly fraction or margin (the teacher's combination rule)."""
     V = fly.score_all(X) if values is None else values; trig = fly.triggers(X, cols); n = len(X)
     strat = np.full(n, None, dtype=object); score = np.full(n, -1.0); hold = np.zeros(n); thr = np.full(n, np.inf); tables = [[] for _ in range(n)]
-    key = np.full(n, -np.inf)
+    key = np.full(n, -np.inf); ch = row_chains(X, cols)
     for j, name in enumerate(fly.strategies):
-        v = V[:, j]; line = fly.lines[name]; ok = trig[:, j] & (v >= line)
-        kv = (np.array([((sizing.band_for(fly.sizings[name], m) or {}).get("kelly") or 0.0) for m in v - line]) + 1e-9 * v
-              if fly.combine == "kelly" and fly.sizings[name] else v - line)
+        v = V[:, j]
+        line = np.array([fly.line_for(name, c) for c in ch]) if n else np.zeros(0)
+        tabs = [fly.sizing_for(name, c) for c in ch]
+        ok = trig[:, j] & (v >= line)
+        kv = (np.array([((sizing.band_for(t, m) or {}).get("kelly") or 0.0) for t, m in zip(tabs, v - line)]) + 1e-9 * v
+              if fly.combine == "kelly" and any(tabs) else v - line)
         take = ok & (kv > key)
         key = np.where(take, kv, key)
         for i in np.flatnonzero(take):
-            strat[i] = name; score[i] = v[i]; hold[i] = fly.rules[name]["hold_min"] * 60.0; thr[i] = line; tables[i] = fly.sizings[name]
+            strat[i] = name; score[i] = v[i]; hold[i] = fly.rules[name]["hold_min"] * 60.0; thr[i] = line[i]; tables[i] = tabs[i]
     return {"strategy": strat, "score": score, "hold_s": hold, "threshold": thr, "tables": tables}
 
 
@@ -607,15 +640,18 @@ def bootstrap(ds: DecisionSet, S: date, epochs: int = EPOCHS, stop: threading.Ev
     prog.update("fly: calibrating its own buy lines", 0, 1, force=True)
     wi = np.flatnonzero(week); V = fly.score_all(ds.X[wi]) if len(wi) else np.zeros((0, len(fly.strategies))); trig = fly.triggers(ds.X[wi], ds.cols)
     A = teacher_allowed(teacher, ds.X[wi], ds.ts[wi], fly.strategies) if fly_calibrate.RULE == "match" else None
-    per = {}
-    for j, name in enumerate(fly.strategies):
-        H = fly.rules[name]["hold_min"]; y = ds.fwd_h.get(H, ds.fwd_pess)
-        known = trig[:, j] & (ds.ts[wi] + H * 60.0 + 60.0 <= s_epoch)        # labels known at S
-        ci = wi[known]
-        target = (len(taken_idx(ds.ts[ci], ds.mint[ci], H * 60.0, np.flatnonzero(A[known, j] & np.isfinite(y[ci])))) if A is not None else None)
-        cal = fly_calibrate.calibrate(ds.ts[ci], ds.mint[ci], H * 60.0, V[known, j], y[ci], rule=fly_calibrate.RULE, target_trades=target)
-        fly.lines[name], fly.sizings[name] = cal.line, cal.sizing
-        per[name] = {"line": cal.line, "trades": cal.trades, "mean": cal.mean, "total": cal.total, "hold_min": H, "rule": fly_calibrate.RULE, "teacher_trades": target}
+    per = {}; wch = ds.chains()[wi]
+    for chain in sorted(set(wch.tolist()), key=lambda c: c != "sol"):       # Solana first: another chain without rows keeps its lines
+        for j, name in enumerate(fly.strategies):
+            H = fly.rules[name]["hold_min"]; y = ds.fwd_h.get(H, ds.fwd_pess)
+            known = trig[:, j] & (ds.ts[wi] + H * 60.0 + 60.0 <= s_epoch) & (wch == chain)       # labels known at S, this chain's rows
+            ci = wi[known]
+            target = (len(taken_idx(ds.ts[ci], ds.mint[ci], H * 60.0, np.flatnonzero(A[known, j] & np.isfinite(y[ci])))) if A is not None else None)
+            cal = fly_calibrate.calibrate(ds.ts[ci], ds.mint[ci], H * 60.0, V[known, j], y[ci], rule=fly_calibrate.RULE, target_trades=target,
+                                          prev_line=fly.lines.get(name) if chain != "sol" else None)
+            fly.set_line(name, chain, cal.line, cal.sizing)
+            per[name if chain == "sol" else f"{name}@{chain}"] = {"line": cal.line, "trades": cal.trades, "mean": cal.mean, "total": cal.total, "hold_min": H,
+                                                                "rule": fly_calibrate.RULE, "teacher_trades": target, "chain": chain}
     d = fly_decide(fly, ds.X[wi], ds.cols, V) if len(wi) else {"strategy": np.array([], dtype=object), "hold_s": np.array([])}
     picked = np.array([x is not None for x in d["strategy"]], bool)
     ret = np.array([ds.fwd_h.get(fly.rules[x]["hold_min"], ds.fwd_pess)[i] if x is not None else np.nan for i, x in zip(wi, d["strategy"])])
@@ -631,7 +667,7 @@ def bootstrap(ds: DecisionSet, S: date, epochs: int = EPOCHS, stop: threading.Ev
     ok, why = gate_check(diag)
     fly.teacher = teacher          # not saved: the replay's match rule reads the teacher's own decisions over its rows
     info = {"S": str(S), "train_through": str(train_end - timedelta(days=1)), "calibration_days": [str(S - timedelta(days=CALIB_DAYS)), str(S - timedelta(days=1))],
-            "line": fly.threshold, "sizing": fly.sizing, "lines": fly.lines, "calibration": comb, "strategies": fly.strategies, "rules": fly.rules,
+            "line": fly.threshold, "sizing": fly.sizing, "lines": fly.lines, "chain_lines": fly.chain_lines, "calibration": comb, "strategies": fly.strategies, "rules": fly.rules,
             "diagnostics": diag, "gates_ok": ok, "gate_failures": why, "fit": fit_info, "teacher": teacher_note or TEACHER_NOTE, "teacher_line": getattr(teacher, "threshold", None),
             "teacher_stack": stack_info}
     log.info("fly bootstrap for %s: strategies %s, lines %s | calibration %d trades, mean %s | MBON share %.1f%% saturated %.0f%% | gates %s",
@@ -652,6 +688,7 @@ def save(fly: FlyModel, metrics: dict, run_id: str | None = None, kind: str = "f
     n = fly.net
     model_io.torch_save({"state_dict": n.state_dict(), "scaler": fly.scaler.state(), "cols": fly.cols, "threshold": fly.threshold, "sizing": fly.sizing,
                 "horizon_min": fly.horizon_min, "rules": fly.rules, "lines": fly.lines, "sizings": fly.sizings, "combine": fly.combine,
+                "chain_lines": fly.chain_lines, "chain_sizings": fly.chain_sizings,
                 "config": {"k_steps": n.k_steps, "leak": n.leak, "hidden": n.hidden, "obs_dim": n.obs_dim, "kc_active": n.kc_active, "scale": n.scale,
                            "n_strategies": n.n_strategies, "aff_rows": n.aff_rows.cpu().tolist() if kind != "fly_selector" else None}, "metrics": metrics}, path)
     sha = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -669,7 +706,8 @@ def load(path: str | Path, graph=None, device=None, model_cls=None) -> FlyModel:
     for bn in (net.eff_norm, net.mb_norm):
         bn.momentum = None
     return (model_cls or FlyModel)(net, RobustScaler.from_state(d["scaler"]), d["cols"], d["horizon_min"], d["threshold"], d.get("sizing"), rules=d.get("rules"),
-                                   lines=d.get("lines"), sizings=d.get("sizings"), combine=d.get("combine", "score"))
+                                   lines=d.get("lines"), sizings=d.get("sizings"), combine=d.get("combine", "score"),
+                                   chain_lines=d.get("chain_lines"), chain_sizings=d.get("chain_sizings"))
 
 
 def latest_current(conn, kind: str = "fly_selector", version: dict | None = None) -> dict | None:

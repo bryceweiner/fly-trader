@@ -295,6 +295,7 @@ def main(days: int | None = None, horizon_min: int = HOLD_MIN, stop_event: threa
     # scored with models refit without the holdout: the deployed ones above have seen those days and would score themselves
     blind = strategies.final_models(ds, stack, exclude_days=stack.holdout_days) if stack.holdout_days else None
     holdout = strategies.score_holdout(ds, blind, stack.holdout_days) if blind is not None else {}
+    by_chain = strategies.score_holdout_by_chain(ds, blind, stack.holdout_days) if blind is not None and ds.chain is not None else {}
     if holdout.get("n"):
         log.info("holdout %s..%s (no fit ever saw these days): %d trades, %s winners, PF %s, %s per trade vs random %s",
                  holdout["days"][0], holdout["days"][1], holdout["n"],
@@ -318,7 +319,7 @@ def main(days: int | None = None, horizon_min: int = HOLD_MIN, stop_event: threa
                      "components": stack.components, "strategies": {k: {x: v[x] for x in ("line", "hold_min", "thr", "high", "hours", "regimes", "sizing", "selection", "evaluation")}
                                                                     for k, v in models["strategies"].items()},
                      "groups": stack.groups, "combine": stack.combine, "veto": {k: v for k, v in (stack.veto or {}).items() if k not in ("p",)} or None,
-                     "fallback": stack.fallback, "holdout": holdout, "line": final.threshold, "costs": "real fees (pool fee by market cap, Jupiter 10 bps, network fee) + impact",
+                     "fallback": stack.fallback, "holdout": holdout, "chains": by_chain, "line": final.threshold, "costs": "real fees (pool fee by market cap, Jupiter 10 bps, network fee) + impact",
                      "data": DATA_VERSION, "deployable": stack.deployable, "deploy_reason": stack.reason, "sizing": final.sizing,
                      "model": {"kind": "stack", "min_age_h": MIN_AGE_H, "min_resq_sol": MIN_RESQ_SOL, "min_vol_15m_sol": MIN_VOL_15M_SOL},
                      "rows": int(len(ds.y)), "days": len(ds.days), "first_day": str(ds.days[0]), "last_day": str(ds.days[-1])}

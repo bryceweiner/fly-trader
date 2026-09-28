@@ -140,7 +140,7 @@ def row_weights(scores: torch.Tensor, lines: torch.Tensor) -> torch.Tensor:
     even at 10x the losing population outweighed the tradeable rows by more than 100:1 and dragged every prediction
     toward the candidate mean. Learning then made the fly worse than the same network frozen (PF 1.012 vs 1.098). A row
     below the line is not a decision, so it carries no weight."""
-    return torch.where(scores >= lines[:, None], 1.0, 0.0)
+    return torch.where(scores >= (lines if lines.dim() == 2 else lines[:, None]), 1.0, 0.0)      # lines [C] or per row [C, B] (each row's chain)
 
 
 class PlasticBank:
