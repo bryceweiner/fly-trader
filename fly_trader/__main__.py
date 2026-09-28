@@ -260,6 +260,25 @@ def _cmd_rh_probe(args):
     print(json.dumps(probe.run(sample=args.sample), indent=1, default=str))
 
 
+def _cmd_rh_wallet(args):
+    from .rh import smoke
+    if args.action == "new":
+        print(f"RH bot wallet {smoke.new_key()} written to .env (RH_BOT_PRIVATE_KEY, RH_BOT_ADDRESS). Fund it with ETH on Robinhood Chain.")
+    else:
+        from . import config
+        from .rh.rpc import RhRpc
+        addr = (config.RH_BOT_ADDRESS or "").lower()
+        print(json.dumps({"address": addr or None, "eth": RhRpc().get_balance(addr) / 1e18 if addr else None,
+                          "live_prerequisites_missing": config.rh_live_prerequisites_missing()}, indent=1))
+
+
+def _cmd_rh_smoke(args):
+    if not args.yes:
+        raise SystemExit("rh-smoke sends real Robinhood Chain transactions: pass --yes")
+    from .rh import smoke
+    print(json.dumps(smoke.run(args.size, args.cap), indent=1, default=str))
+
+
 def _cmd_kalshi_status(args):
     from .kalshi import client
     print(json.dumps(client.status(), indent=1, default=str))
@@ -339,6 +358,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("rh-status", help="Robinhood Chain index cursors, row counts and stream status").set_defaults(fn=_cmd_rh_status)
     rp = sub.add_parser("rh-probe", help="read-only check of the Robinhood Chain path: contracts, Kyber / v4 routability and gas on recent Pons graduates")
     rp.add_argument("--sample", type=int, default=12); rp.set_defaults(fn=_cmd_rh_probe)
+    rw = sub.add_parser("rh-wallet", help="new: create the RH bot key in .env (refuses to replace one); show: its address, ETH and what live trading still needs")
+    rw.add_argument("action", choices=["new", "show"]); rw.set_defaults(fn=_cmd_rh_wallet)
+    rs = sub.add_parser("rh-smoke", help="three tiny real RH round trips (Kyber, v4 fallback, non-ETH quote) booked and reconciled to the wei")
+    rs.add_argument("--size", type=float, default=0.002); rs.add_argument("--cap", type=float, default=0.01); rs.add_argument("--yes", action="store_true")
+    rs.set_defaults(fn=_cmd_rh_smoke)
     sub.add_parser("kalshi-status", help="exchange status, subaccount balance, resting orders, positions, settlements").set_defaults(fn=_cmd_kalshi_status)
     sub.add_parser("kalshi-history", help="the Kalshi corpus worker: dataset seed, settled markets, candles, trades").set_defaults(fn=_cmd_kalshi_history)
     sub.add_parser("kalshi-build", help="build the Kalshi feature parts from the corpus").set_defaults(fn=_cmd_kalshi_build)
