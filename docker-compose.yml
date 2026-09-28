@@ -22,6 +22,7 @@ services:
     # are folders and a file of yours bind-mounted from here (the vault server's compose runs an unprivileged user and
     # never self-updates)
     user: "0:0"
+    # every key (BOT_PRIVATE_KEY, and RH_BOT_PRIVATE_KEY for Robinhood Chain live) comes from .env at run time, never the image
     env_file: .env
     environment:
       DATABASE_URL: postgresql://fly:fly@db:5432/fly_trader

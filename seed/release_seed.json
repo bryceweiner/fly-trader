@@ -6518,6 +6518,7 @@
   "replay": false,
   "runner": true,
   "discover": false,
-  "pumpstream": true
+  "pumpstream": true,
+  "rh_stream": true
  }
 }

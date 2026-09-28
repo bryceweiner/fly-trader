@@ -189,6 +189,9 @@ class Supervisor:
         import json
         val = r["value"] if isinstance(r["value"], dict) else json.loads(r["value"] or "{}")
         started = []
+        from .. import config
+        if "rh_stream" not in val and config.RH_ENABLED:
+            val["rh_stream"] = True          # an install whose autostart predates Robinhood Chain starts its feed with the others
         for n in WORKERS:
             if val.get(n) and not self.alive(n):
                 try:
