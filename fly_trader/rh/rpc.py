@@ -116,5 +116,8 @@ class RhRpc(EvmRpc):
 
 
 def logs_rpc() -> RhRpc:
-    """The endpoint for heavy reads (getLogs, tx lookups): ``RH_RPC_URL_LOGS`` when set, else the public RPC."""
-    return RhRpc(config.RH_RPC_URL_LOGS or config.RH_RPC_URL, service="rh_logs")
+    """The endpoint for heavy reads (getLogs, tx lookups): ``RH_RPC_URL_LOGS`` when set, else the public RPC. Its ``blocks``
+    attribute is the endpoint block headers are read from (``RH_RPC_URL_BLOCKS``)."""
+    r = RhRpc(config.RH_RPC_URL_LOGS or config.RH_RPC_URL, service="rh_logs")
+    r.blocks = RhRpc(config.RH_RPC_URL_BLOCKS, service="rh_blocks") if config.RH_RPC_URL_BLOCKS else r
+    return r

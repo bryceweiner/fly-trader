@@ -18,9 +18,12 @@ BATCH = 100
 
 def _fetch(rpc, blocks: list[int], cache: dict[int, int]) -> None:
     need = [b for b in sorted(set(blocks)) if b not in cache]
+    src = getattr(rpc, "blocks", rpc)                       # the header endpoint (RH_RPC_URL_BLOCKS) when there is one
     for i in range(0, len(need), BATCH):
         chunk = need[i:i + BATCH]
-        res = rpc.batch([("eth_getBlockByNumber", [hex(b), False]) for b in chunk]); scan.pause()
+        res = src.batch([("eth_getBlockByNumber", [hex(b), False]) for b in chunk])
+        if src is rpc:
+            scan.pause()
         for b, r in zip(chunk, res):
             if not isinstance(r, dict) or not r.get("timestamp"):
                 raise RuntimeError(f"no block {b} from the RPC")
