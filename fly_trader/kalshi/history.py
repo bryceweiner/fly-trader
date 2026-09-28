@@ -385,6 +385,10 @@ def main(stop_event: threading.Event | None = None) -> None:
                     done += k; c = counts()
                     rate = done / max(time.time() - t0, 1e-9)
                     _status(stage="filling candles", filled_this_run=done, markets_per_h=rate * 3600, eta_h=(c.get("pending", 0) / rate / 3600) if rate else None, **c)
+                if not (stop is not None and stop.is_set()):
+                    from . import mature                # filled markets become feature rows (the training corpus)
+                    _status(stage="building features", **counts()); built = mature.loop_once()
+                    ok, why = mature.build_complete(); _status(stage="idle", built_this_round=built, build_complete=ok, build_note=why)
                 _status(stage="idle", **counts())
             except Exception as e:
                 log.exception("kalshi history round failed"); record_event("error", "kalshi_history", f"round failed: {type(e).__name__}: {e}")
