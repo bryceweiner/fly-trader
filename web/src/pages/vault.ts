@@ -11,6 +11,9 @@ import { duration, parseAmount, pct, short, sol, solDelta, token, tokenFloat, us
 import { $, busy, h, link, mountWalletBar, setText, statusLine, tabs, txLink } from '../lib/ui'
 import * as vault from '../lib/vault'
 
+/** The ETH pot's claim minimum (the relay's min_wei): 0.0001 ETH. */
+const MIN_WEI = 100_000_000_000_000n
+
 const now = () => Math.floor(Date.now() / 1000)
 const SOL = (l: number | null | undefined, d = 4) => (l == null ? '—' : `${sol(l, d)} SOL`)
 
@@ -393,6 +396,7 @@ function renderPosition() {
     h('div', {}, h('span', { class: 'micro' }, 'Share of the vault'), h('div', { class: 'v' }, sharePct(p))),
     h('div', {}, h('span', { class: 'micro' }, 'Earned, all time'), h('div', { class: 'v' }, a ? SOL(a.allocated) : '—')),
     h('div', {}, h('span', { class: 'micro' }, 'Owed to you now'), h('div', { class: 'v lime-text' }, a ? SOL(a.owed) : '—')),
+    h('div', {}, h('span', { class: 'micro' }, 'Owed in ETH (Robinhood Chain)'), h('div', { class: 'v lime-text' }, a?.eth ? `${token(a.eth.owed, 18, 6)} ETH` : '—')),
     h('div', {}, h('span', { class: 'micro' }, 'Claimed'), h('div', { class: 'v' }, a ? SOL(a.claimed) : '—')),
     h('div', {}, h('span', { class: 'micro' }, 'Claim in flight'), h('div', { class: 'v' }, a ? SOL(a.in_flight) : '—')),
   )
@@ -506,6 +510,7 @@ function renderClaim() {
   const parts: Node[] = [
     h('div', { class: 'kv compact' },
       h('div', {}, h('span', { class: 'micro' }, 'Owed to you'), h('div', { class: 'v lime-text' }, a ? SOL(a.owed) : '—')),
+      h('div', {}, h('span', { class: 'micro' }, 'Owed in ETH'), h('div', { class: 'v lime-text' }, a?.eth ? `${token(a.eth.owed, 18, 6)} ETH` : '—')),
       h('div', {}, h('span', { class: 'micro' }, 'Minimum claim'), h('div', { class: 'v' }, SOL(state.minLamports, 3))),
     ),
   ]
@@ -513,12 +518,13 @@ function renderClaim() {
     parts.push(h('p', { class: 'hint mt-16' }, `Connect ${need.join(' and ')} in the wallet panel.`))
   } else if (a) {
     const inFlight = a.in_flight > 0 || a.claims.some((c) => ['received', 'verified', 'waiting_liquidity', 'sending'].includes(c.status))
-    const tooSmall = a.owed < state.minLamports
-    const btn = h('button', { type: 'button', class: 'btn primary block mt-16', disabled: inFlight || tooSmall }, inFlight ? 'A claim is in progress' : tooSmall ? 'Nothing to claim yet' : `Claim ${SOL(a.owed)} to ${short(solAddr)}`) as HTMLButtonElement
+    const ethOwed = BigInt(a.eth?.owed ?? '0')
+    const tooSmall = a.owed < state.minLamports && ethOwed < MIN_WEI
+    const btn = h('button', { type: 'button', class: 'btn primary block mt-16', disabled: inFlight || tooSmall }, inFlight ? 'A claim is in progress' : tooSmall ? 'Nothing to claim yet' : a.owed >= state.minLamports ? `Claim ${SOL(a.owed)} to ${short(solAddr)}` + (ethOwed >= MIN_WEI ? ` and ${token(a.eth!.owed, 18, 6)} ETH` : '') : `Claim ${token(a.eth!.owed, 18, 6)} ETH`) as HTMLButtonElement
     btn.addEventListener('click', () => void busy(btn, claim))
     parts.push(
       btn,
-      h('p', { class: 'hint' }, 'You will sign two messages, one in each wallet. Signing costs nothing and sends no transaction. The fly then pays everything owed to your EVM address.'),
+      h('p', { class: 'hint' }, 'You will sign two messages, one in each wallet. Signing costs nothing and sends no transaction. The fly then pays everything owed: SOL to your Solana wallet, ETH on Robinhood Chain to your EVM address.'),
     )
   }
   claimLog = h('ol', { class: 'claim-log', 'aria-live': 'polite' })

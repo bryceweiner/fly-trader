@@ -121,6 +121,8 @@ RH_DDL: list[str] = [
     # ---- additive columns on shared tables (defaults keep every Solana row as it was)
     # the hook's fee + tax as a fraction of the swap's gross amount (Pons takes it in whichever currency comes in)
     "ALTER TABLE rh_swaps ADD COLUMN IF NOT EXISTS fee_frac double precision",
+    # when a receipt's fee was recorded: the reconciler counts gas by it (updated_at moves on later status changes)
+    "ALTER TABLE rh_txs ADD COLUMN IF NOT EXISTS fee_at timestamptz",
     "ALTER TABLE rh_tokens ADD COLUMN IF NOT EXISTS curve_indexed boolean NOT NULL DEFAULT false",
     "ALTER TABLE rh_assets ADD COLUMN IF NOT EXISTS ref_path jsonb",
     "ALTER TABLE positions ADD COLUMN IF NOT EXISTS chain text NOT NULL DEFAULT 'sol'",

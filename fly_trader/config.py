@@ -193,6 +193,8 @@ VAULT_IMPL_CODEHASHES = env_list("VAULT_IMPL_CODEHASHES", [])       # implementa
 VAULT_PERIOD_S = env_int("VAULT_PERIOD_S", 7 * 86400)               # one settlement period; the rehearsal uses 900
 VAULT_EPOCH = env_int("VAULT_EPOCH", 345_600)                       # boundaries at EPOCH + k*PERIOD; 345600 = Monday 1970-01-05 00:00 UTC
 CLAIM_MIN_LAMPORTS = env_int("CLAIM_MIN_LAMPORTS", 2_000_000)       # 0.002 SOL: above the rent-exempt minimum of a new wallet
+CLAIM_MIN_WEI = env_int("CLAIM_MIN_WEI", 100_000_000_000_000)          # 0.0001 ETH: smaller ETH owed waits for the next claim
+VAULT_RH_GAS_RESERVE_WEI = env_int("VAULT_RH_GAS_RESERVE_WEI", 200_000_000_000_000)   # ETH the settlement never allocates (the RH wallet pays payout gas)
 RELAY_URL = env_str("RELAY_URL")                                    # the site origin; the fly calls {RELAY_URL}/api/...
 RELAY_KEY_ID = env_str("RELAY_KEY_ID", "k1")
 RELAY_SECRET = env_str("RELAY_SECRET")

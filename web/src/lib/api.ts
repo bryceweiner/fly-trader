@@ -113,6 +113,8 @@ export interface Account {
   owed: number
   allocations: { period_end: number; lamports: number; weight: string; share: number }[]
   claims: AccountClaim[]
+  /** The ETH pot (Robinhood Chain memecoin profits, paid in ETH to this EVM address), in wei strings. */
+  eth?: { allocated: string; claimed: string; in_flight: string; owed: string }
 }
 
 export interface Challenge {

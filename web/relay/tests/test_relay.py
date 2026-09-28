@@ -377,6 +377,15 @@ def test_claim_owed_checks_use_pushed_account(client, vectors):
     assert submit(client, v).status == 202
 
 
+def test_claim_with_only_eth_owed_is_accepted(client, vectors):
+    v = vectors["mainnet"]
+    client.push(accounts=[{**account(owed=0), "eth": {"owed": str(10 ** 14 - 1)}}])
+    r = submit(client, v)
+    assert r.status == 400 and "minimum" in r.json()["error"]
+    client.push(accounts=[{**account(owed=0), "eth": {"owed": str(10 ** 14)}}])
+    assert submit(client, v).status == 202
+
+
 def test_claim_in_flight_409_then_allowed_after_terminal(client, vectors):
     v = vectors["mainnet"]
     client.push(accounts=[account()])

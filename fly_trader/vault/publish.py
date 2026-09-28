@@ -152,8 +152,16 @@ def history(conn, cur: dict) -> tuple[dict, dict]:
     return out, new
 
 
+def eth_accounts(conn) -> dict[str, dict]:
+    """The ETH pot per holder (wei as strings: they exceed 2**53)."""
+    rows = conn.execute("SELECT * FROM vault_eth_accounts").fetchall()
+    return {r["evm"]: {k: str(int(r[k])) for k in ("allocated", "claimed", "in_flight", "owed")} for r in rows}
+
+
 def accounts(conn) -> list[dict]:
-    rows = conn.execute("SELECT * FROM vault_accounts ORDER BY evm").fetchall()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM vault_accounts ORDER BY evm").fetchall()]
+    eth = eth_accounts(conn)
+    rows += [{"evm": e, "allocated": 0, "claimed": 0, "in_flight": 0, "owed": 0} for e in sorted(set(eth) - {r["evm"] for r in rows})]
     out = []
     for r in rows:
         allocs = conn.execute("SELECT s.period_end, a.lamports, a.weight, s.total_weight FROM vault_allocations a JOIN vault_settlements s "
@@ -167,6 +175,8 @@ def accounts(conn) -> list[dict]:
                     "claims": [{"id": int(c["relay_id"]), "status": c["status"],     # the relay's id: GET /api/claim/<id> "lamports": int(c["lamports"] or 0), "sol": c["sol"],
                                 "tx": "", "created_at": _t(c["created_at"]),
                                 "updated_at": _t(c["updated_at"])} for c in cl]})
+        if r["evm"] in eth:
+            out[-1]["eth"] = eth[r["evm"]]
     return out
 
 

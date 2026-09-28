@@ -64,6 +64,7 @@ class Config:
             raise ValueError("sol_chain must be mainnet or devnet")
         self.claim_ttl_s = _need(d, "claim_ttl_s", int, 900)
         self.min_lamports = _need(d, "min_lamports", int, 2000000)
+        self.min_wei = _need(d, "min_wei", int, 10 ** 14)          # the ETH pot's claim minimum (0.0001 ETH)
         h = d.get("client_ip_header")
         if h is not None and not isinstance(h, str):
             raise ValueError("client_ip_header must be a string or null")
@@ -223,6 +224,16 @@ def get_history(r: Req):
     return 200, '{"kind":%s,"items":[%s],"next":%s}' % (dumps(kind), ",".join(bodies), dumps(nxt))
 
 
+def eth_owed(body) -> int:
+    """ETH owed (wei) from a pushed account's body: {"eth": {"owed": "<wei>"}}; 0 when absent or malformed."""
+    try:
+        v = (json.loads(body) if isinstance(body, (str, bytes)) else body).get("eth", {}).get("owed", 0)
+        v = int(v) if isinstance(v, int) or (isinstance(v, str) and v.isdigit()) else 0
+        return max(0, v)
+    except (ValueError, AttributeError, TypeError):
+        return 0
+
+
 def get_account(r: Req):
     limit(r.conn, "read", r.ip, r.now)
     evm = validate.evm_address(r.q.get("evm"))
@@ -295,9 +306,10 @@ def post_claim(r: Req):
             raise HttpError(400, "nonce was issued for another address")
         acct = store.get_account(conn, evm)
         owed = acct[0] if acct else 0
-        if owed <= 0:
+        eth = eth_owed(acct[1]) if acct else 0                 # the ETH pot (Robinhood Chain profits, paid in ETH)
+        if owed <= 0 and eth <= 0:
             raise HttpError(400, "nothing to claim")
-        if owed < r.cfg.min_lamports:
+        if owed < r.cfg.min_lamports and eth < r.cfg.min_wei:
             raise HttpError(400, "owed is below the claim minimum")
         if store.claim_in_flight(conn, evm):
             raise HttpError(409, "a claim for this address is in flight")
