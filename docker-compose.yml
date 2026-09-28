@@ -18,6 +18,10 @@ services:
 
   fly:
     build: .
+    # root inside the container: the self-updater (AUTO_UPDATE=1) replaces the code in /app, and data/, logs/ and .env
+    # are folders and a file of yours bind-mounted from here (the vault server's compose runs an unprivileged user and
+    # never self-updates)
+    user: "0:0"
     env_file: .env
     environment:
       DATABASE_URL: postgresql://fly:fly@db:5432/fly_trader

@@ -6,7 +6,10 @@ the only reader there should ever be (plus AIDE's daily integrity scan); a read 
 process in the brain container -- is the earliest sign of a compromise, so it goes to Telegram at once, with the
 program, user and time. ``ausearch --checkpoint`` makes each event reported once.
 
-    fly_audit_watch.py run            (the systemd timer)
+    fly_audit_watch.py run            (the systemd timer, every minute)
+    fly_audit_watch.py aide           (fly-aide.timer, daily: AIDE's integrity check; changes go to Telegram, since
+                                       this host has no mail. After reviewing expected changes: sudo aide --update and
+                                       sudo cp /var/lib/aide/aide.db.new /var/lib/aide/aide.db)
     fly_audit_watch.py test           (send a test message)
 """
 from __future__ import annotations
@@ -83,9 +86,24 @@ def run() -> int:
     return len(bad)
 
 
+def aide() -> int:
+    """AIDE's exit code: 0 no change, 1-7 added/removed/changed files, >= 14 an error."""
+    r = subprocess.run(["aide", "--check", "--config", "/etc/aide/aide.conf"], capture_output=True, text=True)
+    if r.returncode == 0:
+        return 0
+    summary = [l for l in r.stdout.splitlines() if l.strip() and (l.startswith(("Added", "Removed", "Changed", "f", "d", "l"))
+                                                                   or "entries" in l)][:25]
+    what = "an ERROR" if r.returncode >= 14 else "file changes"
+    alert(f"AIDE found {what} (exit {r.returncode}). If you did not make them (a release, apt upgrades), investigate:\n"
+          + "\n".join(summary) + "\nFull report: sudo aide --check")
+    return r.returncode
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
     if cmd == "test":
         alert("audit watch test message")
+    elif cmd == "aide":
+        aide()
     else:
         run()

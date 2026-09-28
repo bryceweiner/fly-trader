@@ -29,7 +29,8 @@ ENV PYTHONUNBUFFERED=1 \
     HOME=/tmp \
     PATH="/app/.venv/bin:${PATH}"
 
-RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client ca-certificates curl age \
+# openssh-client: ssh-keygen verifies signed releases (the self-updater, fly_trader/ops/autoupdate.py)
+RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client ca-certificates curl age openssh-client \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 10000 fly && useradd -u 10001 -g 10000 -M -s /usr/sbin/nologin fly
 COPY --from=ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424 /uv /usr/local/bin/uv
@@ -41,9 +42,12 @@ COPY . .
 # It names the project extra that pins torch to that index. --frozen: exactly uv.lock with its hashes, never a fresh
 # resolution. The project installs editable: the package IS /app/fly_trader, so config.REPO_ROOT is /app.
 ARG TORCH_INDEX=cpu
+ENV TORCH_INDEX=${TORCH_INDEX}
 RUN uv sync --frozen --no-dev --extra "${TORCH_INDEX}" \
     && chmod +x /app/docker/entrypoint.sh \
     && mkdir -p /app/fly_trader/ui/static/brain && chown -R 10001:10000 /app/fly_trader/ui/static/brain
+# The vault server runs this unprivileged user and never updates itself (AUTO_UPDATE=0). The self-hosted compose file
+# runs the container as root instead: its self-updater replaces /app, and it writes the bind-mounted data/, logs/, .env.
 USER 10001:10000
 
 EXPOSE 8501

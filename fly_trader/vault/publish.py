@@ -1,6 +1,6 @@
-"""The public stats (docs/vault/SPEC.md §4): one snapshot every minute plus history deltas and holder accounts, pushed
-to the relay. Built only from the database and cached prices, so a push never waits on the chain; any failure is
-logged and retried next minute and never reaches trading."""
+"""The public stats (docs/vault/SPEC.md §4): one snapshot every vault-worker loop (~10 s) plus history deltas and holder
+accounts, pushed to the relay. Built only from the database and cached prices, so a push never waits on the chain; any
+failure is logged and retried on the next loop and never reaches trading."""
 from __future__ import annotations
 
 import json
@@ -158,13 +158,13 @@ def accounts(conn) -> list[dict]:
     for r in rows:
         allocs = conn.execute("SELECT s.period_end, a.lamports, a.weight, s.total_weight FROM vault_allocations a JOIN vault_settlements s "
                               "ON s.id = a.settlement_id WHERE a.evm = %s ORDER BY s.period_end DESC LIMIT 52", (r["evm"],)).fetchall()
-        cl = conn.execute("SELECT id, status, lamports, sol, tx_signature, created_at, updated_at FROM vault_claims WHERE evm = %s "
+        cl = conn.execute("SELECT relay_id, status, lamports, sol, created_at, updated_at FROM vault_claims WHERE evm = %s AND relay_id IS NOT NULL "
                           "ORDER BY id DESC LIMIT 20", (r["evm"],)).fetchall()
         out.append({"evm": r["evm"], "allocated": int(r["allocated"]), "claimed": int(r["claimed"]), "in_flight": int(r["in_flight"]),
                     "owed": int(r["owed"]),
                     "allocations": [{"period_end": _t(a["period_end"]), "lamports": int(a["lamports"]), "weight": str(a["weight"]),
                                      "share": float(a["weight"]) / float(a["total_weight"]) if a["total_weight"] else 0.0} for a in allocs],
-                    "claims": [{"id": int(c["id"]), "status": c["status"], "lamports": int(c["lamports"] or 0), "sol": c["sol"],
+                    "claims": [{"id": int(c["relay_id"]), "status": c["status"],     # the relay's id: GET /api/claim/<id> "lamports": int(c["lamports"] or 0), "sol": c["sol"],
                                 "tx": "", "created_at": _t(c["created_at"]),
                                 "updated_at": _t(c["updated_at"])} for c in cl]})
     return out

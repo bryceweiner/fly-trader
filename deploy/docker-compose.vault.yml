@@ -31,7 +31,7 @@ services:
     logging: {driver: json-file, options: {max-size: "20m", max-file: "5"}}
 
   fly-signer:
-    image: fly-signer:${FLY_RELEASE:?set by the updater}
+    image: fly-signer:${FLY_RELEASE:-none}
     env_file: [/srv/fly/custody.env, /srv/fly/signer.env]
     environment:
       BOT_PRIVATE_KEY_FILE: /run/secrets/bot_key
@@ -54,13 +54,14 @@ services:
     logging: {driver: json-file, options: {max-size: "20m", max-file: "5"}}
 
   fly:
-    image: fly-trader:${FLY_RELEASE:?set by the updater}
+    image: fly-trader:${FLY_RELEASE:-none}
     env_file: [/srv/fly/custody.env, /srv/fly/vault.env, /srv/fly/db.env]
     environment:
       DATA_DIR: /app/data
       LOG_DIR: /app/logs
       SIGNER_SOCKET: /run/fly-signer/sock
       VAULT_ENABLED: "1"
+      AUTO_UPDATE: "0"                     # releases come through the host updater (signed, 24 h hold on code), never from inside
     volumes:
       - /srv/fly/data:/app/data
       - /srv/fly/logs:/app/logs

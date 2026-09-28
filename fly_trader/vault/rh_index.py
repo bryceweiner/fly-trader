@@ -116,7 +116,8 @@ def _announce(before: dict, after: dict) -> None:
             continue
         what = "the vault (upgrade or role change)" if o.get("target") == (config.VAULT_ADDRESS or "").lower() else "the timelock itself (delay or proposer change)"
         eta = datetime.fromtimestamp(int(o["eta"]), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        alerts.send(f"timelock operation {op[:10]}… scheduled on {what}; executable from {eta}. Cancel it if you did not schedule it.",
+        alerts.send(f"timelock operation {op} scheduled on {what}; executable from {eta}. If you did not schedule it: "
+                    "Blockscout, the timelock, Write contract, cancel(<that id>) from the owner wallet.",
                     key=f"tl_op:{op}", cooldown_s=30 * 86400)
 
 

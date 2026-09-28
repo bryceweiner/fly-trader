@@ -1,0 +1,8 @@
+[Unit]
+Description=fly-trader vault: daily file-integrity check (AIDE), findings to Telegram
+
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=/usr/bin/python3 /usr/local/lib/fly/fly_audit_watch.py aide
+TimeoutStartSec=3600

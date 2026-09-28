@@ -1,0 +1,6 @@
+# The release keys this install trusts (fly_trader/ops/autoupdate.py, AUTO_UPDATE=1): an update from Hugging Face is
+# installed only if its release.json is signed by one of these keys, for the fly-trader-release namespace. With no key
+# line here, automatic updates are off. A signed release may change this file (key rotation).
+#
+# One line per key: <principal> namespaces="fly-trader-release" <public key>   (principals: bryce, bryce-recovery)
+# docs/vault/RUNBOOK.md section 0 makes these keys; tools/publish_release.py refuses to publish unless its key is here.

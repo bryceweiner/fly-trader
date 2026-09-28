@@ -16,6 +16,7 @@ The distribution branch copies these into its tracked ``models/`` and ``seed/`` 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import sys
@@ -89,8 +90,9 @@ def main(out: Path) -> None:
     for name in ("current.txt", "scale.json", current):
         shutil.copy2(cdir / name, models / "connectome" / name)
     # The fly's inputs include wallet skill: config.json names the fitted (h, L) that FLY_VERSION carries, and the day's
-    # table maps wallets to skill deciles. The newest table ships (~300 MB: too big for GitHub, so the distribution keeps
-    # it on Hugging Face and the container fetches it once); the engine falls back to it while it goes stale.
+    # table maps wallets to skill deciles. The newest table ships in the signed release (~300 MB: too big for GitHub, so
+    # a git checkout has only its name and sha256, and docker/bootstrap.sh downloads and checks it); the engine falls
+    # back to it while it goes stale.
     from fly_trader.train.mature import SKILL_DIR
     tables = sorted(SKILL_DIR.glob("????-??-??.parquet"))
     if not (SKILL_DIR / "config.json").exists() or not tables:
@@ -100,6 +102,8 @@ def main(out: Path) -> None:
         if (SKILL_DIR / name).exists():
             shutil.copy2(SKILL_DIR / name, sk / name)
     shutil.copy2(tables[-1], sk / tables[-1].name); (sk / "TABLE").write_text(tables[-1].name + "\n")
+    # the table is not in git: a self-hosted install downloads it and uses it only if it has this sha256
+    (sk / "TABLE.sha256").write_text(hashlib.sha256((sk / tables[-1].name).read_bytes()).hexdigest() + "\n")
     # The console's 3D brain view needs each neuron's position (brain/geometry.py), built from the FlyWire annotations
     # TSV that a distribution does not ship; the built files depend only on the connectome, so they ship instead and
     # docker/entrypoint.sh copies them into the console's static directory.

@@ -1,10 +1,15 @@
 {
   "repo": "bryceweiner/fly-trader",
   "allowed_signers": "/etc/fly/allowed_signers",
-  "principal": "bryce",
+  "principals": [
+    "bryce",
+    "bryce-recovery"
+  ],
   "namespace": "fly-trader-release",
   "root": "/srv/fly",
   "project": "fly",
+  "code_delay_s": 86400,
+  "expect_manifest_sha256": "",
   "telegram_bot_token": "",
   "telegram_chat_id": ""
 }

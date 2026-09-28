@@ -1,0 +1,9 @@
+#!/bin/sh
+# Run a fly-trader command inside the running brain container, e.g.  sudo fly vault status
+#   sudo fly signer <cmd>   runs python -m fly_trader.signer <cmd> in the signer container (status, clear-panic)
+set -e
+if [ "$1" = "signer" ]; then
+  shift
+  exec docker exec -i fly-fly-signer-1 python -m fly_trader.signer "$@"
+fi
+exec docker exec -i fly-fly-1 fly-trader "$@"

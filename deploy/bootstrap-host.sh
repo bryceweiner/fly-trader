@@ -15,7 +15,7 @@
 #
 # RELEASE_PUBKEY / RECOVERY_PUBKEY: the two keys whose signatures the updater accepts (principals bryce and
 # bryce-recovery), valid for the release namespace only. EXPECT_MANIFEST pins the first release the updater may
-# install (tools/publish_release.py prints it); until it is set the updater installs nothing.
+# install (tools/publish_release.py prints it as the manifest sha256); until it is set the updater installs nothing.
 # TS_AUTHKEY: a one-off, pre-authorised key tagged tag:fly from the Tailscale admin console; used once, not stored.
 #
 # Idempotent: safe to run again (keys and edited config files are never overwritten).
@@ -180,7 +180,7 @@ iptables -F DOCKER-USER
 iptables -A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
 iptables -A DOCKER-USER -i docker0 -o docker0 -j RETURN
 iptables -A DOCKER-USER -i br-+ -o br-+ -j RETURN
-for p in 443 53; do
+for p in 443 80 53; do                  # 80: apt mirrors during image builds (apt checks its own signatures)
   iptables -A DOCKER-USER -i br-+ -p tcp --dport $p -j RETURN
   iptables -A DOCKER-USER -i docker0 -p tcp --dport $p -j RETURN
 done
@@ -289,13 +289,18 @@ install -d -m 0700 -o "$H_SIGNER" -g "$H_SIGNER" /srv/fly/signer        # the si
 install -d -m 0750 -o "$H_SIGNER" -g "$H_FLY" /srv/fly/run              # its socket: the brain may connect, nothing else
 install -d -m 0700 /srv/fly/secrets
 install -d -m 0755 /etc/fly /usr/local/lib/fly
-# release signers: valid for the release namespace only, so these keys sign nothing else this box would accept
+# release signers: valid for the release namespace only, so these keys sign nothing else this box would accept. A re-run
+# without RECOVERY_PUBKEY keeps the recovery signer already installed (so closing SSH or updating the scripts never drops it).
+if [ -z "$RECOVERY_PUBKEY" ] && [ -f /etc/fly/allowed_signers ]; then
+  RECOVERY_PUBKEY="$(awk '$1=="bryce-recovery"{ $1=""; $2=""; sub(/^  */, ""); print; exit }' /etc/fly/allowed_signers)"
+fi
 {
   echo "bryce namespaces=\"fly-trader-release\" ${RELEASE_PUBKEY}"
   if [ -n "$RECOVERY_PUBKEY" ]; then echo "bryce-recovery namespaces=\"fly-trader-release\" ${RECOVERY_PUBKEY}"; fi
 } > /etc/fly/allowed_signers
 chmod 0644 /etc/fly/allowed_signers
 [ -n "$RECOVERY_PUBKEY" ] || echo "WARNING: no RECOVERY_PUBKEY: losing the release key would mean re-bootstrapping the updater"
+install -m 0755 "$HERE/fly" /usr/local/bin/fly     # sudo fly <command>: fly-trader inside the running container
 # the database password: made here, root-only, handed to both database and brain by compose
 if [ ! -s /srv/fly/db.env ]; then
   pw="$(openssl rand -hex 24)"
@@ -303,9 +308,10 @@ if [ ! -s /srv/fly/db.env ]; then
   unset pw
 fi
 chmod 0600 /srv/fly/db.env
-# two wallets, each an ed25519 seed made HERE and never copied off this box in plaintext (the fly's backup job writes
-# age-encrypted copies for you): the trading wallet, and the payout wallet claims are paid from, so holders never see
-# the trading wallet. fly_trader.chain.keys accepts a base58 32-byte seed.
+# two hot keys, each an ed25519 seed made HERE and never copied off this box in plaintext (the signer writes
+# age-encrypted backups for you): the trading key (bot_key: the trading wallet; refills itself from the treasury under
+# L1) and the payout key (payout_key: holds nothing; pays claims from the treasury under L2). Only the signer container
+# mounts them. Their public keys are printed below, once; later: sudo fly signer status.
 make_key() {
   local name="$1"
   if [ ! -e "/srv/fly/secrets/$name" ]; then
@@ -355,8 +361,11 @@ install -m 0644 "$HERE/fly-update.timer" /etc/systemd/system/fly-update.timer
 install -m 0755 "$HERE/fly_audit_watch.py" /usr/local/lib/fly/fly_audit_watch.py
 install -m 0644 "$HERE/fly-audit-watch.service" /etc/systemd/system/fly-audit-watch.service
 install -m 0644 "$HERE/fly-audit-watch.timer" /etc/systemd/system/fly-audit-watch.timer
+install -m 0644 "$HERE/fly-aide.service" /etc/systemd/system/fly-aide.service
+install -m 0644 "$HERE/fly-aide.timer" /etc/systemd/system/fly-aide.timer
 systemctl daemon-reload
 systemctl enable --now fly-audit-watch.timer    # a key read by anything but the signer goes to Telegram within a minute
+systemctl enable --now fly-aide.timer           # the daily file-integrity check reports to Telegram (there is no mail here)
 
 # ---------------------------------------------------------------- 9. audit and integrity
 step "audit log: key reads and config changes"
@@ -408,7 +417,8 @@ Then run this script again with CLOSE_PUBLIC_SSH=1 to remove public SSH."
 fi
 cat <<EOF
 $next
-Next (docs/vault/RUNBOOK.md, section 3):
-  1. edit /srv/fly/{vault,custody,signer}.env and /etc/fly/update.json (Telegram)
-  2. sudo systemctl enable --now fly-update.timer   # pulls, verifies and starts the pinned first release
+Next (docs/vault/RUNBOOK.md, sections 4.3 and 4.4):
+  1. the treasury on https://fly-trader.app/owner.html with your owner wallet (the two keys printed above)
+  2. sudoedit /srv/fly/{custody,signer,vault}.env and /etc/fly/update.json (Telegram)
+  3. sudo systemctl enable --now fly-update.timer   # pulls, verifies and starts the pinned first release
 EOF

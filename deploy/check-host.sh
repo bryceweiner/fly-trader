@@ -31,7 +31,7 @@ echo "Firewall"
 check "ufw active"                      sh -c "ufw status | grep -q 'Status: active'"
 check "incoming denied by default"      sh -c "ufw status verbose | grep -q 'deny (incoming)'"
 check "outgoing denied by default"      sh -c "ufw status verbose | grep -q 'deny (outgoing)'"
-check "only SSH listens publicly"       sh -c "! ss -Hltn | awk '{print \$4}' | grep -vE '^(127\\.|\\[::1\\]|\\[::ffff:127)' | grep -vE ':22\$' | grep -q ."
+check "only SSH listens publicly"       sh -c "! ss -Hltn | awk '{print \$4}' | grep -vE '^(127\\.|\\[::1\\]|\\[::ffff:127|100\\.|\\[fd7a:)' | grep -vE ':22\$' | grep -q ."
 check "container traffic restricted"    sh -c "iptables -S DOCKER-USER | grep -q -- '-j DROP'"
 check "console bound to localhost"      sh -c "! ss -Hltn | grep -E ':8501 ' | grep -vqE '127\\.0\\.0\\.1:8501'"
 
@@ -58,7 +58,7 @@ for k in bot_key payout_key; do
   check "$k not owned by a login user"  sh -c "[ \"\$(stat -c %U $f)\" != root ] || true; ! getent passwd \"\$(stat -c %U $f)\" | grep -qE ':/bin/(ba)?sh\$'"
 done
 check "secrets dir only root"           sh -c "[ \"\$(stat -c %a /srv/fly/secrets)\" = 700 ]"
-check "the two wallets differ"          sh -c "! cmp -s /srv/fly/secrets/bot_key /srv/fly/secrets/payout_key"
+check "signer up (it refuses equal keys)" sh -c "docker inspect fly-fly-signer-1 --format '{{.State.Health.Status}}' | grep -q healthy"
 check "release signer pinned"           sh -c "[ -s /etc/fly/allowed_signers ] && [ \"\$(stat -c %U /etc/fly/allowed_signers)\" = root ]"
 check "updater owned by root"           sh -c "[ \"\$(stat -c %U /usr/local/lib/fly/fly_update.py)\" = root ] && ! [ -w /usr/local/lib/fly/fly_update.py -a \"\$(stat -c %a /usr/local/lib/fly/fly_update.py)\" != 755 ]"
 for e in vault custody signer db; do
@@ -66,7 +66,7 @@ for e in vault custody signer db; do
 done
 check "no default database password"    sh -c "! grep -qE 'POSTGRES_PASSWORD(:|=) *fly\$' /srv/fly/docker-compose.yml /srv/fly/db.env"
 check "release signers namespaced"      sh -c "! grep -v 'namespaces=\"fly-trader-release\"' /etc/fly/allowed_signers | grep -q ."
-check "first release pinned (no TOFU)"  sh -c "grep -q expect_manifest_sha256 /etc/fly/update.json || [ -s /srv/fly/state.json ]"
+check "first release pinned (no TOFU)"  sh -c "grep -Eq '\"expect_manifest_sha256\": *\"[0-9a-f]{64}\"' /etc/fly/update.json || [ -s /srv/fly/state.json ]"
 
 echo "Key isolation"
 check "keys mounted into the signer only" sh -c "! docker inspect fly-fly-1 --format '{{range .Mounts}}{{.Source}} {{end}}' | grep -q /srv/fly/secrets"
@@ -79,6 +79,7 @@ echo "Monitoring"
 check "auditd running"                  systemctl is-active auditd
 check "key reads audited"               sh -c "auditctl -l | grep -q fly_keys"
 check "key-read watcher running"        systemctl is-active fly-audit-watch.timer
+check "daily AIDE report to Telegram"   systemctl is-active fly-aide.timer
 check "AIDE baseline present"           test -f /var/lib/aide/aide.db
 check "journal persistent"              test -d /var/log/journal
 check "automatic security updates"      sh -c "systemctl is-enabled unattended-upgrades && grep -q 'Automatic-Reboot \"true\"' /etc/apt/apt.conf.d/52fly-unattended"

@@ -19,6 +19,10 @@ def vault_env(monkeypatch):
                  "VAULT_SITE_DOMAIN": V["fields"]["domain"], "VAULT_SITE_URI": V["fields"]["uri"], "RH_CHAIN_ID": 46630,
                  "SOLANA_CLUSTER": "devnet", "LIVE_ENABLED": False, "GAS_RESERVE_SOL": 0.01, "TELEGRAM_BOT_TOKEN": None}.items():
         monkeypatch.setattr(config, k, v)
+    # the vectors carry fixed dates, but a claim row's created_at is the real clock: without this the stale-claim rule
+    # (first seen > 1 h after expiry) rejects them from a day after the vectors' date (tests/test_vault_redteam_offchain.py
+    # covers staleness itself)
+    monkeypatch.setattr(claims, "STALE_AFTER_S", 10**12)
     with transaction() as c:
         for t in ("vault_allocations", "vault_settlements", "vault_claims", "vault_flows", "vault_kv"):
             c.execute(f"DELETE FROM {t}")

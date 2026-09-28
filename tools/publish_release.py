@@ -7,7 +7,8 @@ signature; later the Ledger's agent), so the signing key never exists as a file.
 
 1. ``--models``: run tools/make_seed.py into the distribution worktree (models/ and seed/ refreshed from this Mac)
 2. run the vault + release tests inside the worktree, then commit there (skipped when nothing changed)
-3. stage EXACTLY the release files (tracked files of the worktree + the wallet-skill parquet) in a fresh directory
+3. stage EXACTLY the release files (tracked files of the worktree + the wallet-skill table named in TABLE) in a fresh
+   directory; the signing key must be listed in the worktree's release/allowed_signers (self-hosted installs check it)
 4. write ``release.json`` {schema, seq, prev_sha256, created_at, git_commit, code_digest, fly_version, files} and sign it
    with ``ssh-keygen -Y sign -n fly-trader-release`` (the key never leaves the Mac or its Secure Enclave)
 5. verify the staged release with the server's own verifier (deploy/fly_update.py verify)
@@ -52,7 +53,13 @@ def previous(repo: str) -> tuple[int, str | None]:
 
 def stage(worktree: Path, dest: Path) -> list[dict]:
     files = [p for p in sh("git", "ls-files", "-z", cwd=worktree).split("\0") if p]
-    files += [p.relative_to(worktree).as_posix() for p in (worktree / "models" / "wallet_skill").glob("*.parquet")]
+    table = (worktree / "models" / "wallet_skill" / "TABLE")
+    if table.exists():                                  # the one table the release names (git has only its name and sha256)
+        name = table.read_text().strip()
+        if not (worktree / "models" / "wallet_skill" / name).is_file():
+            raise SystemExit(f"models/wallet_skill/{name} (named in TABLE) is not in the worktree: publish with --models, "
+                             "or put that file there")
+        files.append(f"models/wallet_skill/{name}")
     out = []
     for rel in sorted(set(files)):
         src = worktree / rel
@@ -103,10 +110,16 @@ def main() -> None:
         print("signing release.json (approve the Touch ID / agent prompt)")
         sh("ssh-keygen", "-Y", "sign", "-f", str(a.key), "-n", "fly-trader-release", str(st / "release.json"))
         pub = a.key.read_text().strip() if a.key.suffix == ".pub" else sh("ssh-keygen", "-y", "-f", str(a.key))
+        trusted = (wt / "release" / "allowed_signers")
+        material = pub.split()[1] if len(pub.split()) > 1 else pub
+        if not trusted.exists() or material not in trusted.read_text():
+            raise SystemExit("this key is not in the distribution's release/allowed_signers: self-hosted installs would refuse the "
+                             "release. Add it there (and commit) first -- docs/vault/RUNBOOK.md section 0")
         signers = Path(d) / "allowed_signers"; signers.write_text(f'{a.principal} namespaces="fly-trader-release" {pub}\n')
         print(sh(sys.executable, str(REPO / "deploy" / "fly_update.py"), "verify", str(st), str(signers), a.principal))
         classes = sorted({f["class"] for f in files})
         print(f"release {seq + 1}: {len(files)} files ({', '.join(classes)}), commit {commit[:10]}, prev {str(prev)[:12]}")
+        print(f"manifest sha256 (a new server's EXPECT_MANIFEST): {hashlib.sha256((st / 'release.json').read_bytes()).hexdigest()}")
         if a.dry_run:
             print("dry run: nothing pushed or uploaded"); return
         sh("git", "push", "origin", "distribution", cwd=wt, capture=False)
