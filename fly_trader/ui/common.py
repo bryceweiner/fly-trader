@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import streamlit as st
 
-from fly_trader import config
+from fly_trader import config, markets
 from fly_trader.db.queries import q, q1
 from fly_trader.ops.supervisor import WORKERS, get_supervisor
 from fly_trader.train.selector import DATA_VERSION, is_current, is_deployable
@@ -60,7 +60,23 @@ def ago(ts) -> str:
 
 
 def sol(x, nd: int = 4, signed: bool = False) -> str:
-    return "—" if x is None else f"{float(x):{'+' if signed else ''},.{nd}f} SOL"
+    return amount(x, "SOL", nd, signed)
+
+
+def amount(x, unit: str = "SOL", nd: int = 4, signed: bool = False) -> str:
+    """A book amount in its market's unit (SOL on Solana, ETH on Robinhood Chain)."""
+    return "—" if x is None else f"{float(x):{'+' if signed else ''},.{nd}f} {unit}"
+
+
+def chain_picker(key: str = "chain") -> markets.MarketSpec:
+    """The memecoin chain a page shows (Solana, or Robinhood Chain when RH_ENABLED): one choice shared by the pages."""
+    ms = markets.enabled()
+    if len(ms) == 1:
+        return ms[0]
+    names = {m.name: m for m in ms}
+    st.session_state.setdefault(key, ms[0].name)
+    pick = st.segmented_control("Chain", list(names), key=key, label_visibility="collapsed") or ms[0].name
+    return names[pick]
 
 
 def pct(x, nd: int = 2, signed: bool = True) -> str:
@@ -154,14 +170,17 @@ def labels(mints) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------- system state
-def system_state() -> dict:
+def system_state(market: markets.MarketSpec | None = None) -> dict:
+    """What one memecoin market (default Solana) is doing: its books' status keys, its feed, its circuit, its seat."""
+    m = market or markets.SOL; rh = m.chain != "sol"
     sup = get_supervisor(); ws = sup.status(); now = datetime.now(timezone.utc)
-    sel, sel_at = setting("selector_status"); tr, tr_at = setting("training_status"); ps, _ = setting("pumpstream_status")
-    fly, fly_at = setting("fly_status"); ho, _ = setting("handover"); rp, _ = setting("fly_replay")
-    circuit = q1("SELECT kill_switch, kill_reason, tripped, fail_count, entries_paused FROM circuit_state WHERE id = 1") or {}
+    sel, sel_at = setting(m.selector_status_key); tr, tr_at = setting("training_status"); ps, _ = setting(m.stream_status_key)
+    fly, fly_at = setting(m.fly_status_key); ho, _ = setting(m.handover_key); rp, _ = setting("fly_replay")
+    circuit = q1("SELECT kill_switch, kill_reason, tripped, fail_count, entries_paused FROM circuit_state WHERE id = %s", (m.circuit_id,)) or {}
     ft = ps.get("flushed_through")
     feed_age = (now - datetime.fromisoformat(ft)).total_seconds() - 60 if ft else None     # since the newest complete minute closed
-    feed_ok = ws["pumpstream"]["alive"] and feed_age is not None and feed_age < STALE_FEED_S
+    feed_worker = "rh_stream" if rh else "pumpstream"
+    feed_ok = ws.get(feed_worker, {}).get("alive", False) and feed_age is not None and feed_age < STALE_FEED_S
     runner = ws["runner"]["alive"]
     stage = str(tr.get("stage") or "")
     training = ws["train"]["alive"] or (tr_at is not None and (now - tr_at).total_seconds() < 180 and not stage.endswith(("saved", "done")))
@@ -180,9 +199,13 @@ def system_state() -> dict:
         trading, why = "starting", "Warming up on the last 24 hours of market minutes."
     else:
         trading, why = "trading", "Trading every minute."
-    from fly_trader.chain.cluster_guard import signing_allowed
-    live_money = bool(ho) and runner and fly.get("stage") == "trading" and signing_allowed()      # the fly holds the seat and may sign (agent/fly_live.py)
-    return {"workers": ws, "runner": runner, "trading": trading, "trading_why": why, "live_money": live_money,
+    if rh:
+        signing = not config.rh_live_prerequisites_missing()
+    else:
+        from fly_trader.chain.cluster_guard import signing_allowed
+        signing = signing_allowed()
+    live_money = bool(ho) and runner and fly.get("stage") == "trading" and signing      # the fly holds the seat and may sign (agent/fly_live.py, rh/live.py)
+    return {"market": m, "workers": ws, "runner": runner, "trading": trading, "trading_why": why, "live_money": live_money,
             "fly": fly, "fly_at": fly_at, "handover": ho or None, "replay": rp or None,
             "model": loaded_model() if runner else None, "latest": latest_snapshot("selector"), "deployable": latest_snapshot("selector", deployable=True),
             "training": training, "train_status": tr, "train_at": tr_at,
@@ -268,6 +291,11 @@ TRADING_BADGE = {"trading": ("Trading", "green"), "holding": ("Holding: feed sta
 @st.fragment(run_every="5s")
 def status_strip() -> None:
     memecoin_strip()
+    if config.RH_ENABLED:
+        try:
+            rh_strip()
+        except Exception as e:                 # the RH side must never take the Solana console down
+            st.caption(f"Robinhood Chain status unavailable: {type(e).__name__}: {e}")
     try:
         kalshi_strip()
     except Exception as e:                     # the Kalshi side must never take the memecoin console down
@@ -308,6 +336,31 @@ def memecoin_strip() -> None:
         st.badge(f"Training · {tr.get('stage', '')}" if s["training"] else "Not training", icon=":material/model_training:", color="blue" if s["training"] else "gray")
         st.badge("Market feed live" if s["feed_ok"] else "Market feed stale", icon=":material/sensors:", color="green" if s["feed_ok"] else "red",
                  help=f"newest complete minute closed {s['feed_age']:.0f} s ago" if s["feed_age"] is not None else "no minute written yet")
+
+
+def rh_strip() -> None:
+    """The Robinhood Chain row of the status strip: money, trading, the RH fly, its seat and the indexer."""
+    s = system_state(markets.RH); fly = s["fly"]; ix = s["feed"]
+    with st.container(horizontal=True, gap="small"):
+        if s["live_money"]:
+            st.badge("RH live money", icon=":material/payments:", color="red", help="Trades spend real ETH from the Robinhood Chain bot wallet.")
+        else:
+            miss = config.rh_live_prerequisites_missing()
+            st.badge("RH paper — no real ETH", icon=":material/receipt:", color="blue",
+                     help="Pons trades are simulated at market prices with the hook fee and impact" + (f"; live gated: {', '.join(miss)}." if miss else "."))
+        text, color = TRADING_BADGE[s["trading"]]
+        st.badge(f"RH {text[0].lower() + text[1:]}", icon=":material/candlestick_chart:", color=color, help=s["trading_why"])
+        if fly.get("stage") and fly.get("stage") != "not trading":
+            st.badge("RH fly trading", icon=":material/neurology:", color="violet", help="The fly on Robinhood Chain rows (one brain with the Solana fly).")
+        else:
+            st.badge("RH fly not trading", icon=":material/neurology:", color="gray", help=fly.get("detail") or s["trading_why"])
+        if s["handover"]:
+            st.badge("RH fly holds the seat", icon=":material/swap_horiz:", color="green")
+        if ix.get("mode") == "backfill":
+            st.badge(f"RH indexer backfilling · {int(ix.get('behind_blocks') or 0):,} blocks behind", icon=":material/history:", color="blue")
+        else:
+            st.badge("RH feed live" if s["feed_ok"] else "RH feed stale", icon=":material/sensors:", color="green" if s["feed_ok"] else "red",
+                     help=f"newest complete minute closed {s['feed_age']:.0f} s ago" if s["feed_age"] is not None else "no minute written yet")
 
 
 def restart_runner() -> None:

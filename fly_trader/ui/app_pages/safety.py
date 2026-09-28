@@ -34,7 +34,11 @@ def rails_panel(circuit_id: int = 1, title: str = "Trading rails", prefix: str =
             st.space("stretch")
             if st.button("Resume entries" if c.get("entries_paused") else "Pause entries", key=f"{prefix}entries_toggle"):
                 rails.set_entries_paused(not c.get("entries_paused"), circuit_id=circuit_id); st.rerun()
-        for b in q("SELECT book, halted, reason FROM book_state WHERE halted AND (book LIKE '%%kalshi%%') = %s ORDER BY book", (circuit_id == rails.KALSHI_CIRCUIT,)):
+        from fly_trader.markets import MARKETS
+        rh_books = [b for m in MARKETS.values() if m.circuit_id == rails.RH_CIRCUIT for b in m.books]
+        halted = q("SELECT book, halted, reason FROM book_state WHERE halted ORDER BY book")
+        mine = [b for b in halted if ("kalshi" in b["book"]) == (circuit_id == rails.KALSHI_CIRCUIT) and (b["book"] in rh_books) == (circuit_id == rails.RH_CIRCUIT)]
+        for b in mine:
             with st.container(horizontal=True, vertical_alignment="center"):
                 st.badge(f"{b['book']} halted", color="red")
                 st.caption(f"The paper book fell too far below its own peak ({b['reason']}); its entries are blocked, the other book trades on.")
@@ -69,6 +73,24 @@ def wallet_panel() -> None:
         if ev:
             with st.expander("Wallet events"):
                 st.dataframe(pd.DataFrame(ev), hide_index=True)
+
+
+def rh_settings_panel() -> None:
+    missing = config.rh_live_prerequisites_missing()
+    with st.container(border=True):
+        st.markdown(":material/tune: **Robinhood Chain mode and limits**")
+        rows = [("Money", "paper; live mirror " + ("on" if not missing else "gated: " + ", ".join(missing)), "The RH race runs on paper books in ETH; after the RH handover the fly also trades the ETH wallet."),
+                ("RH_LIVE_ENABLED", "1" if config.RH_LIVE_ENABLED else "0", "Allows signing real Robinhood Chain transactions (live_rh)."),
+                ("Chain", f"{config.RH_EXPECTED_CHAIN_ID}" + (" (testnet)" if config.RH_TESTNET else ""), "The guard refuses any other chain id."),
+                ("Bot address", config.RH_BOT_ADDRESS or "not set", "RH_BOT_PRIVATE_KEY must derive to it."),
+                ("Starting capital", f"{config.RH_CAPITAL_ETH:g} ETH", "The USD value of 5 SOL at build time."),
+                ("Largest buy", f"{config.RH_LABEL_SIZE_ETH:g} ETH", "The label size (0.5 SOL in USD at build time): no RH buy is bigger."),
+                ("Smallest position", f"{config.RH_MIN_POSITION_ETH:g} ETH", "Smaller sized buys are skipped."),
+                ("Gas reserve", f"{config.RH_GAS_RESERVE_ETH:g} ETH", "Never spent on positions."),
+                ("Fee cap", f"{config.RH_MAX_FEE_GWEI:g} gwei", "A transaction never offers more per gas; a spike refuses instead."),
+                ("Kill switch", f"{config.RH_KILL_SWITCH_DRAWDOWN:.0%} drawdown", "On the live RH wealth (circuit 3)."),
+                ("Routes", "KyberSwap atomic, Uniswap v4 fallback, two legs through the base last", "Every round trip returns to ETH; no base inventory is kept.")]
+        st.dataframe(pd.DataFrame(rows, columns=["setting", "value", "meaning"]), hide_index=True)
 
 
 def kalshi_settings_panel() -> None:
@@ -140,6 +162,10 @@ with left:
     settings_panel()
 with right:
     wallet_panel()
+if config.RH_ENABLED:
+    st.markdown("#### Robinhood Chain memecoins")
+    rails_panel(rails.RH_CIRCUIT, "Robinhood Chain trading rails", prefix="rh_")
+    rh_settings_panel()
 st.markdown("#### Prediction markets")
 rails_panel(rails.KALSHI_CIRCUIT, "Kalshi trading rails", prefix="k_")
 left, right = st.columns([3, 2])
