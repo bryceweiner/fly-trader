@@ -23,7 +23,7 @@ from ..signer.client import SignerUnavailable
 from ..signer.policy import PolicyError
 from ..db.apilog import record_event
 from ..db.connection import transaction
-from . import alerts, claim_message as cm, evm, sigs, state, walletlock
+from . import alerts, claim_message as cm, claims_eth, evm, sigs, state, walletlock
 
 log = logging.getLogger(__name__)
 MAX_ATTEMPTS = 4
@@ -208,7 +208,11 @@ def process(relay, rpc, signer, rh_rpc=None, now: float | None = None) -> dict:
             if row["status"] in ("verified", "waiting_liquidity"):
                 with walletlock.exclusive(timeout_s=180), transaction() as conn:
                     owed = _owed(conn, row["evm"]) + (int(row["lamports"] or 0) if row["status"] == "waiting_liquidity" else 0)
+                    eth_leg = claims_eth.fix_amount(conn, cid, row["evm"])          # the ETH pot's leg, fixed with the SOL amount
                     if owed < config.CLAIM_MIN_LAMPORTS:
+                        if eth_leg:                                                  # ETH only: the SOL leg has nothing to pay
+                            _set(conn, cid, "paid", lamports=0, reason="no SOL owed; ETH paid on Robinhood Chain")
+                            continue
                         _set(conn, cid, "rejected", reason=f"nothing to claim (owed {owed} lamports)"); out["rejected"] += 1
                         continue
                     _set(conn, cid, "sending", lamports=owed)
@@ -217,6 +221,12 @@ def process(relay, rpc, signer, rh_rpc=None, now: float | None = None) -> dict:
         except Exception as e:
             log.exception("claim %d", cid)
             record_event("error", "vault", f"claim {cid} error", {"error": type(e).__name__})
+    if config.RH_ENABLED:
+        try:
+            out["eth"] = claims_eth.process()
+        except Exception as e:                                   # the ETH legs never block the SOL payouts or the report
+            log.exception("ETH claim legs")
+            record_event("error", "vault", "ETH claim legs failed", {"error": type(e).__name__})
     report(relay)
     return out
 

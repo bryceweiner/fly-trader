@@ -100,6 +100,8 @@ class FakeChain:
                     self.tokens[op["tout"]] = self.tokens.get(op["tout"], 0) + op["out"]; logs.append(self._log(op["tout"], SWAP, ADDR, op["out"]))
         elif tx.data[:4] == abi.selector("approve(address,uint256)"):
             sp, amt = abi.decode(["address", "uint256"], tx.data[4:]); self.allow[(tx.to, sp)] = amt
+        elif tx.to != ADDR:                                             # a plain transfer out (a payout)
+            self.native -= tx.value
         rc = {"blockNumber": hex(self.head - 5), "blockHash": "0xbb", "gasUsed": hex(GAS_USED), "effectiveGasPrice": hex(BASE_FEE),
               "status": "0x1" if ok else "0x0", "logs": logs}
         (self.hidden if self.hide_receipts else self.receipts)[stx.hash] = rc

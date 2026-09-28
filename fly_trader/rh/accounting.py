@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from ..db.apilog import record_event
 from ..execution import ledger
@@ -206,7 +206,7 @@ def booked_native_since(conn, since: datetime) -> int:
     legs = conn.execute("SELECT COALESCE(sum(CASE WHEN asset_out = %s THEN amount_out_raw ELSE 0 END), 0) - "
                         "COALESCE(sum(CASE WHEN asset_in = %s THEN amount_in_raw ELSE 0 END), 0) AS d FROM rh_legs WHERE ts > %s",
                         (NATIVE, NATIVE, since)).fetchone()["d"]
-    gas = conn.execute("SELECT COALESCE(sum(fee_wei), 0) AS g FROM rh_txs WHERE fee_wei IS NOT NULL AND updated_at > %s", (since,)).fetchone()["g"]
+    gas = conn.execute("SELECT COALESCE(sum(fee_wei), 0) AS g FROM rh_txs WHERE fee_wei IS NOT NULL AND fee_at > %s", (since,)).fetchone()["g"]
     flows = conn.execute("SELECT COALESCE(sum(CASE WHEN direction = 'in' THEN wei ELSE -wei END), 0) AS f FROM rh_wallet_flows "
                          "WHERE ts > %s AND kind <> 'unknown_outbound' AND kind <> 'unexplained_in'", (since,)).fetchone()["f"]
     return int(legs) - int(gas) + int(flows)
@@ -217,6 +217,7 @@ def reconcile(conn, wallet, now: datetime | None = None) -> dict:
     native ETH gone unexplained pause circuit 3 (unexplained outbound also trips its kill switch); an unexplained native
     increase is recorded as a deposit."""
     now = now or datetime.now(timezone.utc)
+    before = now - timedelta(microseconds=1)                     # flows found now belong before this mark, never after it
     native = wallet.balance()
     gaps = []
     held: dict[str, int] = {}
@@ -231,14 +232,16 @@ def reconcile(conn, wallet, now: datetime | None = None) -> dict:
             gaps.append({"token": token, "books": want, "chain": have})
     last = conn.execute("SELECT ts, native_wei FROM rh_wallet_marks ORDER BY ts DESC LIMIT 1").fetchone()
     gap_eth = 0.0
-    if last is not None and last["native_wei"] is not None:
+    if last is None:                                             # the first check: what the wallet holds was funded
+        conn.execute("INSERT INTO rh_wallet_flows (ts, direction, kind, wei, note) VALUES (%s, 'in', 'deposit', %s, 'reconciler: opening balance')", (before, native))
+    elif last["native_wei"] is not None:
         expected = int(last["native_wei"]) + booked_native_since(conn, last["ts"])
         gap_eth = (native - expected) / WEI
         if gap_eth > DUST_ETH:
-            conn.execute("INSERT INTO rh_wallet_flows (direction, kind, wei, note) VALUES ('in', 'deposit', %s, 'reconciler: unexplained increase')",
-                         (native - expected,))
+            conn.execute("INSERT INTO rh_wallet_flows (ts, direction, kind, wei, note) VALUES (%s, 'in', 'deposit', %s, 'reconciler: unexplained increase')",
+                         (before, native - expected))
         elif gap_eth < -DUST_ETH:
-            conn.execute("INSERT INTO rh_wallet_flows (direction, kind, wei, note) VALUES ('out', 'unknown_outbound', %s, 'reconciler')", (expected - native,))
+            conn.execute("INSERT INTO rh_wallet_flows (ts, direction, kind, wei, note) VALUES (%s, 'out', 'unknown_outbound', %s, 'reconciler')", (before, expected - native))
     ok = not gaps and gap_eth >= -DUST_ETH
     conn.execute("INSERT INTO rh_wallet_marks (ts, native_wei, consistent) VALUES (%s, %s, %s) ON CONFLICT (ts) DO NOTHING", (now, native, ok))
     if not ok:

@@ -315,4 +315,19 @@ def run_once(rpc, wallet: str, index_state: dict, now: float | None = None, trea
                         f"(pot {res['pot'] / LAMPORTS:.4f}, carried {res['carried'] / LAMPORTS:.4f})")
         else:
             break                                                 # settle in period order
+    if config.RH_ENABLED:                                         # the ETH pot follows each allocated SOL settlement
+        try:
+            from . import settle_eth
+            out["eth"] = settle_eth.run_once(None if paper() else _rh_balance)
+        except Exception as e:
+            log.exception("ETH settlement")
+            record_event("error", "vault", "ETH settlement failed", {"error": type(e).__name__})
     return out
+
+
+def _rh_balance() -> int:
+    """The RH bot wallet's native wei (the address is pinned in config; no key is needed to read it)."""
+    from ..rh.rpc import RhRpc
+    if not config.RH_BOT_ADDRESS:
+        raise RuntimeError("RH_BOT_ADDRESS is not set")
+    return RhRpc().get_balance(config.RH_BOT_ADDRESS.lower())

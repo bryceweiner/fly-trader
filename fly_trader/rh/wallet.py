@@ -35,6 +35,57 @@ class FeeTooHigh(RuntimeError):
     pass
 
 
+class WalletLock:
+    """One RH address, one transaction in flight — across threads (trading intents, vault ETH payouts) and processes
+    (CLI tools): a re-entrant thread lock plus a Postgres advisory lock held while the outermost holder has it. The
+    executor's balance deltas are only that intent's because nothing else can send from the address meanwhile."""
+
+    def __init__(self, address: str):
+        self.key = int.from_bytes(hashlib.sha256(("rh-wallet:" + address.lower()).encode()).digest()[:8], "big", signed=True)
+        self._t = threading.RLock(); self._depth = 0; self._conn = None
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if not self._t.acquire(blocking, timeout):
+            return False
+        if self._depth == 0:
+            from ..db.connection import connect
+            conn = connect(autocommit=True)
+            deadline = None if timeout is None or timeout < 0 else time.monotonic() + timeout
+            while not conn.execute("SELECT pg_try_advisory_lock(%s) AS ok", (self.key,)).fetchone()["ok"]:
+                if not blocking or (deadline is not None and time.monotonic() > deadline):
+                    conn.close(); self._t.release()
+                    return False
+                time.sleep(0.2)
+            self._conn = conn
+        self._depth += 1
+        return True
+
+    def release(self) -> None:
+        self._depth -= 1
+        if self._depth == 0 and self._conn is not None:
+            try:
+                self._conn.execute("SELECT pg_advisory_unlock(%s)", (self.key,))
+            finally:
+                self._conn.close(); self._conn = None
+        self._t.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
+_LOCKS: dict[str, WalletLock] = {}
+_LOCKS_MU = threading.Lock()
+
+
+def wallet_lock(address: str) -> WalletLock:
+    with _LOCKS_MU:
+        return _LOCKS.setdefault(address.lower(), WalletLock(address))
+
+
 class SendFailed(RuntimeError):
     pass
 
@@ -52,7 +103,7 @@ class RhWallet:
             key, address = guard.check(rpc)
         self._key = key
         self.address = (address or "").lower()
-        self.lock = threading.RLock()
+        self.lock = wallet_lock(self.address)
 
     # ---- chain reads
     def balance(self) -> int:
@@ -94,9 +145,10 @@ class RhWallet:
     # ---- send
     def send(self, *, to: str, data=b"", value: int = 0, kind: str, intent_id: int | None = None, position_id: int | None = None,
              gas: int | None = None, nonce: int | None = None, fees: tuple[int, int] | None = None, router: str | None = None,
-             quote: dict | None = None, build: dict | None = None) -> dict:
+             quote: dict | None = None, build: dict | None = None, on_persist=None) -> dict:
         """Sign, persist, broadcast. Returns {id, hash, nonce, gas, max_fee}. Raises SendFailed (the row is marked dropped,
-        so its nonce is reused) or FeeTooHigh (nothing signed)."""
+        so its nonce is reused) or FeeTooHigh (nothing signed). ``on_persist(conn, tx_id)`` runs inside the transaction
+        that persists the signed row, so a caller's own link to it (a claim's payout) is committed before broadcast too."""
         data = _calldata(data)
         with self.lock:
             gas = gas or self.estimate(to, data, value)
@@ -113,6 +165,8 @@ class RhWallet:
                     "error = NULL, updated_at = now() RETURNING id",
                     (intent_id, position_id, kind, self.address, n, stx.hash, stx.raw_hex, to.lower(), value, hashlib.sha256(data).hexdigest(), gas,
                      mx, tip, router, json.dumps(quote) if quote else None, json.dumps(build) if build else None)).fetchone()
+                if on_persist is not None:
+                    on_persist(conn, int(row["id"]))
             tid = int(row["id"])                                              # committed: a crash from here on is recoverable
             try:
                 self.rpc.send_raw(stx.raw_hex)
@@ -145,7 +199,8 @@ class RhWallet:
         """Store a receipt's outcome on its rh_txs row. Returns {ok, fee_wei, gas_used, block}."""
         gas_used = int(rc["gasUsed"], 16); price = int(rc.get("effectiveGasPrice") or "0x0", 16); fee = gas_used * price
         ok = int(rc.get("status", "0x0"), 16) == 1
-        conn.execute("UPDATE rh_txs SET status = %s, block = %s, block_hash = %s, gas_used = %s, eff_gas_price_wei = %s, fee_wei = %s, updated_at = now() "
+        conn.execute("UPDATE rh_txs SET status = %s, block = %s, block_hash = %s, gas_used = %s, eff_gas_price_wei = %s, fee_wei = %s, "
+                     "fee_at = COALESCE(fee_at, clock_timestamp()), updated_at = now() "
                      "WHERE id = %s", ("mined_ok" if ok else "reverted", int(rc["blockNumber"], 16), rc.get("blockHash"), gas_used, price, fee, tx_id))
         return {"ok": ok, "fee_wei": fee, "gas_used": gas_used, "block": int(rc["blockNumber"], 16)}
 
