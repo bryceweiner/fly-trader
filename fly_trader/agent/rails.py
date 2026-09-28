@@ -1,6 +1,9 @@
 """Risk rails outside the model. KillSwitch (−KILL_SWITCH_DRAWDOWN from peak wealth → no entries), CircuitBreaker
 (CIRCUIT_THRESHOLD consecutive execution failures), the rolling 24 h notional ledger, and PauseEntries (console
 toggle). State lives in circuit_state / circuit_events / notional_ledger; the trading engine reads it before entries.
+One circuit per trading type: ``circuit_id`` 1 is the Solana memecoin live book (the default everywhere), 3 the Robinhood
+Chain memecoin live book (``RH_CIRCUIT``, fly_trader/rh; 2 is the development line's Kalshi circuit, unused here);
+``check_drawdown`` takes the drawdown limit of the caller's type.
 """
 from __future__ import annotations
 
@@ -13,6 +16,7 @@ from ..db.apilog import record_event
 from ..db.connection import transaction
 
 log = logging.getLogger(__name__)
+SOLANA_CIRCUIT, KALSHI_CIRCUIT, RH_CIRCUIT = 1, 2, 3
 
 
 @dataclass
@@ -25,48 +29,49 @@ class CircuitState:
     entries_paused: bool = False
 
 
-def load_circuit(conn) -> CircuitState:
-    r = conn.execute("SELECT * FROM circuit_state WHERE id = 1").fetchone()
+def load_circuit(conn, circuit_id: int = SOLANA_CIRCUIT) -> CircuitState:
+    r = conn.execute("SELECT * FROM circuit_state WHERE id = %s", (circuit_id,)).fetchone()
     if not r:
         return CircuitState()
     return CircuitState(r["fail_count"], r["tripped"], r["kill_switch"], r["kill_reason"], r["peak_wealth"], r["entries_paused"])
 
 
-def _event(conn, kind: str, detail: dict | None = None) -> None:
-    conn.execute("INSERT INTO circuit_events (kind, detail) VALUES (%s, %s)", (kind, json.dumps(detail or {}, default=str)))
+def _event(conn, kind: str, detail: dict | None = None, circuit_id: int = SOLANA_CIRCUIT) -> None:
+    conn.execute("INSERT INTO circuit_events (kind, detail) VALUES (%s, %s)", (kind, json.dumps({**(detail or {}), "circuit": circuit_id}, default=str)))
 
 
-def record_failure(conn, reason: str) -> CircuitState:
+def record_failure(conn, reason: str, circuit_id: int = SOLANA_CIRCUIT) -> CircuitState:
     r = conn.execute(
-        "UPDATE circuit_state SET fail_count = fail_count + 1, last_failure_ts = now(), updated_at = now() WHERE id = 1 RETURNING fail_count, tripped"
+        "UPDATE circuit_state SET fail_count = fail_count + 1, last_failure_ts = now(), updated_at = now() WHERE id = %s RETURNING fail_count, tripped", (circuit_id,)
     ).fetchone()
     tripped = r["tripped"]
     if r["fail_count"] >= config.CIRCUIT_THRESHOLD and not tripped:
-        conn.execute("UPDATE circuit_state SET tripped = true, updated_at = now() WHERE id = 1")
-        _event(conn, "tripped", {"reason": reason, "fail_count": r["fail_count"]})
-        record_event("error", "rails", "circuit breaker tripped", {"reason": reason})
-    return load_circuit(conn)
+        conn.execute("UPDATE circuit_state SET tripped = true, updated_at = now() WHERE id = %s", (circuit_id,))
+        _event(conn, "tripped", {"reason": reason, "fail_count": r["fail_count"]}, circuit_id)
+        record_event("error", "rails", "circuit breaker tripped", {"reason": reason, "circuit": circuit_id})
+    return load_circuit(conn, circuit_id)
 
 
-def record_success(conn) -> None:
-    conn.execute("UPDATE circuit_state SET fail_count = 0, updated_at = now() WHERE id = 1")
+def record_success(conn, circuit_id: int = SOLANA_CIRCUIT) -> None:
+    conn.execute("UPDATE circuit_state SET fail_count = 0, updated_at = now() WHERE id = %s", (circuit_id,))
 
 
-def check_drawdown(conn, wealth: float, peak: float) -> bool:
-    """Trip the kill switch when ``wealth`` has fallen KILL_SWITCH_DRAWDOWN below ``peak`` (the book's own peak: the
-    trading engine passes the highest wealth mark of the current run). Returns whether the kill switch is on."""
-    st = load_circuit(conn)
+def check_drawdown(conn, wealth: float, peak: float, circuit_id: int = SOLANA_CIRCUIT, drawdown: float | None = None, unit: str = "SOL") -> bool:
+    """Trip the kill switch when ``wealth`` has fallen ``drawdown`` (default KILL_SWITCH_DRAWDOWN) below ``peak`` (the book's
+    own peak: the trading engine passes the highest wealth mark of the current run). Returns whether the kill switch is on."""
+    st = load_circuit(conn, circuit_id)
     if st.kill_switch:
         return True
-    if peak > 0 and wealth <= peak * (1.0 - config.KILL_SWITCH_DRAWDOWN):
-        conn.execute("UPDATE circuit_state SET kill_switch = true, kill_reason = %s, peak_wealth = %s, updated_at = now() WHERE id = 1",
-                     (f"wealth {wealth:.4f} SOL <= {1 - config.KILL_SWITCH_DRAWDOWN:.2f} x peak {peak:.4f} SOL", peak))
-        _event(conn, "kill_switch", {"wealth": wealth, "peak": peak})
-        record_event("error", "rails", "kill switch tripped: entries blocked", {"wealth": wealth, "peak": peak})
+    dd = config.KILL_SWITCH_DRAWDOWN if drawdown is None else float(drawdown)
+    if peak > 0 and wealth <= peak * (1.0 - dd):
+        conn.execute("UPDATE circuit_state SET kill_switch = true, kill_reason = %s, peak_wealth = %s, updated_at = now() WHERE id = %s",
+                     (f"wealth {wealth:.4f} {unit} <= {1 - dd:.2f} x peak {peak:.4f} {unit}", peak, circuit_id))
+        _event(conn, "kill_switch", {"wealth": wealth, "peak": peak}, circuit_id)
+        record_event("error", "rails", "kill switch tripped: entries blocked", {"wealth": wealth, "peak": peak, "circuit": circuit_id})
         if config.VAULT_ENABLED:                         # the hosted fly: tell the operator at once
             try:
                 from ..vault import alerts
-                alerts.send(f"KILL SWITCH tripped: {wealth:.4f} <= {1 - config.KILL_SWITCH_DRAWDOWN:.2f} x peak {peak:.4f}. Entries blocked"
+                alerts.send(f"KILL SWITCH tripped: {wealth:.4f} {unit} <= {1 - dd:.2f} x peak {peak:.4f} {unit}. Entries blocked"
                             + (", open positions are being liquidated" if config.KILL_SWITCH_LIQUIDATE else "")
                             + ". Clear it with `fly-trader reset-circuit --kill` once you know why.")
             except Exception:
@@ -75,7 +80,7 @@ def check_drawdown(conn, wealth: float, peak: float) -> bool:
     return False
 
 
-def kill_rebase_at(conn, circuit_id: int = 1):
+def kill_rebase_at(conn, circuit_id: int = SOLANA_CIRCUIT):
     """When the kill switch was last cleared: peaks are measured from marks after it, so clearing really re-bases.
     (Before this, the live book recomputed its peak from every wealth mark ever and re-tripped the next minute.)"""
     r = conn.execute("SELECT max(ts) AS ts FROM circuit_events WHERE kind = 'reset' AND (detail->>'kill')::boolean "
@@ -83,13 +88,14 @@ def kill_rebase_at(conn, circuit_id: int = 1):
     return r["ts"] if r else None
 
 
-def check_book_drawdown(conn, book: str, wealth: float, peak: float) -> bool:
-    """A paper race book's own kill switch: KILL_SWITCH_DRAWDOWN below the book's peak halts that book's entries only,
-    so one book's drawdown never stops the other during the race. Returns whether the book is halted."""
+def check_book_drawdown(conn, book: str, wealth: float, peak: float, drawdown: float | None = None, unit: str = "SOL") -> bool:
+    """A paper race book's own kill switch: ``drawdown`` (default KILL_SWITCH_DRAWDOWN) below the book's peak halts that
+    book's entries only, so one book's drawdown never stops the other during the race. Returns whether the book is halted."""
     if book_halted(conn, book):
         return True
-    if peak > 0 and wealth <= peak * (1.0 - config.KILL_SWITCH_DRAWDOWN):
-        reason = f"wealth {wealth:.4f} SOL <= {1 - config.KILL_SWITCH_DRAWDOWN:.2f} x peak {peak:.4f} SOL"
+    dd = config.KILL_SWITCH_DRAWDOWN if drawdown is None else float(drawdown)
+    if peak > 0 and wealth <= peak * (1.0 - dd):
+        reason = f"wealth {wealth:.4f} {unit} <= {1 - dd:.2f} x peak {peak:.4f} {unit}"
         conn.execute("INSERT INTO book_state (book, halted, reason, peak, updated_at) VALUES (%s, true, %s, %s, now()) "
                      "ON CONFLICT (book) DO UPDATE SET halted = true, reason = EXCLUDED.reason, peak = EXCLUDED.peak, updated_at = now()",
                      (book, reason, peak))
@@ -111,28 +117,29 @@ def clear_book_halt(book: str) -> None:
     record_event("info", "rails", f"{book}: drawdown halt cleared")
 
 
-def notional_24h(conn) -> float:
-    r = conn.execute("SELECT COALESCE(sum(sol), 0) AS s FROM notional_ledger WHERE ts > now() - interval '24 hours'").fetchone()
+def notional_24h(conn, market: str = "sol") -> float:
+    """The last 24 h of entries in ``market``'s unit (``sol`` holds ETH on the ``rh`` market's rows)."""
+    r = conn.execute("SELECT COALESCE(sum(sol), 0) AS s FROM notional_ledger WHERE ts > now() - interval '24 hours' AND market = %s", (market,)).fetchone()
     return float(r["s"])
 
 
-def record_notional(conn, sol: float, kind: str = "entry") -> None:
-    conn.execute("INSERT INTO notional_ledger (sol, kind) VALUES (%s, %s)", (sol, kind))
+def record_notional(conn, sol: float, kind: str = "entry", market: str = "sol") -> None:
+    conn.execute("INSERT INTO notional_ledger (sol, kind, market) VALUES (%s, %s, %s)", (sol, kind, market))
 
 
-def reset_circuit(kill: bool = False) -> None:
+def reset_circuit(kill: bool = False, circuit_id: int = SOLANA_CIRCUIT) -> None:
     with transaction() as conn:
-        conn.execute("UPDATE circuit_state SET fail_count = 0, tripped = false, updated_at = now() WHERE id = 1")
-        _event(conn, "reset", {"kill": kill})
+        conn.execute("UPDATE circuit_state SET fail_count = 0, tripped = false, updated_at = now() WHERE id = %s", (circuit_id,))
+        _event(conn, "reset", {"kill": kill}, circuit_id)
         if kill:
-            conn.execute("UPDATE circuit_state SET kill_switch = false, kill_reason = NULL, peak_wealth = NULL, updated_at = now() WHERE id = 1")
-    record_event("info", "rails", "circuit reset" + (" incl. kill switch (peak re-based)" if kill else ""))
+            conn.execute("UPDATE circuit_state SET kill_switch = false, kill_reason = NULL, peak_wealth = NULL, updated_at = now() WHERE id = %s", (circuit_id,))
+    record_event("info", "rails", "circuit reset" + (" incl. kill switch (peak re-based)" if kill else ""), {"circuit": circuit_id})
     print("circuit reset" + (" + kill switch cleared" if kill else ""))
 
 
-def set_entries_paused(paused: bool) -> None:
+def set_entries_paused(paused: bool, circuit_id: int = SOLANA_CIRCUIT) -> None:
     with transaction() as conn:
-        conn.execute("UPDATE circuit_state SET entries_paused = %s, updated_at = now() WHERE id = 1", (paused,))
-        _event(conn, "paused" if paused else "resumed", {})
-    record_event("info", "rails", "entries paused" if paused else "entries resumed")
+        conn.execute("UPDATE circuit_state SET entries_paused = %s, updated_at = now() WHERE id = %s", (paused, circuit_id))
+        _event(conn, "paused" if paused else "resumed", {}, circuit_id)
+    record_event("info", "rails", "entries paused" if paused else "entries resumed", {"circuit": circuit_id})
     print("entries paused" if paused else "entries resumed")
