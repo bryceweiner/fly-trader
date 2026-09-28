@@ -68,6 +68,8 @@ def size_position(score: float, threshold: float, table: list[dict] | None, bank
     unit = market.unit if rh else "SOL"
     if not table:
         size = config.MAX_POSITION_SOL * (market.k() if rh else 1.0)
+        if rh:                               # never above the RH label size, even for a table-less model
+            size = min(size, label_size(res_quote_sol, market))
         return (size, f"fixed {size:g} {unit} (model has no sizing table)") if free >= size else (0.0, "not enough free cash")
     b = band_for(table, score - threshold)
     if b is None or b["kelly"] <= 0:
