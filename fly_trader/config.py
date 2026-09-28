@@ -251,9 +251,9 @@ RH_CAPITAL_ETH = env_float("RH_CAPITAL_ETH", 0.222791)                   # the R
 RH_LABEL_SIZE_ETH = env_float("RH_LABEL_SIZE_ETH", 0.0222791)             # 0.5 SOL at build time: RH labels are priced at it; no RH buy is bigger
 RH_MIN_POSITION_ETH = env_float("RH_MIN_POSITION_ETH", 0.000891166)         # 0.02 SOL at build time
 RH_GAS_RESERVE_ETH = env_float("RH_GAS_RESERVE_ETH", 0.0029)        # 200 round trips at 2x the gas rh-probe measured (356k gas, 0.02 gwei, 2026-09-28)
-RH_MAX_FEE_GWEI = env_float("RH_MAX_FEE_GWEI", 5.0)
+RH_MAX_FEE_GWEI = env_float("RH_MAX_FEE_GWEI", 5.0)                  # a transaction never offers more per gas
 RH_TX_FEE_ETH = env_float("RH_TX_FEE_ETH", 7.2e-6)                 # one swap's gas in ETH (rh-probe 2026-09-28: 356k gas × 0.02 gwei); fixed like the SOL fee
-RH_HOOK_FEE = env_float("RH_HOOK_FEE", 0.029126)                    # Pons hook fee + tax per side (3 % of the net = 2.9126 % of gross, measured) when a minute has none                 # a transaction never offers more per gas
+RH_HOOK_FEE = env_float("RH_HOOK_FEE", 0.029126)                    # Pons hook fee + tax per side (3 % of the net = 2.9126 % of gross, measured) when a minute has none
 RH_KILL_SWITCH_DRAWDOWN = env_float("RH_KILL_SWITCH_DRAWDOWN", 0.30)
 RH_MIN_SWEEP_ETH = env_float("RH_MIN_SWEEP_ETH", 0.0002)           # base-asset or dead-bag balances worth less are dust
 RH_STREAM_POLL_S = env_float("RH_STREAM_POLL_S", 2.0)
