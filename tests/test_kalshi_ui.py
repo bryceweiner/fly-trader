@@ -24,7 +24,7 @@ def test_navigation_has_three_sections_and_every_page_compiles():
                 sections[k.value] = [c.args[0].value for c in v.elts]
     assert list(sections) == ["Memecoins", "Prediction markets", "System"]
     assert sections["Prediction markets"] == ["app_pages/kalshi_overview.py", "app_pages/kalshi_trades.py", "app_pages/kalshi_model.py", "app_pages/kalshi_data.py"]
-    assert sections["System"] == ["app_pages/processes.py", "app_pages/safety.py"]
+    assert sections["System"][:2] == ["app_pages/processes.py", "app_pages/safety.py"]        # other system pages may follow (e.g. the vault)
     for rel in [p for s in sections.values() for p in s]:
         compile((UI / rel).read_text(), rel, "exec")
 
