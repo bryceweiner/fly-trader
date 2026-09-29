@@ -69,7 +69,8 @@ def seed_from_dataset(stop: threading.Event | None = None) -> dict:
         return {"skipped": "no dataset at KALSHI_DATASET_DIR"}
     import duckdb
     mfiles = sorted(glob.glob(str(root / "data" / "kalshi" / "markets" / "*.parquet"))); tfiles = sorted(glob.glob(str(root / "data" / "kalshi" / "trades" / "*.parquet")))
-    stamp = {"markets": [Path(f).name for f in mfiles], "trades": [Path(f).name for f in tfiles], "start": config.KALSHI_HISTORY_START}
+    stamp = {"markets": [Path(f).name for f in mfiles], "trades": [Path(f).name for f in tfiles], "start": config.KALSHI_HISTORY_START,
+             "rule": "volume-floor", "min_volume": float(config.KALSHI_MIN_MARKET_VOLUME)}         # the per-category cap is applied by prune_pending
     with transaction() as conn:
         r = conn.execute("SELECT value FROM ui_settings WHERE key = %s", (SEED_KEY,)).fetchone()
     if r and (r["value"] if isinstance(r["value"], dict) else json.loads(r["value"] or "{}")).get("stamp") == stamp:
@@ -78,14 +79,13 @@ def seed_from_dataset(stop: threading.Event | None = None) -> dict:
     cols = [c[0] for c in con.execute("SELECT * FROM read_parquet(?, union_by_name = true) LIMIT 0", [mfiles]).description]
     want = ["ticker", "event_ticker", "market_type", "title", "yes_sub_title", "no_sub_title", "status", "result", "open_time", "close_time", "volume", "open_interest"]
     sel = ", ".join(c if c in cols else f"NULL AS {c}" for c in want)
-    # the most traded markets of each close day: volume ≥ KALSHI_MIN_MARKET_VOLUME, at most KALSHI_MARKETS_PER_DAY per day (6.8 M settled
-    # yes/no markets since 2025-01-01 are mostly hourly ladders that never traded; ~1.3 s of API per market bounds the corpus)
+    # every settled market above the volume floor (6.8 M settled yes/no markets since 2025-01-01 are mostly hourly ladders that
+    # never traded); which of them the corpus keeps per category and day is prune_pending's decision, once their series are known
     rows = con.execute(f"""SELECT {sel} FROM read_parquet(?, union_by_name = true)
                            WHERE result IN ('yes', 'no') AND close_time >= ? AND COALESCE(volume, 0) >= ?
-                           QUALIFY row_number() OVER (PARTITION BY CAST(close_time AS DATE) ORDER BY volume DESC, ticker) <= ?
-                           ORDER BY close_time DESC""", [mfiles, _start().replace(tzinfo=None), float(config.KALSHI_MIN_MARKET_VOLUME), int(config.KALSHI_MARKETS_PER_DAY)]).fetchall()
+                           ORDER BY close_time DESC""", [mfiles, _start().replace(tzinfo=None), float(config.KALSHI_MIN_MARKET_VOLUME)]).fetchall()
     markets = [dict(zip(want, r)) for r in rows]
-    log.info("dataset seed: %d settled yes/no markets since %s (volume ≥ %g, ≤ %d per day)", len(markets), config.KALSHI_HISTORY_START, config.KALSHI_MIN_MARKET_VOLUME, config.KALSHI_MARKETS_PER_DAY)
+    log.info("dataset seed: %d settled yes/no markets since %s (volume ≥ %g)", len(markets), config.KALSHI_HISTORY_START, config.KALSHI_MIN_MARKET_VOLUME)
     n = 0
     with transaction() as conn:
         for i in range(0, len(markets), 5000):
@@ -278,20 +278,75 @@ def catalogue_missing(rest: KalshiRest, stop: threading.Event | None = None, thr
     return done["n"]
 
 
+CAP_SKIP = "beyond the corpus's markets per category and day"
+OLD_CAP_SKIPS = ("beyond the corpus's markets per day", CAP_SKIP)
+
+
+def ensure_series(rest: KalshiRest, stop: threading.Event | None = None, threads: int | None = None) -> int:
+    """Series of corpus markets missing from the catalogue (the dataset's markets carry no category; their series does)."""
+    with transaction() as conn:
+        todo = [r["st"] for r in conn.execute("""SELECT DISTINCT COALESCE(e.series_ticker, split_part(COALESCE(m.event_ticker, m.ticker), '-', 1)) AS st
+                                                 FROM kalshi_corpus k JOIN kalshi_markets m USING (ticker) LEFT JOIN kalshi_events e USING (event_ticker)
+                                                 WHERE k.status <> 'empty'""").fetchall() if r["st"]]
+        known = _known_series(conn)
+    todo = [t for t in todo if t not in known]
+
+    def one(st: str) -> None:
+        if stop is not None and stop.is_set():
+            return
+        try:
+            s_ = rest.series(st)
+        except KalshiApiError as ex:
+            if ex.status is not None and (ex.status == 429 or ex.status >= 500):
+                return
+            s_ = {"ticker": st}
+        with transaction() as conn:
+            D.upsert_series(conn, s_ if s_.get("ticker") else {**s_, "ticker": st})
+    if todo:
+        with ThreadPoolExecutor(max_workers=max(1, int(threads or config.KALSHI_FILL_THREADS)), thread_name_prefix="kalshi-series") as pool:
+            list(pool.map(one, todo))
+        log.info("catalogued %d series of corpus markets", len(todo))
+    return len(todo)
+
+
 def prune_pending() -> int:
-    """Pending corpus rows beyond the corpus's bounds go to 'skipped': volume below KALSHI_MIN_MARKET_VOLUME (or unknown), or
-    not among the KALSHI_MARKETS_PER_DAY most traded of their close day. Volume unknown on the row is read from the market's raw JSON."""
+    """Which settled markets the corpus keeps: volume ≥ KALSHI_MIN_MARKET_VOLUME, and the KALSHI_MARKETS_PER_DAY most traded of
+    each (category, close day) — Kalshi's category of the market's series (unknown until the series is catalogued). Markets already filled or
+    built always count toward their day's cap; pending ones beyond it are 'skipped', and markets an earlier rule skipped are
+    brought back when the current rule keeps them. Returns the number of rows whose status changed."""
+    import pandas as pd
     with transaction() as conn:
         conn.execute("""UPDATE kalshi_corpus c SET volume = COALESCE(NULLIF(m.raw->>'volume_fp', '')::float, NULLIF(m.raw->>'volume', '')::float)
                         FROM kalshi_markets m WHERE m.ticker = c.ticker AND c.volume IS NULL AND m.raw IS NOT NULL""")
         a = conn.execute("UPDATE kalshi_corpus SET status = 'skipped', last_error = 'volume below the corpus minimum', updated_at = now() "
                          "WHERE status = 'pending' AND COALESCE(volume, 0) < %s", (float(config.KALSHI_MIN_MARKET_VOLUME),)).rowcount
-        b = conn.execute("""UPDATE kalshi_corpus c SET status = 'skipped', last_error = 'beyond the corpus''s markets per day', updated_at = now()
-                            FROM (SELECT ticker, row_number() OVER (PARTITION BY date_trunc('day', close_time) ORDER BY volume DESC NULLS LAST, ticker) AS rk
-                                  FROM kalshi_corpus WHERE status IN ('pending', 'done', 'built') AND close_time IS NOT NULL) r
-                            WHERE r.ticker = c.ticker AND c.status = 'pending' AND r.rk > %s""", (int(config.KALSHI_MARKETS_PER_DAY),)).rowcount
-    return int(a or 0) + int(b or 0)
-
+        rows = conn.execute("""SELECT k.ticker, k.status, k.volume, k.close_time, k.last_error, COALESCE(s.category, se.category) AS scat, e.category AS ecat
+                               FROM kalshi_corpus k JOIN kalshi_markets m USING (ticker) LEFT JOIN kalshi_events e USING (event_ticker)
+                               LEFT JOIN kalshi_series s ON s.ticker = e.series_ticker
+                               LEFT JOIN kalshi_series se ON se.ticker = split_part(COALESCE(m.event_ticker, m.ticker), '-', 1)
+                               WHERE k.close_time IS NOT NULL AND COALESCE(k.volume, 0) >= %s
+                                 AND (k.status IN ('pending', 'done', 'built') OR (k.status = 'skipped' AND k.last_error = ANY(%s)))""",
+                            (float(config.KALSHI_MIN_MARKET_VOLUME), list(OLD_CAP_SKIPS))).fetchall()
+    if not rows:
+        return int(a or 0)
+    df = pd.DataFrame([dict(r) for r in rows])
+    # the cap's category is Kalshi's own (Mentions, Commodities, Financials ... each its own cap), not the feature table's coarser key
+    df["cat"] = [(sc if isinstance(sc, str) and sc else ec if isinstance(ec, str) and ec else "unknown").strip().lower() for sc, ec in zip(df["scat"], df["ecat"])]
+    df["day"] = pd.to_datetime(df["close_time"], utc=True).dt.floor("D")
+    df["kept_first"] = df["status"].isin(["done", "built"])                       # what is filled stays; it takes its place in the cap first
+    df = df.sort_values(["cat", "day", "kept_first", "volume", "ticker"], ascending=[True, True, False, False, True])
+    df["rk"] = df.groupby(["cat", "day"]).cumcount()
+    keep = df["kept_first"] | (df["rk"] < int(config.KALSHI_MARKETS_PER_DAY))
+    to_skip = df.loc[~keep & (df["status"] == "pending"), "ticker"].tolist()
+    to_pend = df.loc[keep & (df["status"] == "skipped"), "ticker"].tolist()
+    with transaction() as conn:
+        for i in range(0, len(to_skip), 20000):
+            conn.execute("UPDATE kalshi_corpus SET status = 'skipped', last_error = %s, updated_at = now() WHERE ticker = ANY(%s) AND status = 'pending'", (CAP_SKIP, to_skip[i:i + 20000]))
+        for i in range(0, len(to_pend), 20000):
+            conn.execute("UPDATE kalshi_corpus SET status = 'pending', last_error = NULL, updated_at = now() WHERE ticker = ANY(%s) AND status = 'skipped'", (to_pend[i:i + 20000],))
+    log.info("corpus rule: %d kept of %d above the floor (%d re-opened, %d skipped); per category: %s", int(keep.sum()), len(df), len(to_pend), len(to_skip),
+             df[keep].groupby("cat").size().sort_values(ascending=False).to_dict())
+    return int(a or 0) + len(to_skip) + len(to_pend)
 
 # ---------------------------------------------------------------- 3. candles and trades
 def _series_for(conn, ticker: str) -> str:
@@ -420,8 +475,8 @@ def main(stop_event: threading.Event | None = None) -> None:
             try:
                 _status(stage="seeding from the dataset"); seeded = seed_from_dataset(stop)
                 _status(stage="refreshing markets", seed=seeded); n_new = refresh_markets(rest, stop)
-                catalogue_missing(rest, stop)
-                skipped = prune_pending()
+                ensure_series(rest, stop); skipped = prune_pending()          # rank per category (series) first,
+                catalogue_missing(rest, stop)                                  # then fetch only the kept markets' events
                 c = counts(); _status(stage="filling candles", refreshed=n_new, skipped_now=skipped, **{k: v for k, v in c.items()})
                 t0 = time.time(); done = 0
                 while not (stop is not None and stop.is_set()):

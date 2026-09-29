@@ -33,7 +33,7 @@ CATEGORY_KEYS = (("politic", "politics"), ("election", "politics"), ("sport", "s
 
 
 def category_key(raw: str | None) -> str:
-    s = (raw or "").lower()
+    s = raw.lower() if isinstance(raw, str) else ""              # None or NaN (a market whose series is not catalogued yet): 'other'
     for needle, key in CATEGORY_KEYS:
         if needle in s:
             return key
