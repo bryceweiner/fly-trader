@@ -158,3 +158,19 @@ def test_parallel_fill_finishes_markets_and_leaves_network_failures_pending(tmp_
     monkeypatch.setattr(H, "pull_candles", lambda *a: (_ for _ in ()).throw(TimeoutError("down")))
     assert H.fill(object(), threads=4, limit=50) == -1                     # everything left failed on the network
     _clean()
+
+
+def test_markets_seeded_without_a_catalogue_get_their_events_and_series():
+    _clean_walk()
+    with transaction() as c:
+        for tk, et in (("TSTH-C1", "TSTH-EVA"), ("TSTH-C2", "TSTH-EVA"), ("TSTH-C3", "TSTH-EVB")):
+            c.execute("INSERT INTO kalshi_markets (ticker, event_ticker, status, source) VALUES (%s, %s, 'settled', 'dataset')", (tk, et))
+            c.execute("INSERT INTO kalshi_corpus (ticker, status, close_time) VALUES (%s, 'built', now())", (tk,))
+    rest = FakeRest([], [])
+    assert H.catalogue_missing(rest, threads=3) == 2
+    assert sorted(c[1] for c in rest.calls if c[0] == "event") == ["TSTH-EVA", "TSTH-EVB"]
+    with transaction() as c:
+        rows = {r["event_ticker"]: r["category"] for r in c.execute("SELECT event_ticker, category FROM kalshi_events WHERE event_ticker LIKE 'TSTH-EV%'").fetchall()}
+        assert rows == {"TSTH-EVA": "Politics", "TSTH-EVB": "Politics"} and c.execute("SELECT count(*) AS n FROM kalshi_series WHERE ticker = 'TSTH'").fetchone()["n"] == 1
+    assert H.catalogue_missing(rest) == 0                                   # nothing left to fetch
+    _clean_walk()

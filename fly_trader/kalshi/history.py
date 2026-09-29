@@ -231,6 +231,53 @@ def refresh_markets(rest: KalshiRest, stop: threading.Event | None = None, max_p
     return n
 
 
+def catalogue_missing(rest: KalshiRest, stop: threading.Event | None = None, threads: int | None = None) -> int:
+    """Events (and their series) of corpus markets that have none in the catalogue — the dataset seed never fetched them, so
+    those markets built with category 'other', fee multiplier 1, not mutually exclusive and no siblings. Fetched
+    ``threads`` at a time under the client's one rate bucket; returns events catalogued."""
+    with transaction() as conn:
+        todo = [r["event_ticker"] for r in conn.execute("""SELECT DISTINCT m.event_ticker FROM kalshi_corpus k JOIN kalshi_markets m USING (ticker)
+                                                           LEFT JOIN kalshi_events e ON e.event_ticker = m.event_ticker
+                                                           WHERE k.status IN ('pending', 'done', 'built') AND m.event_ticker IS NOT NULL AND e.event_ticker IS NULL""").fetchall()]
+        known_s = _known_series(conn)
+    if not todo:
+        return 0
+    lock = threading.Lock(); done = {"n": 0}
+
+    def one(et: str) -> None:
+        if stop is not None and stop.is_set():
+            return
+        try:
+            e = (rest.event(et, with_nested_markets=False) or {}).get("event") or {"event_ticker": et}
+        except KalshiApiError as ex:
+            if ex.status is not None and (ex.status == 429 or ex.status >= 500):
+                return                                          # retried next round
+            e = {"event_ticker": et}
+        st = e.get("series_ticker") or D.series_ticker_of(et); series = None
+        with lock:
+            need = bool(st) and st not in known_s
+            if need:
+                known_s.add(st)
+        if need:
+            try:
+                series = rest.series(st)
+            except KalshiApiError:
+                series = {"ticker": st}
+        with transaction() as conn:
+            D.upsert_event(conn, e)
+            if series is not None:
+                D.upsert_series(conn, series)
+        with lock:
+            done["n"] += 1
+            if done["n"] % 500 == 0:
+                _status(stage="cataloguing seeded markets", catalogued=done["n"], catalogue_total=len(todo))
+
+    with ThreadPoolExecutor(max_workers=max(1, int(threads or config.KALSHI_FILL_THREADS)), thread_name_prefix="kalshi-cat") as pool:
+        list(pool.map(one, todo))
+    log.info("catalogued %d of %d missing events", done["n"], len(todo))
+    return done["n"]
+
+
 def prune_pending() -> int:
     """Pending corpus rows beyond the corpus's bounds go to 'skipped': volume below KALSHI_MIN_MARKET_VOLUME (or unknown), or
     not among the KALSHI_MARKETS_PER_DAY most traded of their close day. Volume unknown on the row is read from the market's raw JSON."""
@@ -373,6 +420,7 @@ def main(stop_event: threading.Event | None = None) -> None:
             try:
                 _status(stage="seeding from the dataset"); seeded = seed_from_dataset(stop)
                 _status(stage="refreshing markets", seed=seeded); n_new = refresh_markets(rest, stop)
+                catalogue_missing(rest, stop)
                 skipped = prune_pending()
                 c = counts(); _status(stage="filling candles", refreshed=n_new, skipped_now=skipped, **{k: v for k, v in c.items()})
                 t0 = time.time(); done = 0
