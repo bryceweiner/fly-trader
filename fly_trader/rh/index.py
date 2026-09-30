@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 CURSOR = "rh"
 IDS_PER_REQUEST = 200
 TOKENS_PER_REQUEST = 200
+TOKENS_PER_REQUEST_BULK = 5000         # HyperSync: bounded by its 2 MB request body, not a log cap
 TX_BATCH = 100
 TRANSFER = abi.event_topic("Transfer(address,address,uint256)")
 PONS_DECIMALS = 18                          # every Pons launch mints 1e9 × 1e18 raw
@@ -204,8 +205,9 @@ def apply_v4(conn, rpc, logs: list[dict], fees: list[dict]) -> dict:
     transfers = []
     if swaps:
         lo_b, hi_b = min(s_["block"] for s_ in swaps), max(s_["block"] for s_ in swaps)
-        for i in range(0, len(toks), TOKENS_PER_REQUEST):
-            transfers += _get_logs(rpc, toks[i:i + TOKENS_PER_REQUEST], lo_b, hi_b, [TRANSFER])
+        per = TOKENS_PER_REQUEST_BULK if hasattr(rpc, "hs") else TOKENS_PER_REQUEST
+        for i in range(0, len(toks), per):
+            transfers += _get_logs(rpc, toks[i:i + per], lo_b, hi_b, [TRANSFER])
     senders = traders_from_transfers(transfers, swaps, {k: v["token"] for k, v in pools.items()})
     n = {"swaps": 0, "liquidity": 0}
     last_state: dict[str, dict] = {}
@@ -249,6 +251,12 @@ def apply_v4(conn, rpc, logs: list[dict], fees: list[dict]) -> dict:
 def step(conn, rpc, lo: int, hi: int) -> dict:
     """Index blocks lo..hi (inclusive) into ``conn`` (the caller commits with the cursor)."""
     pons_topics = [[pons.TOPIC[k] for k in (*pons.FACTORY_EVENTS, "Launched", *pons.HOOK_EVENTS)]]
+    topics0 = [v4.TOPIC["Initialize"], v4.TOPIC["Swap"], v4.TOPIC["ModifyLiquidity"]]
+    bulk = hasattr(rpc, "hs")                                     # HyperSync: no per-query cap, so no pool-id chunks
+    if bulk:                                                      # every PoolManager event in the range, fetched beside the Pons events
+        from concurrent.futures import ThreadPoolExecutor
+        ex = ThreadPoolExecutor(max_workers=1)
+        v4_all = ex.submit(_get_logs, rpc, [config.V4_POOL_MANAGER], lo, hi, [topics0])
     main = _get_logs(rpc, [config.PONS_FACTORY, config.PONS_ROUTER, config.PONS_HOOK], lo, hi, pons_topics)
     evs = [pons.decode(x) for x in _order(main)]
     evs = [e for e in evs if e is not None]
@@ -257,9 +265,13 @@ def step(conn, rpc, lo: int, hi: int) -> dict:
     n = apply_pons(conn, rpc, [e for e in evs if e["event"] != "HookFeeCollected"])
     ids = [r["pool_id"] for r in conn.execute("SELECT pool_id FROM rh_pools WHERE is_pons ORDER BY pool_id").fetchall()]
     v4_logs = []
-    topics0 = [v4.TOPIC["Initialize"], v4.TOPIC["Swap"], v4.TOPIC["ModifyLiquidity"]]
-    for i in range(0, len(ids), IDS_PER_REQUEST):
-        v4_logs += _get_logs(rpc, [config.V4_POOL_MANAGER], lo, hi, [topics0, ids[i:i + IDS_PER_REQUEST]])
+    if bulk:
+        mine = set(ids)
+        v4_logs = [g for g in v4_all.result() if len(g["topics"]) > 1 and g["topics"][1].lower() in mine]
+        ex.shutdown()
+    else:
+        for i in range(0, len(ids), IDS_PER_REQUEST):
+            v4_logs += _get_logs(rpc, [config.V4_POOL_MANAGER], lo, hi, [topics0, ids[i:i + IDS_PER_REQUEST]])
     n.update(apply_v4(conn, rpc, v4_logs, fees))
     n["hook_fees"] = len(fees)
     return n
