@@ -243,7 +243,7 @@ RH_RPC_URL_LOGS = env_str("RH_RPC_URL_LOGS")                        # optional b
 # the official RPC serves logs but rate-limits at ~20 requests/min (measured 2026-09-28) — so each does what it does well
 RH_RPC_URL_BLOCKS = env_str("RH_RPC_URL_BLOCKS", "https://robinhood-rpc.publicnode.com")
 RH_HYPERSYNC_URL = env_str("RH_HYPERSYNC_URL", "https://robinhood.hypersync.xyz")   # log history in bulk when ENVIO_API_TOKEN is set (rh/hypersync.py)
-RH_HYPERSYNC_RPM = env_float("RH_HYPERSYNC_RPM", 60)                 # HyperSync queries per minute (free tier: fair use; Starter plan: 100)
+RH_HYPERSYNC_RPM = env_float("RH_HYPERSYNC_RPM", 40)                 # HyperSync queries per minute (free tier: fair use, refused ~6 % at 60; Starter plan: 100)
 RH_BOT_ADDRESS = env_str("RH_BOT_ADDRESS")                          # the address RH_BOT_PRIVATE_KEY must derive to (a guard, not a secret)
 RH_CONFIRMATIONS = env_int("RH_CONFIRMATIONS", 3)                   # blocks before a live receipt or a live log is applied
 RH_START_BLOCK = env_int("RH_START_BLOCK", 0)                       # the indexer's first block (0: the Pons V2 factory's deployment block)
