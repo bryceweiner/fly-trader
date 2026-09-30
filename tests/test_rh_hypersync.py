@@ -1,8 +1,15 @@
 """HyperSync logs come back in eth_getLogs' shape, with block times, across paginated responses; blocks HyperSync has
 not reached are read from the RPC."""
 import httpx
+import pytest
 
+from fly_trader import config
 from fly_trader.rh import hypersync as H
+
+
+@pytest.fixture(autouse=True)
+def _no_pacing(monkeypatch):
+    monkeypatch.setattr(config, "RH_HYPERSYNC_RPM", 1e6)
 
 
 def _handler(pages):

@@ -8,6 +8,7 @@ field_selection} → {data: [{logs, blocks}], next_block, archive_height}; a res
 """
 from __future__ import annotations
 
+import threading
 import time
 
 import httpx
@@ -17,7 +18,19 @@ from ..db.apilog import record_api_call
 from .rpc import RhRpc
 
 LOG_FIELDS = ["block_number", "log_index", "transaction_hash", "block_hash", "address", "data", "topic0", "topic1", "topic2", "topic3"]
-TRIES = 5
+TRIES = 8
+_PACE_LOCK = threading.Lock()
+_LAST = [0.0]
+
+
+def _pace() -> None:
+    """At most ``RH_HYPERSYNC_RPM`` queries a minute across threads (the free tier is fair-use; Starter 100 rpm)."""
+    gap = 60.0 / max(1.0, float(config.RH_HYPERSYNC_RPM))
+    with _PACE_LOCK:
+        wait = _LAST[0] + gap - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _LAST[0] = time.monotonic()
 
 
 class HyperSyncError(RuntimeError):
@@ -46,7 +59,8 @@ class HyperSync:
 
     def _post(self, body: dict) -> dict:
         for i in range(TRIES):
-            t0 = time.monotonic(); status = None; err = None
+            _pace()
+            t0 = time.monotonic(); status = None; err = None; retry_after = None
             try:
                 r = self.http.post(f"{self.url}/query", json=body); status = r.status_code
                 if r.status_code == 200:
@@ -54,11 +68,13 @@ class HyperSync:
                 err = f"HTTP {r.status_code}: {r.text[:200]}"
                 if r.status_code not in (429, 500, 502, 503, 504):
                     raise HyperSyncError(err)
+                ra = r.headers.get("retry-after")
+                retry_after = float(ra) if ra and ra.replace(".", "", 1).isdigit() else None
             except httpx.HTTPError as e:
                 err = type(e).__name__
             finally:
                 record_api_call("rh_hypersync", "/query", "POST", status, int((time.monotonic() - t0) * 1000), err is None, err)
-            time.sleep(min(30.0, 2.0 * 2 ** i))
+            time.sleep(retry_after if retry_after is not None else min(60.0, 5.0 * 2 ** i))       # a rate-limit window resets within a minute
         raise HyperSyncError(f"HyperSync failed {TRIES} times: {err}")
 
     def archive_height(self) -> int:
