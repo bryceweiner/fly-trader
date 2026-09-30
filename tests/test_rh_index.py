@@ -138,3 +138,24 @@ def test_a_non_eth_minute_without_a_mark_is_not_written(minute_db, monkeypatch):
     with transaction() as conn:
         _swap(conn, 9, t0 + 5, MEME2, "p2", "bob", 1, 50 * 10 ** 6, 2e-6, 9000.0)
         assert minutes.aggregate(conn, t0, t0 + 60) == []
+
+
+def test_a_query_kind_that_hit_the_log_cap_is_asked_in_spans_that_work(monkeypatch):
+    from fly_trader.rh import index, scan
+    monkeypatch.setattr(scan, "PAUSE_S", 0.0); monkeypatch.setattr(index, "_SPAN", {})
+
+    class Rpc:
+        calls = refused = 0
+
+        def get_logs_multi(self, addresses, lo, hi, topics):
+            self.calls += 1
+            if hi - lo + 1 > 3000:                                           # the busy period: > 10k logs above 3000 blocks
+                self.refused += 1
+                raise RuntimeError("logs matched by query exceeds limit of 10000")
+            return [{"blockNumber": hex(b)} for b in range(lo, hi + 1, 1000)]
+    r = Rpc()
+    first = index._get_logs(r, ["0xa"], 0, 19_999, ["0xt"])
+    r1 = r.refused
+    again = index._get_logs(r, ["0xa"], 20_000, 39_999, ["0xt"])
+    assert [int(x["blockNumber"], 16) for x in first] == list(range(0, 20_000, 1000)) or len(first) >= 20
+    assert len(again) >= 20 and r.refused - r1 <= 2                            # the second range barely pays for refusals
