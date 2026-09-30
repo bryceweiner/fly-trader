@@ -14,6 +14,21 @@ from . import scan
 
 SAMPLE = 256
 BATCH = 100
+HDR_MAX = 400_000                                           # header timestamps kept per endpoint before the cache resets
+# Per header endpoint: {"starts": {minute_s: first block with ts >= minute_s}, "hdr": {block: ts}}. The index and every
+# price scan time the same block ranges; a minute's first block found once is never searched for again.
+_CACHE: dict[str, dict] = {}
+
+
+def _cache_for(rpc) -> dict | None:
+    src = getattr(rpc, "blocks", rpc)
+    url = getattr(src, "url", None)
+    if not url:
+        return None
+    c = _CACHE.setdefault(url, {"starts": {}, "hdr": {}})
+    if len(c["hdr"]) > HDR_MAX:
+        c["hdr"].clear()
+    return c
 
 
 def _fetch(rpc, blocks: list[int], cache: dict[int, int]) -> None:
@@ -34,7 +49,14 @@ def times(rpc, lo: int, hi: int, wanted: list[int], sample: int = SAMPLE) -> dic
     """Seconds since epoch for each block in ``wanted`` (all within lo..hi): exact minute, interpolated seconds."""
     if not wanted:
         return {}
-    cache: dict[int, int] = {}
+    shared = _cache_for(rpc)
+    cache: dict[int, int] = shared["hdr"] if shared else {}
+    if shared is not None:
+        _fetch(rpc, [lo, hi], cache)
+        mlo, mhi = cache[lo] // 60, cache[hi] // 60
+        st = shared["starts"]
+        if all(m * 60 in st for m in range(mlo + 1, mhi + 1)):
+            return _from_starts(cache, lo, hi, [(st[m * 60], m * 60) for m in range(mlo + 1, mhi + 1)], wanted)
     grid = list(range(lo, hi + 1, sample))
     if grid[-1] != hi:
         grid.append(hi)
@@ -56,6 +78,9 @@ def times(rpc, lo: int, hi: int, wanted: list[int], sample: int = SAMPLE) -> dic
                 else:
                     s[0] = mid
     starts = sorted((s[1], s[2]) for s in searches)          # (first block of the minute, minute start)
+    if shared is not None:
+        for blk, m in starts:
+            shared["starts"][m] = blk
     start_blocks = [b for b, _ in starts]
     known = sorted(cache.items()); kb = [b for b, _ in known]
     out = {}
@@ -67,6 +92,26 @@ def times(rpc, lo: int, hi: int, wanted: list[int], sample: int = SAMPLE) -> dic
         minute = starts[i][1] if i >= 0 else (cache[lo] // 60) * 60
         j = bisect.bisect_right(kb, blk)
         (b0, t0), (b1, t1) = known[max(0, j - 1)], known[min(len(known) - 1, j)]
+        t = t0 + (t1 - t0) * ((blk - b0) / (b1 - b0)) if b1 != b0 else float(t0)
+        out[blk] = min(max(t, float(minute)), minute + 59.999)
+    return out
+
+
+def _from_starts(hdr: dict[int, int], lo: int, hi: int, starts: list[tuple[int, int]], wanted: list[int]) -> dict[int, float]:
+    """``times`` from known minute starts: the exact minute by bisection, seconds interpolated between the anchors
+    (range ends, minute starts, any header already seen)."""
+    starts = sorted(starts)
+    start_blocks = [b for b, _ in starts]
+    anchors = sorted({(lo, hdr[lo]), (hi, hdr[hi]), *((b, m) for b, m in starts), *((b, t) for b, t in hdr.items() if lo <= b <= hi)})
+    ab = [b for b, _ in anchors]
+    out = {}
+    for blk in wanted:
+        if blk in hdr:
+            out[blk] = float(hdr[blk]); continue
+        i = bisect.bisect_right(start_blocks, blk) - 1
+        minute = starts[i][1] if i >= 0 else (hdr[lo] // 60) * 60
+        j = bisect.bisect_right(ab, blk)
+        (b0, t0), (b1, t1) = anchors[max(0, j - 1)], anchors[min(len(anchors) - 1, j)]
         t = t0 + (t1 - t0) * ((blk - b0) / (b1 - b0)) if b1 != b0 else float(t0)
         out[blk] = min(max(t, float(minute)), minute + 59.999)
     return out

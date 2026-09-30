@@ -25,3 +25,15 @@ def test_every_minute_is_exact(monkeypatch):
     assert all(int(got[b] // 60) == c.ts[b] // 60 for b in wanted)
     assert all(abs(got[b] - c.ts[b]) < 60 for b in wanted)
     assert c.calls < 250                                                       # vs ~4000 per-block lookups
+
+
+def test_minute_starts_found_once_are_reused_exactly(monkeypatch):
+    monkeypatch.setattr(scan, "PAUSE_S", 0.0); monkeypatch.setattr(blocktime, "_CACHE", {})
+    c = Chain(30_000, seed=3); c.url = "https://headers.example"; lo, hi = 1000, 29_000
+    wanted = list(range(lo, hi + 1, 11))
+    first = blocktime.times(c, lo, hi, wanted); n1 = c.calls
+    again = blocktime.times(c, lo, hi, list(range(lo + 5, hi, 13)))          # a price scan over the index's range
+    assert c.calls - n1 <= 1                                                  # the range ends at most: no search
+    assert all(int(again[b] // 60) == c.ts[b] // 60 for b in again) and all(int(first[b] // 60) == c.ts[b] // 60 for b in first)
+    sub = blocktime.times(c, 5000, 9000, list(range(5000, 9001, 3)))          # a sub-range is covered by the same starts
+    assert all(int(sub[b] // 60) == c.ts[b] // 60 for b in sub)
