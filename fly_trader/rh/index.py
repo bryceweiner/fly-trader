@@ -73,45 +73,15 @@ def block_at(rpc, ts: float) -> int:
 
 
 # ---------------------------------------------------------------- one range
-_SPAN: dict[str, int] = {}          # per query kind: the widest block span that last answered without hitting a limit
-SPAN_MIN = 50
-
-
-def _kind(addresses, topics) -> str:
-    t0 = (topics or [None])[0]
-    a = addresses if isinstance(addresses, str) else (addresses[0] if addresses and len(addresses) == 1 else f"{len(addresses or [])}addr")
-    return f"{t0}:{a}:{len(topics or [])}"
-
-
-def _too_big(e: Exception) -> bool:
-    msg = str(e).lower()
-    return "exceeds limit" in msg or "too many" in msg or "timed out" in msg or "timeout" in msg
-
-
 def _get_logs(rpc, addresses, lo, hi, topics):
-    """eth_getLogs over lo..hi. A query kind that hit the RPC's 10,000-log cap (or its time limit) before is asked in
-    chunks of the span that last worked, instead of paying a refused full-range query first; a refused query is split
-    in halves and its kind's span shrinks; answered queries let the span grow back."""
-    k = _kind(addresses, topics)
-    span = _SPAN.get(k)
-    if not span or hi - lo + 1 <= span:
-        return _get_logs_split(rpc, addresses, lo, hi, topics, k)
-    out = []
-    for a in range(lo, hi + 1, span):
-        out += _get_logs_split(rpc, addresses, a, min(hi, a + span - 1), topics, k)
-    if _SPAN.get(k) == span:                                          # no refusal in this call: probe a little wider next time
-        _SPAN[k] = int(span * 1.1) + 1
-    return out
-
-
-def _get_logs_split(rpc, addresses, lo, hi, topics, k):
+    """eth_getLogs, splitting the range in halves while the RPC's 10,000-logs-per-query cap is hit."""
     try:
         out = rpc.get_logs_multi(addresses, lo, hi, topics)
     except Exception as e:
-        if _too_big(e) and hi > lo:                                  # too big a query: halve it, and remember
+        msg = str(e).lower()
+        if ("exceeds limit" in msg or "too many" in msg or "timed out" in msg or "timeout" in msg) and hi > lo:      # too big a query: halve it
             mid = (lo + hi) // 2
-            _SPAN[k] = max(SPAN_MIN, min(_SPAN.get(k, 10 ** 9), mid - lo + 1))
-            return _get_logs_split(rpc, addresses, lo, mid, topics, k) + _get_logs_split(rpc, addresses, mid + 1, hi, topics, k)
+            return _get_logs(rpc, addresses, lo, mid, topics) + _get_logs(rpc, addresses, mid + 1, hi, topics)
         raise
     scan.pause()
     return out
