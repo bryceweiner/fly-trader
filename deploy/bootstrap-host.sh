@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# One-time setup of the vault fly's server (Ubuntu 24.04, e.g. Netcup RS 2000 G12), hardened along the lines of the
-# CIS Ubuntu 24.04 benchmark for a single-purpose host that holds a hot wallet. Run as root, in two passes:
+# One-time setup of the vault fly's server: a dedicated machine (e.g. a mini PC at home) on a fresh Ubuntu Server 24.04
+# with full-disk encryption, hardened along the lines of the CIS Ubuntu 24.04 benchmark for a single-purpose host that
+# holds a hot wallet. Run with sudo, in two passes:
 #
-#   1. TS_AUTHKEY=tskey-auth-... RECOVERY_PUBKEY="ssh-ed25519 AAAA... recovery" EXPECT_MANIFEST=<sha256 of release.json> \
-#        ADMIN_USER=fly-admin bash bootstrap-host.sh "<release public key line: Secretive's ecdsa-sha2-nistp256 ...>"
+#   1. sudo TS_AUTHKEY=tskey-auth-... RECOVERY_PUBKEY="ssh-ed25519 AAAA... recovery" EXPECT_MANIFEST=<sha256 of release.json> \
+#        TPM_UNLOCK=1 ADMIN_USER=fly-admin bash bootstrap-host.sh "<release public key line: Secretive's ecdsa-sha2-nistp256 ...>"
 #      then, from your Mac, log in over Tailscale:  ssh fly-admin@fly-vault   (MagicDNS name or the 100.x address)
-#   2. CLOSE_PUBLIC_SSH=1 bash bootstrap-host.sh "<same release key>"
-#      removes the public SSH rule: after it the server has no open port on the internet at all.
+#   2. sudo CLOSE_PUBLIC_SSH=1 bash bootstrap-host.sh "<same release key>"
+#      removes the SSH rule for the local network / internet: after it the machine accepts SSH only over Tailscale and
+#      has no other open port.
+#
+# TPM_UNLOCK=1 binds the root disk's LUKS encryption to the TPM (clevis, PCR 7 = the Secure Boot state), so an
+# unattended security reboot comes back up without a passphrase; it asks once for the disk passphrase. Without it the
+# machine waits at every boot for the passphrase on its console, and automatic reboots are turned off.
 #
 # ADMIN_USER (default fly-admin) becomes the only account that can log in over SSH (key only, sudo without a
 # password; root login is switched off). If it has no ~/.ssh/authorized_keys yet, root's are copied to it first, and
@@ -25,6 +31,7 @@ RECOVERY_PUBKEY="${RECOVERY_PUBKEY:-}"
 EXPECT_MANIFEST="${EXPECT_MANIFEST:-}"
 TS_AUTHKEY="${TS_AUTHKEY:-}"
 CLOSE_PUBLIC_SSH="${CLOSE_PUBLIC_SSH:-0}"
+TPM_UNLOCK="${TPM_UNLOCK:-0}"
 ADMIN_USER="${ADMIN_USER:-fly-admin}"
 # container users (the images' USER lines); with userns-remap each is REMAP_UID + id on the host
 BRAIN_UID=10001; SIGNER_UID=10002; FLY_GID=10000
@@ -37,7 +44,7 @@ step "packages"
 apt-get update -q
 apt-get install -y -q --no-install-recommends ca-certificates curl ufw unattended-upgrades python3 openssh-client openssl \
   fail2ban python3-systemd auditd audispd-plugins aide aide-common lynis apparmor-utils systemd-timesyncd needrestart \
-  libpam-tmpdir debsums apt-show-versions apt-listchanges acct sysstat
+  libpam-tmpdir debsums apt-show-versions apt-listchanges acct sysstat mokutil
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
@@ -53,6 +60,30 @@ if dpkg -l snapd >/dev/null 2>&1; then apt-get purge -y -q snapd; fi
 # no mail server: nothing here sends mail (alerts go to Telegram), and an MTA is one more listening daemon
 if dpkg -l postfix 2>/dev/null | grep -q '^ii'; then apt-get purge -y -q postfix; fi
 
+# ---------------------------------------------------------------- 1b. the machine itself
+step "machine: wireless off, DMA protection, disk encryption"
+# wired Ethernet only: Wi-Fi and Bluetooth drivers can never load (a radio is a way in that bypasses the router)
+printf 'install cfg80211 /bin/false\ninstall mac80211 /bin/false\ninstall bluetooth /bin/false\ninstall btusb /bin/false\n' \
+  > /etc/modprobe.d/61-fly-no-wireless.conf
+command -v rfkill >/dev/null && rfkill block all 2>/dev/null || true
+systemctl disable --now bluetooth.service wpa_supplicant.service 2>/dev/null || true
+# USB4 / Thunderbolt / OCuLink devices can read memory directly; the IOMMU confines them
+if [ -z "$(ls -A /sys/kernel/iommu_groups 2>/dev/null)" ]; then
+  echo "WARNING: the IOMMU is off: enable it (AMD-Vi / IOMMU) in the firmware settings"
+fi
+# the root filesystem must sit on LUKS: the wallet keys are files on this disk
+ROOT_LUKS="$(lsblk -rno NAME,TYPE -s "$(findmnt -no SOURCE /)" 2>/dev/null | awk '$2=="crypt"{found=1} found && $2=="part"{print "/dev/"$1; exit}')"
+if [ -z "$ROOT_LUKS" ]; then
+  echo "WARNING: the root filesystem is not on an encrypted (LUKS) disk: reinstall with 'Encrypt the LVM group with LUKS'"
+elif [ "$TPM_UNLOCK" = 1 ]; then
+  apt-get install -y -q --no-install-recommends clevis clevis-luks clevis-tpm2 clevis-initramfs
+  if ! clevis luks list -d "$ROOT_LUKS" 2>/dev/null | grep -q tpm2; then
+    echo "binding $ROOT_LUKS to the TPM (PCR 7); enter the disk passphrase when asked"
+    clevis luks bind -d "$ROOT_LUKS" tpm2 '{"pcr_ids":"7"}'
+    update-initramfs -u -k all
+  fi
+fi
+
 # ---------------------------------------------------------------- 2. patching
 step "automatic security updates (reboot 04:00 UTC when a kernel needs it)"
 cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
@@ -60,8 +91,12 @@ APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
-cat > /etc/apt/apt.conf.d/52fly-unattended <<'EOF'
-Unattended-Upgrade::Automatic-Reboot "true";
+REBOOT=true                                  # a disk that needs a typed passphrase at boot: no unattended reboots
+if [ -n "${ROOT_LUKS:-}" ] && ! { command -v clevis >/dev/null && clevis luks list -d "$ROOT_LUKS" 2>/dev/null | grep -q tpm2; }; then
+  REBOOT=false
+fi
+cat > /etc/apt/apt.conf.d/52fly-unattended <<EOF
+Unattended-Upgrade::Automatic-Reboot "$REBOOT";
 Unattended-Upgrade::Automatic-Reboot-Time "04:00";
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
 EOF
@@ -149,7 +184,7 @@ fi
 unset TS_AUTHKEY
 TS_UP=0; tailscale status >/dev/null 2>&1 && TS_UP=1
 
-step "firewall: SSH over Tailscale only (plus public SSH until CLOSE_PUBLIC_SSH=1); out: HTTPS, HTTP (apt), DNS, NTP, WireGuard"
+step "firewall: SSH over Tailscale only (plus LAN/public SSH until CLOSE_PUBLIC_SSH=1); out: HTTPS, HTTP (apt), DNS, NTP, WireGuard"
 ufw --force reset >/dev/null
 ufw default deny incoming
 ufw default deny outgoing

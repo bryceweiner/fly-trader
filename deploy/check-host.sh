@@ -22,6 +22,14 @@ check "fail2ban guards sshd"            sh -c "fail2ban-client status sshd"
 check "client keys: ed25519/P-256/FIDO only" sh -c "sshd -T | grep -i '^pubkeyacceptedalgorithms' | grep -vqi rsa"
 check "admin not in the docker group"   sh -c "! id -nG \"\$(sshd -T | awk 'tolower(\$1)==\"allowusers\"{print \$2}')\" | grep -qw docker"
 
+echo "Machine"
+root_luks() { lsblk -rno NAME,TYPE -s "$(findmnt -no SOURCE /)" | awk '$2=="crypt"{f=1} f && $2=="part"{print "/dev/"$1; exit}'; }
+check "root filesystem encrypted (LUKS)" sh -c "[ -n \"\$(lsblk -rno TYPE -s \$(findmnt -no SOURCE /) | grep -x crypt)\" ]"
+check "unattended reboots unlock (TPM) or are off" sh -c "grep -q 'Automatic-Reboot \"false\"' /etc/apt/apt.conf.d/52fly-unattended || clevis luks list -d $(root_luks) 2>/dev/null | grep -q tpm2"
+check "IOMMU on (USB4/OCuLink DMA)"      sh -c "[ -n \"\$(ls -A /sys/kernel/iommu_groups)\" ]"
+check "Secure Boot on"                  sh -c "mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'"
+check "no Wi-Fi or Bluetooth"           sh -c "! ls /sys/class/net/*/wireless >/dev/null 2>&1 && [ -z \"\$(ls -A /sys/class/bluetooth 2>/dev/null)\" ]"
+
 echo "Tailscale"
 check "tailscaled up"                   sh -c "tailscale status >/dev/null"
 check "Tailnet Lock enabled"            sh -c "tailscale lock status 2>/dev/null | grep -qi 'lock is enabled'"
@@ -82,7 +90,7 @@ check "key-read watcher running"        systemctl is-active fly-audit-watch.time
 check "daily AIDE report to Telegram"   systemctl is-active fly-aide.timer
 check "AIDE baseline present"           test -f /var/lib/aide/aide.db
 check "journal persistent"              test -d /var/log/journal
-check "automatic security updates"      sh -c "systemctl is-enabled unattended-upgrades && grep -q 'Automatic-Reboot \"true\"' /etc/apt/apt.conf.d/52fly-unattended"
+check "automatic security updates"      sh -c "systemctl is-enabled unattended-upgrades && grep -q 'Automatic-Reboot' /etc/apt/apt.conf.d/52fly-unattended"
 check "clock synchronised"              sh -c "timedatectl show -p NTPSynchronized --value | grep -q yes"
 check "no snapd"                        sh -c "! dpkg -l snapd 2>/dev/null | grep -q '^ii'"
 

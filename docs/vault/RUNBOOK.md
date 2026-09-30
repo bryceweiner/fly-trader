@@ -39,7 +39,7 @@ $ git worktree add ../fly-trader-dist distribution                            # 
 ```
 
 ### 0.2 Accounts
-- **2FA everywhere.** Use a hardware key or TOTP on Netcup (both the SCP and CCP logins), Gandi, Hugging Face, GitHub,
+- **2FA everywhere.** Use a hardware key or TOTP on Gandi, Hugging Face, GitHub,
   your Tailscale identity provider and your Apple ID. Set a Telegram two-step password.
 - **Phone wallets.** Write the Solflare and MetaMask seed phrases on paper and keep them offline. The phone needs a
   passcode and biometrics. Keep a little SOL in Solflare (about 0.05 SOL pays the treasury's setup and any later
@@ -214,7 +214,7 @@ The owner page is part of the site, and you need it for the treasury, so the sit
    no caching, clock):
    `$ FLY_RELAY_SECRET=<the secret> python3 web/relay/hmacauth.py https://fly-trader.app/api/fly/probe k1`
 
-## 4. Server (Netcup RS 2000 G12, Ubuntu 24.04)
+## 4. Server (a dedicated machine at home, Ubuntu Server 24.04)
 
 ### 4.1 Publish the first release
 1. The distribution worktree must hold exactly what you want to ship. Code is ported there from master by hand (or with
@@ -235,33 +235,65 @@ The owner page is part of the site, and you need it for the treasury, so the sit
 4. **Do not publish again until the server has installed this release** (section 4.4). A new server accepts only the
    pinned manifest, and it permanently refuses any other head it sees first.
 
-### 4.2 Bootstrap
-1. Order the server with `~/.ssh/fly-ssh.pub` as root's SSH key. Then copy the scripts and the two release public
-   keys to it:
+### 4.2 The machine and its bootstrap
+A dedicated machine at home (the reference is a GMKtec EVO-X3: Ryzen AI Max+ 395, 128 GB, 2 TB NVMe, 2.5 GbE). It
+runs nothing but the vault fly. The fly runs on its CPU; the Radeon GPU is not used (no GPU driver stack in reach of
+the keys).
+
+1. **Firmware** (press Del or F7 at power-on for the setup screen):
+   - Update the BIOS from the vendor's support site first.
+   - Set a supervisor (admin) password.
+   - Turn on the firmware TPM (AMD fTPM / "Security Device Support"), Secure Boot (standard keys) and the IOMMU
+     (AMD-Vi / "IOMMU: Enabled").
+   - Turn off Wi-Fi and Bluetooth if the menu offers it (the bootstrap also blocks their drivers).
+   - "Restore on AC power loss": Power On.
+   - Boot order: the internal disk first. After installing (step 2), turn off booting from USB.
+2. **A clean Ubuntu Server 24.04 LTS install** from a USB stick made from ubuntu.com's image. Erase the preinstalled
+   Windows; some mini-PC vendors have shipped malware in theirs.
+   - Storage: "Use an entire disk", "Set up this disk as an LVM group", **"Encrypt the LVM group with LUKS"**. Keep
+     the passphrase in your password manager.
+   - Profile: server name `fly-vault`, user **`fly-admin`**, any password (the bootstrap locks it).
+   - SSH: "Install OpenSSH server", with password authentication (only until the bootstrap).
+   - No featured snaps.
+3. **Network:** plug it into the router by cable, on its own VLAN or guest port if the router can. Forward no ports to
+   it, and turn off UPnP on the router. Put it on a UPS: during a power or internet outage the fly cannot sell,
+   refill or pay, and healthchecks.io tells you it went quiet.
+4. From the Mac, on the same network (the machine's address is on its console, `ip -4 addr`):
    ```
-   $ scp -o IdentityAgent=$SECRETIVE -r ../fly-trader-dist/deploy ~/.ssh/fly-release.pub ~/fly-keys/fly-release-recovery.pub root@<server IP>:
+   $ ssh-copy-id -o IdentityAgent=$SECRETIVE -f -i ~/.ssh/fly-ssh.pub fly-admin@<LAN address>
+   $ scp -o IdentityAgent=$SECRETIVE -r ../fly-trader-dist/deploy ~/.ssh/fly-release.pub ~/fly-keys/fly-release-recovery.pub fly-admin@<LAN address>:
+   $ ssh -o IdentityAgent=$SECRETIVE fly-admin@<LAN address>
    ```
-2. Log in as root (`$ ssh -o IdentityAgent=$SECRETIVE root@<server IP>`) and run the first pass:
+5. The first pass. `TPM_UNLOCK=1` binds the disk encryption to the TPM, so security-update reboots come back up on
+   their own; it asks once for the disk passphrase. Without it, every boot waits for the passphrase at the console,
+   and automatic reboots are switched off.
    ```
-   # TS_AUTHKEY=<signed key from 0.3 step 4> RECOVERY_PUBKEY="$(cat fly-release-recovery.pub)" \
-       EXPECT_MANIFEST=<manifest sha256 from 4.1> ADMIN_USER=fly-admin bash deploy/bootstrap-host.sh "$(cat fly-release.pub)"
+   server$ sudo TS_AUTHKEY=<signed key from 0.3 step 4> RECOVERY_PUBKEY="$(cat fly-release-recovery.pub)" \
+       EXPECT_MANIFEST=<manifest sha256 from 4.1> TPM_UNLOCK=1 ADMIN_USER=fly-admin bash deploy/bootstrap-host.sh "$(cat fly-release.pub)"
    ```
    It hardens the box (roughly CIS level 1):
-   - **SSH:** only `fly-admin`, key only (ed25519, P-256, FIDO), root off. Root's key is copied to `fly-admin`.
+   - **The machine:** Wi-Fi and Bluetooth drivers can never load; it warns if the IOMMU is off or the disk is not
+     encrypted.
+   - **SSH:** only `fly-admin`, key only (ed25519, P-256, FIDO), root off.
    - **Firewall:** in and out; containers reach only HTTPS, HTTP (apt) and DNS.
    - **Kernel and Docker:** user namespaces, no new privileges.
    - **Monitoring:** fail2ban; an audit log of every read of the wallet keys, with a Telegram alert when anything but
      the signer reads them; a daily AIDE file-integrity check (05:30 UTC) that reports to Telegram when files changed;
-     automatic security updates (reboot 04:00 UTC when needed).
+     automatic security updates (reboot 04:00 UTC when needed and the TPM unlocks the disk).
    - **Keys:** it makes the trading and payout keys and prints them, **once**, as `bot_key: <address>` (the trading
      key) and `payout_key: <address>`. Copy both lines now. Later, once the containers run:
      `server$ sudo fly signer status` (as `"trading"` and `"payout"`).
-3. **Keep the root session open.** From a second terminal on the Mac, log in over Tailscale:
-   `$ ssh fly-vault`. Only when that works, run the second pass in the root session, which removes public SSH:
+6. **Keep this session open.** From a second terminal on the Mac, log in over Tailscale: `$ ssh fly-vault`. Only when
+   that works, run the second pass in the first session. It removes SSH from the local network, leaving Tailscale as
+   the only way in:
    ```
-   # CLOSE_PUBLIC_SSH=1 bash deploy/bootstrap-host.sh "$(cat fly-release.pub)"
+   server$ sudo CLOSE_PUBLIC_SSH=1 bash deploy/bootstrap-host.sh "$(cat fly-release.pub)"
    ```
-   The recovery key already installed is kept. After this the server has no open port on the internet.
+   The recovery key already installed is kept. After this the machine has no open port except SSH over Tailscale.
+7. Physical access is now the way around every other control: keep the machine somewhere only you reach. The disk is
+   useless without the TPM on this board (or the passphrase), and the firmware password and USB-boot-off stop anyone
+   booting another system on it. Unbinding the TPM (a new board, a firmware reset) means typing the passphrase at the
+   console once and re-running step 5 with `TPM_UNLOCK=1`.
 
 ### 4.3 The treasury (your phone)
 1. Open `https://fly-trader.app/owner.html` in Solflare's browser and connect Solflare.

@@ -79,7 +79,7 @@ services:
     stop_grace_period: 150s
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]
-    mem_limit: 14g
+    mem_limit: 48g                         # a dedicated 128 GB box; lower it on a smaller one (16 GB: 14g)
     logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}
 
 networks:
