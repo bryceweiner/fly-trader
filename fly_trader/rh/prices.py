@@ -172,8 +172,11 @@ def run_once(max_ranges: int = 1) -> dict:
                 for h in a["hops"]:
                     pools.setdefault(_hop_key(h), h)
             logs = {k: _swap_logs(rpc, h, lo, hi) for k, h in pools.items()}
-            blocks = sorted({int(g["blockNumber"], 16) for got in logs.values() for g in got})
-            ts = blocktime.times(rpc, lo, hi, blocks) if blocks else {}
+            ts = {int(g["blockNumber"], 16): int(g["blockTimestamp"], 16) for got in logs.values() for g in got
+                  if int(g.get("blockTimestamp") or "0x0", 16)}                    # HyperSync logs carry their block's time
+            blocks = sorted({int(g["blockNumber"], 16) for got in logs.values() for g in got} - set(ts))
+            if blocks:
+                ts.update(blocktime.times(rpc, lo, hi, blocks))
             with transaction() as conn:
                 for a in group:
                     n = scan_asset(conn, rpc, a["asset"], a["hops"], a["at"] + 1, hi, a["state"], lambda bs: {b: ts[b] for b in bs}, logs)

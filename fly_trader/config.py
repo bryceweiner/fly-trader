@@ -16,7 +16,7 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 
 SECRET_ENV_NAMES = ("HELIUS_API_KEY", "JUPITER_API_KEY", "BOT_PRIVATE_KEY", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH",
                     "RELAY_SECRET", "TELEGRAM_BOT_TOKEN", "VAULT_BACKUP_HF_TOKEN", "VAULT_SOLANA_RPC_URL", "SIGNER_RPC_URL",
-                    "SOLANA_CHECK_RPC_URL", "HEALTHCHECK_URL", "RH_BOT_PRIVATE_KEY", "RH_RPC_URL_LOGS")
+                    "SOLANA_CHECK_RPC_URL", "HEALTHCHECK_URL", "RH_BOT_PRIVATE_KEY", "RH_RPC_URL_LOGS", "ENVIO_API_TOKEN", "QUICKNODE_API_KEY")
 
 
 def utcnow() -> datetime:
@@ -242,6 +242,7 @@ RH_RPC_URL_LOGS = env_str("RH_RPC_URL_LOGS")                        # optional b
 # block headers for timing the index (rh/blocktime.py): PublicNode serves header batches fast but refuses eth_getLogs (403),
 # the official RPC serves logs but rate-limits at ~20 requests/min (measured 2026-09-28) — so each does what it does well
 RH_RPC_URL_BLOCKS = env_str("RH_RPC_URL_BLOCKS", "https://robinhood-rpc.publicnode.com")
+RH_HYPERSYNC_URL = env_str("RH_HYPERSYNC_URL", "https://robinhood.hypersync.xyz")   # log history in bulk when ENVIO_API_TOKEN is set (rh/hypersync.py)
 RH_BOT_ADDRESS = env_str("RH_BOT_ADDRESS")                          # the address RH_BOT_PRIVATE_KEY must derive to (a guard, not a secret)
 RH_CONFIRMATIONS = env_int("RH_CONFIRMATIONS", 3)                   # blocks before a live receipt or a live log is applied
 RH_START_BLOCK = env_int("RH_START_BLOCK", 0)                       # the indexer's first block (0: the Pons V2 factory's deployment block)
