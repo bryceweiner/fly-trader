@@ -133,10 +133,11 @@ def candle_rows(candles: list[dict]) -> list[dict]:
     out = []
     for c in candles:
         yb, ya, pr = c.get("yes_bid") or {}, c.get("yes_ask") or {}, c.get("price") or {}
+        plain = 100.0 if c.get("_units") == "dollars" else 1.0           # live: <k>_dollars or <k> in cents; archive: <k> in dollars
 
-        def q(d, k):
+        def q(d, k, plain=plain):
             v = _f(d.get(f"{k}_dollars"))
-            return v * 100.0 if v is not None else (_f(d.get(k)) if d.get(k) is not None else float("nan"))
+            return v * 100.0 if v is not None else (_f(d.get(k)) * plain if d.get(k) is not None and _f(d.get(k)) is not None else float("nan"))
         out.append({"end_ts": int(c.get("end_period_ts") or 0),
                     "yes_bid_open": q(yb, "open"), "yes_bid_high": q(yb, "high"), "yes_bid_low": q(yb, "low"), "yes_bid_close": q(yb, "close"),
                     "yes_ask_open": q(ya, "open"), "yes_ask_high": q(ya, "high"), "yes_ask_low": q(ya, "low"), "yes_ask_close": q(ya, "close"),

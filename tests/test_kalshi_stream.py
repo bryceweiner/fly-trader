@@ -84,3 +84,14 @@ def test_lifecycle_fetch_catalogues_the_market_it_asked_for(monkeypatch):
     with transaction() as c:
         assert {r["ticker"] for r in c.execute("SELECT ticker FROM kalshi_markets WHERE ticker LIKE 'TST-L%'").fetchall()} == {"TST-L1", "TST-L2"}
     _clean()
+
+
+def test_archive_candles_are_dollars_and_live_candles_are_cents():
+    from fly_trader.kalshi import data as D
+    live = {"end_period_ts": 60, "yes_bid": {"close_dollars": "0.4500", "high_dollars": "0.4600"}, "yes_ask": {"close": 47}, "price": {}, "volume_fp": "3.00"}
+    arch = {"end_period_ts": 60, "_units": "dollars", "yes_bid": {"close": "0.4500", "high": "0.4600", "low": "0.4400", "open": "0.4500"},
+            "yes_ask": {"close": "0.4700"}, "price": {"close": None, "previous": "0.0100"}, "volume": "0.00", "open_interest": "6878.00"}
+    a, b = D.candle_rows([live])[0], D.candle_rows([arch])[0]
+    assert (a["yes_bid_close"], a["yes_bid_high"], a["yes_ask_close"]) == (45.0, 46.0, 47.0)
+    assert (b["yes_bid_close"], b["yes_bid_high"], b["yes_bid_low"], b["yes_ask_close"]) == (45.0, 46.0, 44.0, 47.0)
+    assert math.isnan(b["price_close"]) and b["open_interest"] == 6878.0

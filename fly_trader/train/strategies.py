@@ -176,7 +176,8 @@ def _cache_path(ds: DecisionSet, cols: list[str], tag: str) -> "Path":
     from .selector import DATA_VERSION
     k = repr((str(ds.days[0]), str(ds.days[-1]), int(len(ds.y)), float(ds.horizon_s), list(cols), tag,
               DATA_VERSION.get("agg"), DATA_VERSION.get("features"), DATA_VERSION.get("costs"), OBJECTIVE)
-             + (("label-known-purge",) if getattr(ds, "label_ts", None) is not None else ()))
+             + (("label-known-purge",) if getattr(ds, "label_ts", None) is not None else ())
+             + ((("data", getattr(ds, "data_version")),) if getattr(ds, "data_version", None) is not None else ()))     # e.g. the Kalshi feature version
     return CACHE_DIR / f"{hashlib.sha256(k.encode()).hexdigest()[:20]}.npy"
 
 

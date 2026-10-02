@@ -19,7 +19,7 @@ from typing import NamedTuple
 
 from .vendor import kalshi_client as kc
 
-KALSHI_FEATURE_VERSION = 1
+KALSHI_FEATURE_VERSION = 2          # 2: archive candles rescaled from dollars to cents (version 1 read them as cents: 100x too small)
 WINDOW_S = 7 * 86400.0
 WINDOWS = {"5m": 300.0, "15m": 900.0, "1h": 3600.0, "6h": 21600.0, "24h": 86400.0, "7d": WINDOW_S}
 CATEGORIES = ("politics", "sports", "crypto", "economics", "weather", "entertainment", "science", "companies", "world", "health", "other")

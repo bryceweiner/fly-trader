@@ -204,7 +204,8 @@ class KalshiRest:
         except KalshiApiError as e:
             if e.status != 404:
                 raise
-        return (self.request("GET", f"/historical/markets/{ticker}/candlesticks", params) or {}).get("candlesticks") or []
+        cs = (self.request("GET", f"/historical/markets/{ticker}/candlesticks", params) or {}).get("candlesticks") or []
+        return [{**c, "_units": "dollars"} for c in cs]          # the archive sends prices as dollar strings under plain keys ("close": "0.0100")
 
     def trades(self, ticker: str, min_ts: int | None = None, max_ts: int | None = None, historical: bool = False):
         yield from self.pages("/historical/trades" if historical else "/markets/trades", "trades", {"ticker": ticker, "min_ts": min_ts, "max_ts": max_ts})
