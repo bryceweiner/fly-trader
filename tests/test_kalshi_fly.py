@@ -174,3 +174,30 @@ def test_replay_tags_come_due_at_settlement_and_the_verdict_is_versioned(monkeyp
     assert out["learning"] and all(len(d["drift"]) == 2 for d in out["learning"])
     if out.get("chosen"):
         assert out["chosen"]["alpha"] > 0
+
+
+def test_walk_forward_never_trains_on_rows_whose_settlement_comes_after_the_test_block():
+    """Positions run to settlement days later: a training row for block k must have resolved before block k began."""
+    from fly_trader.train import strategies as S
+    ds = _ds(days=40, per_day=200, settle_h=24 * 9)              # every position settles nine days after its row
+    ds.label_ts = ds.ts + ds.hold_s + 60.0
+    seen = []
+    real = S.HistGradientBoostingClassifier.fit
+
+    def spy(self, X, y, *a, **k):
+        seen.append(len(y)); return real(self, X, y, *a, **k)
+    import pytest as _pt
+    mp = _pt.MonkeyPatch(); mp.setattr(S.HistGradientBoostingClassifier, "fit", spy)
+    try:
+        blocks = S.wf_blocks(ds.days)
+        S.wf_classify(ds, np.ones(len(ds.y), bool), lambda idx: ds.X[idx][:, :3], ds.outcome.astype(np.int8), 2)
+    finally:
+        mp.undo()
+    for blk in blocks:
+        t0 = S._day_start(min(blk))
+        tr = np.ones(len(ds.y), bool) & (ds.day < (min(blk) - timedelta(days=1))) & S.known_before(ds, t0)
+        assert (ds.label_ts[tr] < t0).all()
+    assert seen and max(seen) < int((ds.day < blocks[-1][0] - timedelta(days=9)).sum()) + 1     # never more than the rows settled by then
+    # without label times (memecoins) nothing changes
+    del ds.label_ts
+    assert S.known_before(ds, 0.0).all()
