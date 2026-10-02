@@ -17,7 +17,7 @@ from .connection import connect, database_name, database_url
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 9          # 5: the plastic fly's tables and per-book halts (BASE_DDL); 6: the selector's strategy stack (MIGRATIONS[6]); 7: Kalshi (MIGRATIONS[7]); 8: Kalshi minute extremes
+SCHEMA_VERSION = 10          # 5: the plastic fly's tables and per-book halts (BASE_DDL); 6: the selector's strategy stack (MIGRATIONS[6]); 7: Kalshi (MIGRATIONS[7]); 8: Kalshi minute extremes
 _LOCK_KEY = 0x666C795F6D6967  # "fly_mig"
 
 BASE_DDL: list[str] = [
@@ -347,6 +347,14 @@ MIGRATIONS: dict[int, list[str]] = {
         "ALTER TABLE kalshi_minutes ADD COLUMN IF NOT EXISTS yes_bid_high real"],
     # 9: a market's lifetime volume on its corpus row, so the corpus can keep the most traded markets per day (kalshi/history.prune_pending)
     9: ["ALTER TABLE kalshi_corpus ADD COLUMN IF NOT EXISTS volume double precision"],
+    # 10: every settled single market Kalshi listed (the dataset's and the exchange walk's), from which the corpus samples whole
+    # events outcome-blind (kalshi/history.select_corpus)
+    10: ["""CREATE TABLE IF NOT EXISTS kalshi_universe (
+            ticker text PRIMARY KEY, event_ticker text, series_ticker text, title text, open_time timestamptz, close_time timestamptz,
+            settled_ts timestamptz, result text, volume double precision, source text, selected boolean NOT NULL DEFAULT false,
+            updated_at timestamptz NOT NULL DEFAULT now())""",
+         "CREATE INDEX IF NOT EXISTS kalshi_universe_close_idx ON kalshi_universe (close_time)",
+         "CREATE INDEX IF NOT EXISTS kalshi_universe_selected_idx ON kalshi_universe (selected) WHERE selected"],
 }
 
 

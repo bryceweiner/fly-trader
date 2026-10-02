@@ -64,6 +64,13 @@ def build_complete() -> tuple[bool, str]:
     return True, f"{c.get('built', 0)} markets built"
 
 
+def ticker_strike(ticker: str | None) -> float | None:
+    """A ladder market's strike from its ticker's last segment: ``T81299.99`` (threshold) or ``B7650`` (bucket); else None."""
+    import re
+    m = re.fullmatch(r"[TB](-?\d+(?:\.\d+)?)", str(ticker or "").rsplit("-", 1)[-1])
+    return float(m.group(1)) if m else None
+
+
 def load_meta(conn, tickers: list[str]) -> dict[str, MarketMeta]:
     rows = conn.execute("""SELECT m.ticker, m.event_ticker, m.open_time, m.close_time, m.floor_strike, m.cap_strike, e.series_ticker, e.category AS ecat,
                                   e.mutually_exclusive, s.category AS scat, s.frequency, s.fee_type, s.fee_multiplier
@@ -73,6 +80,8 @@ def load_meta(conn, tickers: list[str]) -> dict[str, MarketMeta]:
     for r in rows:
         freq = (r["frequency"] or "").lower()
         strike = r["floor_strike"] if r["floor_strike"] is not None else r["cap_strike"]
+        if strike is None:
+            strike = ticker_strike(r["ticker"])                     # the catalogue lacks it (dataset or universe rows): the ticker carries it
         out[r["ticker"]] = MarketMeta(ticker=r["ticker"], event_ticker=r["event_ticker"], series_ticker=r["series_ticker"] or D.series_ticker_of(r["ticker"]),
                                       category=D.category_key(r["scat"] or r["ecat"]), is_recurring=1.0 if any(k in freq for k in RECURRING) else 0.0,
                                       open_ts=r["open_time"].timestamp() if r["open_time"] else None, close_ts=r["close_time"].timestamp() if r["close_time"] else None,

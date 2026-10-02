@@ -1,9 +1,10 @@
 """The Kalshi corpus (worker ``kalshi_history``, CLI ``kalshi-history``): every settled market since ``KALSHI_HISTORY_START``
 with its 1-minute candles and public trades.
 
-Which markets: an **event sample** that never looks at a market's outcome or its later trading. An event (all its markets
-together, so siblings stay whole) belongs to the corpus iff md5(event ticker) falls below its category's rate; each rate is
-set once from the dataset so a category contributes about ``KALSHI_MARKETS_PER_DAY`` markets a day (``sample_rates``).
+Which markets: an **event sample** that never looks at a market's outcome or its later trading. Every settled single
+market Kalshi listed goes into ``kalshi_universe`` (the dataset's, then the exchange walk's); per (Kalshi category of the
+series, close day) whole events are taken in md5(event ticker) order until the day holds ``KALSHI_MARKETS_PER_DAY``
+markets (``select_corpus``) — a fixed rate per category could not follow Kalshi's listings, which grew several-fold in 2026.
 Until 2026-10-02 the corpus kept the markets with the most lifetime volume, which selects on the future: a cheap strike is
 traded heavily mostly when the price runs to it, so kept 1–5c crypto-ladder sides returned +94.5 % per dollar against
 −78 % for the rest, and the selector learned the selection (snapshots 151–153). Point-in-time liquidity is the decision
@@ -70,8 +71,7 @@ def _sleep(s: float, stop: threading.Event | None) -> None:
 
 
 # ---------------------------------------------------------------- 1. dataset seed
-SAMPLE_KEY = "kalshi_event_sample"
-SAMPLE_RULE = "event-md5-v1"
+SAMPLE_RULE = "event-md5-per-category-day-v1"
 EXCLUDED_CATEGORIES = ("exotics",)            # Kalshi's multivariate combos: not single markets, not our universe
 NOT_SAMPLED = "not in the event sample"
 
@@ -84,52 +84,6 @@ def event_u(event_ticker: str | None) -> float:
 
 def series_categories(conn) -> dict[str, str]:
     return {r["ticker"]: (r["category"] or "unknown").strip().lower() for r in conn.execute("SELECT ticker, category FROM kalshi_series").fetchall()}
-
-
-def compute_sample_rates(mfiles: list[str], cats: dict[str, str]) -> dict:
-    """Per category, the share of events to keep so it contributes about KALSHI_MARKETS_PER_DAY markets a day, measured on the
-    dataset's settled markets since the start (all of them: no volume floor)."""
-    import duckdb
-    import pandas as pd
-    con = duckdb.connect(); con.register("cats", pd.DataFrame({"st": list(cats), "cat": list(cats.values())}))
-    df = con.execute("""SELECT COALESCE(c.cat, 'unknown') AS cat, count(*) AS markets, min(m.close_time) AS a, max(m.close_time) AS b
-                        FROM read_parquet(?, union_by_name = true) m LEFT JOIN cats c ON c.st = split_part(m.event_ticker, '-', 1)
-                        WHERE m.result IN ('yes', 'no') AND m.close_time >= ? GROUP BY 1""", [mfiles, _start().replace(tzinfo=None)]).df()
-    con.close()
-    span = max((pd.Timestamp(df["b"].max()) - pd.Timestamp(df["a"].min())).total_seconds() / 86400.0, 1.0)
-    target = float(config.KALSHI_MARKETS_PER_DAY)
-    rates = {r.cat: (0.0 if r.cat in EXCLUDED_CATEGORIES else float(min(1.0, target / max(r.markets / span, 1e-9)))) for r in df.itertuples()}
-    return {"rule": SAMPLE_RULE, "target_per_day": target, "span_days": span, "rates": rates,
-            "markets": {r.cat: int(r.markets) for r in df.itertuples()}, "at": datetime.now(timezone.utc).isoformat()}
-
-
-def sample_rates(conn=None) -> dict:
-    """The stored rates (``ui_settings[SAMPLE_KEY]``); computed from the dataset on first use. A category not in the table
-    (new since the dataset) is kept whole unless excluded."""
-    def read(c):
-        r = c.execute("SELECT value FROM ui_settings WHERE key = %s", (SAMPLE_KEY,)).fetchone()
-        v = (r["value"] if isinstance(r["value"], dict) else json.loads(r["value"] or "{}")) if r else {}
-        return v if v.get("rule") == SAMPLE_RULE and v.get("target_per_day") == float(config.KALSHI_MARKETS_PER_DAY) else None
-    if conn is not None and (v := read(conn)):
-        return v
-    with transaction() as c:
-        v = read(c); cats = series_categories(c)
-    if v:
-        return v
-    root = Path(config.KALSHI_DATASET_DIR).expanduser() if config.KALSHI_DATASET_DIR else None
-    mfiles = sorted(glob.glob(str(root / "data" / "kalshi" / "markets" / "*.parquet"))) if root else []
-    v = compute_sample_rates(mfiles, cats) if mfiles else {"rule": SAMPLE_RULE, "target_per_day": float(config.KALSHI_MARKETS_PER_DAY), "rates": {}, "markets": {}}
-    with transaction() as c:
-        c.execute("INSERT INTO ui_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()", (SAMPLE_KEY, json.dumps(v)))
-    log.info("event sample rates: %s", {k: round(x, 4) for k, x in v["rates"].items()})
-    return v
-
-
-def in_sample(event_ticker: str | None, category: str | None, rates: dict) -> bool:
-    cat = (category or "unknown").strip().lower()
-    if cat in EXCLUDED_CATEGORIES or not event_ticker:
-        return False
-    return event_u(event_ticker) < float(rates.get("rates", {}).get(cat, 1.0))
 
 
 def refresh_series(rest: KalshiRest) -> int:
@@ -145,79 +99,87 @@ def refresh_series(rest: KalshiRest) -> int:
 
 
 def seed_from_dataset(stop: threading.Event | None = None) -> dict:
-    """Idempotent: skips when ``ui_settings[kalshi_dataset_seed]`` records the same dataset files."""
+    """The dataset's settled single markets since the start, all of them, into ``kalshi_universe`` (source 'dataset').
+    Idempotent: skips when ``ui_settings[kalshi_dataset_seed]`` records the same files and rule."""
     root = Path(config.KALSHI_DATASET_DIR).expanduser() if config.KALSHI_DATASET_DIR else None
     if root is None or not (root / "data" / "kalshi" / "markets").exists():
         return {"skipped": "no dataset at KALSHI_DATASET_DIR"}
     import duckdb
-    mfiles = sorted(glob.glob(str(root / "data" / "kalshi" / "markets" / "*.parquet"))); tfiles = sorted(glob.glob(str(root / "data" / "kalshi" / "trades" / "*.parquet")))
-    rates = sample_rates()
-    stamp = {"markets": [Path(f).name for f in mfiles], "trades": [Path(f).name for f in tfiles], "start": config.KALSHI_HISTORY_START,
-             "rule": SAMPLE_RULE, "rates": rates.get("rates")}
+    mfiles = sorted(glob.glob(str(root / "data" / "kalshi" / "markets" / "*.parquet")))
+    stamp = {"markets": [Path(f).name for f in mfiles], "start": config.KALSHI_HISTORY_START, "rule": SAMPLE_RULE}
     with transaction() as conn:
         r = conn.execute("SELECT value FROM ui_settings WHERE key = %s", (SEED_KEY,)).fetchone()
     if r and (r["value"] if isinstance(r["value"], dict) else json.loads(r["value"] or "{}")).get("stamp") == stamp:
         return {"skipped": "already seeded"}
     t0 = time.time(); con = duckdb.connect()
     cols = [c[0] for c in con.execute("SELECT * FROM read_parquet(?, union_by_name = true) LIMIT 0", [mfiles]).description]
-    want = ["ticker", "event_ticker", "market_type", "title", "yes_sub_title", "no_sub_title", "status", "result", "open_time", "close_time", "volume", "open_interest"]
-    sel = ", ".join(c if c in cols else f"NULL AS {c}" for c in want)
-    # the sampled events' settled markets (the sample never looks at volume or outcome)
-    with transaction() as conn:
-        cats = series_categories(conn)
-    events = [r[0] for r in con.execute("""SELECT DISTINCT event_ticker FROM read_parquet(?, union_by_name = true)
-                                           WHERE result IN ('yes', 'no') AND close_time >= ? AND event_ticker IS NOT NULL""", [mfiles, _start().replace(tzinfo=None)]).fetchall()]
-    keep = [e for e in events if in_sample(e, cats.get(D.series_ticker_of(e)), rates)]
-    con.execute("CREATE TEMP TABLE kept_events AS SELECT * FROM (VALUES " + ",".join("(?)" for _ in keep) + ") t(event_ticker)", keep) if keep else \
-        con.execute("CREATE TEMP TABLE kept_events (event_ticker VARCHAR)")
-    rows = con.execute(f"""SELECT {sel} FROM read_parquet(?, union_by_name = true) JOIN kept_events USING (event_ticker)
-                           WHERE result IN ('yes', 'no') AND close_time >= ? ORDER BY close_time DESC""", [mfiles, _start().replace(tzinfo=None)]).fetchall()
-    markets = [dict(zip(want, r)) for r in rows]
-    log.info("dataset seed: %d settled yes/no markets of %d sampled events (of %d) since %s", len(markets), len(keep), len(events), config.KALSHI_HISTORY_START)
+    title = "title" if "title" in cols else "NULL"
+    rows = con.execute(f"""SELECT ticker, event_ticker, split_part(event_ticker, '-', 1) AS series_ticker, {title} AS title, open_time, close_time, result,
+                                  CAST(volume AS DOUBLE) AS volume
+                           FROM read_parquet(?, union_by_name = true) WHERE result IN ('yes', 'no') AND close_time >= ? AND event_ticker IS NOT NULL""",
+                       [mfiles, _start().replace(tzinfo=None)]).fetchall()
+    con.close()
     n = 0
     with transaction() as conn:
-        for i in range(0, len(markets), 5000):
-            chunk = markets[i:i + 5000]
-            D.upsert_markets(conn, [{**m, "settlement_ts": m.get("close_time")} for m in chunk], "dataset")
-            conn.cursor().executemany("INSERT INTO kalshi_corpus (ticker, status, settled_ts, result, open_time, close_time, seeded_from, volume) VALUES (%s,'pending',%s,%s,%s,%s,'dataset',%s) "
-                                      "ON CONFLICT (ticker) DO UPDATE SET result = COALESCE(kalshi_corpus.result, EXCLUDED.result), close_time = COALESCE(kalshi_corpus.close_time, EXCLUDED.close_time), "
-                                      "volume = COALESCE(EXCLUDED.volume, kalshi_corpus.volume)",
-                                      [(m["ticker"], D.ts(str(m["close_time"])), m["result"], D.ts(str(m["open_time"])) if m.get("open_time") else None, D.ts(str(m["close_time"])),
-                                        float(m["volume"]) if m.get("volume") is not None else None) for m in chunk])
-            n += len(chunk)
-    # trades: one file per market, written from the dataset's trade table restricted to the seeded tickers
-    n_tr = 0
-    if tfiles and markets:
-        con.execute("CREATE TEMP TABLE seeded AS SELECT * FROM (VALUES " + ",".join("(?)" for _ in markets) + ") t(ticker)", [m["ticker"] for m in markets])
-        tcols = [c[0] for c in con.execute("SELECT * FROM read_parquet(?, union_by_name = true) LIMIT 0", [tfiles]).description]
-        side = "taker_side" if "taker_side" in tcols else "NULL"
-        con.execute(f"""CREATE TEMP TABLE tr AS SELECT t.ticker, t.created_time AS ts, CAST(t.yes_price AS INTEGER) AS yes_price, CAST(t.count AS DOUBLE) AS count,
-                        {side} AS taker_side FROM read_parquet(?, union_by_name = true) t JOIN seeded s USING (ticker)""", [tfiles])
-        tickers = [r[0] for r in con.execute("SELECT DISTINCT ticker FROM tr").fetchall()]
-        done: list[tuple[str, str, int]] = []
-        for i, tk in enumerate(tickers):
-            if stop is not None and stop.is_set():
-                break
-            tab = con.execute("SELECT ts, yes_price, count, taker_side FROM tr WHERE ticker = ? ORDER BY ts", [tk]).fetch_arrow_table()
-            rows_t = [{"ts": r["ts"].replace(tzinfo=timezone.utc) if r["ts"].tzinfo is None else r["ts"], "yes_price": int(r["yes_price"]), "count": float(r["count"]),
-                       "taker_side": r["taker_side"] or "", "is_block": False} for r in tab.to_pylist()]
+        conn.execute("CREATE TEMP TABLE u_in (LIKE kalshi_universe INCLUDING DEFAULTS) ON COMMIT DROP")
+        with conn.cursor().copy("COPY u_in (ticker, event_ticker, series_ticker, title, open_time, close_time, settled_ts, result, volume, source) FROM STDIN") as cp:
+            for tk, et, st, ti, ot, ct, res, vol in rows:
+                ot = ot.replace(tzinfo=timezone.utc) if ot is not None and ot.tzinfo is None else ot; ct = ct.replace(tzinfo=timezone.utc) if ct.tzinfo is None else ct
+                cp.write_row((tk, et, st, ti, ot, ct, ct, res, vol, "dataset")); n += 1
+        conn.execute("""INSERT INTO kalshi_universe (ticker, event_ticker, series_ticker, title, open_time, close_time, settled_ts, result, volume, source)
+                        SELECT ticker, event_ticker, series_ticker, title, open_time, close_time, settled_ts, result, volume, source FROM u_in
+                        ON CONFLICT (ticker) DO NOTHING""")
+        conn.execute("INSERT INTO ui_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+                     (SEED_KEY, json.dumps({"stamp": stamp, "markets": n, "at": datetime.now(timezone.utc).isoformat()})))
+    log.info("dataset universe: %d settled single markets since %s in %.0fs", n, config.KALSHI_HISTORY_START, time.time() - t0)
+    return {"universe": n}
+
+
+def seed_dataset_trades(stop: threading.Event | None = None) -> int:
+    """Trade files from the dataset for selected corpus markets that have none yet (the dataset covers its own months)."""
+    root = Path(config.KALSHI_DATASET_DIR).expanduser() if config.KALSHI_DATASET_DIR else None
+    tfiles = sorted(glob.glob(str(root / "data" / "kalshi" / "trades" / "*.parquet"))) if root else []
+    if not tfiles:
+        return 0
+    with transaction() as conn:
+        todo = [r["ticker"] for r in conn.execute("""SELECT k.ticker FROM kalshi_corpus k JOIN kalshi_universe u USING (ticker)
+                                                     WHERE u.source = 'dataset' AND k.trade_path IS NULL AND k.status IN ('pending', 'done')""").fetchall()]
+    if not todo:
+        return 0
+    import duckdb
+    import pandas as pd
+    con = duckdb.connect(); con.register("want", pd.DataFrame({"ticker": todo}))
+    tcols = [c[0] for c in con.execute("SELECT * FROM read_parquet(?, union_by_name = true) LIMIT 0", [tfiles]).description]
+    side = "taker_side" if "taker_side" in tcols else "NULL"
+    con.execute(f"""CREATE TEMP TABLE tr AS SELECT t.ticker, t.created_time AS ts, CAST(t.yes_price AS INTEGER) AS yes_price, CAST(t.count AS DOUBLE) AS count,
+                    {side} AS taker_side FROM read_parquet(?, union_by_name = true) t JOIN want USING (ticker)""", [tfiles])
+    have = [r[0] for r in con.execute("SELECT DISTINCT ticker FROM tr").fetchall()]; done: list = []; n = 0
+    for i, tk in enumerate(have):
+        if stop is not None and stop.is_set():
+            break
+        tab = con.execute("SELECT ts, yes_price, count, taker_side FROM tr WHERE ticker = ? ORDER BY ts", [tk]).fetch_arrow_table()
+        rows_t = [{"ts": r["ts"].replace(tzinfo=timezone.utc) if r["ts"].tzinfo is None else r["ts"], "yes_price": int(r["yes_price"]), "count": float(r["count"]),
+                   "taker_side": r["taker_side"] or "", "is_block": False} for r in tab.to_pylist()]
+        path = D.TRADES_DIR / f"{tk}.parquet"
+        if not path.exists():
+            D.write_parquet(rows_t, D.TRADE_SCHEMA, path)
+        done.append((str(path), len(rows_t), tk)); n += 1
+        if len(done) >= 2000 or i == len(have) - 1:
+            with transaction() as conn:
+                conn.cursor().executemany("UPDATE kalshi_corpus SET trade_path = %s, trades = %s, updated_at = now() WHERE ticker = %s", done)
+            done = []; _status(stage="seeding dataset trades", seed_trades=n, seed_trades_total=len(have))
+    if not (stop is not None and stop.is_set()):                  # markets the dataset has no trades for: an empty file, not an API call
+        missing = sorted(set(todo) - set(have)); empty: list = []
+        for tk in missing:
             path = D.TRADES_DIR / f"{tk}.parquet"
             if not path.exists():
-                D.write_parquet(rows_t, D.TRADE_SCHEMA, path)
-            done.append((str(path), len(rows_t), tk)); n_tr += 1
-            if len(done) >= 2000 or i == len(tickers) - 1:
-                with transaction() as conn:
-                    conn.cursor().executemany("UPDATE kalshi_corpus SET trade_path = %s, trades = %s, updated_at = now() WHERE ticker = %s", done)
-                done = []
-                _status(stage="seeding trades", seed_trades=n_tr, seed_trades_total=len(tickers))
-    con.close()
-    if not (stop is not None and stop.is_set()):
+                D.write_parquet([], D.TRADE_SCHEMA, path)
+            empty.append((str(path), 0, tk))
         with transaction() as conn:
-            conn.execute("INSERT INTO ui_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-                         (SEED_KEY, json.dumps({"stamp": stamp, "markets": n, "trades": n_tr, "at": datetime.now(timezone.utc).isoformat()})))
-    log.info("dataset seed: %d markets, %d trade files in %.0fs", n, n_tr, time.time() - t0)
-    return {"markets": n, "trades": n_tr}
-
+            for i in range(0, len(empty), 5000):
+                conn.cursor().executemany("UPDATE kalshi_corpus SET trade_path = %s, trades = %s, updated_at = now() WHERE ticker = %s", empty[i:i + 5000])
+    con.close()
+    return n
 
 # ---------------------------------------------------------------- 2. exchange refresh
 def _known_events(conn) -> set[str]:
@@ -265,20 +227,16 @@ def _save_walk(conn, st: dict) -> None:
 
 
 def refresh_markets(rest: KalshiRest, stop: threading.Event | None = None, max_pages: int = 10_000) -> int:
-    """Settled yes/no markets of sampled events (``in_sample``) closing after the dataset's newest day (or the start),
-    from the live tier then the archive (both page newest first). The walk is resumable: after every page its tier and page
+    """Every settled single market closing after the dataset's newest day (or the start) into ``kalshi_universe``, from the
+    live tier then the archive (both page newest first); which of them the corpus takes is ``select_corpus``'s decision. The walk is resumable: after every page its tier and page
     cursor are saved with that page's rows (``ui_settings[WALK_KEY]``), so a timeout, a crash or a restart continues from the
     next page instead of walking the newest months again. A completed walk records when it began; later rounds walk only the
     live tier for markets closing since then (less ``RECOVER_DAYS``), and the archive is never walked twice."""
     start = _start(); n = 0
     with transaction() as conn:
-        known_e, known_s = _known_events(conn), _known_series(conn)
-        r = conn.execute("SELECT max(close_time) AS t FROM kalshi_corpus WHERE seeded_from = 'dataset'").fetchone()
+        r = conn.execute("SELECT max(close_time) AS t FROM kalshi_universe WHERE source = 'dataset'").fetchone()
     if r and r["t"] and r["t"] > start:
-        start = r["t"]                                         # the archive covers the days before; the API fills from there on
-    rates = sample_rates()
-    with transaction() as conn:
-        cats = series_categories(conn)
+        start = r["t"]                                         # the dataset covers the days before; the API fills from there on
     st = walk_state(); now = datetime.now(timezone.utc)
     if st.get("complete_through"):
         lower = max(start, datetime.fromisoformat(st["complete_through"]) - timedelta(days=RECOVER_DAYS)); tiers = ["live"]
@@ -297,18 +255,16 @@ def refresh_markets(rest: KalshiRest, stop: threading.Event | None = None, max_p
         for k, (page, nxt) in enumerate(gen):
             if stop is not None and stop.is_set() or k >= max_pages:
                 return n
-            settled = [m for m in page if (m.get("result") in ("yes", "no")) and (D.ts(m.get("close_time")) or lower) >= lower
-                       and in_sample(m.get("event_ticker"), cats.get(D.series_ticker_of(m.get("event_ticker"))), rates)]
+            settled = [m for m in page if (m.get("result") in ("yes", "no")) and (D.ts(m.get("close_time")) or lower) >= lower and m.get("event_ticker")]
             closes = [D.ts(m.get("close_time")) for m in page if D.ts(m.get("close_time"))]
             done_tier = not nxt or (closes and max(closes) < lower)
             with transaction() as conn:
-                D.upsert_markets(conn, settled, tier)
-                conn.cursor().executemany("INSERT INTO kalshi_corpus (ticker, status, settled_ts, result, open_time, close_time, seeded_from, volume) VALUES (%s,'pending',%s,%s,%s,%s,%s,%s) "
-                                          "ON CONFLICT (ticker) DO UPDATE SET settled_ts = COALESCE(EXCLUDED.settled_ts, kalshi_corpus.settled_ts), result = COALESCE(EXCLUDED.result, kalshi_corpus.result), "
-                                          "open_time = COALESCE(EXCLUDED.open_time, kalshi_corpus.open_time), close_time = COALESCE(EXCLUDED.close_time, kalshi_corpus.close_time), "
-                                          "volume = COALESCE(EXCLUDED.volume, kalshi_corpus.volume)",
-                                          [(m["ticker"], D.ts(m.get("settlement_ts") or m.get("settled_time")), m.get("result"), D.ts(m.get("open_time")), D.ts(m.get("close_time")), tier, market_volume(m)) for m in settled])
-                ensure_catalogue(rest, conn, {m["event_ticker"] for m in settled if m.get("event_ticker")}, known_e, known_s)
+                conn.cursor().executemany(
+                    "INSERT INTO kalshi_universe (ticker, event_ticker, series_ticker, title, open_time, close_time, settled_ts, result, volume, source) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ticker) DO UPDATE SET result = COALESCE(EXCLUDED.result, kalshi_universe.result), "
+                    "settled_ts = COALESCE(EXCLUDED.settled_ts, kalshi_universe.settled_ts), volume = COALESCE(EXCLUDED.volume, kalshi_universe.volume), updated_at = now()",
+                    [(m["ticker"], m["event_ticker"], D.series_ticker_of(m["event_ticker"]), m.get("title"), D.ts(m.get("open_time")), D.ts(m.get("close_time")),
+                      D.ts(m.get("settlement_ts") or m.get("settled_time")), m.get("result"), market_volume(m), tier) for m in settled])
                 nxt_tier = tiers[tiers.index(tier) + 1] if done_tier and tiers.index(tier) + 1 < len(tiers) else (None if done_tier else tier)
                 st = {**st, "tier": nxt_tier, "cursor": None if done_tier else nxt, "oldest_close": min(closes).isoformat() if closes else st.get("oldest_close")}
                 if done_tier and nxt_tier is None:             # every tier walked: settlements since this walk began are the next round's work
@@ -396,31 +352,73 @@ def ensure_series(rest: KalshiRest, stop: threading.Event | None = None, threads
     return len(todo)
 
 
-def apply_sample() -> int:
-    """Corpus rows follow the event sample: a market outside it is 'skipped' (its files stay on disk, it is never built or
-    trained on); a sampled market an older rule skipped comes back ('done' when its candles are already on disk, else
-    'pending'). Returns the rows changed."""
-    rates = sample_rates()
+COMPLETE_AFTER_DAYS = 3        # a close day is selected once every market of it has settled (settlement follows close)
+
+
+def select_events(df, target: int) -> set:
+    """Whole events per (category, close day) in md5(event ticker) order until the day holds ``target`` markets (the event
+    that crosses the budget is kept whole). ``df``: ticker, event_ticker, cat, day. Blind to volume and outcome."""
+    import pandas as pd
+    df = df[~df["cat"].isin(EXCLUDED_CATEGORIES)]
+    if not len(df):
+        return set()
+    ev = df.groupby("event_ticker").agg(n=("ticker", "size"), day=("day", "min"), cat=("cat", "first")).reset_index()
+    ev["u"] = [event_u(e) for e in ev["event_ticker"]]
+    ev = ev.sort_values(["cat", "day", "u"]); before = ev.groupby(["cat", "day"])["n"].cumsum() - ev["n"]
+    keep = set(ev.loc[before < target, "event_ticker"])
+    return set(df.loc[df["event_ticker"].isin(keep), "ticker"])
+
+
+def select_corpus() -> dict:
+    """The corpus from the universe: ``select_events`` over every complete close day, marked in ``kalshi_universe.selected``;
+    newly selected markets enter ``kalshi_markets`` and ``kalshi_corpus`` (pending), and the corpus follows the selection
+    (``apply_sample``). Deterministic: the same universe always gives the same corpus."""
+    import pandas as pd
+    t0 = time.time(); cutoff = datetime.now(timezone.utc) - timedelta(days=COMPLETE_AFTER_DAYS)
     with transaction() as conn:
         cats = series_categories(conn)
-        rows = conn.execute("""SELECT k.ticker, k.status, k.candle_path, m.event_ticker, COALESCE(e.series_ticker, split_part(COALESCE(m.event_ticker, m.ticker), '-', 1)) AS st
-                               FROM kalshi_corpus k JOIN kalshi_markets m USING (ticker) LEFT JOIN kalshi_events e USING (event_ticker)
-                               WHERE k.status IN ('pending', 'done', 'built', 'skipped')""").fetchall()
-    out, back_done, back_pending = [], [], []
-    for r in rows:
-        ok = in_sample(r["event_ticker"], cats.get(r["st"]), rates)
-        if not ok and r["status"] in ("pending", "done", "built"):
-            out.append(r["ticker"])
-        elif ok and r["status"] == "skipped":
-            (back_done if r["candle_path"] else back_pending).append(r["ticker"])
+        df = pd.DataFrame([dict(r) for r in conn.execute("SELECT ticker, event_ticker, series_ticker, close_time FROM kalshi_universe WHERE close_time < %s", (cutoff,)).fetchall()])
+    if not len(df):
+        return {"selected": 0}
+    df["cat"] = [cats.get(x, "unknown") for x in df["series_ticker"]]
+    df["day"] = pd.to_datetime(df["close_time"], utc=True).dt.floor("D")
+    sel = select_events(df[["ticker", "event_ticker", "cat", "day"]], int(config.KALSHI_MARKETS_PER_DAY))
+    sel_l = sorted(sel)
     with transaction() as conn:
-        for i in range(0, len(out), 20000):
-            conn.execute("UPDATE kalshi_corpus SET status = 'skipped', last_error = %s, updated_at = now() WHERE ticker = ANY(%s)", (NOT_SAMPLED, out[i:i + 20000]))
-        for st_, lst in (("done", back_done), ("pending", back_pending)):
-            for i in range(0, len(lst), 20000):
-                conn.execute("UPDATE kalshi_corpus SET status = %s, last_error = NULL, updated_at = now() WHERE ticker = ANY(%s)", (st_, lst[i:i + 20000]))
-    log.info("event sample: %d rows left the corpus, %d came back (%d with candles)", len(out), len(back_done) + len(back_pending), len(back_done))
-    return len(out) + len(back_done) + len(back_pending)
+        conn.execute("CREATE TEMP TABLE sel (ticker text PRIMARY KEY) ON COMMIT DROP")
+        with conn.cursor().copy("COPY sel (ticker) FROM STDIN") as cp:
+            for tk in sel_l:
+                cp.write_row((tk,))
+        conn.execute("UPDATE kalshi_universe u SET selected = true, updated_at = now() FROM sel WHERE sel.ticker = u.ticker AND NOT u.selected")
+        conn.execute("UPDATE kalshi_universe u SET selected = false, updated_at = now() WHERE u.selected AND u.close_time < %s "
+                     "AND NOT EXISTS (SELECT 1 FROM sel WHERE sel.ticker = u.ticker)", (cutoff,))
+        new = conn.execute("""SELECT u.* FROM kalshi_universe u JOIN sel USING (ticker) LEFT JOIN kalshi_corpus k USING (ticker) WHERE k.ticker IS NULL""").fetchall()
+        mk = [{"ticker": r["ticker"], "event_ticker": r["event_ticker"], "title": r["title"], "status": "settled", "open_time": r["open_time"], "close_time": r["close_time"],
+               "settlement_ts": r["settled_ts"], "result": r["result"]} for r in new]
+        for i in range(0, len(mk), 5000):
+            D.upsert_markets(conn, mk[i:i + 5000], "universe")
+        conn.cursor().executemany("INSERT INTO kalshi_corpus (ticker, status, settled_ts, result, open_time, close_time, seeded_from, volume) VALUES (%s,'pending',%s,%s,%s,%s,%s,%s) "
+                                  "ON CONFLICT (ticker) DO NOTHING",
+                                  [(r["ticker"], r["settled_ts"], r["result"], r["open_time"], r["close_time"], r["source"], r["volume"]) for r in new])
+    changed = apply_sample()
+    log.info("corpus selection: %d markets of %d in complete days (%d new to the corpus, %d corpus rows changed) in %.0fs",
+             len(sel), len(df), len(new), changed, time.time() - t0)
+    return {"selected": len(sel), "universe": int(len(df)), "new": len(new), "changed": changed}
+
+
+def apply_sample() -> int:
+    """Corpus rows follow the selection: a market not selected is 'skipped' (its files stay on disk, it is never built or
+    trained on); a selected market an older rule skipped comes back ('done' when its candles are already on disk, else
+    'pending'). Markets of days not yet selectable (the last COMPLETE_AFTER_DAYS) are left as they are. Returns rows changed."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=COMPLETE_AFTER_DAYS)
+    with transaction() as conn:
+        a = conn.execute("""UPDATE kalshi_corpus k SET status = 'skipped', last_error = %s, updated_at = now()
+                            WHERE k.status IN ('pending', 'done', 'built') AND k.close_time < %s
+                              AND NOT EXISTS (SELECT 1 FROM kalshi_universe u WHERE u.ticker = k.ticker AND u.selected)""", (NOT_SAMPLED, cutoff)).rowcount
+        b = conn.execute("""UPDATE kalshi_corpus k SET status = CASE WHEN k.candle_path IS NOT NULL THEN 'done' ELSE 'pending' END, last_error = NULL, updated_at = now()
+                            FROM kalshi_universe u WHERE u.ticker = k.ticker AND u.selected AND k.status = 'skipped'""").rowcount
+    log.info("event sample: %d corpus rows left, %d came back", a, b)
+    return int(a or 0) + int(b or 0)
 
 # ---------------------------------------------------------------- 3. candles and trades
 def _series_for(conn, ticker: str) -> str:
@@ -547,10 +545,10 @@ def main(stop_event: threading.Event | None = None) -> None:
     try:
         while not (stop is not None and stop.is_set()):
             try:
-                _status(stage="seeding from the dataset"); refresh_series(rest); seeded = seed_from_dataset(stop)
+                _status(stage="seeding the universe from the dataset"); refresh_series(rest); seeded = seed_from_dataset(stop)
                 _status(stage="refreshing markets", seed=seeded); n_new = refresh_markets(rest, stop)
-                refresh_series(rest); ensure_series(rest, stop); skipped = apply_sample()   # categories first, then the sample,
-                catalogue_missing(rest, stop)                                               # then only the sampled markets' events
+                refresh_series(rest); sel = select_corpus(); skipped = sel.get("changed")      # the outcome-blind event sample,
+                seed_dataset_trades(stop); ensure_series(rest, stop); catalogue_missing(rest, stop)  # then only the selected markets' files and events
                 c = counts(); _status(stage="filling candles", refreshed=n_new, skipped_now=skipped, **{k: v for k, v in c.items()})
                 t0 = time.time(); done = 0
                 while not (stop is not None and stop.is_set()):
