@@ -17,45 +17,6 @@ def _clean():
         c.execute("DELETE FROM ui_settings WHERE key = %s", (H.SEED_KEY,))
 
 
-def test_seed_keeps_every_market_above_the_floor(tmp_path, monkeypatch):
-    _clean()
-    monkeypatch.setattr(config, "KALSHI_DATASET_DIR", str(tmp_path)); monkeypatch.setattr(config, "KALSHI_MIN_MARKET_VOLUME", 100.0); monkeypatch.setattr(config, "KALSHI_MARKETS_PER_DAY", 2)
-    monkeypatch.setattr(config, "KALSHI_HISTORY_START", "2025-01-01"); monkeypatch.setattr(H.D, "TRADES_DIR", tmp_path / "trades_out")
-    d = tmp_path / "data" / "kalshi"; (d / "markets").mkdir(parents=True); (d / "trades").mkdir()
-    day = datetime(2026, 3, 1, 12, 0)
-    rows = [("TSTH-A", 5000.0, day), ("TSTH-B", 300.0, day + timedelta(hours=1)), ("TSTH-C", 200.0, day + timedelta(hours=2)),        # day 1: all above the floor
-            ("TSTH-D", 50.0, day + timedelta(days=1)), ("TSTH-E", 900.0, day + timedelta(days=1, hours=3)),                             # day 2: D below the floor, E kept
-            ("TSTH-F", 9999.0, datetime(2024, 6, 1))]                                                                                     # before the start
-    pq.write_table(pa.table({"ticker": [r[0] for r in rows], "event_ticker": ["TSTH-EV"] * 6, "market_type": ["binary"] * 6, "title": ["t"] * 6, "yes_sub_title": [""] * 6, "no_sub_title": [""] * 6,
-                             "status": ["settled"] * 6, "result": ["yes", "no", "yes", "no", "yes", "no"], "open_time": [r[2] - timedelta(days=2) for r in rows], "close_time": [r[2] for r in rows],
-                             "volume": [r[1] for r in rows], "open_interest": [0.0] * 6}), d / "markets" / "markets_0.parquet")
-    pq.write_table(pa.table({"trade_id": ["1", "2", "3"], "ticker": ["TSTH-A", "TSTH-A", "TSTH-C"], "count": [5.0, 7.0, 1.0], "yes_price": [40, 42, 50], "no_price": [60, 58, 50],
-                             "taker_side": ["yes", "no", "yes"], "created_time": [day - timedelta(hours=5), day - timedelta(hours=4), day - timedelta(hours=1)]}), d / "trades" / "trades_0.parquet")
-    out = H.seed_from_dataset()
-    assert out == {"markets": 4, "trades": 2}                                       # A, B, C, E (the cap is the prune's); A and C have trades
-    with transaction() as c:
-        got = {r["ticker"]: dict(r) for r in c.execute("SELECT ticker, status, volume, trade_path, trades FROM kalshi_corpus WHERE ticker LIKE 'TSTH-%'").fetchall()}
-    assert set(got) == {"TSTH-A", "TSTH-B", "TSTH-C", "TSTH-E"} and got["TSTH-A"]["volume"] == 5000.0 and got["TSTH-A"]["trades"] == 2 and got["TSTH-B"]["trade_path"] is None
-    assert H.seed_from_dataset() == {"skipped": "already seeded"}
-    _clean()
-
-
-def test_prune_marks_pending_rows_beyond_the_bounds_as_skipped(monkeypatch):
-    _clean(); monkeypatch.setattr(config, "KALSHI_MIN_MARKET_VOLUME", 100.0); monkeypatch.setattr(config, "KALSHI_MARKETS_PER_DAY", 1)
-    day = datetime(2026, 4, 1, tzinfo=timezone.utc)
-    with transaction() as c:
-        for tk, vol, close, raw in (("TSTH-P1", 500.0, day, None), ("TSTH-P2", None, day + timedelta(hours=1), '{"volume_fp": "800.00"}'), ("TSTH-P3", None, day + timedelta(hours=2), '{"volume": 20}')):
-            c.execute("INSERT INTO kalshi_markets (ticker, status, source, raw) VALUES (%s, 'settled', 'test', %s::jsonb)", (tk, raw))
-            c.execute("INSERT INTO kalshi_corpus (ticker, status, close_time, volume) VALUES (%s, 'pending', %s, %s)", (tk, close, vol))
-    assert H.prune_pending() == 2
-    with transaction() as c:
-        got = {r["ticker"]: (r["status"], r["volume"]) for r in c.execute("SELECT ticker, status, volume FROM kalshi_corpus WHERE ticker LIKE 'TSTH-P%'").fetchall()}
-    assert got["TSTH-P2"] == ("pending", 800.0)                     # volume read from the raw JSON; the day's most traded stays
-    assert got["TSTH-P1"][0] == "skipped" and got["TSTH-P3"] == ("skipped", 20.0)
-    assert H.market_volume({"volume_fp": "12.50"}) == 12.5 and H.market_volume({"volume": 3}) == 3.0 and H.market_volume({}) is None
-    _clean()
-
-
 class FakeRest:
     """Two tiers of settled markets, newest first, four per page with opaque cursors; ``fail_after`` pages raises a timeout."""
 
@@ -101,7 +62,8 @@ def _clean_walk():
 
 
 def test_the_exchange_walk_resumes_from_its_saved_page_and_later_rounds_cover_only_new_settlements(monkeypatch):
-    _clean_walk(); monkeypatch.setattr(config, "KALSHI_MIN_MARKET_VOLUME", 100.0); monkeypatch.setattr(config, "KALSHI_HISTORY_START", "2026-01-01")
+    _clean_walk(); monkeypatch.setattr(config, "KALSHI_HISTORY_START", "2026-01-01")
+    monkeypatch.setattr(H, "sample_rates", lambda conn=None: {"rates": {}})                # every event sampled: this test is about the walk
     t0 = datetime(2026, 9, 20, tzinfo=timezone.utc)
     live = [_mk(i, t0 - timedelta(hours=6 * i)) for i in range(10)]                     # 3 pages
     hist = [_mk(100 + i, datetime(2026, 7, 20, tzinfo=timezone.utc) - timedelta(days=i)) for i in range(6)]   # 2 pages
@@ -176,25 +138,54 @@ def test_markets_seeded_without_a_catalogue_get_their_events_and_series():
     _clean_walk()
 
 
-def test_the_cap_is_per_category_and_reopens_markets_an_older_rule_skipped(monkeypatch):
-    _clean_walk(); monkeypatch.setattr(config, "KALSHI_MIN_MARKET_VOLUME", 100.0); monkeypatch.setattr(config, "KALSHI_MARKETS_PER_DAY", 1)
-    day = datetime(2026, 5, 1, 12, tzinfo=timezone.utc)
+def test_the_event_sample_is_blind_to_volume_and_outcome_and_keeps_whole_events(tmp_path, monkeypatch):
+    """Membership depends on the event ticker and its category's rate only: two markets of one event are in or out together,
+    whatever they traded or how they settled; combos (exotics) are never in."""
+    rates = {"rates": {"crypto": 0.5, "sports": 1.0, "exotics": 0.0}}
+    evs = [f"KXBTCD-26SEP{i:02d}17" for i in range(200)]
+    kept = [e for e in evs if H.in_sample(e, "Crypto", rates)]
+    assert 60 < len(kept) < 140 and kept == [e for e in evs if H.event_u(e) < 0.5]            # about half, fixed by the hash
+    assert all(H.in_sample(e, "sports", rates) for e in evs[:20]) and not any(H.in_sample(e, "exotics", rates) for e in evs)
+    assert H.event_u("KXBTCD-26SEP0117") == H.event_u("KXBTCD-26SEP0117")
+    assert H.in_sample("ANY-EVENT", "a new category", rates)                                   # categories the dataset never had: kept whole
+
+
+def test_seed_takes_every_market_of_a_sampled_event_and_nothing_else(tmp_path, monkeypatch):
+    _clean()
+    monkeypatch.setattr(config, "KALSHI_DATASET_DIR", str(tmp_path)); monkeypatch.setattr(config, "KALSHI_HISTORY_START", "2025-01-01")
+    monkeypatch.setattr(H.D, "TRADES_DIR", tmp_path / "trades_out")
+    ins = next(e for e in (f"TSTH-IN{i}" for i in range(100)) if H.event_u(e) < 0.5); out = next(e for e in (f"TSTH-OUT{i}" for i in range(100)) if H.event_u(e) >= 0.5)
+    monkeypatch.setattr(H, "sample_rates", lambda conn=None: {"rates": {"unknown": 0.5}})
+    d = tmp_path / "data" / "kalshi"; (d / "markets").mkdir(parents=True); (d / "trades").mkdir()
+    day = datetime(2026, 3, 1, 12, 0)
+    rows = [(f"{ins}-A", ins, 5.0), (f"{ins}-B", ins, 0.0), (f"{out}-A", out, 90000.0)]       # volume is irrelevant either way
+    pq.write_table(pa.table({"ticker": [r[0] for r in rows], "event_ticker": [r[1] for r in rows], "market_type": ["binary"] * 3, "title": ["t"] * 3, "yes_sub_title": [""] * 3,
+                             "no_sub_title": [""] * 3, "status": ["settled"] * 3, "result": ["yes", "no", "yes"], "open_time": [day - timedelta(days=2)] * 3, "close_time": [day] * 3,
+                             "volume": [r[2] for r in rows], "open_interest": [0.0] * 3}), d / "markets" / "markets_0.parquet")
+    pq.write_table(pa.table({"trade_id": ["1"], "ticker": [f"{ins}-A"], "count": [5.0], "yes_price": [40], "no_price": [60], "taker_side": ["yes"],
+                             "created_time": [day - timedelta(hours=5)]}), d / "trades" / "trades_0.parquet")
+    out_ = H.seed_from_dataset()
+    assert out_ == {"markets": 2, "trades": 1}
     with transaction() as c:
-        c.execute("INSERT INTO kalshi_series (ticker, category) VALUES ('TSTHS', 'Sports'), ('TSTHW', 'Climate and Weather')")
-        for tk, series, vol, status, err in (("TSTHS-1", "TSTHS", 9000.0, "pending", None), ("TSTHS-2", "TSTHS", 8000.0, "pending", None),
-                                             ("TSTHW-1", "TSTHW", 300.0, "skipped", "beyond the corpus's markets per day"),     # the old cross-category cap dropped it
-                                             ("TSTHW-2", "TSTHW", 200.0, "built", None)):
-            c.execute("INSERT INTO kalshi_markets (ticker, event_ticker, status, source) VALUES (%s, %s, 'settled', 'dataset')", (tk, f"{series}-EV"))
-            c.execute("INSERT INTO kalshi_corpus (ticker, status, close_time, volume, last_error) VALUES (%s, %s, %s, %s, %s)", (tk, status, day, vol, err))
-    H.prune_pending()
+        got = {r["ticker"] for r in c.execute("SELECT ticker FROM kalshi_corpus WHERE ticker LIKE 'TSTH-%%'").fetchall()}
+    assert got == {f"{ins}-A", f"{ins}-B"}
+    assert H.seed_from_dataset() == {"skipped": "already seeded"}
+    _clean()
+
+
+def test_apply_sample_moves_rows_in_and_out_of_the_corpus(monkeypatch):
+    _clean_walk()
+    ins = next(e for e in (f"TSTH-IN{i}" for i in range(100)) if H.event_u(e) < 0.5); out = next(e for e in (f"TSTH-OUT{i}" for i in range(100)) if H.event_u(e) >= 0.5)
+    monkeypatch.setattr(H, "sample_rates", lambda conn=None: {"rates": {"unknown": 0.5}})
     with transaction() as c:
-        st = {r["ticker"]: r["status"] for r in c.execute("SELECT ticker, status FROM kalshi_corpus WHERE ticker LIKE 'TSTH%%-%%'").fetchall()}
-    assert st["TSTHS-1"] == "pending" and st["TSTHS-2"] == "skipped"      # sports: its own cap of one
-    assert st["TSTHW-2"] == "built" and st["TSTHW-1"] == "skipped"          # weather: the built market holds the one place
-    monkeypatch.setattr(config, "KALSHI_MARKETS_PER_DAY", 2); H.prune_pending()
+        for tk, et, status, cp in ((f"{out}-1", out, "built", "/x.parquet"), (f"{out}-2", out, "pending", None), (f"{ins}-1", ins, "skipped", "/y.parquet"), (f"{ins}-2", ins, "skipped", None),
+                                   (f"{ins}-3", ins, "built", "/z.parquet")):
+            c.execute("INSERT INTO kalshi_markets (ticker, event_ticker, status, source) VALUES (%s, %s, 'settled', 'test')", (tk, et))
+            c.execute("INSERT INTO kalshi_corpus (ticker, status, candle_path, close_time) VALUES (%s, %s, %s, now())", (tk, status, cp))
+    assert H.apply_sample() == 4
     with transaction() as c:
-        st = {r["ticker"]: r["status"] for r in c.execute("SELECT ticker, status FROM kalshi_corpus WHERE ticker LIKE 'TSTH%%-%%'").fetchall()}
-    assert st == {"TSTHS-1": "pending", "TSTHS-2": "pending", "TSTHW-1": "pending", "TSTHW-2": "built"}   # re-opened under the wider cap
-    with transaction() as c:
-        c.execute("DELETE FROM kalshi_corpus WHERE ticker LIKE 'TSTH%%-%%'"); c.execute("DELETE FROM kalshi_markets WHERE ticker LIKE 'TSTH%%-%%'")
-        c.execute("DELETE FROM kalshi_series WHERE ticker IN ('TSTHS', 'TSTHW')")
+        st = {r["ticker"]: (r["status"], r["last_error"]) for r in c.execute("SELECT ticker, status, last_error FROM kalshi_corpus WHERE ticker LIKE 'TSTH-%%'").fetchall()}
+    assert st[f"{out}-1"] == ("skipped", H.NOT_SAMPLED) and st[f"{out}-2"][0] == "skipped"
+    assert st[f"{ins}-1"][0] == "done" and st[f"{ins}-2"][0] == "pending" and st[f"{ins}-3"][0] == "built"
+    assert H.apply_sample() == 0
+    _clean_walk()

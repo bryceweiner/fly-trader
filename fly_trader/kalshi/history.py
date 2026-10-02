@@ -1,9 +1,17 @@
 """The Kalshi corpus (worker ``kalshi_history``, CLI ``kalshi-history``): every settled market since ``KALSHI_HISTORY_START``
 with its 1-minute candles and public trades.
 
-1. Seed (once, idempotent): the open dataset at ``KALSHI_DATASET_DIR`` (jon-becker/prediction-market-analysis:
+Which markets: an **event sample** that never looks at a market's outcome or its later trading. An event (all its markets
+together, so siblings stay whole) belongs to the corpus iff md5(event ticker) falls below its category's rate; each rate is
+set once from the dataset so a category contributes about ``KALSHI_MARKETS_PER_DAY`` markets a day (``sample_rates``).
+Until 2026-10-02 the corpus kept the markets with the most lifetime volume, which selects on the future: a cheap strike is
+traded heavily mostly when the price runs to it, so kept 1–5c crypto-ladder sides returned +94.5 % per dollar against
+−78 % for the rest, and the selector learned the selection (snapshots 151–153). Point-in-time liquidity is the decision
+rows' eligibility gate (spread, 24 h volume, open interest at that minute), never the corpus's membership.
+
+1. Seed (idempotent per rule): the open dataset at ``KALSHI_DATASET_DIR`` (jon-becker/prediction-market-analysis:
    ``data/kalshi/markets/*.parquet`` and ``data/kalshi/trades/*.parquet``) → ``kalshi_markets`` rows (source 'dataset')
-   and ``trades/<ticker>.parquet`` for every settled yes/no market that closed on or after the start.
+   and ``trades/<ticker>.parquet`` for every settled yes/no market of a sampled event that closed on or after the start.
 2. Refresh from the exchange, resumable and paced (``config.KALSHI_RPS``): settled markets from the live tier
    (``GET /markets?status=settled``) and the archive (``GET /historical/markets``), events (category, mutual exclusivity)
    and series (category, frequency, fee multiplier) on first sight.
@@ -62,6 +70,80 @@ def _sleep(s: float, stop: threading.Event | None) -> None:
 
 
 # ---------------------------------------------------------------- 1. dataset seed
+SAMPLE_KEY = "kalshi_event_sample"
+SAMPLE_RULE = "event-md5-v1"
+EXCLUDED_CATEGORIES = ("exotics",)            # Kalshi's multivariate combos: not single markets, not our universe
+NOT_SAMPLED = "not in the event sample"
+
+
+def event_u(event_ticker: str | None) -> float:
+    """A uniform number in [0, 1) fixed by the event ticker alone: independent of the market's outcome and trading."""
+    import hashlib
+    return int(hashlib.md5(str(event_ticker or "").encode()).hexdigest()[:12], 16) / float(16 ** 12)
+
+
+def series_categories(conn) -> dict[str, str]:
+    return {r["ticker"]: (r["category"] or "unknown").strip().lower() for r in conn.execute("SELECT ticker, category FROM kalshi_series").fetchall()}
+
+
+def compute_sample_rates(mfiles: list[str], cats: dict[str, str]) -> dict:
+    """Per category, the share of events to keep so it contributes about KALSHI_MARKETS_PER_DAY markets a day, measured on the
+    dataset's settled markets since the start (all of them: no volume floor)."""
+    import duckdb
+    import pandas as pd
+    con = duckdb.connect(); con.register("cats", pd.DataFrame({"st": list(cats), "cat": list(cats.values())}))
+    df = con.execute("""SELECT COALESCE(c.cat, 'unknown') AS cat, count(*) AS markets, min(m.close_time) AS a, max(m.close_time) AS b
+                        FROM read_parquet(?, union_by_name = true) m LEFT JOIN cats c ON c.st = split_part(m.event_ticker, '-', 1)
+                        WHERE m.result IN ('yes', 'no') AND m.close_time >= ? GROUP BY 1""", [mfiles, _start().replace(tzinfo=None)]).df()
+    con.close()
+    span = max((pd.Timestamp(df["b"].max()) - pd.Timestamp(df["a"].min())).total_seconds() / 86400.0, 1.0)
+    target = float(config.KALSHI_MARKETS_PER_DAY)
+    rates = {r.cat: (0.0 if r.cat in EXCLUDED_CATEGORIES else float(min(1.0, target / max(r.markets / span, 1e-9)))) for r in df.itertuples()}
+    return {"rule": SAMPLE_RULE, "target_per_day": target, "span_days": span, "rates": rates,
+            "markets": {r.cat: int(r.markets) for r in df.itertuples()}, "at": datetime.now(timezone.utc).isoformat()}
+
+
+def sample_rates(conn=None) -> dict:
+    """The stored rates (``ui_settings[SAMPLE_KEY]``); computed from the dataset on first use. A category not in the table
+    (new since the dataset) is kept whole unless excluded."""
+    def read(c):
+        r = c.execute("SELECT value FROM ui_settings WHERE key = %s", (SAMPLE_KEY,)).fetchone()
+        v = (r["value"] if isinstance(r["value"], dict) else json.loads(r["value"] or "{}")) if r else {}
+        return v if v.get("rule") == SAMPLE_RULE and v.get("target_per_day") == float(config.KALSHI_MARKETS_PER_DAY) else None
+    if conn is not None and (v := read(conn)):
+        return v
+    with transaction() as c:
+        v = read(c); cats = series_categories(c)
+    if v:
+        return v
+    root = Path(config.KALSHI_DATASET_DIR).expanduser() if config.KALSHI_DATASET_DIR else None
+    mfiles = sorted(glob.glob(str(root / "data" / "kalshi" / "markets" / "*.parquet"))) if root else []
+    v = compute_sample_rates(mfiles, cats) if mfiles else {"rule": SAMPLE_RULE, "target_per_day": float(config.KALSHI_MARKETS_PER_DAY), "rates": {}, "markets": {}}
+    with transaction() as c:
+        c.execute("INSERT INTO ui_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()", (SAMPLE_KEY, json.dumps(v)))
+    log.info("event sample rates: %s", {k: round(x, 4) for k, x in v["rates"].items()})
+    return v
+
+
+def in_sample(event_ticker: str | None, category: str | None, rates: dict) -> bool:
+    cat = (category or "unknown").strip().lower()
+    if cat in EXCLUDED_CATEGORIES or not event_ticker:
+        return False
+    return event_u(event_ticker) < float(rates.get("rates", {}).get(cat, 1.0))
+
+
+def refresh_series(rest: KalshiRest) -> int:
+    """Every series with its category (one call): the sample's categories come from here."""
+    try:
+        ss = rest.series_list()
+    except KalshiApiError as e:
+        log.warning("series list: %s", e); return 0
+    with transaction() as conn:
+        for x in ss:
+            D.upsert_series(conn, x)
+    return len(ss)
+
+
 def seed_from_dataset(stop: threading.Event | None = None) -> dict:
     """Idempotent: skips when ``ui_settings[kalshi_dataset_seed]`` records the same dataset files."""
     root = Path(config.KALSHI_DATASET_DIR).expanduser() if config.KALSHI_DATASET_DIR else None
@@ -69,8 +151,9 @@ def seed_from_dataset(stop: threading.Event | None = None) -> dict:
         return {"skipped": "no dataset at KALSHI_DATASET_DIR"}
     import duckdb
     mfiles = sorted(glob.glob(str(root / "data" / "kalshi" / "markets" / "*.parquet"))); tfiles = sorted(glob.glob(str(root / "data" / "kalshi" / "trades" / "*.parquet")))
+    rates = sample_rates()
     stamp = {"markets": [Path(f).name for f in mfiles], "trades": [Path(f).name for f in tfiles], "start": config.KALSHI_HISTORY_START,
-             "rule": "volume-floor", "min_volume": float(config.KALSHI_MIN_MARKET_VOLUME)}         # the per-category cap is applied by prune_pending
+             "rule": SAMPLE_RULE, "rates": rates.get("rates")}
     with transaction() as conn:
         r = conn.execute("SELECT value FROM ui_settings WHERE key = %s", (SEED_KEY,)).fetchone()
     if r and (r["value"] if isinstance(r["value"], dict) else json.loads(r["value"] or "{}")).get("stamp") == stamp:
@@ -79,13 +162,18 @@ def seed_from_dataset(stop: threading.Event | None = None) -> dict:
     cols = [c[0] for c in con.execute("SELECT * FROM read_parquet(?, union_by_name = true) LIMIT 0", [mfiles]).description]
     want = ["ticker", "event_ticker", "market_type", "title", "yes_sub_title", "no_sub_title", "status", "result", "open_time", "close_time", "volume", "open_interest"]
     sel = ", ".join(c if c in cols else f"NULL AS {c}" for c in want)
-    # every settled market above the volume floor (6.8 M settled yes/no markets since 2025-01-01 are mostly hourly ladders that
-    # never traded); which of them the corpus keeps per category and day is prune_pending's decision, once their series are known
-    rows = con.execute(f"""SELECT {sel} FROM read_parquet(?, union_by_name = true)
-                           WHERE result IN ('yes', 'no') AND close_time >= ? AND COALESCE(volume, 0) >= ?
-                           ORDER BY close_time DESC""", [mfiles, _start().replace(tzinfo=None), float(config.KALSHI_MIN_MARKET_VOLUME)]).fetchall()
+    # the sampled events' settled markets (the sample never looks at volume or outcome)
+    with transaction() as conn:
+        cats = series_categories(conn)
+    events = [r[0] for r in con.execute("""SELECT DISTINCT event_ticker FROM read_parquet(?, union_by_name = true)
+                                           WHERE result IN ('yes', 'no') AND close_time >= ? AND event_ticker IS NOT NULL""", [mfiles, _start().replace(tzinfo=None)]).fetchall()]
+    keep = [e for e in events if in_sample(e, cats.get(D.series_ticker_of(e)), rates)]
+    con.execute("CREATE TEMP TABLE kept_events AS SELECT * FROM (VALUES " + ",".join("(?)" for _ in keep) + ") t(event_ticker)", keep) if keep else \
+        con.execute("CREATE TEMP TABLE kept_events (event_ticker VARCHAR)")
+    rows = con.execute(f"""SELECT {sel} FROM read_parquet(?, union_by_name = true) JOIN kept_events USING (event_ticker)
+                           WHERE result IN ('yes', 'no') AND close_time >= ? ORDER BY close_time DESC""", [mfiles, _start().replace(tzinfo=None)]).fetchall()
     markets = [dict(zip(want, r)) for r in rows]
-    log.info("dataset seed: %d settled yes/no markets since %s (volume ≥ %g)", len(markets), config.KALSHI_HISTORY_START, config.KALSHI_MIN_MARKET_VOLUME)
+    log.info("dataset seed: %d settled yes/no markets of %d sampled events (of %d) since %s", len(markets), len(keep), len(events), config.KALSHI_HISTORY_START)
     n = 0
     with transaction() as conn:
         for i in range(0, len(markets), 5000):
@@ -177,7 +265,7 @@ def _save_walk(conn, st: dict) -> None:
 
 
 def refresh_markets(rest: KalshiRest, stop: threading.Event | None = None, max_pages: int = 10_000) -> int:
-    """Settled yes/no markets with volume ≥ KALSHI_MIN_MARKET_VOLUME closing after the dataset's newest day (or the start),
+    """Settled yes/no markets of sampled events (``in_sample``) closing after the dataset's newest day (or the start),
     from the live tier then the archive (both page newest first). The walk is resumable: after every page its tier and page
     cursor are saved with that page's rows (``ui_settings[WALK_KEY]``), so a timeout, a crash or a restart continues from the
     next page instead of walking the newest months again. A completed walk records when it began; later rounds walk only the
@@ -188,7 +276,9 @@ def refresh_markets(rest: KalshiRest, stop: threading.Event | None = None, max_p
         r = conn.execute("SELECT max(close_time) AS t FROM kalshi_corpus WHERE seeded_from = 'dataset'").fetchone()
     if r and r["t"] and r["t"] > start:
         start = r["t"]                                         # the archive covers the days before; the API fills from there on
-    min_vol = float(config.KALSHI_MIN_MARKET_VOLUME)
+    rates = sample_rates()
+    with transaction() as conn:
+        cats = series_categories(conn)
     st = walk_state(); now = datetime.now(timezone.utc)
     if st.get("complete_through"):
         lower = max(start, datetime.fromisoformat(st["complete_through"]) - timedelta(days=RECOVER_DAYS)); tiers = ["live"]
@@ -207,7 +297,8 @@ def refresh_markets(rest: KalshiRest, stop: threading.Event | None = None, max_p
         for k, (page, nxt) in enumerate(gen):
             if stop is not None and stop.is_set() or k >= max_pages:
                 return n
-            settled = [m for m in page if (m.get("result") in ("yes", "no")) and (D.ts(m.get("close_time")) or lower) >= lower and (market_volume(m) or 0.0) >= min_vol]
+            settled = [m for m in page if (m.get("result") in ("yes", "no")) and (D.ts(m.get("close_time")) or lower) >= lower
+                       and in_sample(m.get("event_ticker"), cats.get(D.series_ticker_of(m.get("event_ticker"))), rates)]
             closes = [D.ts(m.get("close_time")) for m in page if D.ts(m.get("close_time"))]
             done_tier = not nxt or (closes and max(closes) < lower)
             with transaction() as conn:
@@ -278,10 +369,6 @@ def catalogue_missing(rest: KalshiRest, stop: threading.Event | None = None, thr
     return done["n"]
 
 
-CAP_SKIP = "beyond the corpus's markets per category and day"
-OLD_CAP_SKIPS = ("beyond the corpus's markets per day", CAP_SKIP)
-
-
 def ensure_series(rest: KalshiRest, stop: threading.Event | None = None, threads: int | None = None) -> int:
     """Series of corpus markets missing from the catalogue (the dataset's markets carry no category; their series does)."""
     with transaction() as conn:
@@ -309,44 +396,31 @@ def ensure_series(rest: KalshiRest, stop: threading.Event | None = None, threads
     return len(todo)
 
 
-def prune_pending() -> int:
-    """Which settled markets the corpus keeps: volume ≥ KALSHI_MIN_MARKET_VOLUME, and the KALSHI_MARKETS_PER_DAY most traded of
-    each (category, close day) — Kalshi's category of the market's series (unknown until the series is catalogued). Markets already filled or
-    built always count toward their day's cap; pending ones beyond it are 'skipped', and markets an earlier rule skipped are
-    brought back when the current rule keeps them. Returns the number of rows whose status changed."""
-    import pandas as pd
+def apply_sample() -> int:
+    """Corpus rows follow the event sample: a market outside it is 'skipped' (its files stay on disk, it is never built or
+    trained on); a sampled market an older rule skipped comes back ('done' when its candles are already on disk, else
+    'pending'). Returns the rows changed."""
+    rates = sample_rates()
     with transaction() as conn:
-        conn.execute("""UPDATE kalshi_corpus c SET volume = COALESCE(NULLIF(m.raw->>'volume_fp', '')::float, NULLIF(m.raw->>'volume', '')::float)
-                        FROM kalshi_markets m WHERE m.ticker = c.ticker AND c.volume IS NULL AND m.raw IS NOT NULL""")
-        a = conn.execute("UPDATE kalshi_corpus SET status = 'skipped', last_error = 'volume below the corpus minimum', updated_at = now() "
-                         "WHERE status = 'pending' AND COALESCE(volume, 0) < %s", (float(config.KALSHI_MIN_MARKET_VOLUME),)).rowcount
-        rows = conn.execute("""SELECT k.ticker, k.status, k.volume, k.close_time, k.last_error, COALESCE(s.category, se.category) AS scat, e.category AS ecat
+        cats = series_categories(conn)
+        rows = conn.execute("""SELECT k.ticker, k.status, k.candle_path, m.event_ticker, COALESCE(e.series_ticker, split_part(COALESCE(m.event_ticker, m.ticker), '-', 1)) AS st
                                FROM kalshi_corpus k JOIN kalshi_markets m USING (ticker) LEFT JOIN kalshi_events e USING (event_ticker)
-                               LEFT JOIN kalshi_series s ON s.ticker = e.series_ticker
-                               LEFT JOIN kalshi_series se ON se.ticker = split_part(COALESCE(m.event_ticker, m.ticker), '-', 1)
-                               WHERE k.close_time IS NOT NULL AND COALESCE(k.volume, 0) >= %s
-                                 AND (k.status IN ('pending', 'done', 'built') OR (k.status = 'skipped' AND k.last_error = ANY(%s)))""",
-                            (float(config.KALSHI_MIN_MARKET_VOLUME), list(OLD_CAP_SKIPS))).fetchall()
-    if not rows:
-        return int(a or 0)
-    df = pd.DataFrame([dict(r) for r in rows])
-    # the cap's category is Kalshi's own (Mentions, Commodities, Financials ... each its own cap), not the feature table's coarser key
-    df["cat"] = [(sc if isinstance(sc, str) and sc else ec if isinstance(ec, str) and ec else "unknown").strip().lower() for sc, ec in zip(df["scat"], df["ecat"])]
-    df["day"] = pd.to_datetime(df["close_time"], utc=True).dt.floor("D")
-    df["kept_first"] = df["status"].isin(["done", "built"])                       # what is filled stays; it takes its place in the cap first
-    df = df.sort_values(["cat", "day", "kept_first", "volume", "ticker"], ascending=[True, True, False, False, True])
-    df["rk"] = df.groupby(["cat", "day"]).cumcount()
-    keep = df["kept_first"] | (df["rk"] < int(config.KALSHI_MARKETS_PER_DAY))
-    to_skip = df.loc[~keep & (df["status"] == "pending"), "ticker"].tolist()
-    to_pend = df.loc[keep & (df["status"] == "skipped"), "ticker"].tolist()
+                               WHERE k.status IN ('pending', 'done', 'built', 'skipped')""").fetchall()
+    out, back_done, back_pending = [], [], []
+    for r in rows:
+        ok = in_sample(r["event_ticker"], cats.get(r["st"]), rates)
+        if not ok and r["status"] in ("pending", "done", "built"):
+            out.append(r["ticker"])
+        elif ok and r["status"] == "skipped":
+            (back_done if r["candle_path"] else back_pending).append(r["ticker"])
     with transaction() as conn:
-        for i in range(0, len(to_skip), 20000):
-            conn.execute("UPDATE kalshi_corpus SET status = 'skipped', last_error = %s, updated_at = now() WHERE ticker = ANY(%s) AND status = 'pending'", (CAP_SKIP, to_skip[i:i + 20000]))
-        for i in range(0, len(to_pend), 20000):
-            conn.execute("UPDATE kalshi_corpus SET status = 'pending', last_error = NULL, updated_at = now() WHERE ticker = ANY(%s) AND status = 'skipped'", (to_pend[i:i + 20000],))
-    log.info("corpus rule: %d kept of %d above the floor (%d re-opened, %d skipped); per category: %s", int(keep.sum()), len(df), len(to_pend), len(to_skip),
-             df[keep].groupby("cat").size().sort_values(ascending=False).to_dict())
-    return int(a or 0) + len(to_skip) + len(to_pend)
+        for i in range(0, len(out), 20000):
+            conn.execute("UPDATE kalshi_corpus SET status = 'skipped', last_error = %s, updated_at = now() WHERE ticker = ANY(%s)", (NOT_SAMPLED, out[i:i + 20000]))
+        for st_, lst in (("done", back_done), ("pending", back_pending)):
+            for i in range(0, len(lst), 20000):
+                conn.execute("UPDATE kalshi_corpus SET status = %s, last_error = NULL, updated_at = now() WHERE ticker = ANY(%s)", (st_, lst[i:i + 20000]))
+    log.info("event sample: %d rows left the corpus, %d came back (%d with candles)", len(out), len(back_done) + len(back_pending), len(back_done))
+    return len(out) + len(back_done) + len(back_pending)
 
 # ---------------------------------------------------------------- 3. candles and trades
 def _series_for(conn, ticker: str) -> str:
@@ -473,10 +547,10 @@ def main(stop_event: threading.Event | None = None) -> None:
     try:
         while not (stop is not None and stop.is_set()):
             try:
-                _status(stage="seeding from the dataset"); seeded = seed_from_dataset(stop)
+                _status(stage="seeding from the dataset"); refresh_series(rest); seeded = seed_from_dataset(stop)
                 _status(stage="refreshing markets", seed=seeded); n_new = refresh_markets(rest, stop)
-                ensure_series(rest, stop); skipped = prune_pending()          # rank per category (series) first,
-                catalogue_missing(rest, stop)                                  # then fetch only the kept markets' events
+                refresh_series(rest); ensure_series(rest, stop); skipped = apply_sample()   # categories first, then the sample,
+                catalogue_missing(rest, stop)                                               # then only the sampled markets' events
                 c = counts(); _status(stage="filling candles", refreshed=n_new, skipped_now=skipped, **{k: v for k, v in c.items()})
                 t0 = time.time(); done = 0
                 while not (stop is not None and stop.is_set()):
