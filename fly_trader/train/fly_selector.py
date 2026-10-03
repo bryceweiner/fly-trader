@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -656,7 +657,7 @@ def bootstrap(ds: DecisionSet, S: date, epochs: int = EPOCHS, stop: threading.Ev
     picked = np.array([x is not None for x in d["strategy"]], bool)
     ret = np.array([ds.fwd_h.get(fly.rules[x]["hold_min"], ds.fwd_pess)[i] if x is not None else np.nan for i, x in zip(wi, d["strategy"])])
     known = picked & (ds.ts[wi] + d["hold_s"] + 60.0 <= s_epoch)
-    tr = taken_idx(ds.ts[wi], ds.mint[wi], d["hold_s"], np.flatnonzero(known)); r = ret[tr]
+    tr = taken_idx(ds.ts[wi], ds.mint[wi], d["hold_s"], np.flatnonzero(known & np.isfinite(ret))); r = ret[tr]       # trades with a known outcome
     comb = {"trades": int(len(r)), "mean": float(np.mean(r)) if len(r) else None, "total": float(np.sum(r)) if len(r) else 0.0, "per_strategy": per}
     ci = np.flatnonzero(week & (ds.ts + ds.horizon_s + 60.0 <= s_epoch))
     di = ci if len(ci) <= DIAG_ROWS else np.sort(np.random.default_rng(seed).choice(ci, DIAG_ROWS, replace=False))
@@ -732,7 +733,7 @@ def deployable(meta: dict | None, version: dict | None = None) -> tuple[bool, st
     cal = meta.get("calibration") or {}
     if (cal.get("trades") or 0) < selector.MIN_LINE_TRADES:
         return False, f"too few calibration trades ({cal.get('trades') or 0})"
-    if (cal.get("mean") or 0) <= 0:
+    if not (isinstance(cal.get("mean"), (int, float)) and math.isfinite(cal["mean"]) and cal["mean"] > 0):      # NaN never passes
         return False, f"its calibration week lost money ({(cal.get('mean') or 0) * 100:+.2f}% per trade)"
     return True, f"its line made {cal['mean'] * 100:+.2f}% per trade over {cal['trades']} calibration trades"
 

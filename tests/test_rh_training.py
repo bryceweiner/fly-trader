@@ -63,3 +63,10 @@ def test_row_weights_take_one_line_per_row():
     sc = torch.tensor([[0.1, 0.2, 0.3], [0.1, 0.2, 0.3]])
     assert plastic.row_weights(sc, torch.tensor([0.15, 0.25])).tolist() == [[0, 1, 1], [0, 0, 1]]
     assert plastic.row_weights(sc, torch.tensor([[0.05, 0.25, 0.25], [0.2, 0.2, 0.4]])).tolist() == [[1, 0, 1], [0, 1, 0]]
+
+
+def test_a_nan_calibration_mean_never_deploys_the_fly():
+    from fly_trader.train import fly_selector
+    meta = {"data": fly_selector.FLY_VERSION, "gates_ok": True, "calibration": {"trades": 10 ** 4, "mean": float("nan")}}
+    ok, why = fly_selector.deployable(meta, fly_selector.FLY_VERSION)
+    assert not ok and "lost money" in why
