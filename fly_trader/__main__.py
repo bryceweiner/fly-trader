@@ -144,7 +144,8 @@ def _cmd_fly_replay(args):
     from .logging_setup import setup
     from .train import fly_replay
     setup("train"); _use_device(args)
-    out = fly_replay.main(days=args.days, start_day=args.start_day if args.start_day is not None else fly_replay.DEFAULT_START)
+    out = fly_replay.main(days=args.days, start_day=args.start_day if args.start_day is not None else fly_replay.DEFAULT_START,
+                          only_chains=tuple(args.chains.split(",")) if args.chains else None)
     print(json.dumps({k: out.get(k) for k in ("S", "passed", "reason", "alpha", "half_life_days", "evaluation", "random", "frozen", "plastic_beats_frozen")}, indent=1, default=str))
 
 
@@ -213,7 +214,8 @@ def _cmd_kalshi_fly_replay(args):
     from .kalshi import fly_replay
     from .logging_setup import setup
     setup("kalshi_train"); _use_device(args)
-    out = fly_replay.main(days=args.days, start_day=args.start_day if args.start_day is not None else fly_replay.DEFAULT_START)
+    out = fly_replay.main(days=args.days, start_day=args.start_day if args.start_day is not None else fly_replay.DEFAULT_START,
+                          only_chains=tuple(args.chains.split(",")) if args.chains else None)
     print(json.dumps({k: out.get(k) for k in ("S", "passed", "reason", "alpha", "half_life_days", "evaluation", "random", "frozen", "plastic_beats_frozen")}, indent=1, default=str))
 
 
@@ -327,6 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
     fr.add_argument("--start-day", type=int, default=None,
                     help="day index of the bootstrap (the selector teaches on the days before it); default: train/fly_replay.DEFAULT_START, "
                          "the earliest day that leaves the teacher's walk-forward enough days in each half")
+    fr.add_argument("--chains", default=None, help="store the verdict of these chains only (comma list, e.g. rh); the others keep theirs")
     fr.set_defaults(fn=_cmd_fly_replay)
     bc = sub.add_parser("backtest-corpus"); bc.add_argument("--max-tokens", type=int, default=None); bc.add_argument("--days", type=int, default=None)
     bc.add_argument("--fees", default="0.003,0.0055"); bc.add_argument("--only", default=None); bc.add_argument("--universe", default="graduation", choices=["graduation", "mature"]); bc.set_defaults(fn=_cmd_backtest_corpus)

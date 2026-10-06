@@ -34,7 +34,7 @@ def _two_chain_ds(days=16, per_day=600):
 
 
 def test_fly_lines_per_chain_and_replay_verdict_per_chain(monkeypatch):
-    monkeypatch.setattr(fly_replay, "RH_REPLAY_TRAIN_DAYS", 3); monkeypatch.setattr(fly_replay, "MIN_TRADES", 3)   # a small synthetic market
+    monkeypatch.setattr(fly_replay, "other_chain_lead", lambda: 3); monkeypatch.setattr(fly_replay, "MIN_TRADES", 3)   # a small synthetic market
     ds, _ = _two_chain_ds()
     torch.manual_seed(0)
     fly, boot = fly_selector.bootstrap(ds, ds.days[9], graph=_graph(), device="cpu")
@@ -70,3 +70,15 @@ def test_a_nan_calibration_mean_never_deploys_the_fly():
     meta = {"data": fly_selector.FLY_VERSION, "gates_ok": True, "calibration": {"trades": 10 ** 4, "mean": float("nan")}}
     ok, why = fly_selector.deployable(meta, fly_selector.FLY_VERSION)
     assert not ok and "lost money" in why
+
+
+def test_rejudging_one_chain_keeps_the_others_verdict():
+    from fly_trader.train import fly_replay
+    old = {"data": {"v": 1}, "S": "2026-08-25", "passed": True,
+           "chains": {"sol": {"passed": True, "reason": "sol ok"}, "rh": {"passed": False, "reason": "rh stale teacher"}}}
+    new = {"data": {"v": 1}, "S": "2026-09-10", "finished_at": "x",
+           "chains": {"sol": {"passed": False, "reason": "short window"}, "rh": {"passed": True, "reason": "rh ok"}}}
+    m = fly_replay.merge_chains({"value": old}, new, ("rh",))
+    assert m["chains"]["sol"] == {"passed": True, "reason": "sol ok"}                     # Solana keeps its verdict
+    assert m["chains"]["rh"]["passed"] and m["chains"]["rh"]["S"] == "2026-09-10" and m["passed"]
+    assert fly_replay.merge_chains({"value": {**old, "data": {"v": 0}}}, new, ("rh",)) is new      # other definitions: replaced whole

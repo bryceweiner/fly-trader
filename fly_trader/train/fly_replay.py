@@ -57,7 +57,9 @@ TRADES_DIR = config.BRAIN_DIR / "replay"
 MIN_TRADES = 30              # enough trades for a mean to be judged at all (and for a configuration to be chosen)
 EDGE_P = 0.05                # at most this chance, resampling whole days, that the mean per trade is zero or less
 EDGE_RESAMPLES = 2000
-RH_REPLAY_TRAIN_DAYS = selector.WARMUP_DAYS    # a second chain's evaluation starts no sooner than this many of its own days in      # the chosen book's trades, for studies of sizing on the fly's own out-of-sample trades
+RH_REPLAY_TRAIN_DAYS = 28    # days of its own a second chain's rows give the teacher before the bootstrap: the teacher fits only on days
+#   before S − CALIB_DAYS − PURGE_DAYS (2026-10-06: 21 days from RH's first day left it 12 thin early days, a tenth of
+#   September's volume; its RH picks dried up as the market grew and the matched fly line followed)
 
 
 @dataclass
@@ -99,7 +101,8 @@ def _labels(ds: DecisionSet, hold_min: int) -> np.ndarray:
 
 
 def run(days: int | None = None, start_day: int = START_DAY, configs: list | None = None, stop: threading.Event | None = None, device=None,
-        ds: DecisionSet | None = None, fly=None, boot: dict | None = None, graph=None, save_verdict: bool = True, dump_trades: bool | None = None) -> dict:
+        ds: DecisionSet | None = None, fly=None, boot: dict | None = None, graph=None, save_verdict: bool = True, dump_trades: bool | None = None,
+        only_chains: tuple | None = None) -> dict:
     """The replay; ``ds``/``fly``/``boot`` may be given (tests, or a bootstrap already run). ``dump_trades`` (default: as
     ``save_verdict``) writes the chosen book's trades to ``TRADES_DIR``; a study passes it without saving a verdict."""
     from .strategies import HOLDS_MIN
@@ -114,7 +117,7 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
     ch_all = ds.chains()
     if (ch_all != "sol").any():          # the other chain's evaluation needs training days of its own before it (RH_REPLAY_TRAIN_DAYS)
         first_other = min(ds.day[ch_all != "sol"])
-        start_day = max(start_day, dl.index(first_other) + RH_REPLAY_TRAIN_DAYS if first_other in dl else start_day)
+        start_day = max(start_day, dl.index(first_other) + other_chain_lead() if first_other in dl else start_day)
     if len(dl) <= start_day + 2:
         raise RuntimeError(f"the corpus has {len(dl)} days; the replay needs more than {start_day + 2}")
     S = dl[start_day]
@@ -205,7 +208,7 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
                         updates=n_updates, pending=len(pending), drift=[round(float(x), 4) for x in bank.drift()], eta_s=(n - b) * (time.time() - t0) / max(b, 1))
         g = g1
     return _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_counts, boot, S, save_verdict, time.time() - t0, fly, names, holds_min, lines, learn,
-                    size_log=size_log if (save_verdict if dump_trades is None else dump_trades) else None, slots=slots)
+                    size_log=size_log if (save_verdict if dump_trades is None else dump_trades) else None, slots=slots, only_chains=only_chains)
 
 
 def _learn_add(learn: dict, now: float, st: dict) -> None:
@@ -385,8 +388,29 @@ def _dump_trades(ds, order, ts_o, scores, line_log, size_log, choice, boot_lines
     return str(path)
 
 
+def other_chain_lead() -> int:
+    """Days from a second chain's first day to the bootstrap: its own training days, then the calibration week and purge."""
+    return RH_REPLAY_TRAIN_DAYS + fly_selector.CALIB_DAYS + fly_selector.PURGE_DAYS
+
+
+def merge_chains(row, out: dict, only_chains: tuple) -> dict:
+    """The stored verdict with ``out``'s verdicts for ``only_chains`` put in; the other chains keep theirs (each with the
+    replay start it was judged from). A stored verdict on other definitions is replaced whole."""
+    old = (row["value"] if isinstance(row["value"], dict) else json.loads(row["value"])) if row else None
+    if not old or old.get("data") != out.get("data") or "chains" not in old:
+        return out
+    chains = dict(old["chains"])
+    for c in only_chains:
+        if c in (out.get("chains") or {}):
+            chains[c] = {**out["chains"][c], "S": str(out.get("S"))}
+    merged = {**old, "chains": chains, "passed": any(v.get("passed") for v in chains.values()),
+              "reason": "; ".join(f"{c}: {'passed' if v.get('passed') else 'failed'} — {v.get('reason')}" for c, v in chains.items())}
+    merged.setdefault("rejudged", []).append({"chains": list(only_chains), "S": str(out.get("S")), "at": out.get("finished_at")})
+    return merged
+
+
 def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_counts, boot, S, save_verdict, secs, fly, names, holds_min, lines, learn=None,
-             size_log: dict | None = None, slots: Slots | None = None) -> dict:
+             size_log: dict | None = None, slots: Slots | None = None, only_chains: tuple | None = None) -> dict:
     days_r = sorted(set(ds.day[order[live_from:]].tolist()))
     sel_days, ev_days = days_r[: len(days_r) // 2], days_r[len(days_r) // 2:]
     day_o = ds.day[order]
@@ -467,8 +491,11 @@ def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_co
                      {"per_strategy": {k: {x: v[x] for x in ("alpha", "half_life_days", "hold_min", "plastic")} for k, v in per_strategy.items()}})
         try:        # NaN is valid Python and invalid JSON: never let the store discard a finished replay
             with transaction() as conn:
+                stored = out
+                if only_chains:                    # judge only these chains: the others keep their stored verdicts
+                    stored = merge_chains(conn.execute("SELECT value FROM ui_settings WHERE key = %s", (KEY,)).fetchone(), out, only_chains)
                 conn.execute("INSERT INTO ui_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-                             (KEY, json.dumps(prog._finite(out), default=str)))
+                             (KEY, json.dumps(prog._finite(stored), default=str)))
         except Exception:
             log.exception("could not store the replay verdict; it is in the log above and the fly cannot be armed until it is stored")
         try:        # the chosen configuration's learning, where the console already looks for it
@@ -524,10 +551,10 @@ def verdict() -> dict | None:
     return v if v and v.get("data") == fly_selector.FLY_VERSION else None
 
 
-def main(days: int | None = None, start_day: int = START_DAY, stop_event: threading.Event | None = None) -> dict:
+def main(days: int | None = None, start_day: int = START_DAY, stop_event: threading.Event | None = None, only_chains: tuple | None = None) -> dict:
     """The replay; when it passes and no fly may trade yet, the live fly is bootstrapped at once (taught on the whole corpus)."""
     prog.set_stop_event(stop_event); prog.clear()
-    out = run(days=days, start_day=start_day, stop=stop_event)
+    out = run(days=days, start_day=start_day, stop=stop_event, only_chains=only_chains)
     if out.get("passed") and not (stop_event is not None and stop_event.is_set()):
         with transaction() as conn:
             have = fly_selector.latest_deployable(conn)
