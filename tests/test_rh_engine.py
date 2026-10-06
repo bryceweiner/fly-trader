@@ -164,3 +164,10 @@ def test_admission_per_chain_and_the_rh_fly_shares_the_solana_brain(db_conn, mon
     assert ("selector" in names) == (not sol_handed)
     with transaction() as conn:
         conn.execute("DELETE FROM ui_settings WHERE key = 'handover_rh'")
+
+
+def test_rh_minutes_a_few_minutes_old_are_traded_solana_only_the_current_one():
+    m1 = 1_800_000_000.0
+    sol, rh = me.MinuteEngine(), me.MinuteEngine(market=markets.RH)
+    assert sol.tradeable(m1, m1) and not sol.tradeable(m1 - 60, m1)
+    assert rh.tradeable(m1 - 180, m1) and rh.tradeable(m1, m1) and not rh.tradeable(m1 - 300, m1)

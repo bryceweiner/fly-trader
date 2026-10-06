@@ -261,6 +261,7 @@ RH_HOOK_FEE = env_float("RH_HOOK_FEE", 0.0099)                      # Pons hook 
 RH_KILL_SWITCH_DRAWDOWN = env_float("RH_KILL_SWITCH_DRAWDOWN", 0.30)
 RH_MIN_SWEEP_ETH = env_float("RH_MIN_SWEEP_ETH", 0.0002)           # base-asset or dead-bag balances worth less are dust
 RH_STREAM_POLL_S = env_float("RH_STREAM_POLL_S", 2.0)
+RH_TRADE_LAG_S = env_float("RH_TRADE_LAG_S", 240.0)                 # an RH minute this old (s) is still traded: its stream lands ~2–3 min late
 RH_MINUTES_KEEP_DAYS = env_int("RH_MINUTES_KEEP_DAYS", 14)
 RH_DIR_NAME = "rh"                                                  # data/corpus/rh/... (the RH corpus beside the Solana one)
 # contracts on Robinhood Chain (mainnet; verified to carry code 2026-09-28)
