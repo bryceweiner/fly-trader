@@ -105,7 +105,9 @@ def load_latest() -> KalshiSelectorModel | None:
     return joblib.load(r["path"]) if r else None
 
 
-def main(days: int | None = None, stop_event: threading.Event | None = None) -> dict:
+def main(days: int | None = None, stop_event: threading.Event | None = None, holdout_days: int | None = None) -> dict:
+    """Fit on ``days`` (all when None), withholding the last ``holdout_days`` (default train/strategies.HOLDOUT_DAYS) from
+    every fit; the holdout is scored once afterwards, never used to choose anything."""
     from ..ops.reset import reset_training_stats
     reset_training_stats("kalshi_selector", reason="kalshi selector training")
     prog.set_stop_event(stop_event); prog.clear()
@@ -113,7 +115,7 @@ def main(days: int | None = None, stop_event: threading.Event | None = None) -> 
     t0 = time.time(); ds = KD.build(days=days)
     log.info("kalshi decision points: %d rows, %d days, taker universe mean %+.2f%%, maker filled %.0f%% (%.0fs)", len(ds.y), len(ds.days),
              ds.fwd_pess.mean() * 100, np.isfinite(ds.fwd_h["maker"]).mean() * 100, time.time() - t0)
-    stack = S.fit_stack(ds, stop_event, spec=KALSHI)
+    stack = S.fit_stack(ds, stop_event, holdout_days_n=holdout_days, spec=KALSHI)
     for c in stack.components:
         log.info("component %-28s %s — %s", c["name"], "PASSED" if c["passed"] else "dropped", c["reason"])
         record_event("info", KIND, f"component {c['name']}: {'passed' if c['passed'] else 'dropped'}", c)

@@ -197,7 +197,7 @@ def _cmd_kalshi_train_selector(args):
     from .kalshi import selector
     from .logging_setup import setup
     setup("kalshi_train")
-    out = selector.main(days=args.days)
+    out = selector.main(days=args.days, holdout_days=args.holdout_days)
     print(json.dumps({k: out.get(k) for k in ("snapshot_id", "deployable", "deploy_reason")}, indent=1, default=str))
 
 
@@ -324,6 +324,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("kalshi-history", help="the Kalshi corpus worker: dataset seed, settled markets, candles, trades").set_defaults(fn=_cmd_kalshi_history)
     sub.add_parser("kalshi-build", help="build the Kalshi feature parts from the corpus").set_defaults(fn=_cmd_kalshi_build)
     kts = sub.add_parser("kalshi-train-selector", help="fit the Kalshi strategy stack walk-forward and save it"); kts.add_argument("--days", type=int, default=None)
+    kts.add_argument("--holdout-days", type=int, default=None, help="last days withheld from every fit and scored once (default 21)")
     kts.set_defaults(fn=_cmd_kalshi_train_selector)
     ktf = sub.add_parser("kalshi-train-fly", help="bootstrap the Kalshi fly (optic lobes) from the deployable Kalshi selector")
     ktf.add_argument("--days", type=int, default=None); ktf.add_argument("--epochs", type=int, default=None); ktf.add_argument("--device", default=None)

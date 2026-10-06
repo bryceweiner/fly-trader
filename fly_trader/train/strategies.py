@@ -40,7 +40,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostin
 from .. import config
 from ..agent import sizing
 from . import progress as prog
-from .decisions import GROUPS, LEGACY_COLS, DecisionSet, taken_idx
+from .decisions import GROUPS, LEGACY_COLS, DecisionSet, day_ords, taken_idx
 from .scaling import RobustScaler
 
 log = logging.getLogger(__name__)
@@ -240,7 +240,8 @@ def wf_regress(ds: DecisionSet, rows: np.ndarray, y: np.ndarray, cols: np.ndarra
     for k, blk in enumerate(blocks):
         if stop is not None and stop.is_set():
             break
-        tr = np.flatnonzero(fin & (ds.day < (min(blk) - timedelta(days=1))) & known_before(ds, _day_start(min(blk)))); te = np.flatnonzero(rows & np.isin(ds.day, blk))
+        od = day_ords(ds); b0 = min(blk).toordinal()
+        tr = np.flatnonzero(fin & (od < b0 - 1) & known_before(ds, _day_start(min(blk)))); te = np.flatnonzero(rows & np.isin(od, [d.toordinal() for d in blk]))
         if len(tr) < 10 * _gbm_params()["min_samples_leaf"] or len(te) == 0:
             continue
         Xtr = ds.X[np.ix_(tr, cols)]                                  # this block's own copy: scaled in place, freed before the next
@@ -260,7 +261,8 @@ def wf_classify(ds: DecisionSet, rows: np.ndarray, feats, y: np.ndarray, n_class
     for k, blk in enumerate(blocks):
         if stop is not None and stop.is_set():
             break
-        tr = np.flatnonzero(rows & (ds.day < (min(blk) - timedelta(days=1))) & known_before(ds, _day_start(min(blk)))); te = np.flatnonzero(rows & np.isin(ds.day, blk))
+        od = day_ords(ds); b0 = min(blk).toordinal()
+        tr = np.flatnonzero(rows & (od < b0 - 1) & known_before(ds, _day_start(min(blk)))); te = np.flatnonzero(rows & np.isin(od, [d.toordinal() for d in blk]))
         if len(tr) < 10 * _gbm_params()["min_samples_leaf"] or len(te) == 0 or len(np.unique(y[tr])) < 2:
             continue
         Xtr = np.asarray(feats(tr), dtype=np.float32)                 # as above: one block-sized array at a time
@@ -532,7 +534,7 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
     if len(tdays) < 4:
         raise RuntimeError("too few walk-forward days for the strategy stack")
     half = tdays[len(tdays) // 2]; day0 = tdays[0]
-    tested = np.isin(ds.day, tdays); sel = tested & (ds.day < half); ev = tested & (ds.day >= half)
+    od = day_ords(ds); tested = np.isin(od, [d.toordinal() for d in tdays]); sel = tested & (od < half.toordinal()); ev = tested & (od >= half.toordinal())
     log.info("fitting on %d days (%s..%s); holdout of %d days (%s..%s) is never fitted on", len(tdays), tdays[0], tdays[-1],
              len(holdout_days), holdout_days[0] if holdout_days else "-", holdout_days[-1] if holdout_days else "-")
     comps = []
@@ -680,7 +682,7 @@ def score_holdout(ds: DecisionSet, models: dict, days: list, spec: "StackSpec | 
     sp = spec or memecoin_spec()
     if not days or not (models.get("strategies") or {}):
         return {}
-    eligible = np.isin(ds.day, days) & sp.in_universe(ds.X, ds.cols)
+    eligible = np.isin(day_ords(ds), [d.toordinal() for d in days]) & sp.in_universe(ds.X, ds.cols)
     rows = np.flatnonzero(eligible)
     out = {"days": [str(days[0]), str(days[-1])], "rows": int(len(rows))}
     if not len(rows):
@@ -711,7 +713,7 @@ def final_models(ds: DecisionSet, stack: Stack, exclude_days: list | None = None
     refits on everything; only the holdout measurement excludes, or it would be scoring itself in sample."""
     sp = spec or memecoin_spec()
     uni = sp.in_universe(ds.X, ds.cols); out = {"strategies": {}, "veto": None, "combine": stack.combine, "spec": sp.name}
-    keep = (~np.isin(ds.day, exclude_days) & known_before(ds, _day_start(min(exclude_days)))) if exclude_days else np.ones(len(ds.y), bool)
+    keep = (~np.isin(day_ords(ds), [d.toordinal() for d in exclude_days]) & known_before(ds, _day_start(min(exclude_days)))) if exclude_days else np.ones(len(ds.y), bool)
     for f in stack.fits:
         ci = np.asarray([ds.cols.index(x) for x in f.cols]); y = sp.label(ds, f.hold_min)
         loose = np.zeros(len(ds.y), bool)
