@@ -31,7 +31,7 @@ from .strategies import KALSHI, effective, probability
 log = logging.getLogger(__name__)
 SELECTOR_DIR = config.BRAIN_DIR / "kalshi_selectors"
 KIND = "kalshi_selector"
-DATA_VERSION = {"features": KALSHI_FEATURE_VERSION, "stride": STRIDE_MIN, "selector": "kalshi-1", "arms": "taker+maker",
+DATA_VERSION = {"features": KALSHI_FEATURE_VERSION, "stride": STRIDE_MIN, "selector": "kalshi-3", "arms": "taker+maker",
                 "cols": hashlib.sha1(",".join(K_COLS).encode()).hexdigest()[:8]}
 
 

@@ -31,7 +31,7 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 from scipy.stats import binom
@@ -175,7 +175,9 @@ def beats_random_removal(ds: DecisionSet, pick_before: np.ndarray, pick_after: n
 def _cache_path(ds: DecisionSet, cols: list[str], tag: str) -> "Path":
     from .selector import DATA_VERSION
     k = repr((str(ds.days[0]), str(ds.days[-1]), int(len(ds.y)), float(ds.horizon_s), list(cols), tag,
-              DATA_VERSION.get("agg"), DATA_VERSION.get("features"), DATA_VERSION.get("costs"), OBJECTIVE))
+              DATA_VERSION.get("agg"), DATA_VERSION.get("features"), DATA_VERSION.get("costs"), OBJECTIVE)
+             + (("label-known-purge",) if getattr(ds, "label_ts", None) is not None else ())
+             + ((("data", getattr(ds, "data_version")),) if getattr(ds, "data_version", None) is not None else ()))     # e.g. the Kalshi feature version
     return CACHE_DIR / f"{hashlib.sha256(k.encode()).hexdigest()[:20]}.npy"
 
 
@@ -202,6 +204,19 @@ def _cached(ds: DecisionSet, cols: list[str], tag: str, stop, compute):
 
 
 
+def _day_start(d) -> float:
+    return datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp()
+
+
+def known_before(ds: DecisionSet, t: float) -> np.ndarray:
+    """Rows whose label was known before epoch ``t``. A set with per-row label times (``ds.label_ts``: Kalshi, where a
+    position is held to its settlement up to 10 days later) may train a model for a period only on rows that had resolved
+    when the period began; the day-before purge alone let markets that settle inside the test block — the very markets
+    being tested — into training. Sets without ``label_ts`` (memecoins, 2 h holds) are unaffected."""
+    lt = getattr(ds, "label_ts", None)
+    return np.ones(len(ds.y), bool) if lt is None else (np.asarray(lt, dtype=np.float64) < float(t))
+
+
 def wf_blocks(days: list) -> list[list]:
     from .selector import BLOCK_DAYS, WARMUP_DAYS
     return [days[k:k + BLOCK_DAYS] for k in range(WARMUP_DAYS, len(days), BLOCK_DAYS)]
@@ -225,7 +240,7 @@ def wf_regress(ds: DecisionSet, rows: np.ndarray, y: np.ndarray, cols: np.ndarra
     for k, blk in enumerate(blocks):
         if stop is not None and stop.is_set():
             break
-        tr = np.flatnonzero(fin & (ds.day < (min(blk) - timedelta(days=1)))); te = np.flatnonzero(rows & np.isin(ds.day, blk))
+        tr = np.flatnonzero(fin & (ds.day < (min(blk) - timedelta(days=1))) & known_before(ds, _day_start(min(blk)))); te = np.flatnonzero(rows & np.isin(ds.day, blk))
         if len(tr) < 10 * _gbm_params()["min_samples_leaf"] or len(te) == 0:
             continue
         Xtr = ds.X[np.ix_(tr, cols)]                                  # this block's own copy: scaled in place, freed before the next
@@ -245,7 +260,7 @@ def wf_classify(ds: DecisionSet, rows: np.ndarray, feats, y: np.ndarray, n_class
     for k, blk in enumerate(blocks):
         if stop is not None and stop.is_set():
             break
-        tr = np.flatnonzero(rows & (ds.day < (min(blk) - timedelta(days=1)))); te = np.flatnonzero(rows & np.isin(ds.day, blk))
+        tr = np.flatnonzero(rows & (ds.day < (min(blk) - timedelta(days=1))) & known_before(ds, _day_start(min(blk)))); te = np.flatnonzero(rows & np.isin(ds.day, blk))
         if len(tr) < 10 * _gbm_params()["min_samples_leaf"] or len(te) == 0 or len(np.unique(y[tr])) < 2:
             continue
         Xtr = np.asarray(feats(tr), dtype=np.float32)                 # as above: one block-sized array at a time
@@ -721,7 +736,7 @@ def final_models(ds: DecisionSet, stack: Stack, exclude_days: list | None = None
     refits on everything; only the holdout measurement excludes, or it would be scoring itself in sample."""
     sp = spec or memecoin_spec()
     uni = sp.in_universe(ds.X, ds.cols); out = {"strategies": {}, "veto": None, "combine": stack.combine, "spec": sp.name}
-    keep = ~np.isin(ds.day, exclude_days) if exclude_days else np.ones(len(ds.y), bool)
+    keep = (~np.isin(ds.day, exclude_days) & known_before(ds, _day_start(min(exclude_days)))) if exclude_days else np.ones(len(ds.y), bool)
     for f in stack.fits:
         ci = np.asarray([ds.cols.index(x) for x in f.cols]); y = sp.label(ds, f.hold_min)
         loose = np.zeros(len(ds.y), bool)

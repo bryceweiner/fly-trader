@@ -28,7 +28,7 @@ from .. import config
 from ..train.corpus_features import _epoch_s
 from ..train.decisions import DecisionSet
 from . import data as D
-from .features import K_COLS, KIDX
+from .features import K_COLS, KALSHI_FEATURE_VERSION, KIDX
 from .mature import part_current
 from .vendor import kalshi_client as kc
 
@@ -82,6 +82,8 @@ def build(days: int | None = None, feature_dir=None, label_thr: float = 0.0) -> 
                      day=df["ts"].dt.date.to_numpy(), ts=ts[elig], mint=(df["ticker"] + ":" + df["side"]).to_numpy(), cols=list(X_COLS),
                      horizon_s=float(np.median(settled[elig] - ts[elig])) if elig.any() else 86400.0, fwd_h={"maker": maker[elig].astype(np.float32)})
     ds.hold_s = (settled[elig] - ts[elig]).astype(np.float64)          # per-row: every position is held to its own settlement
+    ds.data_version = f"kalshi-features-{KALSHI_FEATURE_VERSION}"     # in the walk-forward cache key: another feature version never reuses a fit
+    ds.label_ts = (settled[elig] + 60.0).astype(np.float64)             # when the outcome is known: training for a period may use only rows known before it
     ds.outcome = y[elig].astype(np.float32)
     ds.side = df["side"].to_numpy(); ds.ticker = df["ticker"].to_numpy(); ds.category = df["category"].to_numpy()
     return ds

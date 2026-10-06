@@ -123,7 +123,7 @@ class KalshiTeacher(F.StackTeacher):
 
 def _stack_teacher(ds: DecisionSet, train: np.ndarray, stop=None):
     sub = ds.subset(train)
-    for a in ("hold_s", "outcome", "side", "ticker", "category"):
+    for a in ("hold_s", "outcome", "side", "ticker", "category", "label_ts"):
         setattr(sub, a, getattr(ds, a)[train])
     stack = S.fit_stack(sub, stop, holdout_days_n=0, spec=KALSHI)
     if not stack.fits:
@@ -173,7 +173,8 @@ def bootstrap(ds: DecisionSet, Sday: date, epochs: int = F.EPOCHS, stop: threadi
     """A Kalshi fly ready to trade from day ``Sday`` on: distilled from its teacher on the days before ``Sday − 8``, its
     edge lines and sizing calibrated on the week before ``Sday`` from the positions that had settled by then."""
     train_end = Sday - timedelta(days=CALIB_DAYS + PURGE_DAYS)
-    train = ds.day < train_end; uni = in_universe(ds.X, ds.cols)
+    train = (ds.day < train_end) & S.known_before(ds, datetime(train_end.year, train_end.month, train_end.day, tzinfo=timezone.utc).timestamp())   # settled before the purge
+    uni = in_universe(ds.X, ds.cols)
     if not train.any():
         raise RuntimeError(f"no training days before {train_end}")
     stack_info = None
