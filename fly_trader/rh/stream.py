@@ -46,7 +46,9 @@ def one_pass(rpc, skill=None) -> dict:
     lap("head")
     ix = index.run_once(rpc, max_ranges=BACKFILL_RANGES if behind > LIVE_LAG_BLOCKS else 1); lap("index")
     px = prices.run_once(max_ranges=BACKFILL_RANGES if behind > LIVE_LAG_BLOCKS else 2); lap("prices")
-    mn = minutes.run_once(rpc, skill); lap("minutes")
+    from . import wallet_skill
+    wallet_skill.daily(); lap("skill_tables")                  # today's and tomorrow's tables, before their minutes are written
+    mn = minutes.run_once(rpc, wallet_skill.load_today() if skill is None else skill); lap("minutes")
     from . import corpus, meta
     mt = meta.run_once(); lap("meta")
     cp = corpus.run_once(max_days=1) if behind <= LIVE_LAG_BLOCKS * 20 else {}          # the training corpus follows once near the head
@@ -64,16 +66,11 @@ def main(stop_event: threading.Event | None = None) -> None:
     from ..db import schema
     schema.apply_schema()
     rpc = logs_rpc(); stop = stop_event or threading.Event()
-    log.info("rh_stream: %s", config.RH_RPC_URL_LOGS and "dedicated log RPC" or "public RPC")
+    log.info("rh_stream: logs from %s; the head from %s", "HyperSync" if config.env_str("ENVIO_API_TOKEN") else "the RPC",
+             "the dedicated RPC (RH_RPC_URL_LOGS)" if config.RH_RPC_URL_LOGS else "HyperSync / the public RPC")
     while not stop.is_set():
         try:
-            skill = None
-            try:
-                from . import wallet_skill
-                skill = wallet_skill.load_today()
-            except ImportError:
-                pass
-            out = one_pass(rpc, skill)
+            out = one_pass(rpc)                                     # the pass writes and loads the day's skill table itself
             if out["mode"] == "backfill":
                 log.info("rh backfill: through %s, %s blocks behind, %s", out["index_through"], out["behind_blocks"], out["index"])
                 continue

@@ -102,9 +102,56 @@ def table_for(d: date) -> dict | None:
     return dict(zip(t.column("wallet").to_pylist(), t.column("bucket").to_pylist()))
 
 
+_TODAY: dict = {"key": None, "table": None}
+
+
 def load_today() -> dict | None:
-    """Live: today's RH table (wallet → decile), or None (skill columns then stay NULL, as on Solana without a table)."""
-    return table_for(datetime.now(timezone.utc).date())
+    """Live: the RH table in force today (wallet → decile), read once per file. Like the Solana feed
+    (ingest/pumpstream.load_skill), a missing table for today falls back to the newest one on disk: without one every
+    minute's skill inputs read as zero and the selector fails closed on every RH row (2026-10-05..07: no RH trade)."""
+    today = datetime.now(timezone.utc).date()
+    f = SKILL_DIR / f"{today.isoformat()}.parquet"
+    if not f.exists():
+        have = sorted(SKILL_DIR.glob("????-??-??.parquet")) if SKILL_DIR.exists() else []
+        if not have:
+            return None
+        f = have[-1]
+        log.warning("no RH wallet skill table for %s: using the newest on disk, %s", today, f.stem)
+    key = (str(f), f.stat().st_mtime)
+    if _TODAY["key"] != key:
+        t = pq.read_table(f, columns=["wallet", "bucket"])
+        _TODAY["table"] = dict(zip(t.column("wallet").to_pylist(), t.column("bucket").to_pylist())); _TODAY["key"] = key
+        log.info("RH wallet skill table %s loaded: %d wallets", f.stem, len(_TODAY["table"]))
+    return _TODAY["table"]
+
+
+def window_ready(d: date, L: int) -> bool:
+    """Every RH wallet day of D's window exists (days before the first RH wallet day do not count)."""
+    have = sorted(DAY_DIR.glob("????-??-??.parquet")) if DAY_DIR.exists() else []
+    if not have:
+        return False
+    first = date.fromisoformat(have[0].stem)
+    need = [x for x in ws.window_days(d, L) if x >= first]
+    return bool(need) and all((DAY_DIR / f"{x.isoformat()}.parquet").exists() for x in need)
+
+
+def daily(through: date | None = None) -> int:
+    """The table of every day from the first RH wallet day through tomorrow (UTC) once its window exists — written before
+    the day begins, as Solana's (train/wallet_skill.daily), so the live minutes and the corpus read the same file. The
+    window ends GAP_DAYS before the day, so writing early and writing at corpus time give the same table."""
+    c = ws.skill_config()
+    have = sorted(DAY_DIR.glob("????-??-??.parquet")) if DAY_DIR.exists() else []
+    if not c or not have:
+        return 0
+    v = f"h{int(c['h'])}-L{int(c['L'])}"; n = 0
+    d = date.fromisoformat(have[0].stem) + timedelta(days=1)
+    last = through or (datetime.now(timezone.utc).date() + timedelta(days=1))
+    while d <= last:
+        f = SKILL_DIR / f"{d.isoformat()}.parquet"
+        if (not f.exists() or ws.table_version(f) != v) and window_ready(d, int(c["L"])) and write_table(d):
+            n += 1
+        d += timedelta(days=1)
+    return n
 
 
 def path_of(d: date) -> Path:
