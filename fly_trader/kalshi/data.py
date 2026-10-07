@@ -75,7 +75,7 @@ def series_ticker_of(ticker: str | None) -> str | None:
 
 MARKET_COLS = ("ticker", "event_ticker", "market_type", "title", "yes_sub_title", "no_sub_title", "status", "open_time", "close_time",
                "expected_expiration_time", "latest_expiration_time", "settlement_ts", "result", "settlement_value", "strike_type", "floor_strike",
-               "cap_strike", "exchange_index", "price_level_structure", "is_provisional", "can_close_early", "created_time", "source", "raw")
+               "cap_strike", "exchange_index", "price_level_structure", "is_provisional", "can_close_early", "early_close_condition", "created_time", "source", "raw")
 
 
 def market_row(m: dict, source: str) -> dict:
@@ -86,7 +86,7 @@ def market_row(m: dict, source: str) -> dict:
             "result": m.get("result") or None, "settlement_value": _f(m.get("settlement_value_dollars")) if m.get("settlement_value_dollars") is not None else _f(m.get("settlement_value")),
             "strike_type": m.get("strike_type"), "floor_strike": _f(m.get("floor_strike")), "cap_strike": _f(m.get("cap_strike")),
             "exchange_index": m.get("exchange_index"), "price_level_structure": m.get("price_level_structure"), "is_provisional": m.get("is_provisional"),
-            "can_close_early": m.get("can_close_early"), "created_time": ts(m.get("created_time")), "source": source,
+            "can_close_early": m.get("can_close_early"), "early_close_condition": m.get("early_close_condition") or None, "created_time": ts(m.get("created_time")), "source": source,
             "raw": json.dumps({k: v for k, v in m.items() if k not in ("rules_primary", "rules_secondary")}, default=str)}
 
 

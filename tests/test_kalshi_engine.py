@@ -27,8 +27,8 @@ def _seed_markets(close: datetime):
         c.execute("INSERT INTO kalshi_series (ticker, title, category, frequency, fee_type, fee_multiplier) VALUES ('TSTE', 't', 'Politics', 'one_off', 'quadratic', 1.0)")
         c.execute("INSERT INTO kalshi_events (event_ticker, series_ticker, title, category, mutually_exclusive) VALUES ('TSTE-A', 'TSTE', 'e', 'Politics', true)")
         for tk, strike in zip(TICKERS, (1.0, 2.0)):
-            c.execute("INSERT INTO kalshi_markets (ticker, event_ticker, status, open_time, close_time, floor_strike, source) VALUES (%s, 'TSTE-A', 'active', %s, %s, %s, 'test')",
-                      (tk, T0 - timedelta(days=3), close, strike))
+            c.execute("INSERT INTO kalshi_markets (ticker, event_ticker, status, open_time, close_time, expected_expiration_time, floor_strike, source) "
+                      "VALUES (%s, 'TSTE-A', 'active', %s, %s, %s, %s, 'test')", (tk, T0 - timedelta(days=3), close, close + timedelta(minutes=5), strike))
 
 
 def _minute_rows(minutes: int):
@@ -90,7 +90,7 @@ def test_engine_rows_match_the_feature_engine_fed_the_same_bars(monkeypatch):
     assert X[0, KIDX["mutually_exclusive"]] == 1.0 and X[0, KIDX["log_n_siblings"]] > 0 and X[0, KIDX["cat_politics"]] == 1.0 and X[0, KIDX["ladder_resid"]] >= 0
     # a market outside the window (closing in 2 minutes) is fed but not scored
     with transaction() as c:
-        c.execute("UPDATE kalshi_markets SET close_time = %s WHERE ticker = %s", (T0 + timedelta(minutes=2), TICKERS[1]))
+        c.execute("UPDATE kalshi_markets SET close_time = %s WHERE ticker = %s", (T0 + timedelta(minutes=2), TICKERS[1]))     # no early-close condition: the listed close is the anchor
     eng.metas.clear(); eng.meta_at.clear()
     with transaction() as c:
         c.cursor().executemany("INSERT INTO kalshi_minutes (ticker, ts, yes_bid, yes_ask, volume_fp, open_interest_fp, taker_buy_yes, taker_buy_no, n_trades, max_trade, block_contracts) "
@@ -158,3 +158,33 @@ def test_fly_session_scores_trades_both_arms_and_learns_from_a_settlement(monkey
     book.finish()
     with transaction() as c:
         c.execute("DELETE FROM kalshi_markets WHERE ticker LIKE 'TSTS-%'"); c.execute("DELETE FROM kalshi_fly_scored WHERE ticker LIKE 'TSTS-%'")
+
+
+def test_the_time_anchor_is_what_a_trader_knew_at_the_time():
+    """A market that may close early when its event happens is anchored on its scheduled expected expiration, never on the
+    close recorded after the event; one without that condition closes on its listed schedule; unfetched details give no anchor."""
+    from fly_trader.kalshi.mature import time_anchor
+    actual = datetime(2026, 10, 2, 11, 10, 22, tzinfo=timezone.utc); expected = datetime(2026, 10, 2, 14, 30, tzinfo=timezone.utc)
+    assert time_anchor(actual, expected, "This market will close and expire after a winner is declared.") == expected.timestamp()
+    assert time_anchor(actual, expected, None) == actual.timestamp() and time_anchor(actual, expected, "") == actual.timestamp()
+    assert time_anchor(actual, None, None) is None and time_anchor(actual, None, "after a winner is declared") is None
+
+
+def test_an_early_closing_markets_realized_close_never_reaches_the_features():
+    """The engine's rows for a match market use its scheduled end: four minutes before the match actually ends it is still
+    hours from its anchor, and the realized close only times the label (end_ts)."""
+    close = T0 + timedelta(minutes=4); expected = T0 + timedelta(hours=3)
+    with transaction() as c:
+        c.execute("DELETE FROM kalshi_markets WHERE ticker LIKE 'TSTM-%%'"); c.execute("DELETE FROM kalshi_minutes WHERE ticker LIKE 'TSTM-%%'")
+        c.execute("INSERT INTO kalshi_markets (ticker, event_ticker, status, open_time, close_time, expected_expiration_time, early_close_condition, source) "
+                  "VALUES ('TSTM-A-X', 'TSTM-A', 'active', %s, %s, %s, 'This market will close and expire after a winner is declared.', 'test')",
+                  (T0 - timedelta(days=1), close, expected))
+    from fly_trader.kalshi.mature import load_meta
+    with transaction() as c:
+        meta = load_meta(c, ["TSTM-A-X"])["TSTM-A-X"]
+    assert meta.close_ts == expected.timestamp() and meta.end_ts == close.timestamp()
+    st = MarketState("TSTM-A-X"); st.append(Bar(T0.timestamp(), 70.0, 72.0, 71.0, 10, 10, 50.0, 500.0, 5, 1, 2, 3, 0))
+    f = st.features(T0.timestamp(), meta, "yes")
+    assert abs(np.expm1(f[KIDX["log_h_to_close"]]) - 3.0) < 1e-6 and f[KIDX["last_hour"]] == 0.0      # three hours to the anchor, not four minutes
+    with transaction() as c:
+        c.execute("DELETE FROM kalshi_markets WHERE ticker LIKE 'TSTM-%%'")

@@ -19,7 +19,8 @@ from typing import NamedTuple
 
 from .vendor import kalshi_client as kc
 
-KALSHI_FEATURE_VERSION = 3          # 2: archive candles rescaled from dollars to cents; 3: the corpus is an outcome-blind event sample (whole events: complete siblings)
+KALSHI_FEATURE_VERSION = 4          # 2: archive candles rescaled; 3: outcome-blind event sample; 4: time features anchored on what was known at decision time
+                                    # (an early-closing market's realized close is when its event happened: a leak, 2026-10-08)
 WINDOW_S = 7 * 86400.0
 WINDOWS = {"5m": 300.0, "15m": 900.0, "1h": 3600.0, "6h": 21600.0, "24h": 86400.0, "7d": WINDOW_S}
 CATEGORIES = ("politics", "sports", "crypto", "economics", "weather", "entertainment", "science", "companies", "world", "health", "other")
@@ -68,7 +69,9 @@ class MarketMeta:
     category: str = "other"
     is_recurring: float = 0.0
     open_ts: float | None = None
-    close_ts: float | None = None
+    close_ts: float | None = None       # the time ANCHOR known at decision time (listed close, or the scheduled expected expiration
+                                        # for markets that may close early when their event happens): every feature and window uses it
+    end_ts: float | None = None         # the realized close: labels only (a maker order's fill window), never a feature
     mutually_exclusive: float = 0.0
     fee_multiplier: float = 1.0
     maker_fee: float = 0.0

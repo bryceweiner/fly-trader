@@ -278,6 +278,47 @@ def refresh_markets(rest: KalshiRest, stop: threading.Event | None = None, max_p
     return n
 
 
+def fetch_market_details(rest: KalshiRest, stop: threading.Event | None = None, threads: int | None = None) -> int:
+    """Full market objects for corpus events whose markets lack their scheduled ``expected_expiration_time`` (dataset and
+    universe rows carry only the realized close): one call per event, the live tier first, then the archive. They give each
+    market's point-in-time time anchor (kalshi/mature.time_anchor); a market without one builds no rows. Returns events done."""
+    with transaction() as conn:
+        todo = [r["event_ticker"] for r in conn.execute("""SELECT DISTINCT m.event_ticker FROM kalshi_corpus k JOIN kalshi_markets m USING (ticker)
+                                                           WHERE k.status IN ('pending', 'done', 'built') AND m.expected_expiration_time IS NULL
+                                                             AND m.event_ticker IS NOT NULL""").fetchall()]
+    if not todo:
+        return 0
+    lock = threading.Lock(); done = {"n": 0}
+
+    def one(et: str) -> None:
+        if stop is not None and stop.is_set():
+            return
+        ms: list = []
+        for path in ("/markets", "/historical/markets"):
+            try:
+                for page in rest.pages(path, "markets", {"event_ticker": et}, limit=1000):
+                    ms.extend(page)
+            except KalshiApiError as ex:
+                if ex.status is not None and (ex.status == 429 or ex.status >= 500):
+                    return                                      # retried next round
+            except (OSError, TimeoutError, ConnectionError):
+                return
+            if ms:
+                break
+        if ms:
+            with transaction() as conn:
+                D.upsert_markets(conn, ms, "details")
+        with lock:
+            done["n"] += 1
+            if done["n"] % 1000 == 0:
+                _status(stage="fetching market details", details=done["n"], details_total=len(todo))
+
+    with ThreadPoolExecutor(max_workers=max(1, int(threads or config.KALSHI_FILL_THREADS)), thread_name_prefix="kalshi-details") as pool:
+        list(pool.map(one, todo))
+    log.info("market details for %d of %d events", done["n"], len(todo))
+    return done["n"]
+
+
 def catalogue_missing(rest: KalshiRest, stop: threading.Event | None = None, threads: int | None = None) -> int:
     """Events (and their series) of corpus markets that have none in the catalogue — the dataset seed never fetched them, so
     those markets built with category 'other', fee multiplier 1, not mutually exclusive and no siblings. Fetched
@@ -549,6 +590,7 @@ def main(stop_event: threading.Event | None = None) -> None:
                 _status(stage="refreshing markets", seed=seeded); n_new = refresh_markets(rest, stop)
                 refresh_series(rest); sel = select_corpus(); skipped = sel.get("changed")      # the outcome-blind event sample,
                 seed_dataset_trades(stop); ensure_series(rest, stop); catalogue_missing(rest, stop)  # then only the selected markets' files and events
+                fetch_market_details(rest, stop)                                             # and their scheduled expirations (time anchors)
                 c = counts(); _status(stage="filling candles", refreshed=n_new, skipped_now=skipped, **{k: v for k, v in c.items()})
                 t0 = time.time(); done = 0
                 while not (stop is not None and stop.is_set()):

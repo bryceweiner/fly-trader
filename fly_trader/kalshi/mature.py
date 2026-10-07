@@ -29,9 +29,9 @@ from .features import CATEGORIES, K_COLS, KALSHI_FEATURE_VERSION, Bar, EventStat
 
 log = logging.getLogger(__name__)
 STRIDE_MIN = 5
-META_COLS = ["ticker", "side", "ts", "event_ticker", "category", "close_ts", "settled_ts", "result", "fut_min_ask", "fut_min_ask_24h"]
+META_COLS = ["ticker", "side", "ts", "event_ticker", "category", "close_ts", "end_ts", "settled_ts", "result", "fut_min_ask", "fut_min_ask_24h"]
 SCHEMA = pa.schema([("ticker", pa.string()), ("side", pa.string()), ("ts", pa.timestamp("ms", tz="UTC")), ("event_ticker", pa.string()), ("category", pa.string()),
-                    ("close_ts", pa.float64()), ("settled_ts", pa.float64()), ("result", pa.string()), ("fut_min_ask", pa.float32()), ("fut_min_ask_24h", pa.float32())]
+                    ("close_ts", pa.float64()), ("end_ts", pa.float64()), ("settled_ts", pa.float64()), ("result", pa.string()), ("fut_min_ask", pa.float32()), ("fut_min_ask_24h", pa.float32())]
                    + [(c, pa.float32()) for c in K_COLS])
 RECURRING = ("hourly", "daily", "15min", "minute", "4h", "weekly")
 
@@ -71,8 +71,26 @@ def ticker_strike(ticker: str | None) -> float | None:
     return float(m.group(1)) if m else None
 
 
+def time_anchor(close_time, expected_expiration_time, early_close_condition) -> float | None:
+    """The close a trader could know at decision time (epoch s), or None when it cannot be told.
+
+    A market with an early-close condition ("after a winner is declared", "if the price criterion is met", "if the event
+    occurs") may close before its listed close when its event happens; the close recorded after settlement is then the
+    moment of the event — information from the future, and for a threshold market the outcome itself. Its anchor is the
+    scheduled ``expected_expiration_time``, set at listing. A market without one closes on its listed schedule, which is
+    known. Markets whose details were never fetched (no expected expiration recorded) give None: no rows, rather than a
+    leaky anchor. Until 2026-10-08 every feature, window and trigger used the realized close; the selector learned to buy
+    favorites in a match's last 17 minutes, which live it can never know (snapshot 188)."""
+    if expected_expiration_time is None:
+        return None
+    if early_close_condition:
+        return expected_expiration_time.timestamp()
+    return close_time.timestamp() if close_time is not None else None
+
+
 def load_meta(conn, tickers: list[str]) -> dict[str, MarketMeta]:
-    rows = conn.execute("""SELECT m.ticker, m.event_ticker, m.open_time, m.close_time, m.floor_strike, m.cap_strike, e.series_ticker, e.category AS ecat,
+    rows = conn.execute("""SELECT m.ticker, m.event_ticker, m.open_time, m.close_time, m.expected_expiration_time, m.early_close_condition,
+                                  m.floor_strike, m.cap_strike, e.series_ticker, e.category AS ecat,
                                   e.mutually_exclusive, s.category AS scat, s.frequency, s.fee_type, s.fee_multiplier
                            FROM kalshi_markets m LEFT JOIN kalshi_events e USING (event_ticker) LEFT JOIN kalshi_series s ON s.ticker = e.series_ticker
                            WHERE m.ticker = ANY(%s)""", (tickers,)).fetchall()
@@ -84,7 +102,9 @@ def load_meta(conn, tickers: list[str]) -> dict[str, MarketMeta]:
             strike = ticker_strike(r["ticker"])                     # the catalogue lacks it (dataset or universe rows): the ticker carries it
         out[r["ticker"]] = MarketMeta(ticker=r["ticker"], event_ticker=r["event_ticker"], series_ticker=r["series_ticker"] or D.series_ticker_of(r["ticker"]),
                                       category=D.category_key(r["scat"] or r["ecat"]), is_recurring=1.0 if any(k in freq for k in RECURRING) else 0.0,
-                                      open_ts=r["open_time"].timestamp() if r["open_time"] else None, close_ts=r["close_time"].timestamp() if r["close_time"] else None,
+                                      open_ts=r["open_time"].timestamp() if r["open_time"] else None,
+                                      close_ts=time_anchor(r["close_time"], r["expected_expiration_time"], r["early_close_condition"]),
+                                      end_ts=r["close_time"].timestamp() if r["close_time"] else None,
                                       mutually_exclusive=1.0 if r["mutually_exclusive"] else 0.0,
                                       fee_multiplier=float(r["fee_multiplier"]) if r["fee_multiplier"] is not None else 1.0,
                                       maker_fee=1.0 if (r["fee_type"] or "").endswith("maker_fees") else 0.0, strike=float(strike) if strike is not None else None)
@@ -152,7 +172,7 @@ def build_event(event_ticker: str, markets: list[dict], metas: dict[str, MarketM
     fut = {}
     for tk, (ts, ya, nb) in lows.items():
         # a resting order can only fill while the market trades: nothing after close − the maker's quiet margin counts
-        cut = (metas[tk].close_ts or float("inf")) - config.KALSHI_MAKER_QUIET_MIN * 60.0
+        cut = (metas[tk].end_ts or float("inf")) - config.KALSHI_MAKER_QUIET_MIN * 60.0    # a label: the realized close may be used
         live = ts <= cut; ya = np.where(live, ya, np.nan); nb = np.where(live, nb, np.nan)
         fut[tk] = (ts, {"yes": (_suffix_min(ya), _window_min(ts, ya, 86400.0)), "no": (_suffix_min(nb), _window_min(ts, nb, 86400.0))})
     states = {tk: MarketState(tk) for tk in bars}; ev = EventState()
@@ -180,7 +200,7 @@ def build_event(event_ticker: str, markets: list[dict], metas: dict[str, MarketM
                 x = st.features(t_end, meta, side, ev)
                 fmin, fmin24 = fl[side]
                 row = {"ticker": tk, "side": side, "ts": datetime.fromtimestamp(t_end - 60.0, timezone.utc), "event_ticker": event_ticker, "category": meta.category,
-                       "close_ts": meta.close_ts, "settled_ts": (m["settled_ts"].timestamp() if m["settled_ts"] else meta.close_ts), "result": m["result"],
+                       "close_ts": meta.close_ts, "end_ts": meta.end_ts, "settled_ts": (m["settled_ts"].timestamp() if m["settled_ts"] else meta.end_ts), "result": m["result"],
                        "fut_min_ask": float(fmin[j]) if j < len(fmin) and np.isfinite(fmin[j]) else float("nan"),
                        "fut_min_ask_24h": float(fmin24[j]) if j < len(fmin24) and np.isfinite(fmin24[j]) else float("nan")}
                 row.update(zip(K_COLS, x))

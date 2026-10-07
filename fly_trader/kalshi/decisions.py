@@ -64,7 +64,7 @@ def build(days: int | None = None, feature_dir=None, label_thr: float = 0.0) -> 
     stale = [f for f in files if not part_current(f)]
     if stale:
         raise RuntimeError(f"{len(stale)} Kalshi feature part(s) from another version (e.g. {stale[0]}); run kalshi-build")
-    need = list(dict.fromkeys([*X_COLS, "ticker", "side", "ts", "category", "close_ts", "settled_ts", "result", "fut_min_ask"]))
+    need = list(dict.fromkeys([*X_COLS, "ticker", "side", "ts", "category", "close_ts", "end_ts", "settled_ts", "result", "fut_min_ask"]))
     tick_id: dict[str, int] = {}; tick_names: list[str] = []; cat_id: dict[str, int] = {}; cat_names: list[str] = []
     acc: dict[str, list] = {k: [] for k in ("X", "ts", "settled", "y", "fwd", "fwd_pess", "maker", "tick", "side", "cat", "ord")}
     for f in files:
@@ -79,7 +79,8 @@ def build(days: int | None = None, feature_dir=None, label_thr: float = 0.0) -> 
         X[~np.isfinite(X)] = 0.0
         ts = t["ts"].cast("int64").to_numpy().astype(np.float64) / 1000.0
         close = t["close_ts"].to_numpy(zero_copy_only=False).astype(np.float64); st_ = t["settled_ts"].to_numpy(zero_copy_only=False).astype(np.float64)
-        settled = np.where(np.isfinite(st_), st_, close); to_close = close - ts
+        end = t["end_ts"].to_numpy(zero_copy_only=False).astype(np.float64)
+        settled = np.where(np.isfinite(st_), st_, end); to_close = close - ts     # window on the anchor; a label's timing on the realized end
         y = (res == side).astype(np.float64)
         eff = X[:, KIDX["eff_price"]].astype(np.float64); mid = np.clip(X[:, KIDX["side_mid"]].astype(np.float64), 1.0, 99.0)
         fwd_pess = (100.0 * y - eff) / eff; fwd = (100.0 * y - mid) / mid
