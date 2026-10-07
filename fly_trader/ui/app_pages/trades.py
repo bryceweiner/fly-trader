@@ -1,17 +1,21 @@
-"""Trades: closed trades with their results, the decision log (every buy, sell and pick not taken) and fills."""
+"""Trades: closed trades with their results, the decision log (every buy, sell and pick not taken) and fills, for either memecoin chain."""
 import pandas as pd
 import streamlit as st
 
 from fly_trader.db.queries import q, q1
 from fly_trader.markets import for_book
-from fly_trader.ui.common import BOOK, amount, labels, pct
+from fly_trader.ui.common import amount, chain_picker, labels, pct
 
-books = [r["book"] for r in q("SELECT DISTINCT book FROM positions UNION SELECT DISTINCT book FROM fills ORDER BY 1")] or [BOOK]
+mk = chain_picker()
+seen = [r["book"] for r in q("SELECT DISTINCT book FROM positions UNION SELECT DISTINCT book FROM fills ORDER BY 1")]
+books = list(mk.books) + [b for b in seen if b not in mk.books and for_book(b) is mk]     # the chain's books even before their first trade
+if st.session_state.get("trades_book") not in books:
+    st.session_state["trades_book"] = mk.selector_book
 with st.container(horizontal=True, vertical_alignment="bottom"):
     view = st.segmented_control("View", ["Closed trades", "Decision log", "Fills"], default="Closed trades", key="trades_view")
-    book = st.selectbox("Book", books, index=books.index(BOOK) if BOOK in books else 0, key="trades_book", width=220,
-                        help="paper_selector is the selector's paper book; live is the bot wallet; the *_rh books trade Robinhood Chain in ETH.")
-u = for_book(book).unit
+    book = st.selectbox("Book", books, key="trades_book", width=220,
+                        help=f"{mk.selector_book} is the selector's paper book, {mk.fly_book} the fly's, {mk.live_book} the bot wallet; amounts in {mk.unit}.")
+u = mk.unit
 F3, F4 = ("%.3f", "%+.4f") if u == "SOL" else ("%.5f", "%+.6f")     # ETH positions are ~20x smaller in number
 
 if view == "Closed trades":
@@ -37,12 +41,13 @@ if view == "Closed trades":
         st.caption("No closed trades in this book yet.")
 
 elif view == "Decision log":
-    kinds = {"Bought": ("selector_enter", "enter"), "Sold": ("selector_exit", "exit"), "Not taken": ("blocked",)}
+    kinds = {"Bought": ("selector_enter", "fly_enter", "enter"), "Sold": ("selector_exit", "fly_exit", "exit"), "Not taken": ("blocked",)}
     pick = st.pills("Show", list(kinds), selection_mode="multi", default=list(kinds), key="dec_kinds")
     want = [k for p in (pick or []) for k in kinds[p]]
-    rows = q("SELECT ts, kind, mint, m_hat, size_sol, rail, reason FROM decisions WHERE kind = ANY(%s) ORDER BY id DESC LIMIT 300", (want,)) if want else []
+    rows = q("SELECT ts, kind, mint, m_hat, size_sol, rail, reason FROM decisions WHERE kind = ANY(%s) AND (detail->>'book' = %s OR %s = ANY(book_targets)) "
+             "ORDER BY id DESC LIMIT 300", (want, book, book)) if want else []
     if rows:
-        names = labels([r["mint"] for r in rows]); action = {"selector_enter": "Bought", "enter": "Bought", "selector_exit": "Sold", "exit": "Sold", "blocked": "Not taken"}
+        names = labels([r["mint"] for r in rows]); action = {k: p for p, ks in kinds.items() for k in ks}
         df = pd.DataFrame([{"time": r["ts"], "action": action.get(r["kind"], r["kind"]), "token": names.get(r["mint"], (r["mint"] or "")[:6]),
                             "score": float(r["m_hat"]) if r["m_hat"] is not None else None, f"size ({u})": float(r["size_sol"] or 0),
                             "why": (f"{r['rail']}: " if r["rail"] else "") + (r["reason"] or "")} for r in rows])

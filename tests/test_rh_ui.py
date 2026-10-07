@@ -30,3 +30,17 @@ def test_pages_render_on_both_chains(db_conn, monkeypatch, page, chain):
         at.selectbox(key="trades_book").set_value("paper_rh_fly") if "paper_rh_fly" in at.selectbox(key="trades_book").options else None
         at.run()
         assert not at.exception, [e.value for e in at.exception]
+
+
+def test_trades_page_lists_each_chains_books(db_conn, monkeypatch):
+    """The Trades page follows the chain: each chain's books are offered before their first trade, in every view."""
+    from fly_trader import config, markets
+    monkeypatch.setattr(config, "RH_ENABLED", True)
+    for m in (markets.SOL, markets.RH):
+        at = AppTest.from_file(str(UI / "app_pages" / "trades.py"), default_timeout=60)
+        at.session_state["chain"] = m.name
+        at.run()
+        assert list(m.books) == at.selectbox(key="trades_book").options[:3] and at.selectbox(key="trades_book").value == m.selector_book
+        for view in ("Decision log", "Fills"):
+            at.segmented_control(key="trades_view").set_value(view).run()
+            assert not at.exception, [e.value for e in at.exception]
