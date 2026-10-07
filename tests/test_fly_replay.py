@@ -24,6 +24,8 @@ def _boot(ds, start_day):
 
 
 def test_replay_learns_only_from_known_labels_and_judges_with_the_deploy_rule(monkeypatch):
+    from fly_trader import config
+    monkeypatch.setattr(config, "FLY_TEACHER_GATE", False)   # the learning mechanics; the synthetic teacher allows no row (see the gated test)
     ds = _market_ds(days=16, per_day=600); fly, boot = _boot(ds, 9)
     seen = []
     real = plastic.PlasticBank.update
@@ -156,3 +158,17 @@ def test_the_gate_asks_whether_the_edge_is_real_not_whether_it_traded_a_lot():
     assert not fly_replay.gate({"n": len(noise), "mean": float(noise.mean())}, {"mean": -0.05}, pn)[0]
     assert "too few" in fly_replay.gate({"n": 12, "mean": 0.2}, {"mean": -0.05}, 0.0)[1]
     assert fly_replay.edge_p(np.array([0.1, 0.2]), np.array([1, 1])) is None           # one day cannot be resampled
+
+
+def test_a_gated_replay_learns_and_trades_only_what_its_teacher_allows(monkeypatch):
+    """With the teacher gate a fly whose teacher allows nothing neither trades nor learns: every decision is the teacher's."""
+    from fly_trader import config
+    monkeypatch.setattr(config, "FLY_TEACHER_GATE", True)
+    ds = _market_ds(days=16, per_day=600); fly, boot = _boot(ds, 9)
+    assert not fly_selector.teacher_allowed(fly.teacher, ds.X, ds.ts, list(fly.strategies)).any()     # this teacher allows no row
+    seen = []
+    real = plastic.PlasticBank.update
+    monkeypatch.setattr(plastic.PlasticBank, "update", lambda self, tags, r, t: seen.append(len(tags)) or real(self, tags, r, t))
+    out = fly_replay.run(ds=ds, fly=fly, boot=boot, start_day=9, configs=[(0.0, math.inf), (1e-3, 3.0)], save_verdict=False)
+    assert sum(seen) == 0                                                              # nothing it would trade: nothing to learn from
+    assert all(t["trades"] == 0 for t in out["configs"]) and out["passed"] is False and "no strategy" in out["reason"]   # no trades: no pass

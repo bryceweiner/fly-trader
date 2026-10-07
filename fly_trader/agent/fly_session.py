@@ -423,6 +423,7 @@ class FlyBook:
             self.bank.estimate_nu(Y[:, 0], u0, k); self.nu_set = True
         t = ctx.t_start; ts = datetime.fromtimestamp(t, timezone.utc); rows = []; ta = self._teacher_allow(ctx.X, t)
         V = np.full((n, len(self.names)), -np.inf); F = np.full((n, len(self.names)), np.nan)
+        td = self._teacher_decision(ctx) if config.FLY_TEACHER_GATE and self.teacher_live is not None else None
         for j, name in enumerate(self.names):
             loc = np.flatnonzero(trig[:, j])
             if not len(loc):
@@ -436,7 +437,11 @@ class FlyBook:
             al = ta.get(name)
             rows += [(ts, ctx.mints[i], name, int(self.holds[name] // 60), ctx.X[i].tolist(), float(v[q]), float(f[q]), line, fline, self.boot_id,
                       None if al is None else bool(al[i])) for q, i in enumerate(loc)]
-            w = plastic.row_weights(sc[None], torch.tensor([line], dtype=sc.dtype, device=sc.device))
+            if td is not None:   # gated: its decisions are the teacher's trades of this strategy (before its own vetoes), so it learns from those
+                mine = np.array([td["strategy"][i] == name and bool(td["allow"][i]) for i in loc], dtype=np.float32)
+                w = torch.as_tensor(mine[None], dtype=sc.dtype, device=sc.device)
+            else:
+                w = plastic.row_weights(sc[None], torch.tensor([line], dtype=sc.dtype, device=sc.device))
             self.pending.push([(t, ctx.mints[i], name) for i in loc], np.full(len(loc), t), t + self.holds[name] + LABEL_LAG_S, Y[li, j], u0[li], k[li], w, s=j)
             for i in loc:
                 m = ctx.mints[i]; self.watch[m] = self.watch.get(m, 0) + 1
@@ -451,20 +456,24 @@ class FlyBook:
             self.fly.lines = dict(self.lines["plastic"]); self.fly.sizings = {k: list(v) for k, v in self.sizing["plastic"].items()}
         else:                                                    # the shared model decides this chain's rows on this chain's lines
             self.fly.chain_lines[self.chain] = dict(self.lines["plastic"]); self.fly.chain_sizings[self.chain] = {k: list(v) for k, v in self.sizing["plastic"].items()}
-        if config.FLY_TEACHER_GATE and self.teacher_live is not None:
-            d = self._gated(ctx, V, F)
+        if td is not None:
+            d = self._gated(ctx, V, F, td)
             return {"decision": d, "picks": int(d["allow"].sum())}
         d = fly_selector.fly_decide(self.fly, ctx.X, X_COLS, np.where(np.isfinite(V), V, -np.inf))
         return {"decision": d, "picks": int(sum(1 for x in d["strategy"] if x is not None))}
 
-    def _gated(self, ctx, V: np.ndarray, F: np.ndarray) -> dict:
+    def _teacher_decision(self, ctx) -> dict:
+        """The deployed selector's decision on this minute's rows, with its live fail-closed rules."""
+        from .selector_session import fail_closed
+        return fail_closed(self.teacher_groups, ctx.infos, strategies.decide(self.teacher_live, ctx.X, X_COLS, ctx.t_start))
+
+    def _gated(self, ctx, V: np.ndarray, F: np.ndarray, td: dict | None = None) -> dict:
         """The fly's decision under its teacher: each row's strategy, trigger, line, win filter, gates, dump veto and
         fail-closed rules are the deployed selector's (agent/selector_session.fail_closed), so a fresh bootstrap trades the
         selector's set; the fly drops a teacher trade only where its learning has moved its score more than
         ``FLY_LEARNED_VETO`` below its bootstrap score. A row the teacher blocks is recorded with the teacher's reason."""
-        from .selector_session import fail_closed
         n = len(ctx.mints)
-        td = fail_closed(self.teacher_groups, ctx.infos, strategies.decide(self.teacher_live, ctx.X, X_COLS, ctx.t_start))
+        td = td if td is not None else self._teacher_decision(ctx)
         strat = np.full(n, None, dtype=object); score = np.full(n, -1.0); hold = np.zeros(n); thr = np.full(n, np.inf)
         tables = [[] for _ in range(n)]; allow = np.zeros(n, bool); reason = np.full(n, "", dtype=object)
         for i in range(n):

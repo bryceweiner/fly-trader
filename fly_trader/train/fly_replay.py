@@ -199,8 +199,12 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
                     sc, _ = bank.predict(Y[li, s_], u0[li], k[li], s=np.full(len(loc), s_))
                 scores[:, s_, s0 + loc] = sc.float().cpu().numpy()
                 if s0 >= live_from:
-                    ln = lines[:, s_] if slots is None else lines[:, s_ + NS * slots.cidx_o[s0 + loc]]      # each row against its chain's line
-                    w = plastic.row_weights(sc, torch.tensor(ln, dtype=sc.dtype, device=sc.device))
+                    if gate is not None:     # gated, as the live fly: it learns from its teacher's trades of this strategy (agent/fly_session._score)
+                        w = torch.as_tensor(np.broadcast_to(allowed[s0 + loc, s_].astype(np.float32)[None], (sc.shape[0], len(loc))).copy(),
+                                            dtype=sc.dtype, device=sc.device)
+                    else:
+                        ln = lines[:, s_] if slots is None else lines[:, s_ + NS * slots.cidx_o[s0 + loc]]      # each row against its chain's line
+                        w = plastic.row_weights(sc, torch.tensor(ln, dtype=sc.dtype, device=sc.device))
                     keep = np.flatnonzero((w > 0).any(0).cpu().numpy())      # a row no configuration would trade teaches none of them
                     if len(keep):
                         kl = loc[keep]; ki = torch.as_tensor(lo + kl, device=Y.device)

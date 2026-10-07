@@ -25,6 +25,7 @@ def test_the_fly_trades_the_selectors_set_and_only_learning_can_drop_a_trade(mon
     ctx = SimpleNamespace(mints=[f"m{i}" for i in range(6)], infos=infos, X=np.zeros((6, 3)), t_start=0.0)
     V = np.array([[-np.inf, 0.05], [-np.inf, 0.30], [0.9, 0.9], [-np.inf, 0.05], [0.4, -np.inf], [0.4, -np.inf]])   # the fly's own (plastic) scores
     F = np.array([[np.nan, 0.06], [np.nan, 0.30], [0.9, 0.9], [np.nan, 0.08], [0.4, np.nan], [0.4, np.nan]])        # its bootstrap scores
+    me._teacher_decision = lambda c: fly_session.FlyBook._teacher_decision(me, c)
     d = fly_session.FlyBook._gated(me, ctx, V, F)
     assert d["allow"].tolist() == [True, False, False, False, False, True]
     assert d["strategy"][0] == "capitulation" and d["hold_s"][0] == 14400.0          # the teacher's strategy and hold, at a fly score below its own line
