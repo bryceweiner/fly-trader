@@ -211,7 +211,7 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
                         updates=n_updates, pending=len(pending), drift=[round(float(x), 4) for x in bank.drift()], eta_s=(n - b) * (time.time() - t0) / max(b, 1))
         g = g1
     return _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_counts, boot, S, save_verdict, time.time() - t0, fly, names, holds_min, lines, learn,
-                    size_log=size_log if (save_verdict if dump_trades is None else dump_trades) else None, slots=slots, only_chains=only_chains, gate=gate)
+                    size_log=size_log if (save_verdict if dump_trades is None else dump_trades) else None, slots=slots, only_chains=only_chains, teacher_gate=gate)
 
 
 def _learn_add(learn: dict, now: float, st: dict) -> None:
@@ -425,7 +425,7 @@ def merge_chains(row, out: dict, only_chains: tuple) -> dict:
 
 
 def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_counts, boot, S, save_verdict, secs, fly, names, holds_min, lines, learn=None,
-             size_log: dict | None = None, slots: Slots | None = None, only_chains: tuple | None = None, gate: np.ndarray | None = None) -> dict:
+             size_log: dict | None = None, slots: Slots | None = None, only_chains: tuple | None = None, teacher_gate: np.ndarray | None = None) -> dict:
     days_r = sorted(set(ds.day[order[live_from:]].tolist()))
     sel_days, ev_days = days_r[: len(days_r) // 2], days_r[len(days_r) // 2:]
     day_o = ds.day[order]
@@ -440,7 +440,7 @@ def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_co
         y = _labels(ds, holds_min[s_]); table = []
         for c, (alpha, hl) in enumerate(configs):
             Sf, Lf = _arm(ds, order, ts_o, scores[c, s_], line_log, (c, s_), boot_lines[s_], sel_pos, slots, slot_def(s_))
-            okc = _gated_ok(ds, order, ts_o, scores, line_log, c, s_, Sf, Lf, sel_pos, gate, slots, slot_def(s_), boot_lines[s_])
+            okc = _gated_ok(ds, order, ts_o, scores, line_log, c, s_, Sf, Lf, sel_pos, teacher_gate, slots, slot_def(s_), boot_lines[s_])
             tr = taken_idx(ds.ts, ds.mint, holds_min[s_] * 60.0, np.flatnonzero(okc)); r = y[tr]
             table.append({"config": c, "alpha": alpha, "half_life_days": hl if math.isfinite(hl) else None, "trades": int(len(r)), "total": float(np.nansum(r)),
                           "mean": float(np.nanmean(r)) if len(r) else None, "governance": gov_counts.get((c, s_))})
@@ -454,7 +454,7 @@ def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_co
 
     def judge(ch, chain: str | None = None):
         """The evaluation half's book of configuration choice ``ch``: every chain together, or only ``chain``'s rows."""
-        pick, hold, ret = _book(ds, order, ts_o, scores, line_log, ch, boot_lines, holds_min, ev_pos, slots=slots, boot_slot_lines=boot_slot, gate=gate)
+        pick, hold, ret = _book(ds, order, ts_o, scores, line_log, ch, boot_lines, holds_min, ev_pos, slots=slots, boot_slot_lines=boot_slot, gate=teacher_gate)
         test = np.zeros(len(ds.y), bool); test[order[ev_pos]] = True
         if chain is not None:
             test &= row_chain == chain
@@ -496,7 +496,7 @@ def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_co
     if size_log is not None and any(v["plastic"] for v in per_strategy.values()):
         try:
             out["trades_file"] = _dump_trades(ds, order, ts_o, scores, line_log, size_log, choice, boot_lines, holds_min, names, live_pos, day_o, sel_days,
-                                              slots=slots, boot_slot_lines=boot_slot, gate=gate)
+                                              slots=slots, boot_slot_lines=boot_slot, gate=teacher_gate)
         except Exception:
             log.exception("could not write the replay's trades (the verdict is unaffected)")
     log.info("fly replay from %s: %s — %s | frozen %s", S, "PASSED" if out.get("passed") else "FAILED", out.get("reason"), out["frozen"])
