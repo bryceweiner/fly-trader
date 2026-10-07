@@ -81,11 +81,18 @@ def check_drawdown(conn, wealth: float, peak: float, circuit_id: int = SOLANA_CI
 
 
 def kill_rebase_at(conn, circuit_id: int = SOLANA_CIRCUIT):
-    """When the kill switch was last cleared: peaks are measured from marks after it, so clearing really re-bases.
-    (Before this, the live book recomputed its peak from every wealth mark ever and re-tripped the next minute.)"""
-    r = conn.execute("SELECT max(ts) AS ts FROM circuit_events WHERE kind = 'reset' AND (detail->>'kill')::boolean "
+    """When the kill switch was last cleared, or money last withdrawn from the live wallet: peaks are measured from marks
+    after it, so clearing really re-bases and a withdrawal is never a drawdown. (Before this, the live book recomputed its
+    peak from every wealth mark ever and re-tripped the next minute.)"""
+    r = conn.execute("SELECT max(ts) AS ts FROM circuit_events WHERE ((kind = 'reset' AND (detail->>'kill')::boolean) OR kind = 'withdrawal') "
                      "AND COALESCE((detail->>'circuit')::int, 1) = %s", (circuit_id,)).fetchone()
     return r["ts"] if r else None
+
+
+def record_withdrawal(conn, detail: dict, circuit_id: int = SOLANA_CIRCUIT) -> None:
+    """The operator took money out of a live wallet (chain/withdraw.py, rh/withdraw.py): ``kill_rebase_at`` re-bases the
+    live book's peak at it."""
+    _event(conn, "withdrawal", detail, circuit_id)
 
 
 def check_book_drawdown(conn, book: str, wealth: float, peak: float, drawdown: float | None = None, unit: str = "SOL") -> bool:

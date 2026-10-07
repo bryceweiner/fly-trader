@@ -7,33 +7,22 @@ they would move the labels with the market (see config.LABEL_SIZE_SOL).
 
     .venv/bin/python tools/rh_constants.py          # prints the config lines to paste (or env overrides)
 
-SOL/USD from Jupiter (vault/prices.sol_usd); ETH/USD from a KyberSwap quote of 1 ETH into USDG on Robinhood Chain.
+SOL/USD from Jupiter (vault/prices.sol_usd); ETH/USD from a KyberSwap quote of 1 ETH into USDG on Robinhood Chain
+(vault/prices.eth_usd).
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-import httpx
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fly_trader import config  # noqa: E402
 from fly_trader.vault import prices  # noqa: E402
 
-NATIVE = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
-USDG_DECIMALS = 6
-
-
-def eth_usd() -> float:
-    r = httpx.get(f"{config.KYBER_API}/routes", params={"tokenIn": NATIVE, "tokenOut": config.RH_USDG, "amountIn": str(10 ** 18)},
-                  headers={"x-client-id": config.KYBER_CLIENT_ID}, timeout=20.0)
-    r.raise_for_status()
-    return int(r.json()["data"]["routeSummary"]["amountOut"]) / 10 ** USDG_DECIMALS
-
 
 def main() -> None:
-    sol, eth = prices.sol_usd()[0], eth_usd()          # sol_usd() returns (price, fetched_at)
+    sol, eth = prices.sol_usd()[0], prices.eth_usd()[0]          # each returns (price, fetched_at)
     if not sol or not eth:
         raise SystemExit(f"no price (SOL/USD {sol}, ETH/USD {eth})")
     k = sol / eth                                   # ETH per SOL

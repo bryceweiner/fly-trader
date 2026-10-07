@@ -1,12 +1,159 @@
-"""Safety & wallet: the trading rails and their controls, the configured mode and limits, the bot wallet, maintenance."""
+"""Safety & wallet: both chains' bot wallets (balance in USD, withdrawals to your own wallets), the trading rails and their
+controls, the configured mode and limits, maintenance."""
 import pandas as pd
 import streamlit as st
 
-from fly_trader import config
+from fly_trader import config, markets
 from fly_trader.agent import rails
 from fly_trader.db.queries import q, q1
+from fly_trader.ops import wallets
 from fly_trader.ops.supervisor import get_supervisor
-from fly_trader.ui.common import ago
+from fly_trader.ui.common import ago, amount, usd
+
+BASE_UNITS = {"sol": config.LAMPORTS_PER_SOL, "rh": 10 ** 18}
+PRICE_SOURCE = {"sol": "Jupiter", "rh": "KyberSwap ETH→USDG"}
+NO_WALLET = {"sol": "No wallet yet: run `fly-trader wallet new`, then fund it with SOL.",
+             "rh": "No wallet yet: run `fly-trader rh-wallet new`, then fund it with ETH on Robinhood Chain."}
+
+
+@st.cache_data(ttl="15s", show_spinner=False)
+def wallet_summary(chain: str) -> dict:
+    return wallets.summary(chain)
+
+
+@st.cache_data(ttl="10s", show_spinner=False)
+def withdraw_limits(chain: str, to: str) -> dict:
+    return wallets.limits(chain, to)
+
+
+def short(a: str | None) -> str:
+    return f"{a[:6]}…{a[-4:]}" if a else "—"
+
+
+@st.fragment(run_every="30s")
+def wallet_balances(chain: str) -> None:
+    spec, w = markets.MARKETS[chain], wallet_summary(chain)
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.markdown(f":material/account_balance_wallet: **{spec.name} bot wallet**")
+        st.space("stretch")
+        if w["address"]:
+            st.link_button("Explorer", wallets.explorer(chain, "address", w["address"]), icon=":material/open_in_new:", type="tertiary")
+    if not w["address"]:
+        st.caption(NO_WALLET[chain])
+        return
+    st.code(w["address"], language=None)
+    with st.container(horizontal=True):
+        st.metric("Balance", usd(w["native_usd"]), delta=amount(w["native"], w["unit"]), delta_color="off", delta_arrow="off",
+                  help="What the wallet holds in its own coin; this is what can be withdrawn.")
+        st.metric("In live positions", usd(w["positions_usd"]), delta=f"{amount(w['positions'], w['unit'])} · {w['n_open']} open", delta_color="off",
+                  delta_arrow="off", help="The live book's open positions at its last mark, net of exit cost"
+                  + (f" (marked {ago(w['marked_at'])})." if w["marked_at"] else "; at cost before the first mark."))
+        st.metric("Total", usd(w["total_usd"]), delta=amount(None if w["native"] is None else w["native"] + w["positions"], w["unit"]),
+                  delta_color="off", delta_arrow="off")
+    st.caption(f"1 {w['unit']} = {usd(w['price_usd'])} · {PRICE_SOURCE[chain]}, {ago(w['price_at'])}" if w["price_usd"] else f"No {w['unit']}/USD price yet.")
+    if w["error"]:
+        st.warning(f"Balance unavailable: {w['error']}")
+
+
+def send(chain: str, amt: float | None, to: str) -> dict:
+    try:
+        return wallets.withdraw(chain, amt, to)
+    except wallets.REFUSALS as e:
+        return {"status": "refused", "error": str(e)}
+    except Exception as e:                                              # noqa: BLE001 — shown; the outcome is unknown
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+
+
+def open_withdraw(chain: str) -> None:
+    for k in ("result", "amt", "all"):                                  # a fresh form each time it opens
+        st.session_state.pop(f"{chain}_wd_{k}", None)
+    st.session_state["withdraw_open"] = chain
+
+
+def close_withdraw() -> None:
+    st.session_state.pop("withdraw_open", None)
+
+
+def show_result(chain: str, r: dict) -> None:
+    link = f" · [transaction]({wallets.explorer(chain, 'tx', r['tx'])})" if r.get("tx") else ""
+    what = f"{amount(r.get('amount'), markets.MARKETS[chain].unit, 6)} to `{short(r.get('to'))}`"
+    if r["status"] == "confirmed":
+        st.success(f"Sent {what}{link}", icon=":material/check_circle:")
+    elif r["status"] == "pending":
+        st.info(f"Sent {what}, no receipt yet: it is booked when it lands. Look at the transaction before sending again{link}")
+    elif r["status"] == "expired":
+        st.warning("The transaction expired before it landed: nothing moved. You can try again.")
+    elif r["status"] == "failed":
+        st.error(f"The transaction failed on chain: only the fee moved{link}")
+    elif r["status"] == "refused":
+        st.error(f"Nothing was sent: {r['error']}")
+    elif r["status"] == "sending":
+        st.info("The withdrawal was still running when this window refreshed: its outcome is in the wallet's withdrawals.")
+    else:
+        st.error(f"{r['error']}. Whether it went out is unknown: look at the wallet on the explorer before trying again.")
+    if st.button("Close", key=f"{chain}_wd_close", on_click=close_withdraw):
+        st.rerun()
+
+
+@st.dialog("Withdraw", width="medium", on_dismiss=close_withdraw)
+def withdraw_dialog(chain: str) -> None:
+    key, unit, base = f"{chain}_wd", markets.MARKETS[chain].unit, BASE_UNITS[chain]
+    if (done := st.session_state.get(f"{key}_result")) is not None:   # one withdrawal per opening: a second click never sends again
+        show_result(chain, done)
+        return
+    w = wallet_summary(chain)
+    to = st.selectbox("To", wallets.destinations(chain), key=f"{key}_to", help=f"Only your own wallets: {wallets.SETTINGS[chain]} in .env.")
+    if to is None:
+        st.warning(f"None of your own wallets is listed: add yours to {wallets.SETTINGS[chain]} in .env and restart the console.")
+        return
+    try:
+        lim = withdraw_limits(chain, to)
+    except Exception as e:                                              # noqa: BLE001
+        st.error(f"Cannot read the wallet: {type(e).__name__}: {e}")
+        return
+    everything = st.toggle(f"Everything withdrawable: {amount(lim['max'] / base, unit, 6)}", key=f"{key}_all")
+    amt = None if everything else st.number_input(f"Amount ({unit})", min_value=0.0, value=None, step=0.01 if chain == "sol" else 0.001,
+                                                  format="%.6f", placeholder=f"at most {lim['max'] / base:.6f}", key=f"{key}_amt")
+    value, why = wallets.plan(chain, lim, amt) if everything or amt else (0, "enter an amount")
+    fee = f"fee ≈ {lim['fee'] / base:.6f} {unit}" if chain == "sol" else f"gas at most {lim['fee'] / base:.6f} {unit}"
+    keep = f" {lim['keep'] / base:g} {unit} stays for the exits of {lim['n_open']} open live position(s)." if lim["keep"] else ""
+    if why and (everything or amt):
+        st.warning(why)
+    elif not why:
+        px = w.get("price_usd")
+        st.markdown(f"Sends **{amount(value / base, unit, 6)}**" + (f" ({usd(value / base * px)})" if px else "") + f" to `{short(to)}`; {fee}.{keep}")
+    st.caption("This waits for the network's confirmation, up to about a minute.")
+    if st.button(f"Withdraw {amount(value / base, unit, 6)}" if not why else "Withdraw", type="primary", disabled=bool(why), icon=":material/send:", key=f"{key}_go"):
+        with st.spinner("Signing, sending, waiting for confirmation…"):
+            st.session_state[f"{key}_result"] = {"status": "sending"}
+            st.session_state[f"{key}_result"] = send(chain, amt, to)
+        wallet_summary.clear()
+        withdraw_limits.clear()
+        st.rerun()                                                      # the dialog stays open on its result; the page refreshes
+
+
+def wallet_panel(chain: str) -> None:
+    with st.container(border=True):
+        wallet_balances(chain)
+        addr = wallets.address(chain)
+        if not addr:
+            return
+        blockers = wallets.withdraw_blockers(chain)
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.caption("Withdraw: " + "; ".join(blockers) + "." if blockers else f"Withdrawals go only to your own wallets ({wallets.SETTINGS[chain]} in .env).")
+            st.space("stretch")
+            st.button("Withdraw", key=f"{chain}_withdraw", icon=":material/move_up:", disabled=bool(blockers), on_click=open_withdraw, args=(chain,))
+        hist = wallets.history(chain, addr)
+        if hist:
+            with st.expander(f"Withdrawals ({len(hist)})"):
+                df = pd.DataFrame(hist).assign(tx=lambda d: [wallets.explorer(chain, "tx", t) if t else None for t in d["tx"]])
+                st.dataframe(df, hide_index=True, column_config={"amount": st.column_config.NumberColumn(markets.MARKETS[chain].unit, format="%.6f"),
+                                                                  "tx": st.column_config.LinkColumn("transaction", display_text=":material/open_in_new:")})
+        if chain == "sol":
+            ev = q("SELECT ts, kind, pubkey FROM wallet_events ORDER BY id DESC LIMIT 20")
+            if ev:
+                with st.expander("Wallet events"):
+                    st.dataframe(pd.DataFrame(ev), hide_index=True)
 
 
 @st.fragment(run_every="5s")
@@ -63,16 +210,6 @@ def settings_panel() -> None:
                 ("Reset on start", "yes" if config.RESET_ON_START else "no", "Starting the trading engine archives and clears books other than the race books and the live book.")]
         st.dataframe(pd.DataFrame(rows, columns=["setting", "value", "meaning"]), hide_index=True)
         st.caption("Set in the project .env; changes apply after the console restarts.")
-
-
-def wallet_panel() -> None:
-    ev = q("SELECT ts, kind, pubkey FROM wallet_events ORDER BY id DESC LIMIT 20")
-    with st.container(border=True):
-        st.markdown(":material/account_balance_wallet: **Bot wallet**")
-        st.code(ev[0]["pubkey"] if ev else "No wallet yet: run `fly-trader wallet new`.", language=None)
-        if ev:
-            with st.expander("Wallet events"):
-                st.dataframe(pd.DataFrame(ev), hide_index=True)
 
 
 def rh_settings_panel() -> None:
@@ -155,13 +292,16 @@ def maintenance_panel() -> None:
                 st.dataframe(pd.DataFrame(errs), hide_index=True)
 
 
+st.markdown("#### Wallets")
+chains = [m.chain for m in markets.enabled()]
+for col, chain in zip(st.columns(len(chains)), chains):
+    with col:
+        wallet_panel(chain)
+if st.session_state.get("withdraw_open") in chains:                   # open until dismissed or closed, through full reruns
+    withdraw_dialog(st.session_state["withdraw_open"])
 st.markdown("#### Memecoins")
 rails_panel()
-left, right = st.columns([3, 2])
-with left:
-    settings_panel()
-with right:
-    wallet_panel()
+settings_panel()
 if config.RH_ENABLED:
     st.markdown("#### Robinhood Chain memecoins")
     rails_panel(rails.RH_CIRCUIT, "Robinhood Chain trading rails", prefix="rh_")

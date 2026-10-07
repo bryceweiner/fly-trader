@@ -1,5 +1,6 @@
-"""USD prices for the public stats: SOL from Jupiter Price v3, $FLY from its GeckoTerminal pool. Cached 60 s; a
-failed fetch keeps the last good value (and its timestamp, so the page can show its age)."""
+"""USD prices for the public stats and the console: SOL from Jupiter Price v3, $FLY from its GeckoTerminal pool, ETH from a
+KyberSwap quote of 1 ETH into USDG on Robinhood Chain. Cached 60 s; a failed fetch keeps the last good value (and its
+timestamp, so the page can show its age)."""
 from __future__ import annotations
 
 import logging
@@ -12,6 +13,7 @@ from .. import config
 
 log = logging.getLogger(__name__)
 TTL_S = 60.0
+USDG_DECIMALS = 6
 _cache: dict[str, tuple[float, float]] = {}
 _lock = threading.Lock()
 
@@ -47,8 +49,19 @@ def _fly_usd() -> float:
     return float(r.json()["data"]["attributes"]["base_token_price_usd"])
 
 
+def _eth_usd() -> float:
+    from ..rh import kyber as K
+    with httpx.Client(timeout=10, headers={"x-client-id": config.KYBER_CLIENT_ID}) as http:
+        out = K.Kyber(client=http).get_route(K.NATIVE, config.RH_USDG, 10 ** 18)["routeSummary"]["amountOut"]
+    return int(out) / 10 ** USDG_DECIMALS
+
+
 def sol_usd() -> tuple[float, float]:
     return _cached("sol", _sol_usd)
+
+
+def eth_usd() -> tuple[float, float]:
+    return _cached("eth", _eth_usd)
 
 
 def fly_usd() -> tuple[float, float]:

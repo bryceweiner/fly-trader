@@ -196,12 +196,16 @@ class RhWallet:
 
     @staticmethod
     def record_receipt(conn, tx_id: int, rc: dict) -> dict:
-        """Store a receipt's outcome on its rh_txs row. Returns {ok, fee_wei, gas_used, block}."""
+        """Store a receipt's outcome on its rh_txs row. Returns {ok, fee_wei, gas_used, block}. A withdrawal (kind
+        'transfer') is booked with its receipt (rh/withdraw.book), once, whichever path records it."""
         gas_used = int(rc["gasUsed"], 16); price = int(rc.get("effectiveGasPrice") or "0x0", 16); fee = gas_used * price
         ok = int(rc.get("status", "0x0"), 16) == 1
-        conn.execute("UPDATE rh_txs SET status = %s, block = %s, block_hash = %s, gas_used = %s, eff_gas_price_wei = %s, fee_wei = %s, "
-                     "fee_at = COALESCE(fee_at, clock_timestamp()), updated_at = now() "
-                     "WHERE id = %s", ("mined_ok" if ok else "reverted", int(rc["blockNumber"], 16), rc.get("blockHash"), gas_used, price, fee, tx_id))
+        row = conn.execute("UPDATE rh_txs SET status = %s, block = %s, block_hash = %s, gas_used = %s, eff_gas_price_wei = %s, fee_wei = %s, "
+                           "fee_at = COALESCE(fee_at, clock_timestamp()), updated_at = now() "
+                           "WHERE id = %s RETURNING kind", ("mined_ok" if ok else "reverted", int(rc["blockNumber"], 16), rc.get("blockHash"), gas_used, price, fee, tx_id)).fetchone()
+        if row is not None and row["kind"] == "transfer":
+            from .withdraw import book
+            book(conn, tx_id, ok)
         return {"ok": ok, "fee_wei": fee, "gas_used": gas_used, "block": int(rc["blockNumber"], 16)}
 
     def send_and_wait(self, timeout_s: float = 120.0, **kw) -> dict:

@@ -19,8 +19,14 @@ def test_rh_page_is_a_memecoin_page():
 
 @pytest.mark.parametrize("page,chain", [("rh.py", None), ("overview.py", "Solana"), ("overview.py", "Robinhood Chain"), ("trades.py", None), ("safety.py", None)])
 def test_pages_render_on_both_chains(db_conn, monkeypatch, page, chain):
+    import streamlit as st
     from fly_trader import config
+    from fly_trader.ops import wallets
     monkeypatch.setattr(config, "RH_ENABLED", True)
+    st.cache_data.clear()                                                   # the Safety page's wallet reads: no network in tests
+    monkeypatch.setattr(wallets, "summary", lambda c: {"chain": c, "unit": "SOL" if c == "sol" else "ETH", "address": None, "native": None, "error": None,
+                                                       "n_open": 0, "positions": 0.0, "marked_at": None, "price_usd": None, "price_at": None,
+                                                       "native_usd": None, "positions_usd": None, "total_usd": None})
     at = AppTest.from_file(str(UI / "app_pages" / page), default_timeout=60)
     if chain:
         at.session_state["chain"] = chain
