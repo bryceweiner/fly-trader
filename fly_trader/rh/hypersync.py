@@ -54,7 +54,11 @@ def to_rpc_log(g: dict, ts: dict[int, int]) -> dict:
 class HyperSync:
     def __init__(self, token: str, url: str | None = None, client: httpx.Client | None = None):
         self.url = (url or config.RH_HYPERSYNC_URL).rstrip("/")
-        self.http = client or httpx.Client(timeout=120.0, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+        # connect=5: one of robinhood.hypersync.xyz's six addresses (193.32.220.135) never answers from here (2026-10-07), and a
+        # fresh connection that drew it hung ~76 s; with a short connect timeout the next address is tried after 5 s.
+        # keepalive 120 s: httpx closes idle connections after 5 s by default, so nearly every live pass connected anew.
+        self.http = client or httpx.Client(timeout=httpx.Timeout(120.0, connect=5.0), limits=httpx.Limits(keepalive_expiry=120.0),
+                                           headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
         self.height = 0
 
     def _post(self, body: dict) -> dict:
@@ -78,9 +82,19 @@ class HyperSync:
         raise HyperSyncError(f"HyperSync failed {TRIES} times: {err}")
 
     def archive_height(self) -> int:
-        r = self.http.get(f"{self.url}/height"); r.raise_for_status()
-        self.height = int(r.json()["height"])
-        return self.height
+        err = None
+        for i in range(TRIES):
+            t0 = time.monotonic(); status = None; err = None
+            try:
+                r = self.http.get(f"{self.url}/height"); status = r.status_code; r.raise_for_status()
+                self.height = int(r.json()["height"])
+                return self.height
+            except httpx.HTTPError as e:
+                err = type(e).__name__
+            finally:
+                record_api_call("rh_hypersync", "/height", "GET", status, int((time.monotonic() - t0) * 1000), err is None, err)
+            time.sleep(min(10.0, 1.0 * 2 ** i))
+        raise HyperSyncError(f"HyperSync height failed {TRIES} times: {err}")
 
     def get_logs(self, addresses: list[str] | None, lo: int, hi: int, topics: list | None = None) -> list[dict]:
         """Logs in blocks lo..hi (inclusive), eth_getLogs-shaped, in chain order."""
