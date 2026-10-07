@@ -110,10 +110,12 @@ STATS_REFRESH_S = env_float("STATS_REFRESH_S", 600.0)
 # How the fly picks its buy line (train/fly_calibrate.py): total | selector | match. match = its teacher's selectivity:
 # in the 2026-09-26 replays it took 92 trades at +10.1 % (58 % winners, PF 1.92) where total took 1,607 at +2.0 %.
 FLY_CALIB_RULE = env_str("FLY_CALIB_RULE", "match")
-# How the fly sizes a buy (agent/sizing.py): flat = MAX_POSITION_FRACTION of the deployable bankroll on every buy | kelly
-# = its calibrated bands. A selective fly resolves too few trades a week for bands: they flipped between Kelly 0.97, 0 and
-# 0.15, and flat sizing beat them in 98 % of resampled replays.
-FLY_SIZING = env_str("FLY_SIZING", "flat")
+# How the fly sizes a buy (agent/sizing.py): kelly = the selector's own Kelly band for the row (its score, line and sizing
+# table; with FLY_TEACHER_GATE every fly buy is a selector buy, sized exactly as the selector sizes it) | flat =
+# MAX_POSITION_FRACTION of the deployable bankroll on every buy. (Flat was the default while the fly sized from its own
+# calibrated bands, which flipped between Kelly 0.97, 0 and 0.15 on its few trades a week; the selector's bands are fitted
+# on its walk-forward and do not.)
+FLY_SIZING = env_str("FLY_SIZING", "kelly")
 # The fly buys only what its teacher (the deployed selector stack) would buy: the same trigger, line, win filter, gates,
 # dump veto and fail-closed rules. Its own learning (plastic score below its bootstrap score by FLY_LEARNED_VETO) can
 # only drop a teacher trade, never add one (2026-10-08: ungated, the fly bought rows the selector rejected and lost).

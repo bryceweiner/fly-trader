@@ -15,8 +15,10 @@ def test_the_fly_trades_the_selectors_set_and_only_learning_can_drop_a_trade(mon
     teacher = {"strategy": np.array(["capitulation", "capitulation", None, "capitulation", "ev", "ev"], dtype=object),
                "score": np.array([0.10, 0.12, -1.0, 0.11, 0.20, 0.20]),
                "allow": np.array([True, False, False, True, True, True]),
-               "reason": np.array(["trade", "dump veto (P(≤-17 %) ≥ 0.43)", "no strategy fires", "trade", "trade", "trade"], dtype=object)}
-    monkeypatch.setattr(fly_session.strategies, "decide", lambda models, X, cols, t: {k: v.copy() for k, v in teacher.items()})
+               "reason": np.array(["trade", "dump veto (P(≤-17 %) ≥ 0.43)", "no strategy fires", "trade", "trade", "trade"], dtype=object),
+               "threshold": np.array([0.069, 0.069, np.inf, 0.069, 0.115, 0.115]),
+               "tables": [[{"lo": 0.0, "kelly": 0.13}], [{"lo": 0.0, "kelly": 0.15}], [], [{"lo": 0.0, "kelly": 0.13}], [{"lo": 0.0, "kelly": 0.2}], [{"lo": 0.0, "kelly": 0.2}]]}
+    monkeypatch.setattr(fly_session.strategies, "decide", lambda models, X, cols, t: {k: (v.copy() if hasattr(v, "copy") else list(v)) for k, v in teacher.items()})
     me = SimpleNamespace(names=["ev", "capitulation"], holds={"ev": 7200.0, "capitulation": 14400.0},
                          sizing={"plastic": {"ev": [{"lo": 0}], "capitulation": [{"lo": 1}]}}, teacher_live={"strategies": {}}, teacher_groups={"skill"})
     infos = [{}, {}, {}, {}, {"skill_missing": True}, {}]
@@ -26,6 +28,7 @@ def test_the_fly_trades_the_selectors_set_and_only_learning_can_drop_a_trade(mon
     d = fly_session.FlyBook._gated(me, ctx, V, F)
     assert d["allow"].tolist() == [True, False, False, False, False, True]
     assert d["strategy"][0] == "capitulation" and d["hold_s"][0] == 14400.0          # the teacher's strategy and hold, at a fly score below its own line
+    assert d["score"][0] == 0.10 and d["threshold"][0] == 0.069 and d["tables"][0] == [{"lo": 0.0, "kelly": 0.13}]   # sized as the selector sizes it
     assert d["reason"][1].startswith("selector: dump veto")                          # the selector's filter binds the fly
     assert d["strategy"][2] is None and np.isinf(d["threshold"][2])                 # no teacher trade: no fly trade, however high the fly scores it
     assert d["reason"][3].startswith("learned veto")                                 # 0.05 < 0.08 - 0.02: its learning drops the trade

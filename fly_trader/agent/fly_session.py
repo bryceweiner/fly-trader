@@ -472,8 +472,9 @@ class FlyBook:
             if s_ is None or s_ not in self.names:
                 continue
             j = self.names.index(s_); v, f = V[i, j], F[i, j]
-            sc = float(v) if np.isfinite(v) else float(td["score"][i])
-            strat[i] = s_; score[i] = sc; thr[i] = sc; hold[i] = self.holds[s_]; tables[i] = self.sizing["plastic"][s_]
+            # the selector's own score, line and sizing table for the row: a gated fly buy is sized exactly as the selector
+            # sizes it (agent/sizing.size_position; FLY_SIZING=kelly: the same Kelly band, fraction and caps; flat: flat)
+            strat[i] = s_; score[i] = float(td["score"][i]); thr[i] = float(td["threshold"][i]); hold[i] = self.holds[s_]; tables[i] = td["tables"][i]
             if not td["allow"][i]:
                 reason[i] = f"selector: {td['reason'][i]}"
             elif np.isfinite(v) and np.isfinite(f) and v < f - config.FLY_LEARNED_VETO:
