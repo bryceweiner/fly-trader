@@ -1,5 +1,5 @@
-"""The price scan moves every quote asset together: a reference pool two assets share is fetched once per range, each
-asset only writes minutes past its own cursor, and the laggard sets the range."""
+"""The price scan moves every quote asset together: all reference pools are fetched in one query per range (a pool two
+assets share once), each asset only writes minutes past its own cursor, and the laggard sets the range."""
 import json
 
 from fly_trader.db.connection import transaction
@@ -28,17 +28,20 @@ def test_shared_pool_fetched_once_and_cursors_move_together(db_conn, monkeypatch
     fetched = []
     sq = 2 ** 96
 
-    def swap_logs(rpc, h, lo, hi):
-        fetched.append((h["pool"], lo, hi))
-        return [{"blockNumber": hex(b), "logIndex": "0x0", "data": "0x" + "00" * 64 + format(sq, "064x")} for b in range(lo, hi + 1, 100)]
-    monkeypatch.setattr(prices, "_swap_logs", swap_logs)
+    def logs(rpc, addresses, lo, hi, topics):
+        fetched.append((tuple(addresses), lo, hi))
+        return [{"address": a, "topics": [prices.SWAP_V3], "blockNumber": hex(b), "logIndex": "0x0", "data": "0x" + "00" * 64 + format(sq, "064x")}
+                for a in addresses for b in range(lo, hi + 1, 100)]
+    monkeypatch.setattr(prices, "_logs", logs)
     monkeypatch.setattr(prices, "logs_rpc", lambda: None)
     monkeypatch.setattr("fly_trader.rh.blocktime.times", lambda rpc, lo, hi, bs: {b: 1_790_000_000 + b for b in bs})
     prices.run_once(max_ranges=10)
     rounds = sorted({(lo, hi) for _, lo, hi in fetched})
     assert rounds[0][0] == 2000                                                        # the laggard (NVDA) sets the first range
     for lo, hi in rounds:
-        assert sum(1 for p, a, b in fetched if p == P_US and (a, b) == (lo, hi)) == 1  # the shared USDG pool once per range
+        calls = [a for a, x, y in fetched if (x, y) == (lo, hi)]
+        assert len(calls) == 1                                                         # every standalone pool in one query per range
+    assert set(fetched[-1][0]) == {P_US, P_SPY, P_NV}                                  # the shared USDG pool once, beside the others
     with transaction() as conn:
         cur = {r["name"]: int(r["block"]) for r in conn.execute("SELECT name, block FROM rh_scan WHERE name LIKE 'price:%%'").fetchall()}
         first_spy = conn.execute("SELECT min(ts) AS t FROM rh_base_prices WHERE asset = %s", (SPY,)).fetchone()["t"]

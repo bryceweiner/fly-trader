@@ -6,7 +6,9 @@ appending a version-gated block AND bumping SCHEMA_VERSION, or it never runs.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 import psycopg
@@ -19,6 +21,13 @@ log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 10          # 5: the plastic fly's tables and per-book halts (BASE_DDL); 6: the selector's strategy stack (MIGRATIONS[6]); 7: Kalshi (MIGRATIONS[7]); 8: Kalshi minute extremes
 _LOCK_KEY = 0x666C795F6D6967  # "fly_mig"
+# Applying the DDL takes ACCESS EXCLUSIVE on the tables it touches (Postgres takes it for ALTER TABLE ... ADD COLUMN IF NOT
+# EXISTS even when the column exists) and holds it to the end of the transaction, while live workers write those tables.
+# 2026-10-07: the RH stream's start-up apply deadlocked with the trading engine on positions/decisions and crashed. So:
+# unchanged DDL is not re-run at all (its fingerprint is stored), and a run never waits more than LOCK_TIMEOUT for a
+# lock: it rolls back, releases everything it holds, and retries.
+LOCK_TIMEOUT = "5s"
+APPLY_TRIES = 30
 
 BASE_DDL: list[str] = [
     """CREATE TABLE IF NOT EXISTS schema_version (
@@ -372,47 +381,93 @@ def ensure_database(url: str | None = None) -> bool:
         return True
 
 
+def ddl_fingerprint() -> str:
+    """sha256 of every statement apply_schema runs (the ladder, the idempotent vault/RH/ETH DDL) and SCHEMA_VERSION."""
+    from ..rh.schema import RH_DDL
+    from ..vault.eth_schema import ETH_DDL
+    from ..vault.schema import VAULT_DDL
+    h = hashlib.sha256()
+    for stmt in [str(SCHEMA_VERSION), *BASE_DDL, *(x for v in sorted(MIGRATIONS) for x in MIGRATIONS[v]), *VAULT_DDL, *RH_DDL, *ETH_DDL]:
+        h.update(stmt.encode()); h.update(b"\0")
+    return h.hexdigest()
+
+
+def _applied(conn, fp: str) -> int | None:
+    """The schema version when exactly this DDL is already applied (nothing to run), else None."""
+    try:
+        row = conn.execute("SELECT version, ddl_sha256 FROM schema_version WHERE singleton").fetchone()
+    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
+        conn.rollback()
+        return None
+    conn.commit()
+    if row and row["ddl_sha256"] == fp and int(row["version"]) >= SCHEMA_VERSION:
+        return int(row["version"])
+    return None
+
+
+def _apply_all(conn, fp: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")
+        for stmt in BASE_DDL:
+            cur.execute(stmt)
+        cur.execute("ALTER TABLE schema_version ADD COLUMN IF NOT EXISTS ddl_sha256 text")
+        cur.execute("SELECT version FROM schema_version WHERE singleton")
+        row = cur.fetchone()
+        current = int(row["version"]) if row else 0
+        for v in sorted(MIGRATIONS):
+            if current < v:
+                for stmt in MIGRATIONS[v]:
+                    cur.execute(stmt)
+                current = v
+        from ..vault.schema import VAULT_DDL     # idempotent, outside the ladder: same DDL on master and distribution
+        for stmt in VAULT_DDL:
+            cur.execute(stmt)
+        from ..rh.schema import RH_DDL           # idempotent, outside the ladder: the Robinhood Chain market (fly_trader/rh)
+        for stmt in RH_DDL:
+            cur.execute(stmt)
+        from ..vault.eth_schema import ETH_DDL    # the vault's ETH pot (Robinhood Chain profits paid in ETH)
+        for stmt in ETH_DDL:
+            cur.execute(stmt)
+        target = max(current, SCHEMA_VERSION)
+        cur.execute(
+            "INSERT INTO schema_version (singleton, version, ddl_sha256) VALUES (true, %s, %s) "
+            "ON CONFLICT (singleton) DO UPDATE SET version = EXCLUDED.version, ddl_sha256 = EXCLUDED.ddl_sha256, updated_at = now()",
+            (target, fp),
+        )
+        return target
+
+
 def apply_schema(url: str | None = None) -> int:
-    """Apply the ladder under an advisory lock. Returns the resulting version."""
+    """Apply the ladder under an advisory lock. Returns the resulting version. A no-op (no table locks) when this exact
+    DDL was applied before; otherwise every lock wait is bounded by LOCK_TIMEOUT and the whole run is retried."""
+    fp = ddl_fingerprint()
     with connect(url) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_advisory_lock(%s)", (_LOCK_KEY,))
-            try:
-                for stmt in BASE_DDL:
-                    cur.execute(stmt)
-                cur.execute("SELECT version FROM schema_version WHERE singleton")
-                row = cur.fetchone()
-                current = int(row["version"]) if row else 0
-                for v in sorted(MIGRATIONS):
-                    if current < v:
-                        for stmt in MIGRATIONS[v]:
-                            cur.execute(stmt)
-                        current = v
-                from ..vault.schema import VAULT_DDL     # idempotent, outside the ladder: same DDL on master and distribution
-                for stmt in VAULT_DDL:
-                    cur.execute(stmt)
-                from ..rh.schema import RH_DDL           # idempotent, outside the ladder: the Robinhood Chain market (fly_trader/rh)
-                for stmt in RH_DDL:
-                    cur.execute(stmt)
-                from ..vault.eth_schema import ETH_DDL    # the vault's ETH pot (Robinhood Chain profits paid in ETH)
-                for stmt in ETH_DDL:
-                    cur.execute(stmt)
-                target = max(current, SCHEMA_VERSION)
-                cur.execute(
-                    "INSERT INTO schema_version (singleton, version) VALUES (true, %s) "
-                    "ON CONFLICT (singleton) DO UPDATE SET version = EXCLUDED.version, updated_at = now()",
-                    (target,),
-                )
-                conn.commit()
-                ensure_partitions(conn)
-                conn.commit()
-                return target
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                cur.execute("SELECT pg_advisory_unlock(%s)", (_LOCK_KEY,))
-                conn.commit()
+        conn.execute("SELECT pg_advisory_lock(%s)", (_LOCK_KEY,))
+        conn.commit()                                       # the advisory lock is the session's; no transaction stays open
+        try:
+            target = _applied(conn, fp)
+            if target is None:
+                for attempt in range(APPLY_TRIES):
+                    try:
+                        target = _apply_all(conn, fp)
+                        conn.commit()
+                        break
+                    except (psycopg.errors.LockNotAvailable, psycopg.errors.DeadlockDetected) as e:
+                        conn.rollback()                     # releases every table lock this run took
+                        if attempt == APPLY_TRIES - 1:
+                            raise
+                        wait = min(30.0, 1.0 + attempt)
+                        log.warning("schema: %s while applying the DDL (live workers hold the tables); retrying in %.0f s", type(e).__name__, wait)
+                        time.sleep(wait)
+            ensure_partitions(conn)
+            conn.commit()
+            return target
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (_LOCK_KEY,))
+            conn.commit()
 
 
 def _partition_name(base: str, start: datetime, granularity: str) -> str:

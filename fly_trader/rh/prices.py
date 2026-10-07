@@ -71,15 +71,46 @@ def hop_price(h: dict, sqrt_price_x96: int) -> float:
     return p10 if h["token_in"] == h["token0"] else (1.0 / p10 if p10 > 0 else float("nan"))
 
 
-def _swap_logs(rpc, h: dict, lo: int, hi: int) -> list[dict]:
+SWAP_V3 = abi.event_topic("Swap(address,address,int256,int256,uint160,uint128,int24)")      # Uniswap v3 and Slipstream pools
+
+
+def _logs(rpc, addresses, lo: int, hi: int, topics) -> list[dict]:
     from .index import _get_logs
+    return _get_logs(rpc, addresses, lo, hi, topics)
+
+
+def _swap_logs(rpc, h: dict, lo: int, hi: int) -> list[dict]:
     if _is_id(h["pool"]):
-        return _get_logs(rpc, [h["emitter"]], lo, hi, [None, h["pool"]])
-    return _get_logs(rpc, [h["emitter"]], lo, hi, [abi.event_topic("Swap(address,address,int256,int256,uint160,uint128,int24)")])
+        return _logs(rpc, [h["emitter"]], lo, hi, [None, h["pool"]])
+    return _logs(rpc, [h["emitter"]], lo, hi, [SWAP_V3])
+
+
+def fetch_pool_logs(rpc, pools: dict, lo: int, hi: int) -> dict:
+    """Swap logs of every reference pool in ``pools`` (``_hop_key`` → hop) over lo..hi, in as few queries as the venues
+    allow: one for all the standalone pool contracts (one address list, one Swap topic) and one per singleton manager
+    (its pool ids as the topic-1 list). 2026-10-07: 69 pools queried one by one made a live pass take 1–3.5 min."""
+    out = {k: [] for k in pools}
+    plain = sorted({h["emitter"].lower() for h in pools.values() if not _is_id(h["pool"])})
+    if plain:
+        for g in _logs(rpc, plain, lo, hi, [SWAP_V3]):
+            k = (g["address"].lower(), g["address"].lower())
+            if k in out:
+                out[k].append(g)
+    managers: dict[str, list[str]] = {}
+    for h in pools.values():
+        if _is_id(h["pool"]):
+            managers.setdefault(h["emitter"].lower(), []).append(h["pool"].lower())
+    for em, ids in sorted(managers.items()):
+        for g in _logs(rpc, [em], lo, hi, [None, sorted(set(ids))]):
+            tp = g.get("topics") or []
+            k = (em, tp[1].lower()) if len(tp) > 1 else None
+            if k in out:
+                out[k].append(g)
+    return out
 
 
 def _hop_key(h: dict) -> tuple[str, str]:
-    return h["emitter"], h["pool"]
+    return h["emitter"].lower(), h["pool"].lower()
 
 
 def scan_asset(conn, rpc, asset: str, hops: list[dict], lo: int, hi: int, state: dict, times, logs_by_hop: dict | None = None) -> int:
@@ -171,7 +202,7 @@ def run_once(max_ranges: int = 1) -> dict:
             for a in group:
                 for h in a["hops"]:
                     pools.setdefault(_hop_key(h), h)
-            logs = {k: _swap_logs(rpc, h, lo, hi) for k, h in pools.items()}
+            logs = fetch_pool_logs(rpc, pools, lo, hi)
             ts = {int(g["blockNumber"], 16): int(g["blockTimestamp"], 16) for got in logs.values() for g in got
                   if int(g.get("blockTimestamp") or "0x0", 16)}                    # HyperSync logs carry their block's time
             blocks = sorted({int(g["blockNumber"], 16) for got in logs.values() for g in got} - set(ts))
