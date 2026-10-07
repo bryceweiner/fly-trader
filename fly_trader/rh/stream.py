@@ -34,18 +34,25 @@ def _status(**kv) -> None:
 
 
 def one_pass(rpc, skill=None) -> dict:
+    tm: dict[str, float] = {}; t = time.monotonic()
+
+    def lap(step: str) -> None:                             # seconds per step, in the status: where a slow pass spends its time
+        nonlocal t
+        now = time.monotonic(); tm[step] = round(now - t, 2); t = now
     head = rpc.block_number()
     with transaction() as conn:
         r = conn.execute("SELECT block FROM rh_scan WHERE name = 'rh'").fetchone()
     behind = head - (int(r["block"]) if r else 0)
-    ix = index.run_once(rpc, max_ranges=BACKFILL_RANGES if behind > LIVE_LAG_BLOCKS else 1)
-    px = prices.run_once(max_ranges=BACKFILL_RANGES if behind > LIVE_LAG_BLOCKS else 2)
-    mn = minutes.run_once(rpc, skill)
+    lap("head")
+    ix = index.run_once(rpc, max_ranges=BACKFILL_RANGES if behind > LIVE_LAG_BLOCKS else 1); lap("index")
+    px = prices.run_once(max_ranges=BACKFILL_RANGES if behind > LIVE_LAG_BLOCKS else 2); lap("prices")
+    mn = minutes.run_once(rpc, skill); lap("minutes")
     from . import corpus, meta
-    mt = meta.run_once()
+    mt = meta.run_once(); lap("meta")
     cp = corpus.run_once(max_days=1) if behind <= LIVE_LAG_BLOCKS * 20 else {}          # the training corpus follows once near the head
+    lap("corpus")
     out = {"head": head, "index_through": ix.get("through"), "behind_blocks": head - (ix.get("through") or 0), "index": ix.get("counts"), "prices": px,
-           "minutes": mn, "meta": mt, "corpus": cp, "mode": "backfill" if behind > LIVE_LAG_BLOCKS else "live"}
+           "minutes": mn, "meta": mt, "corpus": cp, "mode": "backfill" if behind > LIVE_LAG_BLOCKS else "live", "timings_s": tm}
     _status(**{k: v for k, v in out.items() if k != "minutes"}, minutes_through=mn.get("through"))
     return out
 
