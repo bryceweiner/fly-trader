@@ -201,3 +201,15 @@ def test_walk_forward_never_trains_on_rows_whose_settlement_comes_after_the_test
     # without label times (memecoins) nothing changes
     del ds.label_ts
     assert S.known_before(ds, 0.0).all()
+
+
+def test_training_rows_are_capped_by_a_fixed_label_blind_sample():
+    from fly_trader.train import strategies as S
+    ds = _ds(days=8, per_day=200)
+    idx = np.arange(1500)
+    assert S.cap_rows(ds, idx, 1).tolist() == idx.tolist()                       # no cap on the set: unchanged (memecoins)
+    ds.train_max_rows = 400
+    a, b = S.cap_rows(ds, idx, 7), S.cap_rows(ds, idx, 7)
+    assert len(a) == 400 and a.tolist() == b.tolist() and (np.diff(a) > 0).all()  # fixed by the seed, sorted, no repeats
+    assert S.cap_rows(ds, idx, 8).tolist() != a.tolist()
+    assert S.cap_rows(ds, idx[:300], 7).tolist() == list(range(300))              # under the cap: every row

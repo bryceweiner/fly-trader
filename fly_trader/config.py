@@ -328,6 +328,7 @@ KALSHI_MINUTES_KEEP_DAYS = env_int("KALSHI_MINUTES_KEEP_DAYS", 7)
 KALSHI_MARKETS_PER_DAY = env_int("KALSHI_MARKETS_PER_DAY", 150)           # the event sample's target: about this many markets per category per day (kalshi/history.sample_rates);
                                                                            # events are kept by md5(event ticker) < the category's rate, blind to outcome and volume
 KALSHI_DIR = DATA_DIR / "kalshi"
+KALSHI_TRAIN_MAX_ROWS = env_int("KALSHI_TRAIN_MAX_ROWS", 8_000_000)        # training rows per walk-forward block / final fit (uniform random subset)
 KALSHI_FILL_THREADS = env_int("KALSHI_FILL_THREADS", 8)                   # markets filled at once by the history worker, all under the one KALSHI_RPS bucket
 KALSHI_RPS = env_float("KALSHI_RPS", 16.0)                                 # per process; the account's Advanced grant reads 200 tokens/s at 10 per call = 20 calls/s, the feed uses ~3
 

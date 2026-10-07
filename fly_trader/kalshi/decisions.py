@@ -115,6 +115,7 @@ def build(days: int | None = None, feature_dir=None, label_thr: float = 0.0) -> 
     ds = DecisionSet(X=X, y=(fwd_pess > label_thr).astype(np.int8), fwd=fwd, fwd_pess=fwd_pess, day=day_arr, ts=ts, mint=tick * 2 + side.astype(np.int64),
                      cols=list(X_COLS), horizon_s=float(np.median(settled - ts)), fwd_h={"maker": maker})
     ds._day_ord = ords
+    ds.train_max_rows = int(config.KALSHI_TRAIN_MAX_ROWS) or None   # training rows per fit: a random subset (train/strategies.cap_rows)
     ds.hold_s = (settled - ts).astype(np.float64)                     # per-row: every position is held to its own settlement
     ds.data_version = f"kalshi-features-{KALSHI_FEATURE_VERSION}"     # in the walk-forward cache key: another feature version never reuses a fit
     ds.label_ts = (settled + 60.0).astype(np.float64)                 # when the outcome is known: training for a period may use only rows known before it

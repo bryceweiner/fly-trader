@@ -177,7 +177,8 @@ def _cache_path(ds: DecisionSet, cols: list[str], tag: str) -> "Path":
     k = repr((str(ds.days[0]), str(ds.days[-1]), int(len(ds.y)), float(ds.horizon_s), list(cols), tag,
               DATA_VERSION.get("agg"), DATA_VERSION.get("features"), DATA_VERSION.get("costs"), OBJECTIVE)
              + (("label-known-purge",) if getattr(ds, "label_ts", None) is not None else ())
-             + ((("data", getattr(ds, "data_version")),) if getattr(ds, "data_version", None) is not None else ()))     # e.g. the Kalshi feature version
+             + ((("data", getattr(ds, "data_version")),) if getattr(ds, "data_version", None) is not None else ())     # e.g. the Kalshi feature version
+             + ((("train_max_rows", int(getattr(ds, "train_max_rows"))),) if getattr(ds, "train_max_rows", None) else ()))
     return CACHE_DIR / f"{hashlib.sha256(k.encode()).hexdigest()[:20]}.npy"
 
 
@@ -217,6 +218,16 @@ def known_before(ds: DecisionSet, t: float) -> np.ndarray:
     return np.ones(len(ds.y), bool) if lt is None else (np.asarray(lt, dtype=np.float64) < float(t))
 
 
+def cap_rows(ds: DecisionSet, idx: np.ndarray, seed: int) -> np.ndarray:
+    """At most ``ds.train_max_rows`` of the training rows ``idx``, a uniform random subset fixed by ``seed`` (blind to labels).
+    The Kalshi corpus repeats each market every 5 minutes, so a block's 35 M training rows carry little more than 8 M do,
+    while fitting on all of them took the selector past 70 GB. Sets without the attribute (memecoins) are unchanged."""
+    cap = getattr(ds, "train_max_rows", None)
+    if not cap or len(idx) <= cap:
+        return idx
+    return np.sort(np.random.default_rng(seed).choice(idx, int(cap), replace=False))
+
+
 def wf_blocks(days: list) -> list[list]:
     from .selector import BLOCK_DAYS, WARMUP_DAYS
     return [days[k:k + BLOCK_DAYS] for k in range(WARMUP_DAYS, len(days), BLOCK_DAYS)]
@@ -241,7 +252,7 @@ def wf_regress(ds: DecisionSet, rows: np.ndarray, y: np.ndarray, cols: np.ndarra
         if stop is not None and stop.is_set():
             break
         od = day_ords(ds); b0 = min(blk).toordinal()
-        tr = np.flatnonzero(fin & (od < b0 - 1) & known_before(ds, _day_start(min(blk)))); te = np.flatnonzero(rows & np.isin(od, [d.toordinal() for d in blk]))
+        tr = cap_rows(ds, np.flatnonzero(fin & (od < b0 - 1) & known_before(ds, _day_start(min(blk)))), 1000 + k); te = np.flatnonzero(rows & np.isin(od, [d.toordinal() for d in blk]))
         if len(tr) < 10 * _gbm_params()["min_samples_leaf"] or len(te) == 0:
             continue
         Xtr = ds.X[np.ix_(tr, cols)]                                  # this block's own copy: scaled in place, freed before the next
@@ -262,7 +273,7 @@ def wf_classify(ds: DecisionSet, rows: np.ndarray, feats, y: np.ndarray, n_class
         if stop is not None and stop.is_set():
             break
         od = day_ords(ds); b0 = min(blk).toordinal()
-        tr = np.flatnonzero(rows & (od < b0 - 1) & known_before(ds, _day_start(min(blk)))); te = np.flatnonzero(rows & np.isin(od, [d.toordinal() for d in blk]))
+        tr = cap_rows(ds, np.flatnonzero(rows & (od < b0 - 1) & known_before(ds, _day_start(min(blk)))), 1000 + k); te = np.flatnonzero(rows & np.isin(od, [d.toordinal() for d in blk]))
         if len(tr) < 10 * _gbm_params()["min_samples_leaf"] or len(te) == 0 or len(np.unique(y[tr])) < 2:
             continue
         Xtr = np.asarray(feats(tr), dtype=np.float32)                 # as above: one block-sized array at a time

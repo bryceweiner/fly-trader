@@ -90,7 +90,8 @@ def oos(ds, rows: np.ndarray, y: np.ndarray, ci: np.ndarray, H, stop, label_: st
 
 
 def fit_final(ds, rows: np.ndarray, ci: np.ndarray, H):
-    """The deployed model of a strategy: a classifier of the side paying, on every candidate row."""
+    """The deployed model of a strategy: a classifier of the side paying, on its candidate rows (at most ds.train_max_rows)."""
+    rows = S.cap_rows(ds, np.flatnonzero(rows), 99)
     scaler = RobustScaler.fit(ds.X[np.ix_(rows, ci)], seed=99)
     m = HistGradientBoostingClassifier(**S._gbm_params(), random_state=99); m.fit(scaler.transform(ds.X[np.ix_(rows, ci)]), ds.outcome[rows].astype(np.int8))
     return m, scaler
