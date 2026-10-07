@@ -96,8 +96,10 @@ class HyperSync:
             time.sleep(min(10.0, 1.0 * 2 ** i))
         raise HyperSyncError(f"HyperSync height failed {TRIES} times: {err}")
 
-    def get_logs(self, addresses: list[str] | None, lo: int, hi: int, topics: list | None = None) -> list[dict]:
-        """Logs in blocks lo..hi (inclusive), eth_getLogs-shaped, in chain order."""
+    def get_logs(self, addresses: list[str] | None, lo: int, hi: int, topics: list | None = None, upto: bool = False):
+        """Logs in blocks lo..hi (inclusive), eth_getLogs-shaped, in chain order. With ``upto`` the read stops at
+        HyperSync's archive height (each response reports it) and (logs, last block covered) is returned; the caller
+        reads the rest elsewhere, so the hot path never asks /height."""
         sel: dict = {}
         if addresses:
             sel["address"] = [a.lower() for a in addresses]
@@ -111,12 +113,19 @@ class HyperSync:
                     ts[int(b["number"])] = int(b["timestamp"], 16) if isinstance(b["timestamp"], str) else int(b["timestamp"])
                 out += part.get("logs") or []
             nxt = int(d.get("next_block") or hi + 1)
+            ah = d.get("archive_height")
+            if ah is not None:
+                self.height = max(self.height, int(ah))
             if nxt <= frm:
+                if upto:
+                    break                                   # at the archive tip: nothing more here yet
                 raise HyperSyncError(f"HyperSync made no progress at block {frm}")
             frm = nxt
+            if upto and ah is not None and frm > int(ah):
+                break                                       # covered everything HyperSync has
         logs = [to_rpc_log(g, ts) for g in out]
         logs.sort(key=lambda x: (int(x["blockNumber"], 16), int(x["logIndex"], 16)))
-        return logs
+        return (logs, min(hi, frm - 1)) if upto else logs
 
 
 class HyperRpc(RhRpc):
@@ -127,8 +136,7 @@ class HyperRpc(RhRpc):
         self.hs = hs
 
     def get_logs_multi(self, addresses, from_block: int, to_block: int, topics=None) -> list[dict]:
-        top = self.hs.height if to_block <= self.hs.height else self.hs.archive_height()
-        if to_block <= top:
-            return self.hs.get_logs(addresses, from_block, to_block, topics)
-        out = self.hs.get_logs(addresses, from_block, top, topics) if from_block <= top else []
-        return out + super().get_logs_multi(addresses, max(from_block, top + 1), to_block, topics)
+        out, through = self.hs.get_logs(addresses, from_block, to_block, topics, upto=True)
+        if through >= to_block:
+            return out
+        return out + super().get_logs_multi(addresses, max(from_block, through + 1), to_block, topics)

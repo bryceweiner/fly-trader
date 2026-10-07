@@ -12,20 +12,24 @@ def _no_pacing(monkeypatch):
     monkeypatch.setattr(config, "RH_HYPERSYNC_RPM", 1e6)
 
 
+seen_paths = []
+
+
 def _handler(pages):
     seen = []
 
     def handle(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
         if request.url.path == "/height":
             return httpx.Response(200, json={"height": 1000})
         import json
         body = json.loads(request.content); seen.append(body)
         lo, hi = body["from_block"], body["to_block"]
-        mid = min(hi, lo + pages)
+        mid = min(hi, lo + pages, 1001)                                       # the archive height is 1000
         logs = [{"block_number": b, "log_index": 0, "transaction_hash": f"0x{b:064x}", "block_hash": "0xbb", "address": "0xAA",
                  "data": "0x01", "topic0": "0xt0", "topic1": None} for b in range(lo, mid, 10)]
         blocks = [{"number": b, "timestamp": hex(1_790_000_000 + b)} for b in range(lo, mid, 10)]
-        return httpx.Response(200, json={"data": [{"logs": logs, "blocks": blocks}], "next_block": mid, "archive_height": 1000})
+        return httpx.Response(200, json={"data": [{"logs": logs, "blocks": blocks}], "next_block": max(mid, lo), "archive_height": 1000})
     return handle, seen
 
 
@@ -47,3 +51,4 @@ def test_blocks_past_the_archive_height_come_from_the_rpc(monkeypatch):
     monkeypatch.setattr(H.RhRpc, "get_logs_multi", lambda self, a, lo, hi, t=None: asked.append((lo, hi)) or [])
     logs = rpc.get_logs_multi(["0xaa"], 900, 1100)
     assert asked == [(1001, 1100)] and max(int(g["blockNumber"], 16) for g in logs) <= 1000
+    assert not any(r == "/height" for r in seen_paths)                           # no /height call on the hot path
