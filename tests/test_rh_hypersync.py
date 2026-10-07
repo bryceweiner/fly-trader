@@ -52,3 +52,18 @@ def test_blocks_past_the_archive_height_come_from_the_rpc(monkeypatch):
     logs = rpc.get_logs_multi(["0xaa"], 900, 1100)
     assert asked == [(1001, 1100)] and max(int(g["blockNumber"], 16) for g in logs) <= 1000
     assert not any(r == "/height" for r in seen_paths)                           # no /height call on the hot path
+
+
+def test_near_the_head_a_dedicated_rpc_serves_the_logs(monkeypatch):
+    handle, seen = _handler(pages=10_000)
+    hs = H.HyperSync("tok", url="https://hs.test", client=httpx.Client(transport=httpx.MockTransport(handle)))
+    hs.height = 100_000
+    rpc = H.HyperRpc(hs, url="https://rpc.test", chain_id=4663)
+    asked = []
+    monkeypatch.setattr(H.RhRpc, "get_logs_multi", lambda self, a, lo, hi, t=None: asked.append((lo, hi)) or [])
+    monkeypatch.setattr(config, "RH_RPC_URL_LOGS", "https://quicknode.example")
+    rpc.get_logs_multi(["0xaa"], 99_900, 100_010)                              # the live tail
+    assert asked == [(99_900, 100_010)] and seen == []                        # HyperSync not asked at all
+    monkeypatch.setattr(config, "RH_RPC_URL_LOGS", None)
+    hs.height = 1000; asked.clear(); rpc.get_logs_multi(["0xaa"], 900, 1000)   # (the mock's archive height is 1000)
+    assert asked == [] and len(seen) == 1                                     # no dedicated RPC: HyperSync as before

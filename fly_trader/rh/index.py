@@ -33,6 +33,8 @@ IDS_PER_REQUEST = 200
 TOKENS_PER_REQUEST = 200
 FEE_OBS = 20                           # hook-fee logs read per pool before its fee is taken as known
 TOKENS_PER_REQUEST_BULK = 5000         # HyperSync: bounded by its 2 MB request body, not a log cap
+IDS_PER_REQUEST_BULK = 5000            # 66-char pool ids: ~0.35 MB of filter per request
+LIVE_SPAN_BULK = 20_000                # an index range this small is live: PoolManager events unfiltered (one query)
 TX_BATCH = 100
 TRANSFER = abi.event_topic("Transfer(address,address,uint256)")
 PONS_DECIMALS = 18                          # every Pons launch mints 1e9 × 1e18 raw
@@ -270,11 +272,15 @@ def step(conn, rpc, lo: int, hi: int) -> dict:
     ids = [r["pool_id"] for r in conn.execute("SELECT pool_id FROM rh_pools WHERE is_pons ORDER BY pool_id").fetchall()]
     need = [r["pool_id"] for r in conn.execute("SELECT pool_id FROM rh_pools WHERE is_pons AND hook_fee IS NULL ORDER BY pool_id").fetchall()]
     fee_topic = [pons.TOPIC["HookFeeCollected"]]
-    per = (len(ids) or 1) if bulk else IDS_PER_REQUEST
     v4_logs, fee_logs = [], []
-    for i in range(0, len(ids), per):                             # swaps of every Pons pool (one query on HyperSync)
-        v4_logs += _get_logs(rpc, [config.V4_POOL_MANAGER], lo, hi, [topics0, ids[i:i + per]])
-    per = (len(need) or 1) if bulk else IDS_PER_REQUEST
+    if bulk and hi - lo + 1 <= LIVE_SPAN_BULK:                     # a live range: every PoolManager event, matched to Pons pools here
+        mine = set(ids)                                             # (10k+ pool ids make a ~0.7 MB filter; HyperSync caps bodies at 2 MB)
+        v4_logs = [g for g in _get_logs(rpc, [config.V4_POOL_MANAGER], lo, hi, [topics0]) if len(g["topics"]) > 1 and g["topics"][1].lower() in mine]
+    else:
+        per = IDS_PER_REQUEST_BULK if bulk else IDS_PER_REQUEST
+        for i in range(0, len(ids), per):                           # swaps of every Pons pool, in id chunks
+            v4_logs += _get_logs(rpc, [config.V4_POOL_MANAGER], lo, hi, [topics0, ids[i:i + per]])
+    per = IDS_PER_REQUEST_BULK if bulk else IDS_PER_REQUEST
     for i in range(0, len(need), per):                            # hook fees only of pools whose fee is not known yet
         fee_logs += _get_logs(rpc, [config.PONS_HOOK], lo, hi, [fee_topic, need[i:i + per]])
     fees = [e for e in (pons.decode(x) for x in _order(fee_logs)) if e is not None and e["event"] == "HookFeeCollected"]

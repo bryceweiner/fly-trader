@@ -19,6 +19,8 @@ from .rpc import RhRpc
 
 LOG_FIELDS = ["block_number", "log_index", "transaction_hash", "block_hash", "address", "data", "topic0", "topic1", "topic2", "topic3"]
 TRIES = 8
+LIVE_TIMEOUT_S = 15.0
+LIVE_SPAN = 20_000                          # a read of at most this many blocks is a live read (the stream near the head)
 _PACE_LOCK = threading.Lock()
 _LAST = [0.0]
 
@@ -61,12 +63,15 @@ class HyperSync:
                                            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
         self.height = 0
 
-    def _post(self, body: dict) -> dict:
+    def _post(self, body: dict, live: bool = False) -> dict:
         for i in range(TRIES):
             _pace()
             t0 = time.monotonic(); status = None; err = None; retry_after = None
             try:
-                r = self.http.post(f"{self.url}/query", json=body); status = r.status_code
+                # a live read answers in well under a second; one stuck on a dropped connection (seen 20-62 s, 2026-10-07)
+                # is abandoned after LIVE_TIMEOUT_S and sent again on a fresh connection
+                r = self.http.post(f"{self.url}/query", json=body, timeout=httpx.Timeout(LIVE_TIMEOUT_S, connect=5.0) if live else httpx.USE_CLIENT_DEFAULT)
+                status = r.status_code
                 if r.status_code == 200:
                     return r.json()
                 err = f"HTTP {r.status_code}: {r.text[:200]}"
@@ -78,6 +83,8 @@ class HyperSync:
                 err = type(e).__name__
             finally:
                 record_api_call("rh_hypersync", "/query", "POST", status, int((time.monotonic() - t0) * 1000), err is None, err)
+            if retry_after is None and err in ("ReadTimeout", "ConnectTimeout", "ConnectError", "RemoteProtocolError", "ReadError", "WriteError"):
+                retry_after = 0.5 if i == 0 else min(10.0, 1.0 * 2 ** i)     # a dead connection: retry at once on a new one
             time.sleep(retry_after if retry_after is not None else min(60.0, 5.0 * 2 ** i))       # a rate-limit window resets within a minute
         raise HyperSyncError(f"HyperSync failed {TRIES} times: {err}")
 
@@ -106,8 +113,9 @@ class HyperSync:
         if topics:
             sel["topics"] = _topics(topics)
         out, ts, frm = [], {}, lo
+        live = hi - lo + 1 <= LIVE_SPAN
         while frm <= hi:
-            d = self._post({"from_block": frm, "to_block": hi + 1, "logs": [sel], "field_selection": {"log": LOG_FIELDS, "block": ["number", "timestamp"]}})
+            d = self._post({"from_block": frm, "to_block": hi + 1, "logs": [sel], "field_selection": {"log": LOG_FIELDS, "block": ["number", "timestamp"]}}, live=live)
             for part in d.get("data") or []:
                 for b in part.get("blocks") or []:
                     ts[int(b["number"])] = int(b["timestamp"], 16) if isinstance(b["timestamp"], str) else int(b["timestamp"])
@@ -136,6 +144,8 @@ class HyperRpc(RhRpc):
         self.hs = hs
 
     def get_logs_multi(self, addresses, from_block: int, to_block: int, topics=None) -> list[dict]:
+        if config.RH_RPC_URL_LOGS and self.hs.height and from_block > self.hs.height - LIVE_SPAN:
+            return super().get_logs_multi(addresses, from_block, to_block, topics)      # near the head: the dedicated RPC
         out, through = self.hs.get_logs(addresses, from_block, to_block, topics, upto=True)
         if through >= to_block:
             return out
