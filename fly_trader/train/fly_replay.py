@@ -154,6 +154,9 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
             raise RuntimeError("the match calibration rule needs the bootstrap's teacher (fly.teacher)")
         prog.update("fly replay: the teacher's decisions for the match rule", 0, 1, force=True)
         allowed = fly_selector.teacher_allowed(fly.teacher, ds.X[order], ds.ts[order], names)
+    gate = None
+    if config.FLY_TEACHER_GATE and allowed is not None:        # the fly buys only what its teacher buys, as the live fly (agent/fly_session._gated)
+        gate = np.zeros((len(ds.y), NS), bool); gate[order] = allowed
     pending = plastic.PendingTags(fly.net.n_kc, fly.net.k_active)
     labels = [torch.tensor(_labels(ds, h), dtype=torch.float32) for h in holds_min]
     starts = np.flatnonzero(np.r_[True, ts_o[1:] != ts_o[:-1]]); ends = np.r_[starts[1:], n]
@@ -208,7 +211,7 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
                         updates=n_updates, pending=len(pending), drift=[round(float(x), 4) for x in bank.drift()], eta_s=(n - b) * (time.time() - t0) / max(b, 1))
         g = g1
     return _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_counts, boot, S, save_verdict, time.time() - t0, fly, names, holds_min, lines, learn,
-                    size_log=size_log if (save_verdict if dump_trades is None else dump_trades) else None, slots=slots, only_chains=only_chains)
+                    size_log=size_log if (save_verdict if dump_trades is None else dump_trades) else None, slots=slots, only_chains=only_chains, gate=gate)
 
 
 def _learn_add(learn: dict, now: float, st: dict) -> None:
@@ -330,8 +333,19 @@ def _arm(ds, order, ts_o, scores_cs, line_log, key, default_line, mask_pos, slot
     return S_full, L_full
 
 
+def _gated_ok(ds, order, ts_o, scores, line_log, c: int, s_: int, Sf, Lf, mask_pos, gate, slots: Slots | None, slot_defaults, boot_line) -> np.ndarray:
+    """Rows configuration ``c`` trades for strategy ``s_``: its line without a gate; with one, the teacher's own decisions
+    (``gate``) minus the learned vetoes (its score more than FLY_LEARNED_VETO below the frozen fly's, configuration 0)."""
+    if gate is None:
+        return Sf >= Lf
+    in_mask = np.zeros(len(ds.y), bool); in_mask[order[mask_pos]] = True
+    S0, _ = _arm(ds, order, ts_o, scores[0, s_], line_log, (0, s_), boot_line, mask_pos, slots, slot_defaults)
+    veto = np.isfinite(Sf) & np.isfinite(S0) & (Sf < S0 - config.FLY_LEARNED_VETO)
+    return gate[:, s_] & in_mask & ~veto
+
+
 def _book(ds, order, ts_o, scores, line_log, choice: list[int], boot_lines: list[float], holds_min, mask_pos, detail: bool = False,
-          slots: Slots | None = None, boot_slot_lines=None):
+          slots: Slots | None = None, boot_slot_lines=None, gate: np.ndarray | None = None):
     """The combined book of the per-strategy choices: per row, among the strategies at/above their line in force, the one
     with the largest margin; returns (pick, per-row hold s, per-row return), and with ``detail`` also (per-row strategy index
     or -1, per-row margin over its line)."""
@@ -340,8 +354,9 @@ def _book(ds, order, ts_o, scores, line_log, choice: list[int], boot_lines: list
         Sf, Lf = _arm(ds, order, ts_o, scores[c, s_], line_log, (c, s_), boot_lines[s_], mask_pos, slots,
                       [boot_slot_lines[s_ + slots.NS * ci] for ci in range(len(slots.chains))] if slots else None)
         lab = _labels(ds, holds_min[s_])
-        ok = (Sf >= Lf) & np.isfinite(lab)          # a row whose hold runs past the corpus has no label: not a trade
-        m = np.where(ok, Sf - Lf, -np.inf); take = ok & (m > key)
+        sd = [boot_slot_lines[s_ + slots.NS * ci] for ci in range(len(slots.chains))] if slots else None
+        ok = _gated_ok(ds, order, ts_o, scores, line_log, c, s_, Sf, Lf, mask_pos, gate, slots, sd, boot_lines[s_]) & np.isfinite(lab)   # no label: not a trade
+        m = np.where(ok, np.where(np.isfinite(Sf - Lf), Sf - Lf, 0.0), -np.inf); take = ok & (m > key)
         key = np.where(take, m, key); pick |= ok; who = np.where(take, s_, who)
         hold = np.where(take, holds_min[s_] * 60.0, hold); ret = np.where(take, lab, ret)
     return (pick, hold, ret, who, key) if detail else (pick, hold, ret)
@@ -357,13 +372,13 @@ def _table_at(log_s: list, t: float) -> list:
 
 
 def _dump_trades(ds, order, ts_o, scores, line_log, size_log, choice, boot_lines, holds_min, names, mask_pos, day_o, sel_days, slots: Slots | None = None,
-                 boot_slot_lines=None) -> str | None:
+                 boot_slot_lines=None, gate: np.ndarray | None = None) -> str | None:
     """The chosen book's trades over the replay's live days (one position per token, as ``evaluate`` counts them): entry
     time, token, strategy, margin over the line in force, hold, net return (at the label size), the pool's quote reserve,
     the half, and the sizing table in force — what ``agent/sizing.simulate_bankroll`` needs to replay a sizing rule on the
     fly's own out-of-sample trades. Written next to the verdict as ``data/brain/replay/trades_<S>.json``."""
     pick, hold, ret, who, margin = _book(ds, order, ts_o, scores, line_log, choice, boot_lines, holds_min, mask_pos, detail=True, slots=slots,
-                                         boot_slot_lines=boot_slot_lines)
+                                         boot_slot_lines=boot_slot_lines, gate=gate)
     row_chain = ds.chains()
     rows = np.flatnonzero(who >= 0)
     if not len(rows):
@@ -410,7 +425,7 @@ def merge_chains(row, out: dict, only_chains: tuple) -> dict:
 
 
 def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_counts, boot, S, save_verdict, secs, fly, names, holds_min, lines, learn=None,
-             size_log: dict | None = None, slots: Slots | None = None, only_chains: tuple | None = None) -> dict:
+             size_log: dict | None = None, slots: Slots | None = None, only_chains: tuple | None = None, gate: np.ndarray | None = None) -> dict:
     days_r = sorted(set(ds.day[order[live_from:]].tolist()))
     sel_days, ev_days = days_r[: len(days_r) // 2], days_r[len(days_r) // 2:]
     day_o = ds.day[order]
@@ -425,7 +440,8 @@ def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_co
         y = _labels(ds, holds_min[s_]); table = []
         for c, (alpha, hl) in enumerate(configs):
             Sf, Lf = _arm(ds, order, ts_o, scores[c, s_], line_log, (c, s_), boot_lines[s_], sel_pos, slots, slot_def(s_))
-            tr = taken_idx(ds.ts, ds.mint, holds_min[s_] * 60.0, np.flatnonzero(Sf >= Lf)); r = y[tr]
+            okc = _gated_ok(ds, order, ts_o, scores, line_log, c, s_, Sf, Lf, sel_pos, gate, slots, slot_def(s_), boot_lines[s_])
+            tr = taken_idx(ds.ts, ds.mint, holds_min[s_] * 60.0, np.flatnonzero(okc)); r = y[tr]
             table.append({"config": c, "alpha": alpha, "half_life_days": hl if math.isfinite(hl) else None, "trades": int(len(r)), "total": float(np.nansum(r)),
                           "mean": float(np.nanmean(r)) if len(r) else None, "governance": gov_counts.get((c, s_))})
         ok = [t for t in table if t["alpha"] > 0 and t["trades"] >= MIN_TRADES]
@@ -438,7 +454,7 @@ def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_co
 
     def judge(ch, chain: str | None = None):
         """The evaluation half's book of configuration choice ``ch``: every chain together, or only ``chain``'s rows."""
-        pick, hold, ret = _book(ds, order, ts_o, scores, line_log, ch, boot_lines, holds_min, ev_pos, slots=slots, boot_slot_lines=boot_slot)
+        pick, hold, ret = _book(ds, order, ts_o, scores, line_log, ch, boot_lines, holds_min, ev_pos, slots=slots, boot_slot_lines=boot_slot, gate=gate)
         test = np.zeros(len(ds.y), bool); test[order[ev_pos]] = True
         if chain is not None:
             test &= row_chain == chain
@@ -480,7 +496,7 @@ def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_co
     if size_log is not None and any(v["plastic"] for v in per_strategy.values()):
         try:
             out["trades_file"] = _dump_trades(ds, order, ts_o, scores, line_log, size_log, choice, boot_lines, holds_min, names, live_pos, day_o, sel_days,
-                                              slots=slots, boot_slot_lines=boot_slot)
+                                              slots=slots, boot_slot_lines=boot_slot, gate=gate)
         except Exception:
             log.exception("could not write the replay's trades (the verdict is unaffected)")
     log.info("fly replay from %s: %s — %s | frozen %s", S, "PASSED" if out.get("passed") else "FAILED", out.get("reason"), out["frozen"])

@@ -114,6 +114,11 @@ FLY_CALIB_RULE = env_str("FLY_CALIB_RULE", "match")
 # = its calibrated bands. A selective fly resolves too few trades a week for bands: they flipped between Kelly 0.97, 0 and
 # 0.15, and flat sizing beat them in 98 % of resampled replays.
 FLY_SIZING = env_str("FLY_SIZING", "flat")
+# The fly buys only what its teacher (the deployed selector stack) would buy: the same trigger, line, win filter, gates,
+# dump veto and fail-closed rules. Its own learning (plastic score below its bootstrap score by FLY_LEARNED_VETO) can
+# only drop a teacher trade, never add one (2026-10-08: ungated, the fly bought rows the selector rejected and lost).
+FLY_TEACHER_GATE = env_bool("FLY_TEACHER_GATE", True)
+FLY_LEARNED_VETO = env_float("FLY_LEARNED_VETO", 0.02)
 DEVICE = env_str("DEVICE", "auto")          # auto (CUDA, else MPS, else CPU) | cpu | cuda | cuda:N | mps  — brain/device.py
 NT_SIGN_MODE = env_str("NT_SIGN_MODE", "shiu")  # shiu | flybrain
 CELL_TYPES_SOURCE = env_str("CELL_TYPES_SOURCE", "annotations")  # annotations | flybrain
