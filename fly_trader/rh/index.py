@@ -37,6 +37,9 @@ IDS_PER_REQUEST_BULK = 5000            # 66-char pool ids: ~0.35 MB of filter pe
 LIVE_SPAN_BULK = 20_000                # an index range this small is live: PoolManager events unfiltered (one query)
 TX_BATCH = 100
 TRANSFER = abi.event_topic("Transfer(address,address,uint256)")
+PONS_TOPICS = [[pons.TOPIC[k] for k in (*pons.FACTORY_EVENTS, "Launched", *pons.HOOK_EVENTS) if k != "HookFeeCollected"]]
+V4_TOPICS0 = [v4.TOPIC["Initialize"], v4.TOPIC["Swap"], v4.TOPIC["ModifyLiquidity"]]
+FEE_TOPIC = pons.TOPIC["HookFeeCollected"]
 PONS_DECIMALS = 18                          # every Pons launch mints 1e9 × 1e18 raw
 STABLES = ("USDG", "USDC", "USDT", "PYUSD", "USDE")
 
@@ -87,7 +90,8 @@ def _get_logs(rpc, addresses, lo, hi, topics):
             mid = (lo + hi) // 2
             return _get_logs(rpc, addresses, lo, mid, topics) + _get_logs(rpc, addresses, mid + 1, hi, topics)
         raise
-    scan.pause()
+    if not getattr(rpc, "served_last", False):                # a read answered from a live pass's memory needs no pause
+        scan.pause()
     return out
 
 
@@ -261,17 +265,16 @@ def apply_v4(conn, rpc, logs: list[dict], fees: list[dict]) -> dict:
 
 def step(conn, rpc, lo: int, hi: int) -> dict:
     """Index blocks lo..hi (inclusive) into ``conn`` (the caller commits with the cursor)."""
-    pons_topics = [[pons.TOPIC[k] for k in (*pons.FACTORY_EVENTS, "Launched", *pons.HOOK_EVENTS) if k != "HookFeeCollected"]]
-    topics0 = [v4.TOPIC["Initialize"], v4.TOPIC["Swap"], v4.TOPIC["ModifyLiquidity"]]
+    topics0 = V4_TOPICS0
     bulk = hasattr(rpc, "hs")                                     # HyperSync: no per-query cap, so no pool-id chunks
-    main = _get_logs(rpc, [config.PONS_FACTORY, config.PONS_ROUTER, config.PONS_HOOK], lo, hi, pons_topics)
+    main = _get_logs(rpc, [config.PONS_FACTORY, config.PONS_ROUTER, config.PONS_HOOK], lo, hi, PONS_TOPICS)
     evs = [pons.decode(x) for x in _order(main)]
     evs = [e for e in evs if e is not None]
     fill_timestamps(rpc, evs, lo, hi)
     n = apply_pons(conn, rpc, evs)
     ids = [r["pool_id"] for r in conn.execute("SELECT pool_id FROM rh_pools WHERE is_pons ORDER BY pool_id").fetchall()]
     need = [r["pool_id"] for r in conn.execute("SELECT pool_id FROM rh_pools WHERE is_pons AND hook_fee IS NULL ORDER BY pool_id").fetchall()]
-    fee_topic = [pons.TOPIC["HookFeeCollected"]]
+    fee_topic = [FEE_TOPIC]
     v4_logs, fee_logs = [], []
     if bulk and hi - lo + 1 <= LIVE_SPAN_BULK:                     # a live range: every PoolManager event, matched to Pons pools here
         mine = set(ids)                                             # (10k+ pool ids make a ~0.7 MB filter; HyperSync caps bodies at 2 MB)
@@ -297,12 +300,13 @@ def start_block(rpc) -> int:
     return block_at(rpc, datetime.fromisoformat(config.RH_START_DAY).replace(tzinfo=timezone.utc).timestamp())
 
 
-def run_once(rpc: RhRpc | None = None, *, head_margin: int | None = None, max_ranges: int = 1) -> dict:
-    """Advance the cursor by up to ``max_ranges`` ranges, each ending at most ``head − head_margin`` (RH_CONFIRMATIONS).
+def run_once(rpc: RhRpc | None = None, *, head_margin: int | None = None, max_ranges: int = 1, head: int | None = None) -> dict:
+    """Advance the cursor by up to ``max_ranges`` ranges, each ending at most ``head − head_margin`` (RH_CONFIRMATIONS);
+    ``head``: the last block to index, already settled (a live pass's fetched range, rh/prefetch.py).
     Returns {through, head, ranges, counts}."""
     rpc = rpc or logs_rpc()
     margin = config.RH_CONFIRMATIONS if head_margin is None else head_margin
-    head = rpc.block_number() - margin
+    head = rpc.block_number() - margin if head is None else head
     total: dict = {}; done = 0
     with transaction() as conn:
         at, rng = scan.cursor(conn, CURSOR, -1)

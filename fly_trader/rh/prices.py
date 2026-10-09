@@ -159,12 +159,12 @@ def base_eth(conn, asset: str | None, ts) -> tuple[float | None, bool]:
     return float(r["price_eth"]), bool(r["stale"]) or age > STALE_S
 
 
-def run_once(max_ranges: int = 1) -> dict:
+def run_once(max_ranges: int = 1, rpc=None) -> dict:
     """Advance every traded quote asset's price cursor (``price:<asset>``) toward the index cursor, all in lockstep: each
     round takes the range after the laggard's cursor, fetches every distinct reference pool's swaps in it once (the
     stock paths share USDG → WETH), times them once, and moves every asset whose cursor is inside the range."""
     from . import blocktime
-    rpc = logs_rpc(); out: dict = {}
+    rpc = rpc or logs_rpc(); out: dict = {}          # the stream's (one connection, a live pass's memory), not a new one per pass
     with transaction() as conn:
         top = conn.execute("SELECT block, detail FROM rh_scan WHERE name = 'rh'").fetchone()
         rows = conn.execute("SELECT DISTINCT a.asset, a.decimals, a.ref_path FROM rh_assets a JOIN rh_pools p ON p.quote_asset = a.asset "

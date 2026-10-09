@@ -27,7 +27,8 @@ from . import prices
 RESQ_BAND_SOL = (0.001, 100000.0)          # ingest/pumpstream.RESQ_BAND
 PRICE_BAND = 50.0
 REF_LEGS = 200
-GRACE_S = 20                               # a minute is complete once the index is this far past its end
+GRACE_S = 2                                # a minute is complete once the index is this far past its end: block times never
+#   decrease, so every swap before the minute's end is indexed once a later block is (ingest/pumpstream.FLUSH_GRACE_S; 20 until 2026-10-09)
 
 
 class _Row:

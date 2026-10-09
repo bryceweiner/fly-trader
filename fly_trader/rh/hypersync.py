@@ -63,8 +63,9 @@ class HyperSync:
                                            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
         self.height = 0
 
-    def _post(self, body: dict, live: bool = False) -> dict:
-        for i in range(TRIES):
+    def _post(self, body: dict, live: bool = False, tries: int = TRIES) -> dict:
+        err = None
+        for i in range(tries):
             _pace()
             t0 = time.monotonic(); status = None; err = None; retry_after = None
             try:
@@ -85,8 +86,10 @@ class HyperSync:
                 record_api_call("rh_hypersync", "/query", "POST", status, int((time.monotonic() - t0) * 1000), err is None, err)
             if retry_after is None and err in ("ReadTimeout", "ConnectTimeout", "ConnectError", "RemoteProtocolError", "ReadError", "WriteError"):
                 retry_after = 0.5 if i == 0 else min(10.0, 1.0 * 2 ** i)     # a dead connection: retry at once on a new one
+            if i == tries - 1:
+                break
             time.sleep(retry_after if retry_after is not None else min(60.0, 5.0 * 2 ** i))       # a rate-limit window resets within a minute
-        raise HyperSyncError(f"HyperSync failed {TRIES} times: {err}")
+        raise HyperSyncError(f"HyperSync failed {tries} times: {err}")
 
     def archive_height(self) -> int:
         err = None
@@ -107,15 +110,20 @@ class HyperSync:
         """Logs in blocks lo..hi (inclusive), eth_getLogs-shaped, in chain order. With ``upto`` the read stops at
         HyperSync's archive height (each response reports it) and (logs, last block covered) is returned; the caller
         reads the rest elsewhere, so the hot path never asks /height."""
-        sel: dict = {}
-        if addresses:
-            sel["address"] = [a.lower() for a in addresses]
-        if topics:
-            sel["topics"] = _topics(topics)
+        logs, through, _ = self.get_logs_sel([selection(addresses, topics)], lo, hi, upto=upto)
+        return (logs, through) if upto else logs
+
+    def get_logs_sel(self, sels: list[dict], lo: int, hi: int, upto: bool = False, tries: int = TRIES, all_blocks: bool = False):
+        """(logs, last block covered, {block: timestamp}) for several selections (``selection``) in one query: the union
+        of their logs, each once, in chain order. ``all_blocks``: every block's timestamp in the range, not only those
+        with a selected log (a live pass learns its last block's time without asking the RPC)."""
         out, ts, frm = [], {}, lo
         live = hi - lo + 1 <= LIVE_SPAN
         while frm <= hi:
-            d = self._post({"from_block": frm, "to_block": hi + 1, "logs": [sel], "field_selection": {"log": LOG_FIELDS, "block": ["number", "timestamp"]}}, live=live)
+            body = {"from_block": frm, "to_block": hi + 1, "logs": sels, "field_selection": {"log": LOG_FIELDS, "block": ["number", "timestamp"]}}
+            if all_blocks:
+                body["include_all_blocks"] = True
+            d = self._post(body, live=live, tries=tries)
             for part in d.get("data") or []:
                 for b in part.get("blocks") or []:
                     ts[int(b["number"])] = int(b["timestamp"], 16) if isinstance(b["timestamp"], str) else int(b["timestamp"])
@@ -131,9 +139,23 @@ class HyperSync:
             frm = nxt
             if upto and ah is not None and frm > int(ah):
                 break                                       # covered everything HyperSync has
-        logs = [to_rpc_log(g, ts) for g in out]
+        seen = set(); logs = []
+        for g in out:                                       # a log two selections both match comes back twice
+            k = (int(g["block_number"]), int(g["log_index"]))
+            if k not in seen:
+                seen.add(k); logs.append(to_rpc_log(g, ts))
         logs.sort(key=lambda x: (int(x["blockNumber"], 16), int(x["logIndex"], 16)))
-        return (logs, min(hi, frm - 1)) if upto else logs
+        return logs, (min(hi, frm - 1) if upto else hi), ts
+
+
+def selection(addresses: list[str] | None, topics: list | None = None) -> dict:
+    """One HyperSync log selection from eth_getLogs' (addresses, topics)."""
+    sel: dict = {}
+    if addresses:
+        sel["address"] = [a.lower() for a in addresses]
+    if topics:
+        sel["topics"] = _topics(topics)
+    return sel
 
 
 class HyperRpc(RhRpc):
