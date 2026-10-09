@@ -37,6 +37,26 @@ sys.path.insert(0, str(REPO / "deploy"))
 import fly_update  # noqa: E402  (the server's verifier, reused so both sides agree)
 
 
+# Hugging Face reads a model card's metadata from YAML at the top of README.md; GitHub would show it as a table, so it is
+# added to the staged copy only (the manual uploads before signed releases prepended it by hand)
+HF_CARD = """---
+license: mit
+pipeline_tag: reinforcement-learning
+library_name: pytorch
+tags:
+  - solana
+  - memecoin
+  - pump.fun
+  - robinhood-chain
+  - trading
+  - connectome
+  - drosophila
+  - flywire
+---
+
+"""
+
+
 def sh(*args, cwd=None, check=True, capture=True) -> str:
     r = subprocess.run(list(args), cwd=cwd, check=check, capture_output=capture, text=True)
     return (r.stdout or "").strip()
@@ -68,6 +88,8 @@ def stage(worktree: Path, dest: Path) -> list[dict]:
         if not fly_update.PATH_RE.match(rel):
             raise SystemExit(f"path not allowed in a release: {rel}")
         dst = dest / rel; dst.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(src, dst)
+        if rel == "README.md" and not dst.read_text().startswith("---"):
+            dst.write_text(HF_CARD + dst.read_text())
         out.append({"path": rel, "sha256": fly_update.sha256_file(dst), "size": dst.stat().st_size, "class": fly_update.classify(rel)})
     return out
 
