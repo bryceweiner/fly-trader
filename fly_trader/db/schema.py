@@ -297,6 +297,12 @@ def apply_schema(url: str | None = None) -> int:
                 from ..vault.schema import VAULT_DDL     # idempotent, outside the ladder: same DDL on master and distribution
                 for stmt in VAULT_DDL:
                     cur.execute(stmt)
+                from ..rh.schema import RH_DDL           # idempotent, outside the ladder: the Robinhood Chain market (fly_trader/rh)
+                for stmt in RH_DDL:
+                    cur.execute(stmt)
+                from ..vault.eth_schema import ETH_DDL    # the vault's ETH pot (Robinhood Chain profits paid in ETH)
+                for stmt in ETH_DDL:
+                    cur.execute(stmt)
                 target = max(current, SCHEMA_VERSION)
                 cur.execute(
                     "INSERT INTO schema_version (singleton, version) VALUES (true, %s) "

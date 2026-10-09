@@ -110,6 +110,13 @@ def apply_release(release_dir: Path, bootstrap: bool = False) -> dict:
             _set(conn, "pinned_selector_snapshot", {"id": ids[pin], "why": f"release {seed.get('seq')}", "pinned_at": time.strftime("%Y-%m-%d")})
         if bootstrap and seed.get("autostart"):
             conn.execute("INSERT INTO ui_settings (key, value) VALUES ('autostart', %s) ON CONFLICT (key) DO NOTHING", (json.dumps(seed["autostart"]),))
+        for a in seed.get("rh_assets") or []:          # Robinhood Chain reference rows (tools/make_seed.py); an existing row is kept
+            conn.execute("INSERT INTO rh_assets (asset, symbol, class, decimals, approved, graduation_threshold_raw, ref_pool, ref_kind, ref_quote, "
+                         "ref_fee_bps, trading_hours, note, ref_path) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (asset) DO NOTHING",
+                         (str(a["asset"]).lower(), a.get("symbol"), a["class"], int(a["decimals"]), bool(a.get("approved", True)),
+                          a.get("graduation_threshold_raw"), a.get("ref_pool"), a.get("ref_kind"), a.get("ref_quote"), a.get("ref_fee_bps"),
+                          None if a.get("trading_hours") is None else json.dumps(a["trading_hours"]), a.get("note"),
+                          None if a.get("ref_path") is None else json.dumps(a["ref_path"])))
         _set(conn, "release", {"seq": seed.get("seq"), "git_commit": seed.get("git_commit"), "applied_at": int(time.time()),
                                "fly": ids.get(next((s["sha256"] for s in seed["snapshots"] if s["kind"] == "fly_selector"), ""))})
         _set(conn, "release_applied_at", int(time.time()))

@@ -14,6 +14,7 @@ from __future__ import annotations
 import numpy as np
 
 from .. import config
+from ..market.exit_cost import label_size
 
 N_BANDS = 4
 MIN_BAND_TRADES = 50
@@ -57,27 +58,37 @@ def band_for(table: list[dict], margin: float) -> dict | None:
 
 
 def size_position(score: float, threshold: float, table: list[dict] | None, bankroll_sol: float, cash_sol: float,
-                  res_quote_sol: float | None) -> tuple[float, str]:
-    """(size in SOL, why). Size 0 means skip the buy."""
-    reserve = config.GAS_RESERVE_SOL; free = cash_sol - reserve
+                  res_quote_sol: float | None, market=None) -> tuple[float, str]:
+    """(size in the book's unit, why). Size 0 means skip the buy. ``market`` (fly_trader/markets; default Solana): a
+    Robinhood Chain book sizes with its own gas reserve and minimum position, a table-less model's ``MAX_POSITION_SOL``
+    in ETH (× K), and never buys above its label size (``RH_LABEL_SIZE_ETH``, or ``MAX_POOL_SHARE`` of the pool)."""
+    rh = market is not None and market.chain != "sol"
+    reserve = market.gas_reserve() if rh else config.GAS_RESERVE_SOL; free = cash_sol - reserve
+    min_pos = market.min_position() if rh else config.MIN_POSITION_SOL
+    unit = market.unit if rh else "SOL"
     if not table:
-        size = config.MAX_POSITION_SOL
-        return (size, f"fixed {size:g} SOL (model has no sizing table)") if free >= size else (0.0, "not enough free cash")
+        size = config.MAX_POSITION_SOL * (market.k() if rh else 1.0)
+        if rh:                               # never above the RH label size, even for a table-less model
+            size = min(size, label_size(res_quote_sol, market))
+        return (size, f"fixed {size:g} {unit} (model has no sizing table)") if free >= size else (0.0, "not enough free cash")
     b = band_for(table, score - threshold)
     if b is None or b["kelly"] <= 0:
         return 0.0, "no edge in this score band"
     deployable = max(0.0, bankroll_sol - reserve)
     size = config.KELLY_FRACTION * b["kelly"] * deployable
     caps = {"bankroll cap": config.MAX_POSITION_FRACTION * deployable, "free cash": free}
-    if res_quote_sol:
+    if rh:                                   # the size every RH label was priced at: past it the edge is an extrapolation
+        caps["label size"] = label_size(res_quote_sol, market)
+    elif res_quote_sol:
         caps["pool depth"] = config.MAX_POOL_SHARE * res_quote_sol
     limit = min(caps, key=caps.get)
-    why = f"band from +{b['lo']:.3f} over the line: Kelly {b['kelly']:.2f} × {config.KELLY_FRACTION:g} of {deployable:.2f} SOL"
+    why = f"band from +{b['lo']:.3f} over the line: Kelly {b['kelly']:.2f} × {config.KELLY_FRACTION:g} of {deployable:.2f} {unit}"
     if caps[limit] < size:
         size = caps[limit]; why += f", capped by {limit}"
-    if size < config.MIN_POSITION_SOL:
-        return 0.0, why + f" → {size:.3f} SOL is below the {config.MIN_POSITION_SOL:g} SOL minimum"
-    return float(size), why + f" → {size:.3f} SOL"
+    if size < min_pos:
+        return 0.0, why + f" → {size:.6g} {unit} is below the {min_pos:g} {unit} minimum" if rh else \
+            why + f" → {size:.3f} SOL is below the {config.MIN_POSITION_SOL:g} SOL minimum"
+    return float(size), why + (f" → {size:.6g} {unit}" if rh else f" → {size:.3f} SOL")
 
 
 def simulate_bankroll(ts: np.ndarray, horizon_s, margins: np.ndarray, returns: np.ndarray, table: list[dict] | None,

@@ -130,7 +130,8 @@ def test_the_handover_gate_reads_its_thresholds_from_config(db_conn, monkeypatch
     count, and HANDOVER_BEAT_SELECTOR=0 drops the race against the paper selector."""
     from fly_trader.agent import fly_session, handover
     now = datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc); race = now - timedelta(days=2)
-    stub = SimpleNamespace(race_started_at=race.timestamp(), boot_id=62)
+    from fly_trader import markets
+    stub = SimpleNamespace(race_started_at=race.timestamp(), boot_id=62, chain="sol", market=markets.SOL, BOOK="paper_fly")
     with transaction() as conn:
         conn.execute("DELETE FROM ui_settings WHERE key = %s", (handover.KEY,)); conn.execute("DELETE FROM positions WHERE mint LIKE 'HAND_%%'")
         for i in range(20):

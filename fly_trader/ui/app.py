@@ -35,6 +35,7 @@ pages = [
     st.Page("app_pages/trades.py", title="Trades", icon=":material/swap_horiz:"),
     st.Page("app_pages/model.py", title="Model & training", icon=":material/psychology:"),
     st.Page("app_pages/data.py", title="Data pipelines", icon=":material/database:"),
+    st.Page("app_pages/rh.py", title="Robinhood Chain", icon=":material/link:", url_path="rh"),
     st.Page("app_pages/processes.py", title="Processes", icon=":material/settings_applications:"),
     st.Page("app_pages/safety.py", title="Safety & wallet", icon=":material/shield:"),
     st.Page("app_pages/vault.py", title="$FLY vault", icon=":material/savings:", url_path="vault"),

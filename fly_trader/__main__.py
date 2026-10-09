@@ -183,6 +183,21 @@ def _cmd_worker(args):
     procs.worker_cli(args.action, args.name)
 
 
+def _cmd_rh_backfill(args):
+    from .rh import stream
+    stream.main()
+
+
+def _cmd_rh_status(args):
+    from .rh import stream
+    print(json.dumps(stream.status(), indent=1, default=str))
+
+
+def _cmd_rh_probe(args):
+    from .rh import probe
+    print(json.dumps(probe.run(sample=args.sample), indent=1, default=str))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="fly-trader")
     sub = p.add_subparsers(dest="command", required=True)
@@ -234,6 +249,10 @@ def build_parser() -> argparse.ArgumentParser:
     from .vault import cli as vault_cli
     vault_cli.add(sub)
     wk = sub.add_parser("worker"); wk.add_argument("action", choices=["start", "stop", "status"]); wk.add_argument("name", nargs="?"); wk.set_defaults(fn=_cmd_worker)
+    sub.add_parser("rh-backfill", help="the Robinhood Chain index from Pons V2's deployment to the head, then live (the rh_stream worker)").set_defaults(fn=_cmd_rh_backfill)
+    sub.add_parser("rh-status", help="Robinhood Chain index cursors, row counts and stream status").set_defaults(fn=_cmd_rh_status)
+    rp = sub.add_parser("rh-probe", help="read-only check of the Robinhood Chain path: contracts, Kyber / v4 routability and gas on recent Pons graduates")
+    rp.add_argument("--sample", type=int, default=12); rp.set_defaults(fn=_cmd_rh_probe)
     return p
 
 

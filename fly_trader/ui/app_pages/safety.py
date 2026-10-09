@@ -10,31 +10,35 @@ from fly_trader.ui.common import ago
 
 
 @st.fragment(run_every="5s")
-def rails_panel() -> None:
-    c = q1("SELECT * FROM circuit_state WHERE id = 1") or {}
+def rails_panel(circuit_id: int = 1, title: str = "Trading rails", prefix: str = "") -> None:
+    c = q1("SELECT * FROM circuit_state WHERE id = %s", (circuit_id,)) or {}
     with st.container(border=True):
-        st.markdown(":material/shield: **Trading rails**")
+        st.markdown(f":material/shield: **{title}**")
         with st.container(horizontal=True, vertical_alignment="center"):
             st.badge("Kill switch tripped" if c.get("kill_switch") else "Kill switch armed", color="red" if c.get("kill_switch") else "green")
             st.caption("Trips when the live book falls too far below its peak wealth; blocks new entries until cleared."
                        + (f" Reason: {c['kill_reason']}." if c.get("kill_reason") else ""))
             st.space("stretch")
-            if st.button("Clear kill switch", key="kill_clear", disabled=not c.get("kill_switch"), help="Clears the switch and re-bases the peak at current wealth."):
-                rails.reset_circuit(kill=True); st.toast("Kill switch cleared"); st.rerun()
+            if st.button("Clear kill switch", key=f"{prefix}kill_clear", disabled=not c.get("kill_switch"), help="Clears the switch and re-bases the peak at current wealth."):
+                rails.reset_circuit(kill=True, circuit_id=circuit_id); st.toast("Kill switch cleared"); st.rerun()
         with st.container(horizontal=True, vertical_alignment="center"):
             st.badge(f"Circuit tripped ({c.get('fail_count', 0)} failures)" if c.get("tripped") else f"Circuit ok ({c.get('fail_count', 0)} failures)",
                      color="red" if c.get("tripped") else "green")
             st.caption("Trips after repeated failed or unverifiable live orders; blocks new live entries.")
             st.space("stretch")
-            if st.button("Reset circuit", key="circuit_reset", disabled=not c.get("tripped") and not c.get("fail_count")):
-                rails.reset_circuit(kill=False); st.toast("Circuit reset"); st.rerun()
+            if st.button("Reset circuit", key=f"{prefix}circuit_reset", disabled=not c.get("tripped") and not c.get("fail_count")):
+                rails.reset_circuit(kill=False, circuit_id=circuit_id); st.toast("Circuit reset"); st.rerun()
         with st.container(horizontal=True, vertical_alignment="center"):
             st.badge("New entries paused" if c.get("entries_paused") else "New entries allowed", color="orange" if c.get("entries_paused") else "green")
             st.caption("Operator switch: no new positions while paused; open positions still exit on schedule.")
             st.space("stretch")
-            if st.button("Resume entries" if c.get("entries_paused") else "Pause entries", key="entries_toggle"):
-                rails.set_entries_paused(not c.get("entries_paused")); st.rerun()
-        for b in q("SELECT book, halted, reason FROM book_state WHERE halted ORDER BY book"):
+            if st.button("Resume entries" if c.get("entries_paused") else "Pause entries", key=f"{prefix}entries_toggle"):
+                rails.set_entries_paused(not c.get("entries_paused"), circuit_id=circuit_id); st.rerun()
+        from fly_trader.markets import MARKETS
+        rh_books = [b for m in MARKETS.values() if m.circuit_id == rails.RH_CIRCUIT for b in m.books]
+        halted = q("SELECT book, halted, reason FROM book_state WHERE halted ORDER BY book")
+        mine = [b for b in halted if (b["book"] in rh_books) == (circuit_id == rails.RH_CIRCUIT)]
+        for b in mine:
             with st.container(horizontal=True, vertical_alignment="center"):
                 st.badge(f"{b['book']} halted", color="red")
                 st.caption(f"The paper book fell too far below its own peak ({b['reason']}); its entries are blocked, the other book trades on.")
@@ -71,6 +75,24 @@ def wallet_panel() -> None:
                 st.dataframe(pd.DataFrame(ev), hide_index=True)
 
 
+def rh_settings_panel() -> None:
+    missing = config.rh_live_prerequisites_missing()
+    with st.container(border=True):
+        st.markdown(":material/tune: **Robinhood Chain mode and limits**")
+        rows = [("Money", "paper; live mirror " + ("on" if not missing else "gated: " + ", ".join(missing)), "The RH race runs on paper books in ETH; after the RH handover the fly also trades the ETH wallet."),
+                ("RH_LIVE_ENABLED", "1" if config.RH_LIVE_ENABLED else "0", "Allows signing real Robinhood Chain transactions (live_rh)."),
+                ("Chain", f"{config.RH_EXPECTED_CHAIN_ID}" + (" (testnet)" if config.RH_TESTNET else ""), "The guard refuses any other chain id."),
+                ("Bot address", config.RH_BOT_ADDRESS or "not set", "RH_BOT_PRIVATE_KEY must derive to it."),
+                ("Starting capital", f"{config.RH_CAPITAL_ETH:g} ETH", "The USD value of 5 SOL at build time."),
+                ("Largest buy", f"{config.RH_LABEL_SIZE_ETH:g} ETH", "The label size (0.5 SOL in USD at build time): no RH buy is bigger."),
+                ("Smallest position", f"{config.RH_MIN_POSITION_ETH:g} ETH", "Smaller sized buys are skipped."),
+                ("Gas reserve", f"{config.RH_GAS_RESERVE_ETH:g} ETH", "Never spent on positions."),
+                ("Fee cap", f"{config.RH_MAX_FEE_GWEI:g} gwei", "A transaction never offers more per gas; a spike refuses instead."),
+                ("Kill switch", f"{config.RH_KILL_SWITCH_DRAWDOWN:.0%} drawdown", "On the live RH wealth (circuit 3)."),
+                ("Routes", "KyberSwap atomic, Uniswap v4 fallback, two legs through the base last", "Every round trip returns to ETH; no base inventory is kept.")]
+        st.dataframe(pd.DataFrame(rows, columns=["setting", "value", "meaning"]), hide_index=True)
+
+
 def maintenance_panel() -> None:
     sup = get_supervisor()
     with st.container(border=True):
@@ -90,10 +112,16 @@ def maintenance_panel() -> None:
                 st.dataframe(pd.DataFrame(errs), hide_index=True)
 
 
+st.markdown("#### Memecoins")
 rails_panel()
 left, right = st.columns([3, 2])
 with left:
     settings_panel()
 with right:
     wallet_panel()
+if config.RH_ENABLED:
+    st.markdown("#### Robinhood Chain memecoins")
+    rails_panel(rails.RH_CIRCUIT, "Robinhood Chain trading rails", prefix="rh_")
+    rh_settings_panel()
+st.markdown("#### Maintenance")
 maintenance_panel()

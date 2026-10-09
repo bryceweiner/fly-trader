@@ -41,10 +41,13 @@ def _entry(name: str):
     if name == "vault":                        # the $FLY vault: flows, settlement, claims, public stats (fly_trader/vault)
         from ..vault import worker
         return worker.main
+    if name == "rh_stream":                    # Robinhood Chain: the Pons / Uniswap v4 index, marks and minutes (rh/stream.py)
+        from ..rh import stream as rh_stream
+        return rh_stream.main
     raise KeyError(name)
 
 
-WORKERS = ("discover", "runner", "train", "replay", "pumpstream", "vault")
+WORKERS = ("discover", "runner", "train", "replay", "pumpstream", "rh_stream", "vault")
 REPLACE_WAIT_S = 20.0        # how long a new console waits for the one it replaces to finish winding down (its workers flush on stop)
 
 
@@ -186,6 +189,9 @@ class Supervisor:
         import json
         val = r["value"] if isinstance(r["value"], dict) else json.loads(r["value"] or "{}")
         started = []
+        from .. import config
+        if "rh_stream" not in val and config.RH_ENABLED:
+            val["rh_stream"] = True          # an install whose autostart predates Robinhood Chain starts its feed with the others
         for n in WORKERS:
             if val.get(n) and not self.alive(n):
                 try:

@@ -47,7 +47,11 @@ GROUPS = {"rug": [*CURVE_COLS, "curve_known", "prior_rug_share", "prior_known", 
           "skill": list(SKILL_COLS)}
 _GROUPED = {c for g in GROUPS.values() for c in g}
 LEGACY_COLS = [c for c in FEATURES + EXTRA_COLS + META_COLS if c not in DROPPED_COLS and c not in _GROUPED]
-X_COLS = LEGACY_COLS + [c for g in GROUPS.values() for c in g]
+# One model family for both memecoin chains (branch rh-memecoins, 2026-09-28): amounts stay in each chain's own unit (SOL,
+# ETH) and these inputs tell the rows apart — the chain, and on Robinhood Chain the class of the pool's quote asset (ETH
+# is all zeros). Appended after the 64 Solana inputs, so every Solana value is unchanged (tests/test_solana_identity.py).
+CHAIN_COLS = ["chain_rh", "qc_stable", "qc_btc", "qc_stock"]
+X_COLS = LEGACY_COLS + [c for g in GROUPS.values() for c in g] + CHAIN_COLS
 # Hold and gates fitted to the market at real costs (2026-09-15 sweep over 149 days: holds 10–240 min × age × pool ×
 # 15-min volume × buy line, walk-forward): a 120-minute hold with pools ≥ 10 SOL and ≥ 5 SOL traded in 15 minutes (and
 # tokens ≥ 6 h past graduation, train/selector.MIN_AGE_H) made money in every month and on 46–49 of 64 days in each
@@ -68,6 +72,10 @@ class DecisionSet:
     cols: list[str]
     horizon_s: float
     fwd_h: dict = field(default_factory=dict)    # hold (min) → [N] float32 net return (next-open fill) over that hold; NaN past the data
+    chain: np.ndarray | None = None               # [N] 'sol' | 'rh' (None: every row Solana)
+
+    def chains(self) -> np.ndarray:
+        return self.chain if self.chain is not None else np.full(len(self.y), "sol", dtype=object)
 
     @property
     def days(self) -> list[date]:
@@ -77,7 +85,8 @@ class DecisionSet:
         """The rows of ``mask`` (e.g. the days before a bootstrap), labels for every hold included."""
         m = np.asarray(mask, dtype=bool)
         return DecisionSet(X=self.X[m], y=self.y[m], fwd=self.fwd[m], fwd_pess=self.fwd_pess[m], day=self.day[m], ts=self.ts[m], mint=self.mint[m],
-                           cols=list(self.cols), horizon_s=self.horizon_s, fwd_h={h: v[m] for h, v in self.fwd_h.items()})
+                           cols=list(self.cols), horizon_s=self.horizon_s, fwd_h={h: v[m] for h, v in self.fwd_h.items()},
+                           chain=None if self.chain is None else self.chain[m])
 
     def mask_days(self, lo: date | None = None, hi: date | None = None) -> np.ndarray:
         m = np.ones(len(self.y), bool)
@@ -91,35 +100,70 @@ class DecisionSet:
 def _label_exit_cost(df) -> np.ndarray:
     """One side's real cost per row, at the size the book trades (market/exit_cost.cost_at_size). The live engine puts
     the same value in every bar it hands the fly (agent/minute_engine.py), so what the fly learns from and what it was
-    trained on are one cost model."""
+    trained on are one cost model. Robinhood Chain rows are priced at their own market's sizes (markets.RH)."""
     from ..market.exit_cost import cost_at_size
-    return cost_at_size(df["exit_cost_0p1"].to_numpy(dtype=float), df["resq"].to_numpy(dtype=float))
+    ec = cost_at_size(df["exit_cost_0p1"].to_numpy(dtype=float), df["resq"].to_numpy(dtype=float))
+    if "_chain" in df and (df["_chain"] == "rh").any():
+        from ..markets import RH
+        rh = (df["_chain"] == "rh").to_numpy()
+        ec = np.asarray(ec, dtype=float).copy()
+        ec[rh] = cost_at_size(df["exit_cost_0p1"].to_numpy(dtype=float)[rh], df["resq"].to_numpy(dtype=float)[rh], market=RH)
+    return ec
+
+
+def _roots(feature_dir) -> list[tuple]:
+    """(feature part root, chain, part_current) per market: the given directory alone (Solana: tests, studies), else the
+    Solana corpus plus Robinhood Chain's when it is enabled and built (rh/corpus.py)."""
+    if feature_dir is not None:
+        return [(feature_dir, "sol", part_current)]
+    out = [(config.CORPUS_DIR / "features_mature", "sol", part_current)]
+    if config.RH_ENABLED:
+        from ..rh import corpus as rh_corpus
+        if any(rh_corpus.FEAT_DIR.glob("*/part.parquet")):
+            out.append((rh_corpus.FEAT_DIR, "rh", rh_corpus.part_current))
+    return out
 
 
 def build(days: int | None = 45, horizon_min: int = HOLD_MIN, fee: float | None = None, label_thr: float = 0.03, feature_dir=None, holds=None) -> DecisionSet:
     """``holds``: extra holds (minutes) whose labels are computed in the same pass (``DecisionSet.fwd_h``)."""
-    root = feature_dir or (config.CORPUS_DIR / "features_mature")
-    files = sorted(glob.glob(str(root / "*" / "part.parquet")))
-    if days:
-        files = files[-days - 1:]
-    if not files:
-        raise RuntimeError("no mature feature parts; run build-mature")
-    stale = [f for f in files if not part_current(f)]
-    if stale:
-        raise RuntimeError(f"{len(stale)} feature part(s) were built with another feature or aggregation version (e.g. {stale[0]}); run build-mature")
     need = ["mint", "ts", "open", "close", "resq", "age_h", "traders_15m", "traders_1h", "n_trades_1m"] + FEATURES + FLOW_COLS + SKILL_COLS + MARKET_COLS
     optional = set(FLOW_COLS + SKILL_COLS + MARKET_COLS)      # parts that predate the wallet-flow columns (tests' synthetic parts) read as 0
-    df = pd.concat([pq.read_table(f, columns=[c for c in need if c not in optional or c in pq.read_schema(f).names]).to_pandas() for f in files],
-                   ignore_index=True).sort_values(["mint", "ts"]).reset_index(drop=True)
+    roots = _roots(feature_dir); per_root = []
+    for root, chain, current in roots:
+        files = sorted(glob.glob(str(root / "*" / "part.parquet")))
+        per_root.append((files, chain, current))
+    if days:                                                  # the last ``days`` calendar days (+1 of warm-up) of the newest corpus
+        last = max((f.split("/")[-2] for files, _, _ in per_root for f in files), default=None)
+        if last is not None:
+            lo = (date.fromisoformat(last) - pd.Timedelta(days=days)).isoformat()
+            per_root = [([f for f in files if f.split("/")[-2] >= lo], c, cur) for files, c, cur in per_root]
+    if not any(files for files, _, _ in per_root):
+        raise RuntimeError("no mature feature parts; run build-mature")
+    frames = []
+    for files, chain, current in per_root:
+        stale = [f for f in files if not current(f)]
+        if stale:
+            raise RuntimeError(f"{len(stale)} feature part(s) were built with another feature or aggregation version (e.g. {stale[0]}); run build-mature")
+        for f in files:
+            fr = pq.read_table(f, columns=[c for c in need if c not in optional or c in pq.read_schema(f).names]).to_pandas()
+            fr["_chain"] = chain; frames.append(fr)
+    df = pd.concat(frames, ignore_index=True).sort_values(["mint", "ts"]).reset_index(drop=True)
+    kk = np.where(df["_chain"].to_numpy() == "rh", config.RH_ETH_PER_SOL, 1.0)      # ETH per SOL on RH rows: fixed-unit thresholds
     for c in optional:
         if c not in df:
             df[c] = 0.0
     # a mint whose series breaks scale (secondary pool in another quote, impossible reserve) is ineligible FROM THAT MINUTE ON —
     # never before it, so no decision row is judged with the token's future (rows before a dump keep their labels)
     jump = (df["close"] / df.groupby("mint")["close"].shift(1)).fillna(1.0)
-    df["_off"] = ((jump > 50) | (jump < 1 / 50) | (df["resq"] > 1e5)).astype(np.int8)
+    df["_off"] = ((jump > 50) | (jump < 1 / 50) | (df["resq"] > 1e5 * kk)).astype(np.int8)
     broken = df.groupby("mint")["_off"].cummax().to_numpy().astype(bool)
-    df = df.merge(load_features(), on="mint", how="left")
+    meta = load_features()
+    if (df["_chain"] == "rh").any():                          # each chain's launch facts, same columns (rh/meta.py)
+        from ..rh.meta import load_features as rh_features
+        rmeta = rh_features()
+        with_q = rmeta.merge(_rh_quote_classes(), on="mint", how="left") if len(rmeta) else rmeta
+        meta = pd.concat([meta, with_q], ignore_index=True)
+    df = df.merge(meta, on="mint", how="left")
     df["meta_known"] = df["ttg_min"].notna().astype(np.float32) if "ttg_min" in df else np.float32(0.0)
     H = horizon_min * 60.0
     ts = _epoch_s(df["ts"]); cl = df["close"].to_numpy(); op = df["open"].to_numpy()
@@ -154,15 +198,28 @@ def build(days: int | None = 45, horizon_min: int = HOLD_MIN, fee: float | None 
     df["age_known"] = df["age_h"].notna().astype(np.float32)
     df["mayhem"] = df["mayhem"].astype(float) if "mayhem" in df else 0.0
     last_ts = df["ts"].max()
-    elig = (np.isfinite(df["resq"]) & (df["resq"] >= MIN_RESQ_SOL) & (df["logvol_15m"] >= math.log1p(MIN_VOL_15M_SOL))
+    df["chain_rh"] = (df["_chain"] == "rh").astype(np.float32)
+    qc = df["quote_class"] if "quote_class" in df else pd.Series(None, index=df.index)
+    for c, cls in (("qc_stable", "stable"), ("qc_btc", "btc"), ("qc_stock", "stock")):
+        df[c] = (qc == cls).astype(np.float32)
+    vol_line = np.where(kk == 1.0, math.log1p(MIN_VOL_15M_SOL), np.log1p(MIN_VOL_15M_SOL * kk))      # Solana: exactly today's threshold
+    elig = (np.isfinite(df["resq"]) & (df["resq"] >= MIN_RESQ_SOL * kk) & (df["logvol_15m"] >= vol_line)
             & np.isfinite(fwd) & (df["ts"] < last_ts - pd.Timedelta(minutes=horizon_min + 5))).to_numpy() & ~broken
     for hm in hold_list:                             # no label where that hold runs past the data
         fh[hm][(df["ts"] >= last_ts - pd.Timedelta(minutes=hm + 5)).to_numpy()] = np.nan
+    chain = df["_chain"].to_numpy()[elig]
     df = df[elig].reset_index(drop=True); fwd = fwd[elig]; fwdp = fwdp[elig]; ts = ts[elig]
     X = df[X_COLS].astype(np.float32).replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy()
     return DecisionSet(X=X, y=(fwd > label_thr).astype(np.int8), fwd=fwd.astype(np.float32), fwd_pess=fwdp.astype(np.float32),
                        day=df["ts"].dt.date.to_numpy(), ts=ts, mint=df["mint"].to_numpy(), cols=list(X_COLS), horizon_s=H,
-                       fwd_h={hm: fh[hm][elig].astype(np.float32) for hm in hold_list})
+                       fwd_h={hm: fh[hm][elig].astype(np.float32) for hm in hold_list}, chain=None if (chain == "sol").all() else chain.astype(object))
+
+
+def _rh_quote_classes() -> pd.DataFrame:
+    from ..db.connection import transaction
+    with transaction() as conn:
+        rows = conn.execute("SELECT mint, quote_class FROM rh_meta").fetchall()
+    return pd.DataFrame(rows, columns=["mint", "quote_class"]) if rows else pd.DataFrame(columns=["mint", "quote_class"])
 
 
 def taken_idx(ts: np.ndarray, mint: np.ndarray, horizon_s: float, idx: np.ndarray) -> np.ndarray:

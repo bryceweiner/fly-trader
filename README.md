@@ -125,6 +125,29 @@ Scaling the wallet up scales the positions with it (`MAX_POSITION_FRACTION`). Th
 not scale: at most `SIGNER_MAX_BUY_SOL` (1) per buy, `SIGNER_DAILY_BUY_SOL` (10) of buys a day and
 `SIGNER_SWAPS_PER_MIN` (6) swaps a minute; raise them in `.env` deliberately.
 
+## Robinhood Chain (Pons) memecoins
+
+The same engine also trades Robinhood Chain: tokens launched on Pons that graduated into Uniswap v4 pools.
+
+- **Paper by default, in ETH.** The `rh_stream` worker starts with the others and indexes Pons launches, graduations
+  and swaps into 1-minute rows (a backfill from `RH_START_DAY`, then live). The Robinhood Chain books
+  (`paper_rh_selector`, `paper_rh_fly`) keep their money in native ETH (`RH_CAPITAL_ETH`, 5 SOL's worth at build time)
+  and pay Pons' hook fee, price impact and gas. They have their own kill switch and circuit (Safety & wallet →
+  Robinhood Chain trading rails) and their own handover. The console's chain picker switches Overview and Trades
+  between the two chains, and the **Robinhood Chain** page shows the indexer, the quote-asset prices and the ETH wallet.
+- **The RH books start only once a combined model passes the RH replay verdict.** The selector and the fly are trained
+  on both chains' rows together, and the replay judges each chain on its own trades. Until a model trained that way
+  has passed on Robinhood Chain, the RH books do not trade (Solana does not wait for them).
+- **Live** needs `RH_LIVE_ENABLED=1`, `RH_BOT_PRIVATE_KEY` (in `.env` only, never in the image) and the address it
+  derives to as `RH_BOT_ADDRESS`, plus a funded wallet (ETH on Robinhood Chain, chain 4663). Then
+  `docker compose restart fly`. As on Solana, the fly trades the wallet only after it has won the RH paper race.
+- `RH_ENABLED=0` turns all of it off.
+
+> **TODO:** RH corpus parts (the Robinhood Chain training data) will ship here once they are built. Until then this
+> branch carries no RH training data, and the shipped fly and selector were trained on Solana alone: a model release
+> trained on both chains (`tools/make_seed.py` on the development line) has to replace them before the RH books, or this
+> branch's definitions, can admit a model.
+
 ## NVIDIA GPU
 
 Optional. The CPU image trades fine; a GPU makes the once-a-minute scoring and the fly's learning a little faster.
