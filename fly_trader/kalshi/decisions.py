@@ -7,9 +7,13 @@ the minute's date, and — because every position is held to settlement — a pe
 - ``fwd_pess`` (taker): ``(100·y − eff) / eff`` with ``eff = effective_price_cents(side ask)`` and ``y`` the settlement
   of the side (1 when it paid);
 - ``fwd`` (reference): the same at the side's mid;
-- ``fwd_h["maker"]``: rest at ``side ask − MAKER_DISCOUNT`` at the minute; filled iff the side's ask later fell strictly
-  below the rest price (better_bot's traded-through rule, ``maker_paper.would_have_filled``) before close; the maker fee
-  where the series charges one; NaN when unfilled.
+- ``fwd_h["maker"]``: the maker arm's order (kalshi/maker.py): a bid resting one tick above the side's bid, never at or
+  through its ask (``maker_rest``), for the order's lifetime (``KALSHI_MAKER_TTL_H``, ending ``KALSHI_MAKER_QUIET_MIN``
+  before close); filled (``maker_filled``) when the side's ask came down to it — every bid at that price, ours included,
+  was taken — or a taker sold the side below it, or at it when our bid set a new best price and so stood first in its
+  queue; the maker fee where the series charges one; NaN when unfilled. Until feature version 5 the order rested one tick
+  inside the ask, for the market's whole life, and filled only when the ask later fell strictly below it: it paid away
+  the spread makers earn and counted only the fills that came with an adverse move (2026-10-09).
 Eligibility (the live engine applies the same, ``kalshi/engine.KalshiMinuteEngine.eligible``): both quotes present,
 spread ≤ KALSHI_MAX_SPREAD_CENTS, side ask in 1..99, open interest ≥ KALSHI_MIN_OPEN_INTEREST, 24 h volume ≥
 KALSHI_MIN_VOLUME_24H, settlement yes/no, time to close inside the entry window.
@@ -32,8 +36,24 @@ from .features import K_COLS, KALSHI_FEATURE_VERSION, KIDX
 from .mature import part_current
 from .vendor import kalshi_client as kc
 
-MAKER_DISCOUNT = 1                    # cents inside the ask a resting order sits (better_bot PAPER_MAKER_DISCOUNT_CENTS)
 X_COLS = list(K_COLS)
+
+
+def maker_rest(side_bid, side_ask) -> np.ndarray:
+    """The maker arm's bid (cents): one tick above the side's best bid, at most one tick below its ask (``post_only``
+    never crosses); with a one-tick spread it joins the bid's queue."""
+    return np.clip(np.minimum(np.round(np.asarray(side_bid, dtype=float)) + 1.0, np.round(np.asarray(side_ask, dtype=float)) - 1.0), 1.0, 99.0)
+
+
+def maker_filled(rest, side_bid, ask_low, sold_low) -> np.ndarray:
+    """Would a bid at ``rest``, posted when the side's bid was ``side_bid``, have filled, given the lowest ask the side
+    showed (``ask_low``) and the lowest price a taker sold the side at (``sold_low``) while it rested (NaN: none). The ask
+    reaching ``rest`` means every bid at ``rest`` was taken; a taker sale below ``rest`` means the same; a sale at
+    ``rest`` reaches us only when we were first there — our bid improved on the best bid, so nobody was ahead of us."""
+    rest = np.asarray(rest, dtype=float); ask_low = np.asarray(ask_low, dtype=float); sold_low = np.asarray(sold_low, dtype=float)
+    first = rest > np.round(np.asarray(side_bid, dtype=float))
+    with np.errstate(invalid="ignore"):
+        return (np.isfinite(ask_low) & (ask_low <= rest)) | (np.isfinite(sold_low) & ((sold_low < rest) | (first & (sold_low <= rest))))
 
 
 def maker_fee_cents(price_cents, fee_mult, charged) -> np.ndarray:
@@ -64,7 +84,7 @@ def build(days: int | None = None, feature_dir=None, label_thr: float = 0.0) -> 
     stale = [f for f in files if not part_current(f)]
     if stale:
         raise RuntimeError(f"{len(stale)} Kalshi feature part(s) from another version (e.g. {stale[0]}); run kalshi-build")
-    need = list(dict.fromkeys([*X_COLS, "ticker", "side", "ts", "category", "close_ts", "end_ts", "settled_ts", "result", "fut_min_ask"]))
+    need = list(dict.fromkeys([*X_COLS, "ticker", "side", "ts", "category", "close_ts", "end_ts", "settled_ts", "result", "fill_ask_low", "fill_sold_low"]))
     tick_id: dict[str, int] = {}; tick_names: list[str] = []; cat_id: dict[str, int] = {}; cat_names: list[str] = []
     acc: dict[str, list] = {k: [] for k in ("X", "ts", "settled", "y", "fwd", "fwd_pess", "maker", "tick", "side", "cat", "ord")}
     for f in files:
@@ -84,9 +104,9 @@ def build(days: int | None = None, feature_dir=None, label_thr: float = 0.0) -> 
         y = (res == side).astype(np.float64)
         eff = X[:, KIDX["eff_price"]].astype(np.float64); mid = np.clip(X[:, KIDX["side_mid"]].astype(np.float64), 1.0, 99.0)
         fwd_pess = (100.0 * y - eff) / eff; fwd = (100.0 * y - mid) / mid
-        rest = np.clip(np.round(X[:, KIDX["side_ask"]]) - MAKER_DISCOUNT, 1.0, 99.0)
-        fut = t["fut_min_ask"].to_numpy(zero_copy_only=False).astype(np.float64)
-        filled = np.isfinite(fut) & (fut < rest)
+        rest = maker_rest(X[:, KIDX["side_bid"]], X[:, KIDX["side_ask"]])
+        filled = maker_filled(rest, X[:, KIDX["side_bid"]], t["fill_ask_low"].to_numpy(zero_copy_only=False).astype(np.float64),
+                              t["fill_sold_low"].to_numpy(zero_copy_only=False).astype(np.float64))
         m_eff = rest + maker_fee_cents(rest, X[:, KIDX["fee_mult"]], X[:, KIDX["maker_fee"]])
         maker = np.where(filled, (100.0 * y - m_eff) / m_eff, np.nan)
         elig = ok & eligible_mask(X, X_COLS, to_close) & np.isfinite(fwd_pess) & (settled > ts)
@@ -122,4 +142,8 @@ def build(days: int | None = None, feature_dir=None, label_thr: float = 0.0) -> 
     ds.label_ts = (settled + 60.0).astype(np.float64)                 # when the outcome is known: training for a period may use only rows known before it
     ds.outcome = y.astype(np.float32)
     ds.side = np.array(["no", "yes"], dtype=object)[side]; ds.ticker = tick_names[tick]; ds.category = cat_names[catc]
+    # the stack's bars (train/strategies.Score): a positive mean with a weekly sign test, not the memecoin PF ≥ 1.3 and 65 %
+    # winners — a contract bought at 95c that pays 5c when it wins needs a 1.3 % edge for PF 1.3, about all the edge the
+    # literature finds left on Kalshi, and its win rate is set by its price (operator decision, 2026-10-09)
+    ds.gate = "significance"
     return ds

@@ -19,7 +19,8 @@ from typing import NamedTuple
 
 from .vendor import kalshi_client as kc
 
-KALSHI_FEATURE_VERSION = 4          # 2: archive candles rescaled; 3: outcome-blind event sample; 4: time features anchored on what was known at decision time
+KALSHI_FEATURE_VERSION = 5          # 2: archive candles rescaled; 3: outcome-blind event sample; 4: time features anchored on what was known at decision time;
+                                    # 5: the maker label is the arms' order (one tick above the bid, the order's lifetime, fills from taker-sell prints)
                                     # (an early-closing market's realized close is when its event happened: a leak, 2026-10-08)
 WINDOW_S = 7 * 86400.0
 WINDOWS = {"5m": 300.0, "15m": 900.0, "1h": 3600.0, "6h": 21600.0, "24h": 86400.0, "7d": WINDOW_S}

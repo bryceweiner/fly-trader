@@ -7,7 +7,6 @@ import streamlit as st
 
 from fly_trader import config
 from fly_trader.db.queries import q, q1
-from fly_trader.kalshi.features import KALSHI_FEATURE_VERSION
 from fly_trader.ops.supervisor import get_supervisor
 from fly_trader.ui.common import ago, setting
 
@@ -18,11 +17,11 @@ def _state_badge(alive: bool, ok: bool = True) -> None:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def feature_parts() -> dict:
-    from fly_trader.kalshi.mature import part_version
+    from fly_trader.kalshi.mature import part_current
     files = sorted(glob.glob(str(config.KALSHI_DIR / "features" / "*" / "part-*.parquet")))
     days = sorted({f.split("/")[-2] for f in files})
     return {"n": len(files), "days": len(days), "first": days[0] if days else None, "last": days[-1] if days else None,
-            "current": sum(1 for f in files if part_version(f) == KALSHI_FEATURE_VERSION)}
+            "current": sum(1 for f in files if part_current(f))}
 
 
 @st.cache_data(ttl=60, show_spinner=False)

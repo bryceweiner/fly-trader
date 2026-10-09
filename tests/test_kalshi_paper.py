@@ -74,40 +74,42 @@ def test_book_halt_on_its_own_drawdown(db_conn, monkeypatch):
     assert m["halted"] and P.blocked_reason(db_conn, book) == "book halted"
 
 
-def test_maker_arm_posts_keeps_replaces_cancels_adjudicates_and_expires(db_conn, monkeypatch):
+def test_maker_arm_posts_keeps_cancels_adjudicates_and_expires(db_conn, monkeypatch):
     monkeypatch.setattr(config, "KALSHI_CAPITAL_USD", 100.0); monkeypatch.setattr(config, "KALSHI_MAKER_QUIET_MIN", 30.0); monkeypatch.setattr(config, "KALSHI_MAKER_TTL_H", 6.0)
     run, beat, m1 = _beat(db_conn); book = P.BOOKS["maker"]; now = m1.timestamp()
     metas = {"M1": MarketMeta("M1", close_ts=now + 2 * 86400, maker_fee=0.0), "M2": MarketMeta("M2", close_ts=now + 20 * 60, maker_fee=1.0)}
-    quotes = {"M1": (70.0, 72.0), "M2": (40.0, 42.0)}
+    quotes = {"M1": (69.0, 72.0), "M2": (40.0, 42.0)}
     pick = lambda tk, side, edge: {"ticker": tk, "side": side, "p": 0.8, "edge": edge, "line": 0.02, "table": TABLE, "strategy": "favorite"}
     out = maker.plan(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now, picks=[pick("M1", "yes", 0.06), pick("M2", "yes", 0.06)], quotes=quotes, metas=metas)
-    assert len(out["posted"]) == 1 and out["posted"][0]["price_cents"] == 71 and out["resting"] == 1          # M2 is inside the quiet margin
+    assert len(out["posted"]) == 1 and out["posted"][0]["price_cents"] == 70 and out["resting"] == 1          # one tick above the bid; M2 is inside the quiet margin
     o = out["posted"][0]; assert o["count"] == 14 and abs(o["expiration_ts"] - (now + 6 * 3600)) < 1e-6 and o["decision_id"]
-    row = maker.resting(db_conn)[0]; assert row["post_only"] and row["tif"] == "good_till_canceled" and row["status"] == "resting"
+    row = maker.resting(db_conn)[0]; assert row["post_only"] and row["tif"] == "good_till_canceled" and row["status"] == "resting" and row["request"]["bid"] == 69.0
     out2 = maker.plan(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 60, picks=[pick("M1", "yes", 0.06)], quotes=quotes, metas=metas)
-    assert out2["posted"] == [] and out2["replaced"] == 0 and out2["resting"] == 1                             # unchanged ask: the order keeps resting
+    assert out2["posted"] == [] and out2["replaced"] == 0 and out2["resting"] == 1
     out3 = maker.plan(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 120, picks=[pick("M1", "yes", 0.06)], quotes={"M1": (73.0, 75.0)}, metas=metas)
-    assert out3["replaced"] == 1 and len(out3["posted"]) == 1 and out3["posted"][0]["price_cents"] == 74       # the ask moved: cancel/replace
-    assert [r["status"] for r in db_conn.execute("SELECT status FROM kalshi_orders WHERE book = %s ORDER BY id", (book,)).fetchall()] == ["replaced", "resting"]
-    adj = maker.adjudicate(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 180, extremes={"M1": (75.0, 73.0)}, metas=metas)
-    assert adj["filled"] == [] and adj["expired"] == 0                                                          # the ask never reached 74
-    adj = maker.adjudicate(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 240, extremes={"M1": (74.0, 72.0)}, metas=metas)
-    assert len(adj["filled"]) == 1 and adj["filled"][0]["price_cents"] == 74
-    pos = P.open_positions(db_conn, book); assert len(pos) == 1 and pos[0]["arm"] == "maker" and pos[0]["fee_cents"] == 0.0 and pos[0]["cost_cents"] == 74 * pos[0]["contracts"]
+    assert out3["posted"] == [] and out3["replaced"] == 0 and out3["resting"] == 1                             # the book moved: the order keeps its price, as the label's does
+    assert [r["status"] for r in db_conn.execute("SELECT status FROM kalshi_orders WHERE book = %s ORDER BY id", (book,)).fetchall()] == ["resting"]
+    adj = maker.adjudicate(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 180, extremes={"M1": (75.0, 73.0, 71.0, 74.0)}, metas=metas)
+    assert adj["filled"] == [] and adj["expired"] == 0                                                          # no ask at 70, no taker sale at or below it
+    adj = maker.adjudicate(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 240, extremes={"M1": (75.0, 73.0, 70.0, 74.0)}, metas=metas)
+    assert len(adj["filled"]) == 1 and adj["filled"][0]["price_cents"] == 70                                   # a taker sold at 70: our bid was first there
+    pos = P.open_positions(db_conn, book); assert len(pos) == 1 and pos[0]["arm"] == "maker" and pos[0]["fee_cents"] == 0.0 and pos[0]["cost_cents"] == 70 * pos[0]["contracts"]
     out4 = maker.plan(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 300, picks=[pick("M1", "yes", 0.06)], quotes={"M1": (73.0, 75.0)}, metas=metas)
     assert out4["posted"] == [] and out4["resting"] == 0                                                        # held: no second order on the market
-    # a NO bid fills when 100 − the minute's highest YES bid reaches it; a fee is charged where the series charges makers
+    # a NO bid: NO bid = 100 − YES ask, NO ask = 100 − YES bid; a taker sold NO when it bought YES; a fee where the series charges makers
     metas["M3"] = MarketMeta("M3", close_ts=now + 86400, maker_fee=1.0)
     out5 = maker.plan(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 360, picks=[pick("M3", "no", 0.06)], quotes={"M3": (30.0, 33.0)}, metas=metas)
-    assert out5["posted"][0]["price_cents"] == 69                                                               # NO ask = 100 − 30 = 70; rest one tick inside
-    adj = maker.adjudicate(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 420, extremes={"M3": (33.0, 31.0)}, metas=metas)
+    assert out5["posted"][0]["price_cents"] == 68                                                               # NO bid 67, NO ask 70
+    adj = maker.adjudicate(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 420, extremes={"M3": (33.0, 31.0, None, 31.0)}, metas=metas)
+    assert adj["filled"] == []                                                                                  # NO ask 69, NO sold at 69
+    adj = maker.adjudicate(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 480, extremes={"M3": (33.0, 31.0, None, 32.0)}, metas=metas)
     assert len(adj["filled"]) == 1 and adj["filled"][0]["side"] == "no"
     fee = [p for p in P.open_positions(db_conn, book) if p["ticker"] == "M3"][0]["fee_cents"]; assert fee > 0
     # cancel when no longer picked; expire past the expiration
-    out6 = maker.plan(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 480, picks=[pick("M1", "no", 0.06), pick("M4", "yes", 0.06)],
+    out6 = maker.plan(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 540, picks=[pick("M1", "no", 0.06), pick("M4", "yes", 0.06)],
                       quotes={"M1": (73.0, 75.0), "M4": (50.0, 52.0)}, metas={**metas, "M4": MarketMeta("M4", close_ts=now + 3600, maker_fee=0.0)})
     assert len(out6["posted"]) == 1 and out6["posted"][0]["ticker"] == "M4" and abs(out6["posted"][0]["expiration_ts"] - (now + 3600 - 1800)) < 1e-6
-    out7 = maker.plan(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 540, picks=[], quotes={"M4": (50.0, 52.0)}, metas=metas)
+    out7 = maker.plan(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 570, picks=[], quotes={"M4": (50.0, 52.0)}, metas=metas)
     assert out7["canceled"] == 1 and maker.resting(db_conn) == []
     out8 = maker.plan(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 600, picks=[pick("M4", "yes", 0.06)], quotes={"M4": (50.0, 52.0)},
                       metas={"M4": MarketMeta("M4", close_ts=now + 3600, maker_fee=0.0)})

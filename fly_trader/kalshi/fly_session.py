@@ -44,6 +44,7 @@ from ..db.connection import transaction
 from ..ops.reset import kalshi_activity_dir, kalshi_fly_state_dir
 from ..train import fly_calibrate, fly_governance as gov
 from . import fly as KF, maker, paper as P
+from .decisions import maker_filled, maker_rest
 from .features import K_COLS, KIDX
 from .strategies import effective
 
@@ -84,7 +85,8 @@ def try_start() -> tuple["KalshiFlyBook | None", str]:
 
 def arm_label(x: np.ndarray, side_won: float, arm: str, ticker: str, filled: bool | None) -> float | None:
     """The realised net return per dollar of the arm on a row (the training labels): taker at the effective ask; maker
-    one tick inside the ask plus the maker fee, when the resting bid filled (None when it did not, or is not known)."""
+    at its bid (kalshi/decisions.maker_rest) plus the maker fee, when the resting bid filled (None when it did not, or is
+    not known)."""
     eff = float(effective(x[None], K_COLS, arm)[0])
     if arm == "maker" and not filled:
         return None
@@ -282,11 +284,19 @@ class KalshiFlyBook:
     def _empty_stats() -> dict:
         return {"n": 0, "sum_delta": 0.0, "sum_abs": 0.0, "step": 0.0, "capped": 0, "unknown": 0}
 
-    def _maker_filled(self, conn, ticker: str, side: str, t: float, rest: float) -> bool:
-        """Did a bid at ``rest`` (cents) resting from minute ``t`` fill: a later minute's ask on the side reached it."""
-        col = "min(yes_ask_low)" if side == "yes" else "100 - max(yes_bid_high)"
-        r = conn.execute(f"SELECT {col} AS m FROM kalshi_minutes WHERE ticker = %s AND ts > %s", (ticker, datetime.fromtimestamp(t, timezone.utc))).fetchone()
-        return r is not None and r["m"] is not None and float(r["m"]) <= rest
+    def _maker_filled(self, conn, ticker: str, side: str, t: float, x: np.ndarray, close_ts: float | None) -> bool:
+        """Did the maker arm's bid for the row scored in minute ``t`` (inputs ``x``) fill over the order's life — the
+        minutes after the decision, until ``KALSHI_MAKER_TTL_H`` later or ``KALSHI_MAKER_QUIET_MIN`` before close: the label's
+        rule (kalshi/decisions.maker_filled) on the stream's minute extremes."""
+        bid = float(x[KIDX["side_bid"]]); rest = float(maker_rest(bid, x[KIDX["side_ask"]]))
+        end = t + 60.0 + config.KALSHI_MAKER_TTL_H * 3600.0
+        if close_ts is not None:
+            end = min(end, close_ts - config.KALSHI_MAKER_QUIET_MIN * 60.0)
+        cols = "min(yes_ask_low) AS a, min(yes_sold_low) AS s" if side == "yes" else "100 - max(yes_bid_high) AS a, 100 - max(yes_bought_high) AS s"
+        r = conn.execute(f"SELECT {cols} FROM kalshi_minutes WHERE ticker = %s AND ts > %s AND ts + interval '1 minute' <= %s",
+                         (ticker, datetime.fromtimestamp(t, timezone.utc), datetime.fromtimestamp(end, timezone.utc))).fetchone()
+        f = lambda v: float(v) if v is not None else math.nan
+        return r is not None and bool(maker_filled(rest, bid, f(r["a"]), f(r["s"])))
 
     def _learn(self, conn, ctx) -> dict:
         now = ctx.m1_epoch
@@ -309,7 +319,8 @@ class KalshiFlyBook:
                 x = rows.get((t, tk, side, name)); arm = self.arms[name]; lab = None
                 if x is not None:
                     xa = np.asarray(x, dtype=np.float32)
-                    filled = self._maker_filled(conn, tk, side, t, float(np.clip(np.round(xa[KIDX["side_ask"]]) - 1, 1, 99))) if arm == "maker" else None
+                    meta = ctx.metas.get(tk)
+                    filled = self._maker_filled(conn, tk, side, t, xa, meta.close_ts if meta is not None else None) if arm == "maker" else None
                     lab = arm_label(xa, y, arm, tk, filled)
                 out_keys.append((lab, "resolved" if lab is not None else "unfilled", datetime.fromtimestamp(t, timezone.utc), tk, side, name))
             elif now - t > UNKNOWN_AFTER_S:

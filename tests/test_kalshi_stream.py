@@ -40,6 +40,7 @@ def test_minutes_aggregate_with_extremes_and_flush_on_the_watermark():
         r = dict(c.execute("SELECT * FROM kalshi_minutes WHERE ticker = 'TST-A'").fetchone())
     assert (r["yes_bid"], r["yes_ask"]) == (43.0, 48.0) and r["yes_ask_low"] == 46.0 and r["yes_bid_high"] == 45.0     # close, and the extremes
     assert r["taker_buy_yes"] == 3 and r["taker_buy_no"] == 7 and r["n_trades"] == 2 and r["max_trade"] == 7 and r["block_contracts"] == 7 and r["last"] == 45.0
+    assert r["yes_sold_low"] == 45.0 and r["yes_bought_high"] == 46.0                    # the taker sales a resting bid fills on (kalshi/decisions.maker_filled)
     assert r["bid_size"] == 12 and r["ask_size"] == 7 and r["volume_fp"] == 10 and r["open_interest_fp"] == 55
     agg.ingest(_ticker("TST-A", 1, 2, T0 + 55))                                           # late for a flushed minute: dropped, never merged
     assert agg.stats["dropped_late"] == 1 and int(T0) not in agg.minutes

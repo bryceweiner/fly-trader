@@ -19,7 +19,7 @@ from .connection import connect, database_name, database_url
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 11          # 5: the plastic fly's tables and per-book halts (BASE_DDL); 6: the selector's strategy stack (MIGRATIONS[6]); 7: Kalshi (MIGRATIONS[7]); 8: Kalshi minute extremes
+SCHEMA_VERSION = 12          # 5: the plastic fly's tables and per-book halts (BASE_DDL); 6: the selector's strategy stack (MIGRATIONS[6]); 7: Kalshi (MIGRATIONS[7]); 8: Kalshi minute extremes
 _LOCK_KEY = 0x666C795F6D6967  # "fly_mig"
 # Applying the DDL takes ACCESS EXCLUSIVE on the tables it touches (Postgres takes it for ALTER TABLE ... ADD COLUMN IF NOT
 # EXISTS even when the column exists) and holds it to the end of the transaction, while live workers write those tables.
@@ -367,6 +367,10 @@ MIGRATIONS: dict[int, list[str]] = {
     # 11: a market's early-close condition: such a market may close before its listed close when its event happens, so its
     # realized close carries the outcome; its time anchor is the scheduled expected expiration (kalshi/mature.load_meta)
     11: ["ALTER TABLE kalshi_markets ADD COLUMN IF NOT EXISTS early_close_condition text"],
+    # 12: the minute's taker sales at their extremes: the lowest YES price a taker sold YES at (bought NO) and the highest a
+    # taker bought YES at (sold NO at 100 − it): a resting bid fills when a taker sells into it (kalshi/decisions.maker_filled)
+    12: ["ALTER TABLE kalshi_minutes ADD COLUMN IF NOT EXISTS yes_sold_low real",
+         "ALTER TABLE kalshi_minutes ADD COLUMN IF NOT EXISTS yes_bought_high real"],
 }
 
 

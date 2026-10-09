@@ -64,11 +64,12 @@ def _num(v, default=0.0) -> float:
 
 class KMinute:
     __slots__ = ("yes_bid", "yes_ask", "last", "bid_size", "ask_size", "volume", "oi", "dollar_volume", "ask_low", "bid_high", "taker_yes", "taker_no",
-                 "n_trades", "max_trade", "block")
+                 "n_trades", "max_trade", "block", "sold_low", "bought_high")
 
     def __init__(self):
         self.yes_bid = self.yes_ask = self.last = math.nan; self.bid_size = self.ask_size = 0.0; self.volume = self.oi = self.dollar_volume = math.nan
         self.ask_low = math.inf; self.bid_high = -math.inf; self.taker_yes = self.taker_no = 0.0; self.n_trades = 0; self.max_trade = 0.0; self.block = 0.0
+        self.sold_low = math.inf; self.bought_high = -math.inf          # YES prices of the minute's taker sales of YES (bought NO) / buys of YES
 
 
 class Aggregator:
@@ -139,8 +140,12 @@ class Aggregator:
                 return
             if msg.get("taker_side") == "yes":
                 row.taker_yes += cnt
+                if math.isfinite(px) and 0 < px < 100:
+                    row.bought_high = max(row.bought_high, px)
             else:
                 row.taker_no += cnt
+                if math.isfinite(px) and 0 < px < 100:
+                    row.sold_low = min(row.sold_low, px)
             row.n_trades += 1; row.max_trade = max(row.max_trade, cnt)
             if msg.get("is_block_trade"):
                 row.block += cnt
@@ -180,19 +185,20 @@ class Aggregator:
             for tk, r in self.minutes[m].items():
                 f = lambda v: (v if math.isfinite(v) else None)
                 rows.append((tk, ts, f(r.yes_bid), f(r.yes_ask), f(r.last), r.bid_size, r.ask_size, f(r.volume), f(r.oi), f(r.dollar_volume),
-                             r.taker_yes, r.taker_no, r.n_trades, r.max_trade, r.block, f(r.ask_low), f(r.bid_high)))
+                             r.taker_yes, r.taker_no, r.n_trades, r.max_trade, r.block, f(r.ask_low), f(r.bid_high), f(r.sold_low), f(r.bought_high)))
         if rows:
             with transaction() as conn:
                 conn.cursor().executemany(
                     "INSERT INTO kalshi_minutes (ticker, ts, yes_bid, yes_ask, last, bid_size, ask_size, volume_fp, open_interest_fp, dollar_volume, taker_buy_yes, taker_buy_no, "
-                    "n_trades, max_trade, block_contracts, yes_ask_low, yes_bid_high) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                    "n_trades, max_trade, block_contracts, yes_ask_low, yes_bid_high, yes_sold_low, yes_bought_high) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                     "ON CONFLICT (ticker, ts) DO UPDATE SET yes_bid = COALESCE(EXCLUDED.yes_bid, kalshi_minutes.yes_bid), yes_ask = COALESCE(EXCLUDED.yes_ask, kalshi_minutes.yes_ask), "
                     "last = COALESCE(EXCLUDED.last, kalshi_minutes.last), bid_size = EXCLUDED.bid_size, ask_size = EXCLUDED.ask_size, "
                     "volume_fp = COALESCE(EXCLUDED.volume_fp, kalshi_minutes.volume_fp), open_interest_fp = COALESCE(EXCLUDED.open_interest_fp, kalshi_minutes.open_interest_fp), "
                     "dollar_volume = COALESCE(EXCLUDED.dollar_volume, kalshi_minutes.dollar_volume), taker_buy_yes = kalshi_minutes.taker_buy_yes + EXCLUDED.taker_buy_yes, "
                     "taker_buy_no = kalshi_minutes.taker_buy_no + EXCLUDED.taker_buy_no, n_trades = kalshi_minutes.n_trades + EXCLUDED.n_trades, "
                     "max_trade = greatest(kalshi_minutes.max_trade, EXCLUDED.max_trade), block_contracts = kalshi_minutes.block_contracts + EXCLUDED.block_contracts, "
-                    "yes_ask_low = least(kalshi_minutes.yes_ask_low, EXCLUDED.yes_ask_low), yes_bid_high = greatest(kalshi_minutes.yes_bid_high, EXCLUDED.yes_bid_high)", rows)
+                    "yes_ask_low = least(kalshi_minutes.yes_ask_low, EXCLUDED.yes_ask_low), yes_bid_high = greatest(kalshi_minutes.yes_bid_high, EXCLUDED.yes_bid_high), "
+                    "yes_sold_low = least(kalshi_minutes.yes_sold_low, EXCLUDED.yes_sold_low), yes_bought_high = greatest(kalshi_minutes.yes_bought_high, EXCLUDED.yes_bought_high)", rows)
         for m in done:
             self.minutes.pop(m, None)
         self.stats["flushed_minutes"] += len(done); self.stats["flushed_rows"] += len(rows)

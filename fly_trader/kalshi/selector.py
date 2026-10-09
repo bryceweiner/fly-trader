@@ -25,14 +25,30 @@ from ..train.decisions import DecisionSet, random_trades, summarize
 from ..train.selector import MIN_EV, MIN_LINE_TRADES, deploy_decision
 from . import decisions as KD
 from .features import K_COLS, KALSHI_FEATURE_VERSION
-from .mature import STRIDE_MIN
+from .mature import MAKER_WINDOW, STRIDE_MIN
 from .strategies import KALSHI, effective, probability
 
 log = logging.getLogger(__name__)
 SELECTOR_DIR = config.BRAIN_DIR / "kalshi_selectors"
 KIND = "kalshi_selector"
-DATA_VERSION = {"features": KALSHI_FEATURE_VERSION, "stride": STRIDE_MIN, "selector": "kalshi-3", "arms": "taker+maker",
+DATA_VERSION = {"features": KALSHI_FEATURE_VERSION, "stride": STRIDE_MIN, "selector": "kalshi-4", "arms": "taker+maker", "maker": MAKER_WINDOW, "gate": "significance",
                 "cols": hashlib.sha1(",".join(K_COLS).encode()).hexdigest()[:8]}
+
+
+def holdout_passes(h: dict) -> tuple[bool, str]:
+    """The Kalshi stack trades only if its holdout — the last days, never fitted on — clears the same bars as its two
+    walk-forward halves (a positive mean, the weekly sign test, the trade count) and beats random picks there. Pass or
+    fail only: nothing is chosen on it, so a failed holdout is never tuned against (operator decision, 2026-10-09)."""
+    if not h or not h.get("n"):
+        return False, "no holdout trades"
+    m, rm = h.get("mean"), h.get("random_mean")
+    if not h.get("base_ok"):
+        return False, (f"its holdout fails the bars: {h.get('n')} trades, mean {(m or 0) * 100:+.2f}%, {h.get('weeks_pos')}/{h.get('weeks')} weeks positive"
+                       f"{' (sign test passed)' if h.get('sign_ok') else ''}")
+    if rm is not None and m <= rm:
+        return False, f"its holdout did not beat random picks ({m * 100:+.2f}% vs {rm * 100:+.2f}%)"
+    return True, f"its holdout made {m * 100:+.2f}% per trade over {h.get('n')} trades, {h.get('weeks_pos')}/{h.get('weeks')} weeks positive"
+
 
 
 def is_current(meta: dict | None) -> bool:
@@ -107,7 +123,8 @@ def load_latest() -> KalshiSelectorModel | None:
 
 def main(days: int | None = None, stop_event: threading.Event | None = None, holdout_days: int | None = None) -> dict:
     """Fit on ``days`` (all when None), withholding the last ``holdout_days`` (default train/strategies.HOLDOUT_DAYS) from
-    every fit; the holdout is scored once afterwards, never used to choose anything."""
+    every fit; the holdout is scored once afterwards, never used to choose anything — but the stack trades only if it
+    passes there too (``holdout_passes``)."""
     from ..ops.reset import reset_training_stats
     reset_training_stats("kalshi_selector", reason="kalshi selector training")
     prog.set_stop_event(stop_event); prog.clear()
@@ -124,17 +141,22 @@ def main(days: int | None = None, stop_event: threading.Event | None = None, hol
     prog.update("kalshi selector: fitting the deployable models on every day", 0, 1, force=True)
     models = S.final_models(ds, stack, spec=KALSHI) if stack.fits else {"strategies": {}, "spec": "kalshi"}
     holdout = S.score_holdout(ds, S.final_models(ds, stack, exclude_days=stack.holdout_days, spec=KALSHI), stack.holdout_days, spec=KALSHI) if stack.holdout_days and stack.fits else {}
+    deployable, reason = stack.deployable, stack.reason
+    if deployable:
+        h_ok, h_why = holdout_passes(holdout)
+        deployable = h_ok; reason = f"{reason}; {h_why}"
     final = KalshiSelectorModel(stack=models, cols=list(ds.cols), trained_through=str(ds.days[-1]))
     final.metrics = {"walk_forward": {**stack.evaluation, "days": None}, "selection": stack.selection, "random_baseline": {"mean": stack.evaluation.get("random_mean")},
                      "components": stack.components,
                      "strategies": {k: {x: v[x] for x in ("line", "hold_min", "thr", "high", "sizing", "selection", "evaluation")} for k, v in models["strategies"].items()},
                      "combine": stack.combine, "veto": {k: v for k, v in (stack.veto or {}).items() if k not in ("p",)} or None, "fallback": stack.fallback,
-                     "holdout": holdout, "costs": "Kalshi taker fee (factor x series multiplier x P(1-P)) at the ask; maker one tick inside the ask + maker fee where charged",
-                     "data": DATA_VERSION, "deployable": stack.deployable, "deploy_reason": stack.reason,
+                     "holdout": holdout, "costs": "Kalshi taker fee (factor x series multiplier x P(1-P)) at the ask; maker one tick above the bid (below the ask) "
+                                                  "+ maker fee where charged, filled on the ask reaching it or a taker sale into it within the order's life",
+                     "data": DATA_VERSION, "deployable": deployable, "deploy_reason": reason,
                      "model": {"kind": "kalshi-stack", "max_days_to_close": config.KALSHI_MAX_DAYS_TO_CLOSE, "max_spread": config.KALSHI_MAX_SPREAD_CENTS},
                      "rows": int(len(ds.y)), "days": len(ds.days), "first_day": str(ds.days[0]), "last_day": str(ds.days[-1])}
     path, sid = save(final)
-    record_event("info", KIND, f"selector saved (snapshot {sid})", {"path": str(path), "deployable": stack.deployable, "reason": stack.reason, **stack.evaluation})
-    prog.update("kalshi selector: saved", 1, 1, force=True, snapshot_id=sid, deployable=stack.deployable, deploy_reason=stack.reason)
-    log.info("kalshi selector saved: %s (snapshot %d) — %s: %s", path, sid, "put to work" if stack.deployable else "NOT put to work", stack.reason)
-    return {"snapshot_id": sid, "deployable": stack.deployable, "deploy_reason": stack.reason, "components": stack.components}
+    record_event("info", KIND, f"selector saved (snapshot {sid})", {"path": str(path), "deployable": deployable, "reason": reason, **stack.evaluation})
+    prog.update("kalshi selector: saved", 1, 1, force=True, snapshot_id=sid, deployable=deployable, deploy_reason=reason)
+    log.info("kalshi selector saved: %s (snapshot %d) — %s: %s", path, sid, "put to work" if deployable else "NOT put to work", reason)
+    return {"snapshot_id": sid, "deployable": deployable, "deploy_reason": reason, "components": stack.components}

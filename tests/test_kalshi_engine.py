@@ -76,7 +76,7 @@ def test_engine_rows_match_the_feature_engine_fed_the_same_bars(monkeypatch):
     assert out["markets_active"] == 2 and out["in_window"] == 2 and out["eligible"] == 4
     X, keys, hold, extremes, n_rows = rec.ctxs[-1]
     assert keys == [(TICKERS[0], "yes"), (TICKERS[0], "no"), (TICKERS[1], "yes"), (TICKERS[1], "no")] and n_rows == 4
-    assert np.allclose(hold, close.timestamp() - (m1 - 60.0)) and extremes[TICKERS[0]] == (pytest.approx(63.0 + (4 % 3) - 0.5), pytest.approx(60.0 + (4 % 3) + 0.5))
+    assert np.allclose(hold, close.timestamp() - (m1 - 60.0)) and extremes[TICKERS[0]][:2] == (pytest.approx(63.0 + (4 % 3) - 0.5), pytest.approx(60.0 + (4 % 3) + 0.5))
     # parity: the same bars through a fresh MarketState / EventState give the same vectors
     meta = {tk: MarketMeta(tk, event_ticker="TSTE-A", series_ticker="TSTE", category="politics", open_ts=(T0 - timedelta(days=3)).timestamp(), close_ts=close.timestamp(),
                            mutually_exclusive=1.0, fee_multiplier=1.0, maker_fee=0.0, strike=float(i + 1)) for i, tk in enumerate(TICKERS)}

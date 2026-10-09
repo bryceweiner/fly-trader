@@ -21,7 +21,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 
 from ..train import strategies as S
 from ..train.scaling import RobustScaler
-from .decisions import MAKER_DISCOUNT, X_COLS, maker_fee_cents
+from .decisions import X_COLS, maker_fee_cents, maker_rest
 from .features import KIDX
 
 ARMS = ("taker", "maker")
@@ -74,11 +74,12 @@ def hold_s(ds, H):
 
 
 def effective(X: np.ndarray, cols: list[str], H) -> np.ndarray:
-    """The arm's fee-inclusive price per contract (cents): the ask for the taker, one tick inside it plus the maker fee for the maker."""
+    """The arm's fee-inclusive price per contract (cents): the ask for the taker; for the maker its bid (one tick above
+    the side's bid, below the ask: kalshi/decisions.maker_rest) plus the maker fee."""
     X = np.atleast_2d(X)
     if H == "taker":
         return X[:, cols.index("eff_price")].astype(np.float64)
-    rest = np.clip(np.round(X[:, cols.index("side_ask")]) - MAKER_DISCOUNT, 1.0, 99.0)
+    rest = maker_rest(X[:, cols.index("side_bid")], X[:, cols.index("side_ask")])
     return rest + maker_fee_cents(rest, X[:, cols.index("fee_mult")], X[:, cols.index("maker_fee")])
 
 

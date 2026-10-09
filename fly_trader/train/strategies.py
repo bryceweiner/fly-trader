@@ -71,6 +71,11 @@ WIN_MIN, PF_MIN, SIGN_ALPHA = 0.65, 1.3, 0.05
 # each walk-forward half it demanded 8 winning weeks (89 %), a stricter bar than the 65 % winners it was meant to protect,
 # and nothing in the corpus passed it (operator decision, 2026-09-16).
 OBJECTIVE = f"win{WIN_MIN}-pf{PF_MIN}-trades-noweekly"
+# A decision set may carry ``gate = "significance"`` (the Kalshi set does: kalshi/decisions.build): a setting then needs a
+# positive mean and the weekly sign test (p ≤ SIGN_ALPHA) instead of PF ≥ PF_MIN and WIN_MIN winners. A contract held to
+# settlement has its win rate fixed by its price and PF by price and edge together (bought at 95c, PF 1.3 takes a 1.3 %
+# edge), and the Kalshi halves are long enough (~39 weeks each) for the sign test to be passable (operator decision,
+# 2026-10-09).
 QUANTILES = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.975, 0.99, 0.995, 0.999)
 LOSS_QUANTILES = (0.05, 0.10, 0.20, 0.30)
 RANDOM_SEEDS = 20
@@ -110,25 +115,35 @@ class Score:
     weeks: int = 0
     weeks_pos: int = 0
     sign_ok: bool = False
+    gate: str = "memecoin"           # "significance": the bars are a positive mean and the weekly sign test (see OBJECTIVE)
 
     @property
     def base_ok(self) -> bool:
+        if self.gate == "significance":
+            return self.n >= _min_trades() and self.mean is not None and self.mean > 0 and self.sign_ok
         return self.n >= _min_trades() and self.pf is not None and self.pf >= PF_MIN
 
     @property
     def admissible(self) -> bool:
+        if self.gate == "significance":
+            return self.base_ok
         return self.base_ok and self.win is not None and self.win >= WIN_MIN
 
     def dict(self) -> dict:
         return {"n": self.n, "win": self.win, "pf": self.pf, "total": self.total, "mean": self.mean, "weeks": self.weeks, "weeks_pos": self.weeks_pos,
-                "sign_ok": self.sign_ok, "admissible": self.admissible, "base_ok": self.base_ok}
+                "sign_ok": self.sign_ok, "admissible": self.admissible, "base_ok": self.base_ok, "gate": self.gate}
+
+
+def bars(gate: str) -> str:
+    """The bars a setting must clear, in words."""
+    return f"a positive mean with a weekly sign test p ≤ {SIGN_ALPHA:g}" if gate == "significance" else f"≥{WIN_MIN:.0%} winners and PF ≥{PF_MIN:g}"
 
 
 def score_trades(ds: DecisionSet, tr: np.ndarray, returns: np.ndarray, day0) -> Score:
-    r = np.asarray(returns[tr], dtype=np.float64)
+    r = np.asarray(returns[tr], dtype=np.float64); gate = getattr(ds, "gate", "memecoin")
     ok = np.isfinite(r); r = r[ok]; tr = np.asarray(tr)[ok]
     if len(r) == 0:
-        return Score()
+        return Score(gate=gate)
     g, l = r[r > 0].sum(), -r[r <= 0].sum()
     wk = np.array([(d - day0).days // 7 for d in ds.day[tr]])
     tot = np.bincount(wk - wk.min(), weights=r) if len(wk) else np.array([])
@@ -136,7 +151,7 @@ def score_trades(ds: DecisionSet, tr: np.ndarray, returns: np.ndarray, day0) -> 
     weeks = int(has.sum()); pos = int(((tot > 0) & has).sum())
     p = float(binom.sf(pos - 1, weeks, 0.5)) if weeks else 1.0          # P(X ≥ pos) under no edge
     return Score(n=len(r), win=float((r > 0).mean()), pf=float(g / l) if l > 0 else float("inf"), total=float(r.sum()), mean=float(r.mean()),
-                 weeks=weeks, weeks_pos=pos, sign_ok=p <= SIGN_ALPHA)
+                 weeks=weeks, weeks_pos=pos, sign_ok=p <= SIGN_ALPHA, gate=gate)
 
 
 def score_pick(ds: DecisionSet, pick: np.ndarray, hold_s, returns: np.ndarray, day0) -> Score:
@@ -433,7 +448,8 @@ def fit_strategy(ds: DecisionSet, name: str, cols: list[str], uni: np.ndarray, s
             H, line, thr, high = best_p
     if best_p is None:
         return StrategyFit(name, H, float("inf"), thr, high, cols, oos=oos[H], trials=trials, best_seen=seen.dict() if seen else {},
-                           reason="no setting met PF and the trade count on the selection half", spec=sp)
+                           reason=("no setting met the sign test, a positive mean and the trade count on the selection half" if getattr(ds, "gate", "") == "significance"
+                                   else "no setting met PF and the trade count on the selection half"), spec=sp)
     H, line, thr, high = best_p
     return StrategyFit(name, H, float(line), thr, high, cols, oos=oos[H], selection=best.dict(), trials=trials, best_seen=seen.dict() if seen else {}, spec=sp)
 
@@ -610,7 +626,7 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
         evs = score_pick(ds, f.pick(ds, ev, uni), sp.hold_s(ds, f.hold_min), y_r, day0)
         sel_adm = f.selection.get("admissible")
         f.evaluation = evs.dict(); f.passed = passes(evs, fallback=not sel_adm)
-        f.reason = ("meets ≥65 % winners and PF ≥1.3 on both halves" if sel_adm and evs.admissible else
+        f.reason = (f"meets {bars(evs.gate)} on both halves" if sel_adm and evs.admissible else
                     "profit fallback: below 65 % winners, PF ≥1.3 on both halves" if f.passed else "fails on the evaluation half")
         comps.append(_comp(f"strategy: {name}", f.passed, f.reason, f.selection, f.evaluation, {"hold_min": f.hold_min, "line": f.line, "thr": f.thr, "high": f.high}, f.trials,
                            best=f.best_seen))
@@ -687,7 +703,7 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
     strict = s_sel.admissible and s_ev.admissible
     fb = (not strict) and s_sel.base_ok and s_ev.base_ok
     deployable = dep and (strict or fb)
-    reason = (why + ("; meets ≥65 % winners and PF ≥1.3 on both halves" if strict else "; profit fallback (below 65 % winners)" if fb else "; fails the stack's bars"))
+    reason = (why + (f"; meets {bars(s_ev.gate)} on both halves" if strict else "; profit fallback (below 65 % winners)" if fb else f"; fails the stack's bars ({bars(s_ev.gate)})"))
     return Stack(groups, cols, fits, combine, veto, comps, s_sel.dict(), {**s_ev.dict(), "random_mean": rnd.get("mean")}, deployable, fb and deployable, reason, tables,
                  holdout_days=holdout_days)
 

@@ -3,9 +3,12 @@
 Per event, every settled market's candles and trades are merged into minute bars and stepped through together (the
 siblings' quotes feed ``EventState``), and every ``STRIDE_MIN`` minutes inside the entry window (the last
 ``KALSHI_MAX_DAYS_TO_CLOSE`` days before close, at least ``KALSHI_MIN_MINUTES_TO_CLOSE`` before it) a row per side is
-written with the ``K_COLS`` vector, the settlement (``result``), the times the labels need and ``fut_min_ask`` — the
-lowest ask the side saw over the rest of the market's life, which is what decides whether a resting order would have
-filled (kalshi/decisions.py). Output: ``data/kalshi/features/<day>/part-<batch>.parquet`` (day = the row's UTC date),
+written with the ``K_COLS`` vector, the settlement (``result``), the times the labels need, and what decides whether the
+maker arm's bid would have filled (kalshi/decisions.maker_filled) over the order's life — the minutes after the decision
+up to ``KALSHI_MAKER_TTL_H`` later, ending ``KALSHI_MAKER_QUIET_MIN`` before the close known at decision time (the arm's
+expiry): ``fill_ask_low``, the lowest ask the side showed, and ``fill_sold_low``, the lowest price a taker sold the side
+at (from the trades). The order's window is stamped on every part (``MAKER_WINDOW``): another window is another corpus.
+Output: ``data/kalshi/features/<day>/part-<batch>.parquet`` (day = the row's UTC date),
 version-stamped like train/mature.py; markets go ``done → built`` in ``kalshi_corpus``; ``kalshi_days`` counts rows.
 """
 from __future__ import annotations
@@ -18,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -29,10 +33,11 @@ from .features import CATEGORIES, K_COLS, KALSHI_FEATURE_VERSION, Bar, EventStat
 
 log = logging.getLogger(__name__)
 STRIDE_MIN = 5
-META_COLS = ["ticker", "side", "ts", "event_ticker", "category", "close_ts", "end_ts", "settled_ts", "result", "fut_min_ask", "fut_min_ask_24h"]
+META_COLS = ["ticker", "side", "ts", "event_ticker", "category", "close_ts", "end_ts", "settled_ts", "result", "fill_ask_low", "fill_sold_low"]
 SCHEMA = pa.schema([("ticker", pa.string()), ("side", pa.string()), ("ts", pa.timestamp("ms", tz="UTC")), ("event_ticker", pa.string()), ("category", pa.string()),
-                    ("close_ts", pa.float64()), ("end_ts", pa.float64()), ("settled_ts", pa.float64()), ("result", pa.string()), ("fut_min_ask", pa.float32()), ("fut_min_ask_24h", pa.float32())]
+                    ("close_ts", pa.float64()), ("end_ts", pa.float64()), ("settled_ts", pa.float64()), ("result", pa.string()), ("fill_ask_low", pa.float32()), ("fill_sold_low", pa.float32())]
                    + [(c, pa.float32()) for c in K_COLS])
+MAKER_WINDOW = f"{config.KALSHI_MAKER_TTL_H:g}h-quiet{config.KALSHI_MAKER_QUIET_MIN:g}m"     # the maker order's life the labels assume
 RECURRING = ("hourly", "daily", "15min", "minute", "4h", "weekly")
 
 
@@ -46,7 +51,7 @@ def part_version(path) -> int:
 
 def part_current(path) -> bool:
     p = Path(path)
-    return p.exists() and part_version(p) == KALSHI_FEATURE_VERSION
+    return p.exists() and part_version(p) == KALSHI_FEATURE_VERSION and (pq.read_schema(p).metadata or {}).get(b"maker_window") == MAKER_WINDOW.encode()
 
 
 def build_complete() -> tuple[bool, str]:
@@ -146,35 +151,57 @@ def _side_ask_lows(c_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return c["end_ts"].to_numpy(dtype=np.int64), ya, nb
 
 
-def _suffix_min(a: np.ndarray) -> np.ndarray:
-    """min over positions > i (exclusive), NaN-aware; NaN where nothing follows."""
-    x = np.where(np.isfinite(a), a, np.inf)
-    s = np.minimum.accumulate(x[::-1])[::-1]
-    out = np.full(len(a), np.nan); out[:-1] = s[1:]
-    return np.where(np.isfinite(out), out, np.nan)
-
-
-def _window_min(ts: np.ndarray, a: np.ndarray, span_s: float) -> np.ndarray:
-    """min over positions j > i with ts[j] <= ts[i] + span (a rolling forward window), NaN-aware."""
-    out = np.full(len(a), np.nan); x = np.where(np.isfinite(a), a, np.inf)
-    j_end = np.searchsorted(ts, ts + span_s, side="right")
-    for i in range(len(a)):
-        seg = x[i + 1:j_end[i]]
-        if len(seg):
-            m = seg.min(); out[i] = m if np.isfinite(m) else np.nan
+def _side_sold_lows(t_path: str | None) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Per side, (minute end, lowest price a taker sold the side at in that minute) from a trade file: a taker who bought
+    NO sold YES at the trade's YES price, one who bought YES sold NO at 100 − it."""
+    out = {s: (np.zeros(0, np.int64), np.zeros(0)) for s in ("yes", "no")}
+    if not t_path or not Path(t_path).exists():
+        return out
+    t = pq.read_table(t_path, columns=["ts", "yes_price", "taker_side"]).to_pandas()
+    if not len(t):
+        return out
+    ends = (np.floor(_epoch_s(t["ts"]) / 60.0) * 60 + 60).astype(np.int64); yp = t["yes_price"].to_numpy(dtype=float); who = t["taker_side"].to_numpy()
+    for side, seller, price in (("yes", "no", yp), ("no", "yes", 100.0 - yp)):
+        m = (who == seller) & (yp > 0) & (yp < 100)
+        if m.any():
+            s = pd.Series(price[m]).groupby(ends[m]).min()
+            out[side] = (s.index.to_numpy(np.int64), s.to_numpy(dtype=float))
     return out
+
+
+def _window_lows(ends: np.ndarray, vals: np.ndarray, after: np.ndarray, until: np.ndarray) -> np.ndarray:
+    """Per query i, the lowest of ``vals`` over the minutes whose end lies in (after[i], until[i]]; NaN where there is none.
+    ``ends`` ascending; a sparse table answers every query in O(1)."""
+    out = np.full(len(after), np.nan)
+    if not len(ends) or not len(after):
+        return out
+    tab = [np.where(np.isfinite(vals), vals, np.inf)]
+    while (1 << len(tab)) <= len(ends):
+        h = 1 << (len(tab) - 1); tab.append(np.minimum(tab[-1][:-h], tab[-1][h:]))
+    lo = np.searchsorted(ends, after, side="right"); hi = np.searchsorted(ends, until, side="right"); n = hi - lo; ok = n > 0
+    k = np.zeros(len(after), np.int64); k[ok] = np.floor(np.log2(n[ok])).astype(np.int64)
+    k[ok] -= np.left_shift(1, k[ok]) > n[ok]                                      # float log2 rounding up at a power of two
+    for kk in np.unique(k[ok]):
+        m = ok & (k == kk); v = np.minimum(tab[kk][lo[m]], tab[kk][hi[m] - (1 << int(kk))])
+        out[m] = np.where(np.isfinite(v), v, np.nan)
+    return out
+
+
+def fill_lows(candle_path: str, trade_path: str | None, anchor_close: float | None) -> tuple[np.ndarray, dict]:
+    """(candle minute ends, side -> (fill_ask_low, fill_sold_low) per candle minute) for a maker bid posted at the end of
+    each candle minute and resting for the order's life: until ``KALSHI_MAKER_TTL_H`` later, ending ``KALSHI_MAKER_QUIET_MIN``
+    before the close known at decision time (kalshi/maker.plan's expiry; minutes after an early close have no data)."""
+    ends, ya, nb = _side_ask_lows(candle_path); sold = _side_sold_lows(trade_path)
+    o = np.argsort(ends, kind="stable"); ends, ya, nb = ends[o], ya[o], nb[o]
+    cut = (anchor_close if anchor_close is not None else math.inf) - config.KALSHI_MAKER_QUIET_MIN * 60.0
+    until = np.minimum(ends + config.KALSHI_MAKER_TTL_H * 3600.0, cut)
+    return ends, {side: (_window_lows(ends, asks, ends, until), _window_lows(*sold[side], ends, until)) for side, asks in (("yes", ya), ("no", nb))}
 
 
 def build_event(event_ticker: str, markets: list[dict], metas: dict[str, MarketMeta]) -> list[dict]:
     """Rows of every market of one event, stepped minute by minute together."""
     bars = {m["ticker"]: bars_from_files(m["candle_path"], m["trade_path"]) for m in markets}
-    lows = {m["ticker"]: _side_ask_lows(m["candle_path"]) for m in markets if m["candle_path"]}
-    fut = {}
-    for tk, (ts, ya, nb) in lows.items():
-        # a resting order can only fill while the market trades: nothing after close − the maker's quiet margin counts
-        cut = (metas[tk].end_ts or float("inf")) - config.KALSHI_MAKER_QUIET_MIN * 60.0    # a label: the realized close may be used
-        live = ts <= cut; ya = np.where(live, ya, np.nan); nb = np.where(live, nb, np.nan)
-        fut[tk] = (ts, {"yes": (_suffix_min(ya), _window_min(ts, ya, 86400.0)), "no": (_suffix_min(nb), _window_min(ts, nb, 86400.0))})
+    fills = {m["ticker"]: fill_lows(m["candle_path"], m["trade_path"], metas[m["ticker"]].close_ts) for m in markets if m["candle_path"]}
     states = {tk: MarketState(tk) for tk in bars}; ev = EventState()
     pos = {tk: 0 for tk in bars}
     minutes = sorted({b.t_end for bs in bars.values() for b in bs})
@@ -194,15 +221,14 @@ def build_event(event_ticker: str, markets: list[dict], metas: dict[str, MarketM
             to_close = meta.close_ts - t_end
             if not (min_s <= to_close <= max_s):
                 continue
-            ts_arr, fl = fut[tk]
-            j = int(np.searchsorted(ts_arr, int(t_end)))
+            ends, fl = fills[tk]
+            j = int(np.searchsorted(ends, int(t_end)))
             for side in ("yes", "no"):
                 x = st.features(t_end, meta, side, ev)
-                fmin, fmin24 = fl[side]
+                f_ask, f_sold = fl[side]
                 row = {"ticker": tk, "side": side, "ts": datetime.fromtimestamp(t_end - 60.0, timezone.utc), "event_ticker": event_ticker, "category": meta.category,
                        "close_ts": meta.close_ts, "end_ts": meta.end_ts, "settled_ts": (m["settled_ts"].timestamp() if m["settled_ts"] else meta.end_ts), "result": m["result"],
-                       "fut_min_ask": float(fmin[j]) if j < len(fmin) and np.isfinite(fmin[j]) else float("nan"),
-                       "fut_min_ask_24h": float(fmin24[j]) if j < len(fmin24) and np.isfinite(fmin24[j]) else float("nan")}
+                       "fill_ask_low": float(f_ask[j]) if j < len(f_ask) else float("nan"), "fill_sold_low": float(f_sold[j]) if j < len(f_sold) else float("nan")}
                 row.update(zip(K_COLS, x))
                 out.append(row)
     return out
@@ -248,7 +274,8 @@ def build_batch(limit: int = 300) -> int:
     batch = int(time.time() * 1000); n_rows = 0
     for day, rows in rows_by_day.items():
         path = D.FEATURES_DIR / day / f"part-{batch}.parquet"; path.parent.mkdir(parents=True, exist_ok=True)
-        tab = pa.Table.from_pylist(rows, schema=SCHEMA).replace_schema_metadata({b"fly_version": str(KALSHI_FEATURE_VERSION).encode(), b"stride_min": str(STRIDE_MIN).encode()})
+        tab = pa.Table.from_pylist(rows, schema=SCHEMA).replace_schema_metadata({b"fly_version": str(KALSHI_FEATURE_VERSION).encode(), b"stride_min": str(STRIDE_MIN).encode(),
+                                                                         b"maker_window": MAKER_WINDOW.encode()})
         tmp = path.with_name(path.name + ".tmp"); pq.write_table(tab, tmp, compression="zstd"); tmp.replace(path); n_rows += len(rows)
     with transaction() as conn:
         conn.cursor().executemany("UPDATE kalshi_corpus SET status = 'built', updated_at = now() WHERE ticker = %s", [(t,) for t in built])

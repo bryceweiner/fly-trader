@@ -53,7 +53,7 @@ class KMinute:
     hold_s: np.ndarray                 # per row: seconds from the minute start to the market's close (the position's hold)
     metas: dict                        # ticker → MarketMeta (every market with a state)
     quotes: dict                       # ticker → (yes_bid, yes_ask, bid_size, ask_size) latest known
-    extremes: dict                     # ticker → (yes_ask_low, yes_bid_high) of this minute (markets with a row)
+    extremes: dict                     # ticker → (yes_ask_low, yes_bid_high, yes_sold_low, yes_bought_high) of this minute (markets with a row)
     n_rows: int
     fresh: bool
     trade: bool
@@ -102,7 +102,7 @@ class KalshiMinuteEngine:
     # ---- one minute ----
     def _rows(self, conn, m0: datetime) -> list[dict]:
         return [dict(r) for r in conn.execute("SELECT ticker, yes_bid, yes_ask, last, bid_size, ask_size, volume_fp, open_interest_fp, taker_buy_yes, taker_buy_no, n_trades, max_trade, "
-                                              "block_contracts, yes_ask_low, yes_bid_high FROM kalshi_minutes WHERE ts = %s", (m0,)).fetchall()]
+                                              "block_contracts, yes_ask_low, yes_bid_high, yes_sold_low, yes_bought_high FROM kalshi_minutes WHERE ts = %s", (m0,)).fetchall()]
 
     @staticmethod
     def _bar(r: dict, t_end: float) -> Bar:
@@ -191,7 +191,7 @@ class KalshiMinuteEngine:
             rows = self._rows(conn, m0)
             fed = self.feed(conn, rows, m1_epoch)
             X, keys, holds, n_rows = self.rows_for(fed, m1_epoch)
-            extremes = {r["ticker"]: (r["yes_ask_low"], r["yes_bid_high"]) for r in rows}
+            extremes = {r["ticker"]: (r["yes_ask_low"], r["yes_bid_high"], r["yes_sold_low"], r["yes_bought_high"]) for r in rows}
             ctx = KMinute(conn=conn, m0=m0, m1=m1, m1_epoch=m1_epoch, X=X, keys=keys, hold_s=holds, metas=self.metas, quotes=self.quotes, extremes=extremes,
                           n_rows=n_rows, fresh=trade and self.stream_fresh(m1_epoch - 60), trade=trade, engine=self)
             out.update(markets_active=len(rows), in_window=n_rows // 2, eligible=len(keys)); held: set[str] = set()
