@@ -180,6 +180,16 @@ An unsigned or wrongly signed commit is refused and logged. While `release/allow
 installed. `docker compose logs -f fly` shows what it did. `AUTO_UPDATE=0` in `.env` turns this off; then the
 "Refreshing the model" steps below are the manual way.
 
+**Installed before October 2026? Rebuild once.** The updater in those images installed whatever Hugging Face held,
+unverified; it may install this release by itself, but only a rebuilt image can check signatures (it needs `ssh-keygen`),
+so it stops at this release. From your install directory:
+
+```bash
+git pull && docker compose up -d --build
+```
+
+Your data, the fly's learned state and open positions are kept. Robinhood Chain stays off until you turn it on.
+
 ## Refreshing the model
 
 The model is a snapshot of one training run. To ship a newer one, on a `master` checkout with its database, after a
