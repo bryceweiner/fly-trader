@@ -21,8 +21,10 @@ def _rate_limited(e: Exception) -> bool:
 
 
 class RhRpc(EvmRpc):
+    """Without an explicit ``url``: the transaction endpoint (``RH_RPC_URL_TX``, e.g. QuickNode), else the public RPC. Log
+    readers pass their endpoint (``logs_rpc``): the transaction endpoint may refuse log ranges."""
     def __init__(self, url: str | None = None, chain_id: int | None = None, service: str = "rh_rpc", timeout: float = 20.0):
-        super().__init__(url or config.RH_RPC_URL, chain_id if chain_id is not None else config.RH_EXPECTED_CHAIN_ID, service, timeout)
+        super().__init__(url or config.RH_RPC_URL_TX or config.RH_RPC_URL, chain_id if chain_id is not None else config.RH_EXPECTED_CHAIN_ID, service, timeout)
 
     def call(self, method: str, params: list | None = None) -> Any:
         """``EvmRpc.call`` that waits out a rate limit (429) with exponential backoff; any other error raises at once.

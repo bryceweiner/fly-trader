@@ -16,7 +16,8 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 
 SECRET_ENV_NAMES = ("HELIUS_API_KEY", "JUPITER_API_KEY", "BOT_PRIVATE_KEY", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH",
                     "RELAY_SECRET", "TELEGRAM_BOT_TOKEN", "VAULT_BACKUP_HF_TOKEN", "VAULT_SOLANA_RPC_URL", "SIGNER_RPC_URL",
-                    "SOLANA_CHECK_RPC_URL", "HEALTHCHECK_URL", "RH_BOT_PRIVATE_KEY", "RH_RPC_URL_LOGS", "ENVIO_API_TOKEN", "QUICKNODE_API_KEY")
+                    "SOLANA_CHECK_RPC_URL", "HEALTHCHECK_URL", "RH_BOT_PRIVATE_KEY", "RH_RPC_URL_LOGS", "ENVIO_API_TOKEN", "QUICKNODE_API_KEY",
+                    "QUICKNODE_RH_API_KEY", "QUICKNODE_RH_API_URL", "RH_RPC_URL_TX")
 
 
 def utcnow() -> datetime:
@@ -246,6 +247,21 @@ RH_LIVE_ENABLED = env_bool("RH_LIVE_ENABLED", False)                # sign and s
 RH_TESTNET = env_bool("RH_TESTNET", False)                          # chain 46630 (the rehearsal); the guard refuses a mismatch
 RH_EXPECTED_CHAIN_ID = 46630 if RH_TESTNET else RH_CHAIN_ID
 RH_RPC_URL_LOGS = env_str("RH_RPC_URL_LOGS")                        # optional better endpoint for eth_getLogs / tx lookups (else RH_RPC_URL)
+
+
+def quicknode_rh_url() -> str | None:
+    """The QuickNode RH endpoint: QUICKNODE_RH_API_URL, with QUICKNODE_RH_API_KEY appended when the URL does not carry it."""
+    url, key = env_str("QUICKNODE_RH_API_URL"), env_str("QUICKNODE_RH_API_KEY")
+    if not url:
+        return None
+    return url if not key or key in url else url.rstrip("/") + "/" + key
+
+
+# sending and reading transactions (sends, receipts, nonces, balances, eth_call, gas): every RhRpc() without an explicit URL.
+# Never logs: QuickNode's free Discover plan caps eth_getLogs at 5 blocks (measured 2026-10-09), so logs stay on HyperSync /
+# RH_RPC_URL_LOGS / RH_RPC_URL; its 10M credits a month cover the trading path, not a log tail. QuickNode serves mainnet
+# only while RH_RPC_URL is the default: a run that points RH_RPC_URL elsewhere (anvil, the testnet rehearsal) sends there.
+RH_RPC_URL_TX = env_str("RH_RPC_URL_TX") or (quicknode_rh_url() if env_str("RH_RPC_URL") is None and not RH_TESTNET else None)
 # block headers for timing the index (rh/blocktime.py): PublicNode serves header batches fast but refuses eth_getLogs (403),
 # the official RPC serves logs but rate-limits at ~20 requests/min (measured 2026-09-28) — so each does what it does well
 RH_RPC_URL_BLOCKS = env_str("RH_RPC_URL_BLOCKS", "https://robinhood-rpc.publicnode.com")

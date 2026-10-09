@@ -36,7 +36,7 @@ def run(sample: int = 12, amount_wei: int = 10 ** 14) -> dict:
     rpc = RhRpc(); rep = {"chain_id": rpc.chain(), "expected": config.RH_EXPECTED_CHAIN_ID, "contracts": {}, "pools": []}
     for name in CONTRACTS:
         a = getattr(config, name); rep["contracts"][name] = {"address": a, "code_bytes": max(0, len(rpc.code(a)) // 2 - 1)}
-    grads = recent_graduations(rpc)[-sample:]
+    grads = recent_graduations(RhRpc(config.RH_RPC_URL))[-sample:]   # 50k-block log ranges: the public RPC, not the transaction endpoint
     ky = K.Kyber(); gas_k = []
     for g in grads:
         row = {"meme": g["meme"], "quote": "ETH" if int(g["quote"], 16) == 0 else g["quote"]}
