@@ -372,6 +372,8 @@ WEB = Path(__file__).parents[1] / "web"
 
 class RelayHttp:
     def __init__(self, tmp_path, monkeypatch, **cfg_over):
+        if not (WEB / "relay").is_dir():
+            pytest.skip("the relay lives on master (web/relay)")
         monkeypatch.syspath_prepend(str(WEB))
         from relay import app as relay_app, ratelimit
         self.app, self.now = relay_app, 1790557200.0

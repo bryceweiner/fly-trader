@@ -18,6 +18,7 @@ from fly_trader.vault import claim_message as cm, claims, publish, sigs
 from fly_trader.vault.relay_client import RelayClient
 
 WEB = Path(__file__).parents[1] / "web"
+pytestmark = pytest.mark.skipif(not (WEB / "relay").is_dir(), reason="the relay lives on master (web/relay)")
 V = json.loads((Path(__file__).parent / "vectors" / "claim_v1.json").read_text())["vectors"][1]
 SECRET = "c3" * 32
 
