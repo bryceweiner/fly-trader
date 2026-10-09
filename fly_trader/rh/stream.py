@@ -24,6 +24,8 @@ log = logging.getLogger(__name__)
 BACKFILL_RANGES = 20            # ranges per pass while far behind (then a status write)
 LIVE_LAG_BLOCKS = 5_000         # closer than this to the head counts as live
 RPC_CATCHUP_S = 3.0             # between catch-up passes while HyperSync is down (each reads ~2-3 times from the public RPC)
+SLOW_EVERY_S = 60.0             # meta and corpus refresh with each written minute, else at least this often
+_SLOW = {"at": 0.0}
 
 
 def _status(**kv) -> None:
@@ -82,9 +84,12 @@ def one_pass(rpc, skill=None) -> dict:
     wallet_skill.daily(); lap("skill_tables")                  # today's and tomorrow's tables, before their minutes are written
     mn = minutes.run_once(src, wallet_skill.load_today() if skill is None else skill); lap("minutes")
     from . import corpus, meta
-    mt = meta.run_once(); lap("meta")
-    cp = corpus.run_once(max_days=1) if behind <= LIVE_LAG_BLOCKS * 20 else {}          # the training corpus follows once near the head
-    lap("corpus")
+    mt, cp = {}, {}
+    if mn.get("minutes") or time.monotonic() - _SLOW["at"] >= SLOW_EVERY_S:   # after a written minute: passes in between stay short
+        _SLOW["at"] = time.monotonic()
+        mt = meta.run_once(); lap("meta")
+        cp = corpus.run_once(max_days=1) if behind <= LIVE_LAG_BLOCKS * 20 else {}      # the training corpus follows once near the head
+        lap("corpus")
     out = {"head": head, "index_through": ix.get("through"), "behind_blocks": head - (ix.get("through") or 0), "index": ix.get("counts"), "prices": px,
            "minutes": mn, "meta": mt, "corpus": cp, "mode": "backfill" if behind > LIVE_LAG_BLOCKS else "live", "timings_s": tm,
            "logs_from": pre.source if pre is not None else ("hypersync" if hasattr(rpc, "hs") else "rpc"),

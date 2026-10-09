@@ -173,8 +173,15 @@ def run_once(max_ranges: int = 1, rpc=None) -> dict:
         return out
     through = int(top["block"])
     start = int(((top["detail"] or {}).get("start_block")) or config.RH_START_BLOCK or through)      # where the index began
+    with transaction() as conn:          # every price cursor in one read: a pass every few seconds cannot afford ~4 queries per asset
+        curs = {r["name"]: r for r in conn.execute("SELECT name, block, range_blocks, detail FROM rh_scan WHERE name LIKE 'price:%%'").fetchall()}
     assets = []
     for a in rows:
+        c = curs.get(f"price:{a['asset']}")
+        if a["ref_path"] and c is not None:                      # the usual case: path known, cursor exists
+            hops = json.loads(a["ref_path"]) if isinstance(a["ref_path"], str) else a["ref_path"]
+            assets.append({"asset": a["asset"], "hops": hops, "at": int(c["block"]), "rng": int(c["range_blocks"]), "state": (c["detail"] or {}).get("state", {})})
+            continue
         try:
             with transaction() as conn:
                 hops = a["ref_path"] if a["ref_path"] else discover(conn, rpc, a["asset"], int(a["decimals"]))
