@@ -14,9 +14,10 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env", override=False)
 
-SECRET_ENV_NAMES = ("HELIUS_API_KEY", "JUPITER_API_KEY", "BOT_PRIVATE_KEY",
+SECRET_ENV_NAMES = ("HELIUS_API_KEY", "JUPITER_API_KEY", "BOT_PRIVATE_KEY", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH",
                     "RELAY_SECRET", "TELEGRAM_BOT_TOKEN", "VAULT_BACKUP_HF_TOKEN", "VAULT_SOLANA_RPC_URL", "SIGNER_RPC_URL",
-                    "SOLANA_CHECK_RPC_URL", "HEALTHCHECK_URL", "RH_BOT_PRIVATE_KEY", "RH_RPC_URL_LOGS")
+                    "SOLANA_CHECK_RPC_URL", "HEALTHCHECK_URL", "RH_BOT_PRIVATE_KEY", "RH_RPC_URL_LOGS", "ENVIO_API_TOKEN", "QUICKNODE_API_KEY",
+                    "QUICKNODE_RH_API_KEY", "QUICKNODE_RH_API_URL", "RH_RPC_URL_TX")
 
 
 def utcnow() -> datetime:
@@ -77,9 +78,12 @@ KELLY_FRACTION = env_float("KELLY_FRACTION", 0.25)                 # quarter Kel
 MAX_POSITION_FRACTION = env_float("MAX_POSITION_FRACTION", 0.10)   # of the deployable bankroll (wealth minus the gas reserve)
 MAX_POOL_SHARE = env_float("MAX_POOL_SHARE", 0.02)                 # of the pool's quote reserve (bounds price impact)
 # The training label charges what an exit really costs at the size the book takes. market/features.py prices
-# exit_cost_0p1 for a fixed 0.1 SOL, but positions are Kelly-sized up to MAX_POSITION_FRACTION of the bankroll, and
-# impact = value/(value + reserves) grows with size. 0 = the sizing rule's own ceiling (train/decisions.py).
-LABEL_SIZE_SOL = env_float("LABEL_SIZE_SOL", 0.0)
+# exit_cost_0p1 for a fixed 0.1 SOL, but impact = value/(value + reserves) grows with size. Labels are priced at
+# min(LABEL_SIZE_SOL, MAX_POOL_SHARE of the pool) -- the "label size" -- and no position is ever bigger (agent/sizing.py):
+# every edge the models show was measured at that size. A fixed reference, never a share of the bankroll: derived from
+# CAPITAL_SOL it made the labels, and the sizes, grow with the bankroll, and in the 2026-09-26 replay a 500 SOL book
+# sized past it lost 426 SOL over 60 days where one capped at it made the same +13 SOL as a 5 or 50 SOL book.
+LABEL_SIZE_SOL = env_float("LABEL_SIZE_SOL", 0.5)
 MIN_POSITION_SOL = env_float("MIN_POSITION_SOL", 0.02)             # smaller sizes are skipped
 KILL_SWITCH_DRAWDOWN = env_float("KILL_SWITCH_DRAWDOWN", 0.30)
 KILL_SWITCH_LIQUIDATE = env_bool("KILL_SWITCH_LIQUIDATE", False)   # a tripped kill switch also sells every open live position (agent/fly_live.py)
@@ -104,6 +108,20 @@ LAMPORTS_PER_SOL = 1_000_000_000
 STATS_REFRESH_S = env_float("STATS_REFRESH_S", 600.0)
 
 # ---- connectome (the fly) ----
+# How the fly picks its buy line (train/fly_calibrate.py): total | selector | match. match = its teacher's selectivity:
+# in the 2026-09-26 replays it took 92 trades at +10.1 % (58 % winners, PF 1.92) where total took 1,607 at +2.0 %.
+FLY_CALIB_RULE = env_str("FLY_CALIB_RULE", "match")
+# How the fly sizes a buy (agent/sizing.py): kelly = the selector's own Kelly band for the row (its score, line and sizing
+# table; with FLY_TEACHER_GATE every fly buy is a selector buy, sized exactly as the selector sizes it) | flat =
+# MAX_POSITION_FRACTION of the deployable bankroll on every buy. (Flat was the default while the fly sized from its own
+# calibrated bands, which flipped between Kelly 0.97, 0 and 0.15 on its few trades a week; the selector's bands are fitted
+# on its walk-forward and do not.)
+FLY_SIZING = env_str("FLY_SIZING", "kelly")
+# The fly buys only what its teacher (the deployed selector stack) would buy: the same trigger, line, win filter, gates,
+# dump veto and fail-closed rules. Its own learning (plastic score below its bootstrap score by FLY_LEARNED_VETO) can
+# only drop a teacher trade, never add one (2026-10-08: ungated, the fly bought rows the selector rejected and lost).
+FLY_TEACHER_GATE = env_bool("FLY_TEACHER_GATE", True)
+FLY_LEARNED_VETO = env_float("FLY_LEARNED_VETO", 0.02)
 DEVICE = env_str("DEVICE", "auto")          # auto (CUDA, else MPS, else CPU) | cpu | cuda | cuda:N | mps  — brain/device.py
 NT_SIGN_MODE = env_str("NT_SIGN_MODE", "shiu")  # shiu | flybrain
 CELL_TYPES_SOURCE = env_str("CELL_TYPES_SOURCE", "annotations")  # annotations | flybrain
@@ -173,7 +191,7 @@ PAYOUT_PRIVATE_KEY_FILE = env_str("PAYOUT_PRIVATE_KEY_FILE")      # the key that
 VAULT_BOOK = env_str("VAULT_BOOK", "live")                         # the book the vault shares: live; a paper book (e.g. paper_fly) for a dry run on real decisions without real SOL
 VAULT_CLUSTER = env_str("VAULT_CLUSTER", "mainnet-beta")           # devnet only for the rehearsal (trading off, claims on devnet)
 VAULT_SOLANA_RPC_URL = env_str("VAULT_SOLANA_RPC_URL")             # overrides Helius for the vault's reads/claims (the devnet rehearsal)
-FUNDING_ADDRESSES = env_list("FUNDING_ADDRESSES", [])              # SOL from these is a deposit; from anyone else, profit
+FUNDING_ADDRESSES = env_list("FUNDING_ADDRESSES", [])              # your own Solana wallets: SOL from these is a deposit (vault); the console withdraws only to these
 RH_CHAIN_ID = env_int("RH_CHAIN_ID", 4663)
 RH_RPC_URL = env_str("RH_RPC_URL", "https://rpc.mainnet.chain.robinhood.com")
 VAULT_ADDRESS = env_str("VAULT_ADDRESS")                            # the FlyVault proxy
@@ -229,10 +247,28 @@ RH_LIVE_ENABLED = env_bool("RH_LIVE_ENABLED", False)                # sign and s
 RH_TESTNET = env_bool("RH_TESTNET", False)                          # chain 46630 (the rehearsal); the guard refuses a mismatch
 RH_EXPECTED_CHAIN_ID = 46630 if RH_TESTNET else RH_CHAIN_ID
 RH_RPC_URL_LOGS = env_str("RH_RPC_URL_LOGS")                        # optional better endpoint for eth_getLogs / tx lookups (else RH_RPC_URL)
+
+
+def quicknode_rh_url() -> str | None:
+    """The QuickNode RH endpoint: QUICKNODE_RH_API_URL, with QUICKNODE_RH_API_KEY appended when the URL does not carry it."""
+    url, key = env_str("QUICKNODE_RH_API_URL"), env_str("QUICKNODE_RH_API_KEY")
+    if not url:
+        return None
+    return url if not key or key in url else url.rstrip("/") + "/" + key
+
+
+# sending and reading transactions (sends, receipts, nonces, balances, eth_call, gas): every RhRpc() without an explicit URL.
+# Never logs: QuickNode's free Discover plan caps eth_getLogs at 5 blocks (measured 2026-10-09), so logs stay on HyperSync /
+# RH_RPC_URL_LOGS / RH_RPC_URL; its 10M credits a month cover the trading path, not a log tail. QuickNode serves mainnet
+# only while RH_RPC_URL is the default: a run that points RH_RPC_URL elsewhere (anvil, the testnet rehearsal) sends there.
+RH_RPC_URL_TX = env_str("RH_RPC_URL_TX") or (quicknode_rh_url() if env_str("RH_RPC_URL") is None and not RH_TESTNET else None)
 # block headers for timing the index (rh/blocktime.py): PublicNode serves header batches fast but refuses eth_getLogs (403),
 # the official RPC serves logs but rate-limits at ~20 requests/min (measured 2026-09-28) — so each does what it does well
 RH_RPC_URL_BLOCKS = env_str("RH_RPC_URL_BLOCKS", "https://robinhood-rpc.publicnode.com")
+RH_HYPERSYNC_URL = env_str("RH_HYPERSYNC_URL", "https://robinhood.hypersync.xyz")   # log history in bulk when ENVIO_API_TOKEN is set (rh/hypersync.py)
+RH_HYPERSYNC_RPM = env_float("RH_HYPERSYNC_RPM", 40)                 # HyperSync queries per minute (free tier: fair use, refused ~6 % at 60; Starter plan: 100)
 RH_BOT_ADDRESS = env_str("RH_BOT_ADDRESS")                          # the address RH_BOT_PRIVATE_KEY must derive to (a guard, not a secret)
+RH_FUNDING_ADDRESSES = env_list("RH_FUNDING_ADDRESSES", [])         # your own EVM wallets: the console withdraws the RH bot's ETH only to these
 RH_CONFIRMATIONS = env_int("RH_CONFIRMATIONS", 3)                   # blocks before a live receipt or a live log is applied
 RH_START_BLOCK = env_int("RH_START_BLOCK", 0)                       # the indexer's first block (0: the Pons V2 factory's deployment block)
 RH_START_DAY = env_str("RH_START_DAY", "2026-08-04")                # Pons V2 went live: the first RH corpus day
@@ -245,10 +281,11 @@ RH_MIN_POSITION_ETH = env_float("RH_MIN_POSITION_ETH", 0.000891166)         # 0.
 RH_GAS_RESERVE_ETH = env_float("RH_GAS_RESERVE_ETH", 0.0029)        # 200 round trips at 2x the gas rh-probe measured (356k gas, 0.02 gwei, 2026-09-28)
 RH_MAX_FEE_GWEI = env_float("RH_MAX_FEE_GWEI", 5.0)                  # a transaction never offers more per gas
 RH_TX_FEE_ETH = env_float("RH_TX_FEE_ETH", 7.2e-6)                 # one swap's gas in ETH (rh-probe 2026-09-28: 356k gas × 0.02 gwei); fixed like the SOL fee
-RH_HOOK_FEE = env_float("RH_HOOK_FEE", 0.029126)                    # Pons hook fee + tax per side (3 % of the net = 2.9126 % of gross, measured) when a minute has none
+RH_HOOK_FEE = env_float("RH_HOOK_FEE", 0.0099)                      # Pons hook fee + creator tax per side when a minute has none: the median of 52k indexed swaps (1 % of the net = 0.99 % of gross; high-tax launches reach 5.7 %)
 RH_KILL_SWITCH_DRAWDOWN = env_float("RH_KILL_SWITCH_DRAWDOWN", 0.30)
 RH_MIN_SWEEP_ETH = env_float("RH_MIN_SWEEP_ETH", 0.0002)           # base-asset or dead-bag balances worth less are dust
 RH_STREAM_POLL_S = env_float("RH_STREAM_POLL_S", 2.0)
+RH_TRADE_LAG_S = env_float("RH_TRADE_LAG_S", 240.0)                 # an RH minute this old (s) is still traded: its stream lands ~2–3 min late
 RH_MINUTES_KEEP_DAYS = env_int("RH_MINUTES_KEEP_DAYS", 14)
 RH_DIR_NAME = "rh"                                                  # data/corpus/rh/... (the RH corpus beside the Solana one)
 # contracts on Robinhood Chain (mainnet; verified to carry code 2026-09-28)
@@ -284,6 +321,55 @@ def rh_live_prerequisites_missing() -> list[str]:
             missing.append(name)
     return missing
 
+
+# ---- Kalshi prediction markets (fly_trader/kalshi; the same key names as better_bot, whose client is vendored) ----
+KALSHI_API_KEY_ID = env_str("KALSHI_API_KEY_ID")
+KALSHI_PRIVATE_KEY_PATH = env_str("KALSHI_PRIVATE_KEY_PATH")
+KALSHI_API_BASE_URL = env_str("KALSHI_API_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2")
+KALSHI_WS_URL = env_str("KALSHI_WS_URL", "wss://api.elections.kalshi.com/trade-api/ws/v2")
+KALSHI_SUBACCOUNT = env_int("KALSHI_SUBACCOUNT", 0)                # 0 = the primary account: only a dedicated subaccount may trade live
+KALSHI_FEE_FACTOR = env_float("KALSHI_FEE_FACTOR", 0.07)            # taker fee per contract = factor x multiplier x P(1-P)
+KALSHI_MAKER_FEE_FACTOR = env_float("KALSHI_MAKER_FEE_FACTOR", 0.0175)
+KALSHI_CAPITAL_USD = env_float("KALSHI_CAPITAL_USD", 100.0)         # the cap both Kalshi arms share (paper start; live never sizes above it)
+KALSHI_CASH_FLOOR_USD = env_float("KALSHI_CASH_FLOOR_USD", 5.0)     # the gas reserve's analogue: never spent
+KALSHI_MIN_PAYOUT_CENTS = env_int("KALSHI_MIN_PAYOUT_CENTS", 25)    # a fill whose winning profit is below this is skipped
+KALSHI_LIVE_ENABLED = env_bool("KALSHI_LIVE_ENABLED", False)
+KALSHI_TAKER_LIVE = env_bool("KALSHI_TAKER_LIVE", True)
+KALSHI_MAKER_LIVE = env_bool("KALSHI_MAKER_LIVE", True)
+KALSHI_KILL_SWITCH_DRAWDOWN = env_float("KALSHI_KILL_SWITCH_DRAWDOWN", 0.30)
+KALSHI_MAX_SLATE_FRACTION = env_float("KALSHI_MAX_SLATE_FRACTION", 0.50)   # of the cap deployed at once across every open position
+KALSHI_MAX_DAYS_TO_CLOSE = env_float("KALSHI_MAX_DAYS_TO_CLOSE", 10.0)     # the evidence base (Whelan 2026) covers the last 10 days
+KALSHI_MIN_MINUTES_TO_CLOSE = env_float("KALSHI_MIN_MINUTES_TO_CLOSE", 5.0)
+KALSHI_MAX_SPREAD_CENTS = env_int("KALSHI_MAX_SPREAD_CENTS", 10)
+KALSHI_MIN_OPEN_INTEREST = env_float("KALSHI_MIN_OPEN_INTEREST", 100.0)
+KALSHI_MIN_VOLUME_24H = env_float("KALSHI_MIN_VOLUME_24H", 50.0)
+KALSHI_MAKER_QUIET_MIN = env_float("KALSHI_MAKER_QUIET_MIN", 30.0)         # no resting orders this close to the market's close
+KALSHI_MAKER_TTL_H = env_float("KALSHI_MAKER_TTL_H", 6.0)
+KALSHI_MAKER_MAX_RESTING = env_int("KALSHI_MAKER_MAX_RESTING", 40)
+KALSHI_HISTORY_START = env_str("KALSHI_HISTORY_START", "2025-01-01")
+KALSHI_DATASET_DIR = env_str("KALSHI_DATASET_DIR")                        # jon-becker/prediction-market-analysis checkout (data/kalshi/{markets,trades})
+KALSHI_MINUTES_KEEP_DAYS = env_int("KALSHI_MINUTES_KEEP_DAYS", 7)
+KALSHI_MARKETS_PER_DAY = env_int("KALSHI_MARKETS_PER_DAY", 150)           # the event sample's target: about this many markets per category per day (kalshi/history.sample_rates);
+                                                                           # events are kept by md5(event ticker) < the category's rate, blind to outcome and volume
+KALSHI_DIR = DATA_DIR / "kalshi"
+KALSHI_TRAIN_MAX_ROWS = env_int("KALSHI_TRAIN_MAX_ROWS", 8_000_000)        # training rows per walk-forward block / final fit (uniform random subset)
+KALSHI_FILL_THREADS = env_int("KALSHI_FILL_THREADS", 8)                   # markets filled at once by the history worker, all under the one KALSHI_RPS bucket
+KALSHI_RPS = env_float("KALSHI_RPS", 16.0)                                 # per process; the account's Advanced grant reads 200 tokens/s at 10 per call = 20 calls/s, the feed uses ~3
+
+
+def kalshi_live_prerequisites_missing() -> list[str]:
+    missing = []
+    if not KALSHI_LIVE_ENABLED:
+        missing.append("KALSHI_LIVE_ENABLED=1")
+    if not KALSHI_API_KEY_ID:
+        missing.append("KALSHI_API_KEY_ID")
+    if not KALSHI_PRIVATE_KEY_PATH or not Path(KALSHI_PRIVATE_KEY_PATH).expanduser().exists():
+        missing.append("KALSHI_PRIVATE_KEY_PATH (readable PEM file)")
+    if KALSHI_SUBACCOUNT <= 0:
+        missing.append("KALSHI_SUBACCOUNT (a dedicated subaccount, never the primary)")
+    if KALSHI_CAPITAL_USD <= 0:
+        missing.append("KALSHI_CAPITAL_USD")
+    return missing
 
 # ---- historical corpus (every pump.fun graduation, pulled from the migration wallet + pump.fun's swap-api) ----
 CORPUS_DIR = DATA_DIR / "corpus"

@@ -154,6 +154,37 @@ def test_the_fly_is_taught_by_the_selector_the_book_trades(monkeypatch):
     assert t2 is None and sid2 is None and "nope" in note2                                          # never distil inputs the corpus lacks
 
 
+def test_the_teacher_never_saw_the_week_the_fly_calibrates_on(monkeypatch):
+    """Fly #107 distilled selector #100, fit on every day through 2026-09-23, and calibrated its line and sizing on
+    2026-09-17..23: the teacher's in-sample fit made that week look like +2.79 % a trade, and its biggest bets lost
+    live. The teacher is now the same stack refit without its holdout days, used only when that fit ends before the week."""
+    from datetime import timedelta
+
+    from fly_trader.agent import selector_session
+    ds = _market_ds(); train = ds.day < ds.days[-3]; wk = ds.days[-1]; ok = str(wk - timedelta(days=fly_selector.PURGE_DAYS + 1))
+    ev = {"cols": ["f0", "f1"], "line": 0.046, "hold_min": 120, "thr": {}, "high": None}
+    blind = {"models": {"strategies": {"ev": {**ev, "line": 0.05}}, "combine": "score"}, "fit_through": ok, "holdout_days": [ok, str(wk)]}
+    monkeypatch.setattr(selector_session, "pinned_snapshot", lambda: 100)
+    load = lambda **kw: monkeypatch.setattr(fly_selector.selector, "load_snapshot", lambda i: SimpleNamespace(stack={"strategies": {"ev": ev}, "combine": "score"}, **kw))
+
+    load(blind=blind, trained_through=str(wk))
+    t, note, sid = fly_selector.deployed_teacher(ds, train, calib_start=wk)
+    assert sid == 100 and t.lines["ev"] == 0.05 and "blind" in note                    # the holdout-blind refit, same strategy
+
+    load(blind={**blind, "fit_through": str(wk - timedelta(days=fly_selector.PURGE_DAYS))}, trained_through=str(wk))
+    t, note, sid = fly_selector.deployed_teacher(ds, train, calib_start=wk)
+    assert t is None and sid is None and "saw the calibration week" in note             # its labels would spill into the week
+
+    load(trained_through=ok)                                                            # an old snapshot fit before the week
+    t, note, sid = fly_selector.deployed_teacher(ds, train, calib_start=wk)
+    assert sid == 100 and t.lines["ev"] == 0.046 and "before the calibration week" in note
+
+    load(trained_through=str(wk))                                                       # an old snapshot that saw it
+    t, note, sid = fly_selector.deployed_teacher(ds, train, calib_start=wk)
+    assert t is None and "no blind models" in note
+    assert fly_selector.deployed_teacher(ds, train)[2] == 100                           # without a week to protect: as before
+
+
 def test_training_stops_when_an_epoch_buys_less_than_its_own_noise(monkeypatch):
     """One epoch left a per-row error of ~3.9 % net return against a 4.6 % line, so the ordering near the line was
     mostly noise. The count is now the data's to choose: passes end when the held-out error stops moving by more than

@@ -6,6 +6,18 @@ set -e
 cd /app
 until pg_isready -d "$DATABASE_URL" >/dev/null 2>&1; do echo "fly-trader: waiting for postgres"; sleep 2; done
 fly-trader init-db
+# models/ holds exactly this release's fly and selector: an earlier release's (the updater before signed releases never
+# deleted a file) would be copied below, and a pickled .joblib makes apply-release refuse the whole release
+if [ -f seed/release_seed.json ]; then
+  python - <<'PY'
+import json, pathlib
+keep = {s["file"] for s in json.loads(pathlib.Path("seed/release_seed.json").read_text())["snapshots"]}
+for sub in ("policies", "selectors"):
+    for f in pathlib.Path("models", sub).glob("*"):
+        if f.is_file() and f.name not in keep:
+            f.unlink(); print(f"fly-trader: removed {f} (not in this release)")
+PY
+fi
 for sub in policies selectors connectome; do
   mkdir -p "data/brain/$sub"
   for f in models/$sub/*; do [ -e "$f" ] || continue; [ -e "data/brain/$sub/$(basename "$f")" ] || cp "$f" "data/brain/$sub/"; done

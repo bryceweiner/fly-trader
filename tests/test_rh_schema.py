@@ -6,7 +6,7 @@ def test_rh_ddl_applies_twice_and_adds_circuit_3(db_conn):
     schema.apply_schema(); schema.apply_schema()                      # idempotent
     with db_conn.cursor() as cur:
         cur.execute("SELECT id FROM circuit_state ORDER BY id")
-        assert {r["id"] for r in cur.fetchall()} >= {1, 3}              # no Kalshi circuit (2) on the distribution
+        assert {r["id"] for r in cur.fetchall()} >= {1, 2, 3}
         cur.execute("SELECT to_regclass(t) AS r FROM unnest(ARRAY['rh_scan','rh_assets','rh_tokens','rh_pools','rh_curve_trades','rh_swaps',"
                     "'rh_liquidity','rh_base_prices','rh_minutes','rh_meta','rh_insiders','rh_intents','rh_txs','rh_legs','rh_base_lots',"
                     "'rh_wallet_flows','rh_wallet_marks']) AS t")

@@ -3,6 +3,8 @@ the refuse-production guard in fly_trader.db.connection can never see the real d
 import os
 
 os.environ["DATABASE_URL"] = "postgresql:///fly_trader_test"
+for _name in ("RH_RPC_URL_TX", "QUICKNODE_RH_API_URL", "QUICKNODE_RH_API_KEY"):   # no test reaches the real transaction endpoint
+    os.environ[_name] = ""
 
 import pytest  # noqa: E402
 

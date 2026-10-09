@@ -17,8 +17,9 @@ weights at that last step (``D`` = None is the frozen fly). The descending neuro
 the previous step, so ``D`` reaches the output only through the MBON readout.
 
 Bootstrap (``bootstrap``, the one time the selector teaches): the teacher is the selector the live book trades
-(``deployed_teacher``); only when none is deployed is a stack refit on the days before ``S − 8`` (one purge day before
-the calibration week), which is also what the replay uses, since there the refit is the honest out-of-sample teacher.
+(``deployed_teacher``) as refit without its holdout days, so the calibration week is one it never saw; only when none is
+deployed, or it has no such fit, is a stack refit on the days before ``S − 8`` (one purge day before the calibration
+week), which is also what the replay uses, since there the refit is the honest out-of-sample teacher.
 The fly imitates it on the tradable minutes of those days (the teacher's top ``DISTIL_TOP`` plus a random
 ``DISTIL_SAMPLE``; squared error weighted ``TOP_WEIGHT`` × on the teacher's top 1 %; passes stop when a held-out
 slice stops improving by more than its own standard error, so the epoch count comes from the data), both
@@ -33,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -75,7 +77,8 @@ DIAG_ROWS = 50_000
 GATES = {"mbon_share_min": 0.10, "mbon_saturated_max": 0.20, "slope_min": 0.6, "slope_max": 1.4}
 TEACHER_NOTE = "a stack refit on the fly's training days (no deployed selector to copy)"
 # the definitions a fly was trained on (the selector's, as its teacher, + the fly's network and plasticity design)
-FLY_VERSION = {**selector.DATA_VERSION, "fly": "flynet-3-ch", "plastic": "mb4-ch", "teacher": "deployed-1",
+# "calib": how its buy line is picked (config.FLY_CALIB_RULE): a verdict or fly calibrated under another rule is not this one
+FLY_VERSION = {**selector.DATA_VERSION, "fly": "flynet-3-ch", "plastic": "mb4-ch", "teacher": "deployed-1", "calib": config.FLY_CALIB_RULE,
                "lines": "per-chain-1"}                    # its own line per (strategy, chain), judged per chain (train/fly_replay.Slots)
 
 
@@ -88,17 +91,20 @@ class FlyNet(nn.Module):
     normalised descending neurons → decoder, + signed readout of the normalised MBONs → predicted net return (× ``SCALE``)."""
 
     def __init__(self, graph, obs_dim: int, k_steps: int = K_STEPS, leak: float = LEAK, hidden: int = HIDDEN, kc_active: float = KC_ACTIVE, device=None,
-                 n_strategies: int = 1):
+                 n_strategies: int = 1, aff_rows=None, scale: float = SCALE):
+        """``aff_rows``: the neurons the features enter (default: the memecoin fly's ``AFFERENT_POPS``; the Kalshi fly passes
+        the photoreceptors). ``scale``: the unit of the head's output (net return × 20 for memecoins; probability × 1 for Kalshi)."""
         super().__init__()
         dev = torch.device(device) if device else graph.device
         self.N, self.k_steps, self.leak, self.obs_dim, self.hidden, self.kc_active = graph.N, k_steps, leak, obs_dim, hidden, kc_active
+        self.scale = float(scale)
         self.register_buffer("pre", graph.indices[1].to(dev)); self.register_buffer("post", graph.indices[0].to(dev))
         vals = graph.values_raw.float(); self.register_buffer("sign", torch.sign(vals).to(dev))
         s = float(getattr(graph, "s", 0.0) or 0.0) or 0.99 / float(getattr(graph, "spectral_radius_raw", None) or 2788.0)
         self.theta = nn.Parameter(_inv_softplus(vals.abs() * s).to(dev))                          # softplus^-1(|w|)
         self.gain = nn.Parameter(torch.ones(self.N, device=dev)); self.bias = nn.Parameter(torch.zeros(self.N, device=dev))
-        aff = [torch.arange(*graph.pop_ranges[p]) for p in AFFERENT_POPS if p in graph.pop_ranges]
-        self.register_buffer("aff_rows", torch.cat(aff).to(dev)); self.register_buffer("eff_rows", torch.arange(*graph.pop_ranges[EFFERENT_POP]).to(dev))
+        aff = torch.as_tensor(aff_rows, dtype=torch.long) if aff_rows is not None else torch.cat([torch.arange(*graph.pop_ranges[p]) for p in AFFERENT_POPS if p in graph.pop_ranges])
+        self.register_buffer("aff_rows", aff.to(dev)); self.register_buffer("eff_rows", torch.arange(*graph.pop_ranges[EFFERENT_POP]).to(dev))
         # the mushroom body: KC→MBON pairs of the connectome (MBON columns: approach, avoid, other)
         (self.kc0, self.kc1), self.mb0, self.mb1 = graph.pop_ranges["KC"], graph.pop_ranges["MBON_APP"][0], graph.pop_ranges["MBON_OTHER"][1]
         self.n_kc, self.n_mbon = self.kc1 - self.kc0, self.mb1 - self.mb0
@@ -223,7 +229,7 @@ class FlyModel:
         self.sizings = {k: list((sizings or {}).get(k, sizing or [])) for k in self.strategies}
         self.combine = combine
         # the other chains' own lines and sizing per strategy (fly_trader/markets: 'rh'); ``lines`` / ``sizings`` are Solana's.
-        # One network scores both chains; each chain's line is calibrated on that chain's rows.
+        # One network scores both chains; each chain's line is calibrated on that chain's rows (its teacher budget too).
         self.chain_lines = {ch: {k: float(v) for k, v in d.items()} for ch, d in (chain_lines or {}).items()}
         self.chain_sizings = {ch: {k: list(v) for k, v in d.items()} for ch, d in (chain_sizings or {}).items()}
 
@@ -271,7 +277,7 @@ class FlyModel:
         device's memory affords (``FlyNet.batch_rows``)."""
         self.net.eval(); batch = batch or self.net.batch_rows(); out = np.empty((len(X), len(self.strategies)), np.float64)
         for i in range(0, len(X), batch):
-            out[i:i + batch] = (self.net.forward_all(self._x(X[i:i + batch])) / SCALE).float().cpu().numpy()
+            out[i:i + batch] = (self.net.forward_all(self._x(X[i:i + batch])) / self.net.scale).float().cpu().numpy()
         return out
 
     def score(self, X: np.ndarray, batch: int = 2048) -> np.ndarray:
@@ -367,14 +373,29 @@ class StackTeacher:
         return T, A
 
 
-def _teacher_targets(teacher, ds: DecisionSet, idx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def teacher_allowed(teacher, X: np.ndarray, ts: np.ndarray, names: list[str], chunk: int = 200_000) -> np.ndarray:
+    """[B, S]: where the teacher itself would trade each of the fly's strategies (its final decision: trigger, line and
+    every filter) — the selectivity ``fly_calibrate``'s ``match`` rule copies."""
+    A = np.zeros((len(X), len(names)), bool)
+    for i in range(0, len(X), chunk):
+        if isinstance(teacher, StackTeacher):
+            _, a = teacher.targets(X[i:i + chunk], ts[i:i + chunk])
+            for j, k in enumerate(names):
+                if k in teacher.strategies:
+                    A[i:i + chunk, j] = a[:, teacher.strategies.index(k)]
+        else:
+            A[i:i + chunk, :] = (teacher.score(X[i:i + chunk]) >= teacher.threshold)[:, None]
+    return A
+
+
+def _teacher_targets(teacher, ds: DecisionSet, idx: np.ndarray, clip: tuple = (-1.0, 1.0)) -> tuple[np.ndarray, np.ndarray]:
     """[n, S] targets (NaN: not a candidate of that strategy) and loss weights for the rows ``idx``."""
     if isinstance(teacher, StackTeacher):
         T = np.full((len(idx), len(teacher.strategies)), np.nan, np.float32); W = np.ones_like(T)
         for i in range(0, len(idx), 200_000):
             t, a = teacher.targets(ds.X[idx[i:i + 200_000]], ds.ts[idx[i:i + 200_000]])
             T[i:i + 200_000] = t; W[i:i + 200_000] = np.where(a, TOP_WEIGHT, 1.0)
-        return np.clip(T, -1.0, 1.0), W
+        return np.clip(T, clip[0], clip[1]), W
     tgt = np.empty(len(idx), np.float32)
     for i in range(0, len(idx), 500_000):
         tgt[i:i + 500_000] = teacher.score(ds.X[idx[i:i + 500_000]])
@@ -393,7 +414,7 @@ def _val_mse(net: FlyNet, scaler: RobustScaler, ds: DecisionSet, idx: np.ndarray
     for i in range(0, len(val), batch):
         sl = val[i:i + batch]
         x = torch.tensor(scaler.transform(ds.X[idx[sl]]), device=dev)
-        t = torch.tensor(np.nan_to_num(T[sl]) * SCALE, device=dev); m = torch.tensor(np.isfinite(T[sl]), device=dev).float()
+        t = torch.tensor(np.nan_to_num(T[sl]) * net.scale, device=dev); m = torch.tensor(np.isfinite(T[sl]), device=dev).float()
         w = torch.tensor(W[sl], device=dev) * m
         parts.append(((w * (net.forward_all(x) - t) ** 2).sum(1) / w.sum(1).clamp(min=1e-9)).cpu())
     net.train()
@@ -402,13 +423,17 @@ def _val_mse(net: FlyNet, scaler: RobustScaler, ds: DecisionSet, idx: np.ndarray
 
 
 def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, batch: int = BATCH, stop: threading.Event | None = None,
-              seed: int = 0, graph=None, device=None) -> tuple[FlyModel | None, dict]:
+              seed: int = 0, graph=None, device=None, net_kwargs: dict | None = None, model_cls=None, target_clip: tuple = (-1.0, 1.0),
+              horizon_min: int | None = None) -> tuple[FlyModel | None, dict]:
     """Distil ``teacher`` (a StackTeacher, or anything with ``score`` and ``scaler``) into a FlyNet over the training rows
-    ``rows`` (mask): one head per strategy, each learning its strategy's targets on that strategy's candidates."""
+    ``rows`` (mask): one head per strategy, each learning its strategy's targets on that strategy's candidates.
+    ``net_kwargs`` (``aff_rows``, ``scale``), ``model_cls`` and ``target_clip`` let another trading type (kalshi/fly.py) run
+    its own fly through this loop; the memecoin defaults are unchanged."""
     brain_device.seed_all(seed); rng = np.random.default_rng(seed); dev = torch.device(device) if device else _device()
     n_s = len(teacher.strategies) if isinstance(teacher, StackTeacher) else 1
-    net = FlyNet(graph if graph is not None else _graph(), obs_dim=len(ds.cols), device=dev, n_strategies=n_s)
-    idx = np.flatnonzero(rows); T, W = _teacher_targets(teacher, ds, idx)
+    net = FlyNet(graph if graph is not None else _graph(), obs_dim=len(ds.cols), device=dev, n_strategies=n_s, **(net_kwargs or {}))
+    model_cls = model_cls or FlyModel
+    idx = np.flatnonzero(rows); T, W = _teacher_targets(teacher, ds, idx, target_clip)
     keep = np.isfinite(T).any(1); idx, T, W = idx[keep], T[keep], W[keep]
     if not len(idx):
         return None, {"stopped": False, "reason": "no teacher candidates"}
@@ -418,7 +443,7 @@ def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, 
         n_v = min(VAL_ROWS, len(use) // 10); p0 = rng.permutation(len(use)); val, use = np.sort(use[p0[:n_v]]), np.sort(use[p0[n_v:]])
     with torch.no_grad():
         for j, hd in enumerate(net.heads):
-            col = T[:, j]; hd.bias.fill_(float(np.nanmean(col)) * SCALE if np.isfinite(col).any() else 0.0); hd.weight.mul_(0.1)
+            col = T[:, j]; hd.bias.fill_(float(np.nanmean(col)) * net.scale if np.isfinite(col).any() else 0.0); hd.weight.mul_(0.1)
     batch = min(batch, net.batch_rows(ceiling=batch, training=True))      # a training step keeps every propagation step: ~4x a forward pass
     opt = torch.optim.Adam(net.param_groups(LR_GRAPH, LR_HEAD)); n_b = max(1, len(use) // batch); total = max(1, epochs * n_b); hist = []; t0 = time.time()
     best = best_v = prev_v = early = None
@@ -429,7 +454,7 @@ def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, 
                 return None, {"epochs": hist, "stopped": True}
             sel = perm[b * batch:(b + 1) * batch]
             x = torch.tensor(teacher.scaler.transform(ds.X[idx[sel]]), device=dev)
-            t = torch.tensor(np.nan_to_num(T[sel]) * SCALE, device=dev); m = torch.tensor(np.isfinite(T[sel]), device=dev).float()
+            t = torch.tensor(np.nan_to_num(T[sel]) * net.scale, device=dev); m = torch.tensor(np.isfinite(T[sel]), device=dev).float()
             w = torch.tensor(W[sel], device=dev) * m
             loss = (w * (net.forward_all(x) - t) ** 2).sum() / w.sum().clamp(min=1e-9)
             opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0); opt.step(); tot += loss.item()
@@ -459,9 +484,10 @@ def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, 
     rec = idx[rng.choice(len(idx), min(RECAL_ROWS, len(idx)), replace=False)]
     recalibrate(net, ds.X[np.sort(rec)], teacher.scaler, batch)
     if isinstance(teacher, StackTeacher):
-        fly = FlyModel(net, teacher.scaler, ds.cols, int(teacher.rules[teacher.strategies[0]]["hold_min"]), rules=teacher.rules, combine=teacher.combine)
+        h0 = teacher.rules[teacher.strategies[0]]["hold_min"]
+        fly = model_cls(net, teacher.scaler, ds.cols, horizon_min if horizon_min is not None else int(h0), rules=teacher.rules, combine=teacher.combine)
     else:
-        fly = FlyModel(net, teacher.scaler, ds.cols, int(ds.horizon_s // 60))
+        fly = model_cls(net, teacher.scaler, ds.cols, horizon_min if horizon_min is not None else int(ds.horizon_s // 60))
     return fly, {"epochs": hist, "stopped": False, "rows": int(len(use)), "training_rows": int(len(idx)), "top_weight": TOP_WEIGHT,
                  "strategies": fly.strategies, "epochs_run": len(hist), "epoch_cap": int(epochs), "val_rows": int(len(val)),
                  "val_mse": best_v, "early_stop": early}
@@ -480,7 +506,7 @@ def diagnose(fly: FlyModel, X: np.ndarray, teacher_scores: np.ndarray | None = N
     out = {"mbon_share": float(mb.var() / tot.var()) if tot.var() > 0 else 0.0, "mbon_saturated": float((sat.median(0).values > 2.0).float().mean()),
            "kc_active": float(act.mean()), "rows": int(len(X))}
     if teacher_scores is not None:
-        s = (tot / SCALE).numpy()
+        s = (tot / net.scale).numpy()
         out["slope"] = float(np.polyfit(np.asarray(teacher_scores, dtype=np.float64), s, 1)[0]) if np.std(teacher_scores) > 0 else None
         out["rank_corr"] = rank_corr(s, teacher_scores)
     return out
@@ -508,7 +534,7 @@ def _stack_teacher(ds: DecisionSet, train: np.ndarray, stop=None):
     return StackTeacher(strategies.final_models(sub, stack), RobustScaler.fit(sub.X, seed=7), ds.cols), stack
 
 
-def deployed_teacher(ds: DecisionSet, train: np.ndarray) -> tuple[StackTeacher | None, str, int | None]:
+def deployed_teacher(ds: DecisionSet, train: np.ndarray, calib_start: date | None = None) -> tuple[StackTeacher | None, str, int | None]:
     """The selector the live book actually trades, wrapped as the fly's teacher, with the reason and the snapshot id.
 
     Until 2026-09-21 the bootstrap always refit its own stack on the days before ``S − 8`` and distilled that instead.
@@ -517,8 +543,12 @@ def deployed_teacher(ds: DecisionSet, train: np.ndarray) -> tuple[StackTeacher |
     traded ``capitulation`` at 0.010 over 240 — five of eight components flipped by one extra week of corpus. The fly
     was never a copy of the selector it was being judged against. None (with the reason) falls back to that refit.
 
-    The deployed selector is fit on the whole corpus, the fly's calibration week included, so that week is not
-    out-of-sample for the teacher; the fly's own line is still calibrated on realised labels, never on the teacher's."""
+    ``calib_start``: the first day of the fly's calibration week. The deployed selector is fit on the whole corpus, that
+    week included, so distilling it let the teacher's in-sample fit flatter the fly's line and sizing bands there (fly
+    #107: 474 calibration trades at +2.79 %, then its biggest bets lost live). Given ``calib_start``, the teacher is the
+    same stack refit without its holdout days (``SelectorModel.blind``: same strategies, settings and lines), used only
+    when that fit ends at least ``PURGE_DAYS`` before the week; a selector whose own fit already ends there is used as
+    is; otherwise None with the reason, and the bootstrap refits a stack on its training days."""
     from ..agent.selector_session import pinned_snapshot
     sid = pinned_snapshot()
     if sid is None:
@@ -533,11 +563,24 @@ def deployed_teacher(ds: DecisionSet, train: np.ndarray) -> tuple[StackTeacher |
     st = getattr(m, "stack", None) or {}
     if not st.get("strategies"):
         return None, f"selector #{sid} has no strategy stack; {TEACHER_NOTE}", None
+    seen = ""
+    if calib_start is not None:
+        last_ok = calib_start - timedelta(days=PURGE_DAYS + 1)          # the last day a fit may reach, labels spilling over included
+        blind = getattr(m, "blind", None) or {}
+        through = str(getattr(m, "trained_through", "") or "")
+        if blind.get("models", {}).get("strategies") and date.fromisoformat(blind["fit_through"]) <= last_ok:
+            st = blind["models"]; seen = f", refit through {blind['fit_through']} (blind to the calibration week from {calib_start})"
+        elif through and date.fromisoformat(through) <= last_ok:
+            seen = f", fit through {through} (before the calibration week from {calib_start})"
+        else:
+            fit = blind.get("fit_through") or through or "an unknown day"
+            return None, (f"selector #{sid} saw the calibration week from {calib_start} (its fit reaches {fit}"
+                          f"{'' if blind else ', and it has no blind models'}); {TEACHER_NOTE}"), None
     missing = sorted({c for v in st["strategies"].values() for c in v["cols"]} - set(ds.cols))
     if missing:
         return None, f"selector #{sid} wants columns the corpus lacks ({', '.join(missing[:4])}); {TEACHER_NOTE}", None
     names = ", ".join(f"{k} (line {v['line']:.4f}, {v['hold_min']} min)" for k, v in st["strategies"].items())
-    return StackTeacher(st, RobustScaler.fit(ds.X[np.flatnonzero(train)], seed=7), list(ds.cols)), f"deployed selector #{sid}: {names}", sid
+    return StackTeacher(st, RobustScaler.fit(ds.X[np.flatnonzero(train)], seed=7), list(ds.cols)), f"deployed selector #{sid}: {names}{seen}", sid
 
 
 def row_chains(X: np.ndarray, cols: list[str]) -> np.ndarray:
@@ -597,21 +640,24 @@ def bootstrap(ds: DecisionSet, S: date, epochs: int = EPOCHS, stop: threading.Ev
     week = (ds.day >= S - timedelta(days=CALIB_DAYS)) & (ds.day < S) & uni
     prog.update("fly: calibrating its own buy lines", 0, 1, force=True)
     wi = np.flatnonzero(week); V = fly.score_all(ds.X[wi]) if len(wi) else np.zeros((0, len(fly.strategies))); trig = fly.triggers(ds.X[wi], ds.cols)
+    A = teacher_allowed(teacher, ds.X[wi], ds.ts[wi], fly.strategies) if fly_calibrate.RULE == "match" else None
     per = {}; wch = ds.chains()[wi]
     for chain in sorted(set(wch.tolist()), key=lambda c: c != "sol"):       # Solana first: another chain without rows keeps its lines
         for j, name in enumerate(fly.strategies):
             H = fly.rules[name]["hold_min"]; y = ds.fwd_h.get(H, ds.fwd_pess)
             known = trig[:, j] & (ds.ts[wi] + H * 60.0 + 60.0 <= s_epoch) & (wch == chain)       # labels known at S, this chain's rows
             ci = wi[known]
-            cal = fly_calibrate.calibrate(ds.ts[ci], ds.mint[ci], H * 60.0, V[known, j], y[ci], prev_line=fly.lines.get(name) if chain != "sol" else None)
+            target = (len(taken_idx(ds.ts[ci], ds.mint[ci], H * 60.0, np.flatnonzero(A[known, j] & np.isfinite(y[ci])))) if A is not None else None)
+            cal = fly_calibrate.calibrate(ds.ts[ci], ds.mint[ci], H * 60.0, V[known, j], y[ci], rule=fly_calibrate.RULE, target_trades=target,
+                                          prev_line=fly.lines.get(name) if chain != "sol" else None)
             fly.set_line(name, chain, cal.line, cal.sizing)
             per[name if chain == "sol" else f"{name}@{chain}"] = {"line": cal.line, "trades": cal.trades, "mean": cal.mean, "total": cal.total, "hold_min": H,
-                                                                "chain": chain}
+                                                                "rule": fly_calibrate.RULE, "teacher_trades": target, "chain": chain}
     d = fly_decide(fly, ds.X[wi], ds.cols, V) if len(wi) else {"strategy": np.array([], dtype=object), "hold_s": np.array([])}
     picked = np.array([x is not None for x in d["strategy"]], bool)
     ret = np.array([ds.fwd_h.get(fly.rules[x]["hold_min"], ds.fwd_pess)[i] if x is not None else np.nan for i, x in zip(wi, d["strategy"])])
     known = picked & (ds.ts[wi] + d["hold_s"] + 60.0 <= s_epoch)
-    tr = taken_idx(ds.ts[wi], ds.mint[wi], d["hold_s"], np.flatnonzero(known)); r = ret[tr]
+    tr = taken_idx(ds.ts[wi], ds.mint[wi], d["hold_s"], np.flatnonzero(known & np.isfinite(ret))); r = ret[tr]       # trades with a known outcome
     comb = {"trades": int(len(r)), "mean": float(np.mean(r)) if len(r) else None, "total": float(np.sum(r)) if len(r) else 0.0, "per_strategy": per}
     ci = np.flatnonzero(week & (ds.ts + ds.horizon_s + 60.0 <= s_epoch))
     di = ci if len(ci) <= DIAG_ROWS else np.sort(np.random.default_rng(seed).choice(ci, DIAG_ROWS, replace=False))
@@ -620,6 +666,7 @@ def bootstrap(ds: DecisionSet, S: date, epochs: int = EPOCHS, stop: threading.Ev
         ok_t = np.isfinite(t_sc); di, t_sc = di[ok_t], t_sc[ok_t]
     diag = diagnose(fly, ds.X[di], t_sc) if len(di) else {"mbon_share": 0.0, "mbon_saturated": 1.0, "kc_active": 0.0, "rows": 0}
     ok, why = gate_check(diag)
+    fly.teacher = teacher          # not saved: the replay's match rule reads the teacher's own decisions over its rows
     info = {"S": str(S), "train_through": str(train_end - timedelta(days=1)), "calibration_days": [str(S - timedelta(days=CALIB_DAYS)), str(S - timedelta(days=1))],
             "line": fly.threshold, "sizing": fly.sizing, "lines": fly.lines, "chain_lines": fly.chain_lines, "calibration": comb, "strategies": fly.strategies, "rules": fly.rules,
             "diagnostics": diag, "gates_ok": ok, "gate_failures": why, "fit": fit_info, "teacher": teacher_note or TEACHER_NOTE, "teacher_line": getattr(teacher, "threshold", None),
@@ -630,73 +677,75 @@ def bootstrap(ds: DecisionSet, S: date, epochs: int = EPOCHS, stop: threading.Ev
     return fly, info
 
 
-def is_current(meta: dict | None) -> bool:
-    return bool(meta) and meta.get("data") == FLY_VERSION
+def is_current(meta: dict | None, version: dict | None = None) -> bool:
+    return bool(meta) and meta.get("data") == (version or FLY_VERSION)
 
 
-def save(fly: FlyModel, metrics: dict, run_id: str | None = None) -> tuple[Path, int]:
-    root = config.BRAIN_DIR / "policies"; root.mkdir(parents=True, exist_ok=True)
-    path = root / f"fly_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.pt"
+def save(fly: FlyModel, metrics: dict, run_id: str | None = None, kind: str = "fly_selector", subdir: str = "policies", version: dict | None = None,
+         prefix: str = "fly") -> tuple[Path, int]:
+    """``kind`` / ``subdir`` / ``version`` / ``prefix``: another trading type's fly keeps its own snapshots apart (kalshi/fly.py)."""
+    root = config.BRAIN_DIR / subdir; root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{prefix}_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.pt"
     n = fly.net
     model_io.torch_save({"state_dict": n.state_dict(), "scaler": fly.scaler.state(), "cols": fly.cols, "threshold": fly.threshold, "sizing": fly.sizing,
                 "horizon_min": fly.horizon_min, "rules": fly.rules, "lines": fly.lines, "sizings": fly.sizings, "combine": fly.combine,
                 "chain_lines": fly.chain_lines, "chain_sizings": fly.chain_sizings,
-                "config": {"k_steps": n.k_steps, "leak": n.leak, "hidden": n.hidden, "obs_dim": n.obs_dim, "kc_active": n.kc_active, "scale": SCALE,
-                           "n_strategies": n.n_strategies}, "metrics": metrics}, path)
+                "config": {"k_steps": n.k_steps, "leak": n.leak, "hidden": n.hidden, "obs_dim": n.obs_dim, "kc_active": n.kc_active, "scale": n.scale,
+                           "n_strategies": n.n_strategies, "aff_rows": n.aff_rows.cpu().tolist() if kind != "fly_selector" else None}, "metrics": metrics}, path)
     sha = hashlib.sha256(path.read_bytes()).hexdigest()
     with transaction() as conn:
-        row = conn.execute("INSERT INTO brain_snapshots (run_id, path, sha256, kind, note) VALUES (%s,%s,%s,'fly_selector',%s) RETURNING id",
-                           (run_id, str(path), sha, json.dumps({**metrics, "data": FLY_VERSION}, default=str))).fetchone()
+        row = conn.execute("INSERT INTO brain_snapshots (run_id, path, sha256, kind, note) VALUES (%s,%s,%s,%s,%s) RETURNING id",
+                           (run_id, str(path), sha, kind, json.dumps({**metrics, "data": version or FLY_VERSION}, default=str))).fetchone()
     return path, int(row["id"])
 
 
-def load(path: str | Path, graph=None, device=None) -> FlyModel:
+def load(path: str | Path, graph=None, device=None, model_cls=None) -> FlyModel:
     d = model_io.torch_load(path); c = d["config"]
     net = FlyNet(graph if graph is not None else _graph(), obs_dim=c["obs_dim"], k_steps=c["k_steps"], leak=c["leak"], hidden=c["hidden"],
-                 kc_active=c["kc_active"], device=device or _device(), n_strategies=c.get("n_strategies", 1))
+                 kc_active=c["kc_active"], device=device or _device(), n_strategies=c.get("n_strategies", 1), aff_rows=c.get("aff_rows"), scale=c.get("scale", SCALE))
     net.load_state_dict(d["state_dict"]); net.eval()
     for bn in (net.eff_norm, net.mb_norm):
         bn.momentum = None
-    return FlyModel(net, RobustScaler.from_state(d["scaler"]), d["cols"], d["horizon_min"], d["threshold"], d.get("sizing"), rules=d.get("rules"),
-                    lines=d.get("lines"), sizings=d.get("sizings"), combine=d.get("combine", "score"),
-                    chain_lines=d.get("chain_lines"), chain_sizings=d.get("chain_sizings"))
+    return (model_cls or FlyModel)(net, RobustScaler.from_state(d["scaler"]), d["cols"], d["horizon_min"], d["threshold"], d.get("sizing"), rules=d.get("rules"),
+                                   lines=d.get("lines"), sizings=d.get("sizings"), combine=d.get("combine", "score"),
+                                   chain_lines=d.get("chain_lines"), chain_sizings=d.get("chain_sizings"))
 
 
-def latest_current(conn) -> dict | None:
+def latest_current(conn, kind: str = "fly_selector", version: dict | None = None) -> dict | None:
     """The newest fly bootstrap trained on the current definitions (``FLY_VERSION``) whose file exists, or None."""
-    for r in conn.execute("SELECT id, path, note FROM brain_snapshots WHERE kind = 'fly_selector' ORDER BY id DESC").fetchall():
+    for r in conn.execute("SELECT id, path, note FROM brain_snapshots WHERE kind = %s ORDER BY id DESC", (kind,)).fetchall():
         try:
             meta = json.loads(r["note"] or "{}")
         except ValueError:
             continue
-        if is_current(meta) and Path(r["path"]).exists():
+        if is_current(meta, version) and Path(r["path"]).exists():
             return {**dict(r), "meta": meta}
     return None
 
 
-def deployable(meta: dict | None) -> tuple[bool, str]:
+def deployable(meta: dict | None, version: dict | None = None) -> tuple[bool, str]:
     """A bootstrap may trade: current definitions, healthy network (``GATES``) and its own line made money over at least
     100 trades on its calibration week."""
-    if not is_current(meta):
+    if not is_current(meta, version):
         return False, "trained on other definitions"
     if not meta.get("gates_ok"):
         return False, "; ".join(meta.get("gate_failures") or ["network gates failed"])
     cal = meta.get("calibration") or {}
     if (cal.get("trades") or 0) < selector.MIN_LINE_TRADES:
         return False, f"too few calibration trades ({cal.get('trades') or 0})"
-    if (cal.get("mean") or 0) <= 0:
+    if not (isinstance(cal.get("mean"), (int, float)) and math.isfinite(cal["mean"]) and cal["mean"] > 0):      # NaN never passes
         return False, f"its calibration week lost money ({(cal.get('mean') or 0) * 100:+.2f}% per trade)"
     return True, f"its line made {cal['mean'] * 100:+.2f}% per trade over {cal['trades']} calibration trades"
 
 
-def latest_deployable(conn) -> dict | None:
+def latest_deployable(conn, kind: str = "fly_selector", version: dict | None = None) -> dict | None:
     """The newest bootstrap that may trade (``deployable``), or None."""
-    for r in conn.execute("SELECT id, path, note FROM brain_snapshots WHERE kind = 'fly_selector' ORDER BY id DESC").fetchall():
+    for r in conn.execute("SELECT id, path, note FROM brain_snapshots WHERE kind = %s ORDER BY id DESC", (kind,)).fetchall():
         try:
             meta = json.loads(r["note"] or "{}")
         except ValueError:
             continue
-        if deployable(meta)[0] and Path(r["path"]).exists():
+        if deployable(meta, version)[0] and Path(r["path"]).exists():
             return {**dict(r), "meta": meta}
     return None
 
@@ -710,7 +759,7 @@ def main(days: int | None = None, epochs: int | None = None, stop_event: threadi
     prog.update("fly: building decision points", 0, 1, force=True)
     from .strategies import HOLDS_MIN
     ds = build(days=days, horizon_min=HOLD_MIN, holds=HOLDS_MIN); S = ds.days[-1] + timedelta(days=1)
-    teacher, note, taught_by = deployed_teacher(ds, ds.day < S - timedelta(days=CALIB_DAYS + PURGE_DAYS))
+    teacher, note, taught_by = deployed_teacher(ds, ds.day < S - timedelta(days=CALIB_DAYS + PURGE_DAYS), calib_start=S - timedelta(days=CALIB_DAYS))
     log.info("fly bootstrap teacher: %s", note)
     fly, info = bootstrap(ds, S, epochs=EPOCHS if epochs is None else epochs, stop=stop_event, teacher=teacher, teacher_note=note)
     if fly is None:

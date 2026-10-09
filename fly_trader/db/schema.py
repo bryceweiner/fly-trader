@@ -6,7 +6,9 @@ appending a version-gated block AND bumping SCHEMA_VERSION, or it never runs.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 import psycopg
@@ -17,8 +19,15 @@ from .connection import connect, database_name, database_url
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6          # 5: the plastic fly's tables and per-book halts (BASE_DDL); 6: the selector's strategy stack (MIGRATIONS[6])
+SCHEMA_VERSION = 12          # 5: the plastic fly's tables and per-book halts (BASE_DDL); 6: the selector's strategy stack (MIGRATIONS[6]); 7: Kalshi (MIGRATIONS[7]); 8: Kalshi minute extremes
 _LOCK_KEY = 0x666C795F6D6967  # "fly_mig"
+# Applying the DDL takes ACCESS EXCLUSIVE on the tables it touches (Postgres takes it for ALTER TABLE ... ADD COLUMN IF NOT
+# EXISTS even when the column exists) and holds it to the end of the transaction, while live workers write those tables.
+# 2026-10-07: the RH stream's start-up apply deadlocked with the trading engine on positions/decisions and crashed. So:
+# unchanged DDL is not re-run at all (its fingerprint is stored), and a run never waits more than LOCK_TIMEOUT for a
+# lock: it rolls back, releases everything it holds, and retries.
+LOCK_TIMEOUT = "5s"
+APPLY_TRIES = 30
 
 BASE_DDL: list[str] = [
     """CREATE TABLE IF NOT EXISTS schema_version (
@@ -150,11 +159,11 @@ BASE_DDL: list[str] = [
         running_mean real[], running_var real[], n bigint NOT NULL DEFAULT 0,
         updated_at timestamptz NOT NULL DEFAULT now())""",
     """CREATE TABLE IF NOT EXISTS circuit_state (
-        id int PRIMARY KEY CHECK (id = 1), fail_count int NOT NULL DEFAULT 0, last_failure_ts timestamptz,
+        id int PRIMARY KEY, fail_count int NOT NULL DEFAULT 0, last_failure_ts timestamptz,
         tripped boolean NOT NULL DEFAULT false, kill_switch boolean NOT NULL DEFAULT false, kill_reason text,
         peak_wealth double precision, entries_paused boolean NOT NULL DEFAULT false,
         updated_at timestamptz NOT NULL DEFAULT now())""",
-    "INSERT INTO circuit_state (id) VALUES (1) ON CONFLICT DO NOTHING",
+    "INSERT INTO circuit_state (id) VALUES (1) ON CONFLICT DO NOTHING",       # id 2 (the Kalshi rails) is inserted by MIGRATIONS[7], after the CHECK is dropped
     """CREATE TABLE IF NOT EXISTS circuit_events (
         id bigserial PRIMARY KEY, ts timestamptz NOT NULL DEFAULT now(), kind text NOT NULL, detail jsonb)""",
     """CREATE TABLE IF NOT EXISTS notional_ledger (
@@ -223,6 +232,8 @@ BASE_DDL: list[str] = [
         label real, state text NOT NULL DEFAULT 'pending', resolved_at timestamptz, bootstrap_id bigint,
         PRIMARY KEY (ts, mint))""",
     "CREATE INDEX IF NOT EXISTS fly_scored_state_ts_idx ON fly_scored (state, ts)",
+    # would the fly's teacher have traded this row (its final decision)? the match calibration rule's budget (train/fly_calibrate.py)
+    "ALTER TABLE fly_scored ADD COLUMN IF NOT EXISTS teacher_allow boolean",
     """CREATE TABLE IF NOT EXISTS fly_calibrations (
         day date NOT NULL, arm text NOT NULL, line real, sizing jsonb, trades int, total real, mean real, window_days int,
         created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (day, arm))""",
@@ -261,6 +272,105 @@ MIGRATIONS: dict[int, list[str]] = {
         "ALTER TABLE fly_scored ADD COLUMN IF NOT EXISTS hold_min int",
         "ALTER TABLE fly_scored DROP CONSTRAINT IF EXISTS fly_scored_pkey",
         "ALTER TABLE fly_scored ADD PRIMARY KEY (ts, mint, strategy)"],
+    # 7: Kalshi prediction markets (fly_trader/kalshi): the exchange catalogue, live minutes and quotes, the corpus registry,
+    # the four Kalshi books' positions/orders/fills, the visual fly's tables, and a second circuit (id 2) for the Kalshi rails
+    7: ["ALTER TABLE circuit_state DROP CONSTRAINT IF EXISTS circuit_state_id_check",
+        "INSERT INTO circuit_state (id) VALUES (2) ON CONFLICT DO NOTHING",
+        """CREATE TABLE IF NOT EXISTS kalshi_series (
+            ticker text PRIMARY KEY, title text, category text, categories text[], tags text[], frequency text, fee_type text,
+            fee_multiplier double precision, settlement_sources jsonb, updated_at timestamptz NOT NULL DEFAULT now())""",
+        """CREATE TABLE IF NOT EXISTS kalshi_events (
+            event_ticker text PRIMARY KEY, series_ticker text, title text, sub_title text, category text, mutually_exclusive boolean,
+            strike_date timestamptz, strike_period text, collateral_return_type text, exchange_index int, raw jsonb,
+            updated_at timestamptz NOT NULL DEFAULT now())""",
+        "CREATE INDEX IF NOT EXISTS kalshi_events_series_idx ON kalshi_events (series_ticker)",
+        """CREATE TABLE IF NOT EXISTS kalshi_markets (
+            ticker text PRIMARY KEY, event_ticker text, market_type text, title text, yes_sub_title text, no_sub_title text, status text,
+            open_time timestamptz, close_time timestamptz, expected_expiration_time timestamptz, latest_expiration_time timestamptz,
+            settlement_ts timestamptz, result text, settlement_value double precision, strike_type text, floor_strike double precision,
+            cap_strike double precision, exchange_index int, price_level_structure text, is_provisional boolean, can_close_early boolean,
+            created_time timestamptz, source text, raw jsonb, updated_at timestamptz NOT NULL DEFAULT now())""",
+        "CREATE INDEX IF NOT EXISTS kalshi_markets_status_close_idx ON kalshi_markets (status, close_time)",
+        "CREATE INDEX IF NOT EXISTS kalshi_markets_event_idx ON kalshi_markets (event_ticker)",
+        "CREATE INDEX IF NOT EXISTS kalshi_markets_settled_idx ON kalshi_markets (settlement_ts)",
+        # the pump_minutes analogue: one row per (market, UTC minute) from the ticker and trade channels
+        """CREATE TABLE IF NOT EXISTS kalshi_minutes (
+            ticker text NOT NULL, ts timestamptz NOT NULL, yes_bid real, yes_ask real, last real, bid_size real, ask_size real,
+            volume_fp double precision, open_interest_fp double precision, dollar_volume double precision,
+            taker_buy_yes double precision, taker_buy_no double precision, n_trades int, max_trade double precision, block_contracts double precision,
+            PRIMARY KEY (ticker, ts))""",
+        "CREATE INDEX IF NOT EXISTS kalshi_minutes_ts_idx ON kalshi_minutes (ts)",
+        # the live top of book (every ticker message), read by the maker arm and the vendored venue's spread tiers
+        """CREATE TABLE IF NOT EXISTS kalshi_quotes (
+            ticker text PRIMARY KEY, ts timestamptz, yes_bid real, yes_ask real, mid real, bid_size real, ask_size real, last real,
+            updated_at timestamptz NOT NULL DEFAULT now())""",
+        """CREATE OR REPLACE VIEW venue_market_cache AS
+            SELECT 'kalshi'::text AS venue, ticker AS market_id, yes_ask AS yes_ask_cents, mid AS market_prob FROM kalshi_quotes""",
+        # the corpus registry (kalshi/history.py) and the daily feature builds (kalshi/mature.py)
+        """CREATE TABLE IF NOT EXISTS kalshi_corpus (
+            ticker text PRIMARY KEY, status text NOT NULL DEFAULT 'pending', settled_ts timestamptz, result text, open_time timestamptz,
+            close_time timestamptz, candles_1m int, trades int, candle_path text, trade_path text, seeded_from text, last_error text,
+            updated_at timestamptz NOT NULL DEFAULT now())""",
+        "CREATE INDEX IF NOT EXISTS kalshi_corpus_status_idx ON kalshi_corpus (status, settled_ts DESC)",
+        """CREATE TABLE IF NOT EXISTS kalshi_days (
+            day date PRIMARY KEY, markets int, rows int, took_s real, built_at timestamptz NOT NULL DEFAULT now())""",
+        # the four Kalshi books (paper_kalshi_taker, paper_kalshi_maker, live_kalshi_taker, live_kalshi_maker); money in cents
+        """CREATE TABLE IF NOT EXISTS kalshi_positions (
+            id bigserial PRIMARY KEY, book text NOT NULL, ticker text NOT NULL, side text NOT NULL, contracts double precision NOT NULL,
+            cost_cents double precision NOT NULL, fee_cents double precision NOT NULL DEFAULT 0, avg_price_cents double precision,
+            opened_at timestamptz NOT NULL DEFAULT now(), closed_at timestamptz, entry_decision_id bigint, exit_decision_id bigint,
+            order_id text, status text NOT NULL DEFAULT 'open', result text, payout_cents double precision, realized_cents double precision,
+            strategy text, arm text, score real, line real, last_mark_cents real, last_mark_ts timestamptz)""",
+        "CREATE INDEX IF NOT EXISTS kalshi_positions_book_status_idx ON kalshi_positions (book, status)",
+        "CREATE INDEX IF NOT EXISTS kalshi_positions_ticker_idx ON kalshi_positions (ticker)",
+        """CREATE TABLE IF NOT EXISTS kalshi_orders (
+            id bigserial PRIMARY KEY, book text NOT NULL, order_id text, client_order_id text, decision_id bigint, ticker text NOT NULL,
+            side text NOT NULL, action text NOT NULL DEFAULT 'buy', price_cents int NOT NULL, count double precision NOT NULL, tif text NOT NULL,
+            post_only boolean NOT NULL DEFAULT false, expiration_ts timestamptz, status text NOT NULL, fill_count double precision NOT NULL DEFAULT 0,
+            remaining double precision, avg_fill_cents double precision, fee_cents double precision, exchange_index int, subaccount int,
+            fair_cents real, margin_cents real, strategy text, request jsonb, response jsonb, error text,
+            ts timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now())""",
+        "CREATE INDEX IF NOT EXISTS kalshi_orders_book_status_idx ON kalshi_orders (book, status)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS kalshi_orders_order_id_uniq ON kalshi_orders (order_id) WHERE order_id IS NOT NULL",
+        """CREATE TABLE IF NOT EXISTS kalshi_fills (
+            trade_id text PRIMARY KEY, order_id text, book text, ticker text NOT NULL, side text NOT NULL, price_cents double precision NOT NULL,
+            count double precision NOT NULL, fee_cents double precision, is_taker boolean, action text, ts timestamptz NOT NULL,
+            post_position double precision, raw jsonb)""",
+        "CREATE INDEX IF NOT EXISTS kalshi_fills_order_idx ON kalshi_fills (order_id)",
+        # the visual fly (kalshi/fly_session.py): scored (market, minute, side) rows waiting for settlement, calibrations, learning, rollbacks
+        """CREATE TABLE IF NOT EXISTS kalshi_fly_scored (
+            ts timestamptz NOT NULL, ticker text NOT NULL, side text NOT NULL, strategy text NOT NULL, x real[], score real, frozen_score real,
+            line real, frozen_line real, label real, state text NOT NULL DEFAULT 'pending', due_ts timestamptz, resolved_at timestamptz,
+            bootstrap_id bigint, PRIMARY KEY (ts, ticker, side, strategy))""",
+        "CREATE INDEX IF NOT EXISTS kalshi_fly_scored_state_idx ON kalshi_fly_scored (state, due_ts)",
+        """CREATE TABLE IF NOT EXISTS kalshi_fly_calibrations (
+            day date NOT NULL, arm text NOT NULL, line real, sizing jsonb, trades int, total real, mean real, window_days int,
+            created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (day, arm))""",
+        """CREATE TABLE IF NOT EXISTS kalshi_fly_updates (
+            hour timestamptz PRIMARY KEY, n int, mean_delta real, mean_abs_delta real, step real, capped int, drift real, ic real, detail jsonb)""",
+        """CREATE TABLE IF NOT EXISTS kalshi_fly_rollbacks (
+            id bigserial PRIMARY KEY, ts timestamptz NOT NULL DEFAULT now(), reason text, checks jsonb, from_snapshot bigint, to_snapshot bigint)"""],
+    # the minute's lowest YES ask and highest YES bid: whether a resting order would have filled (kalshi/maker.py) — the
+    # candle archive's yes_ask_low / yes_bid_high, which the label rule reads (kalshi/mature.py)
+    8: ["ALTER TABLE kalshi_minutes ADD COLUMN IF NOT EXISTS yes_ask_low real",
+        "ALTER TABLE kalshi_minutes ADD COLUMN IF NOT EXISTS yes_bid_high real"],
+    # 9: a market's lifetime volume on its corpus row, so the corpus can keep the most traded markets per day (kalshi/history.prune_pending)
+    9: ["ALTER TABLE kalshi_corpus ADD COLUMN IF NOT EXISTS volume double precision"],
+    # 10: every settled single market Kalshi listed (the dataset's and the exchange walk's), from which the corpus samples whole
+    # events outcome-blind (kalshi/history.select_corpus)
+    10: ["""CREATE TABLE IF NOT EXISTS kalshi_universe (
+            ticker text PRIMARY KEY, event_ticker text, series_ticker text, title text, open_time timestamptz, close_time timestamptz,
+            settled_ts timestamptz, result text, volume double precision, source text, selected boolean NOT NULL DEFAULT false,
+            updated_at timestamptz NOT NULL DEFAULT now())""",
+         "CREATE INDEX IF NOT EXISTS kalshi_universe_close_idx ON kalshi_universe (close_time)",
+         "CREATE INDEX IF NOT EXISTS kalshi_universe_selected_idx ON kalshi_universe (selected) WHERE selected"],
+    # 11: a market's early-close condition: such a market may close before its listed close when its event happens, so its
+    # realized close carries the outcome; its time anchor is the scheduled expected expiration (kalshi/mature.load_meta)
+    11: ["ALTER TABLE kalshi_markets ADD COLUMN IF NOT EXISTS early_close_condition text"],
+    # 12: the minute's taker sales at their extremes: the lowest YES price a taker sold YES at (bought NO) and the highest a
+    # taker bought YES at (sold NO at 100 − it): a resting bid fills when a taker sells into it (kalshi/decisions.maker_filled)
+    12: ["ALTER TABLE kalshi_minutes ADD COLUMN IF NOT EXISTS yes_sold_low real",
+         "ALTER TABLE kalshi_minutes ADD COLUMN IF NOT EXISTS yes_bought_high real"],
 }
 
 
@@ -278,47 +388,93 @@ def ensure_database(url: str | None = None) -> bool:
         return True
 
 
+def ddl_fingerprint() -> str:
+    """sha256 of every statement apply_schema runs (the ladder, the idempotent vault/RH/ETH DDL) and SCHEMA_VERSION."""
+    from ..rh.schema import RH_DDL
+    from ..vault.eth_schema import ETH_DDL
+    from ..vault.schema import VAULT_DDL
+    h = hashlib.sha256()
+    for stmt in [str(SCHEMA_VERSION), *BASE_DDL, *(x for v in sorted(MIGRATIONS) for x in MIGRATIONS[v]), *VAULT_DDL, *RH_DDL, *ETH_DDL]:
+        h.update(stmt.encode()); h.update(b"\0")
+    return h.hexdigest()
+
+
+def _applied(conn, fp: str) -> int | None:
+    """The schema version when exactly this DDL is already applied (nothing to run), else None."""
+    try:
+        row = conn.execute("SELECT version, ddl_sha256 FROM schema_version WHERE singleton").fetchone()
+    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
+        conn.rollback()
+        return None
+    conn.commit()
+    if row and row["ddl_sha256"] == fp and int(row["version"]) >= SCHEMA_VERSION:
+        return int(row["version"])
+    return None
+
+
+def _apply_all(conn, fp: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")
+        for stmt in BASE_DDL:
+            cur.execute(stmt)
+        cur.execute("ALTER TABLE schema_version ADD COLUMN IF NOT EXISTS ddl_sha256 text")
+        cur.execute("SELECT version FROM schema_version WHERE singleton")
+        row = cur.fetchone()
+        current = int(row["version"]) if row else 0
+        for v in sorted(MIGRATIONS):
+            if current < v:
+                for stmt in MIGRATIONS[v]:
+                    cur.execute(stmt)
+                current = v
+        from ..vault.schema import VAULT_DDL     # idempotent, outside the ladder: same DDL on master and distribution
+        for stmt in VAULT_DDL:
+            cur.execute(stmt)
+        from ..rh.schema import RH_DDL           # idempotent, outside the ladder: the Robinhood Chain market (fly_trader/rh)
+        for stmt in RH_DDL:
+            cur.execute(stmt)
+        from ..vault.eth_schema import ETH_DDL    # the vault's ETH pot (Robinhood Chain profits paid in ETH)
+        for stmt in ETH_DDL:
+            cur.execute(stmt)
+        target = max(current, SCHEMA_VERSION)
+        cur.execute(
+            "INSERT INTO schema_version (singleton, version, ddl_sha256) VALUES (true, %s, %s) "
+            "ON CONFLICT (singleton) DO UPDATE SET version = EXCLUDED.version, ddl_sha256 = EXCLUDED.ddl_sha256, updated_at = now()",
+            (target, fp),
+        )
+        return target
+
+
 def apply_schema(url: str | None = None) -> int:
-    """Apply the ladder under an advisory lock. Returns the resulting version."""
+    """Apply the ladder under an advisory lock. Returns the resulting version. A no-op (no table locks) when this exact
+    DDL was applied before; otherwise every lock wait is bounded by LOCK_TIMEOUT and the whole run is retried."""
+    fp = ddl_fingerprint()
     with connect(url) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_advisory_lock(%s)", (_LOCK_KEY,))
-            try:
-                for stmt in BASE_DDL:
-                    cur.execute(stmt)
-                cur.execute("SELECT version FROM schema_version WHERE singleton")
-                row = cur.fetchone()
-                current = int(row["version"]) if row else 0
-                for v in sorted(MIGRATIONS):
-                    if current < v:
-                        for stmt in MIGRATIONS[v]:
-                            cur.execute(stmt)
-                        current = v
-                from ..vault.schema import VAULT_DDL     # idempotent, outside the ladder: same DDL on master and distribution
-                for stmt in VAULT_DDL:
-                    cur.execute(stmt)
-                from ..rh.schema import RH_DDL           # idempotent, outside the ladder: the Robinhood Chain market (fly_trader/rh)
-                for stmt in RH_DDL:
-                    cur.execute(stmt)
-                from ..vault.eth_schema import ETH_DDL    # the vault's ETH pot (Robinhood Chain profits paid in ETH)
-                for stmt in ETH_DDL:
-                    cur.execute(stmt)
-                target = max(current, SCHEMA_VERSION)
-                cur.execute(
-                    "INSERT INTO schema_version (singleton, version) VALUES (true, %s) "
-                    "ON CONFLICT (singleton) DO UPDATE SET version = EXCLUDED.version, updated_at = now()",
-                    (target,),
-                )
-                conn.commit()
-                ensure_partitions(conn)
-                conn.commit()
-                return target
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                cur.execute("SELECT pg_advisory_unlock(%s)", (_LOCK_KEY,))
-                conn.commit()
+        conn.execute("SELECT pg_advisory_lock(%s)", (_LOCK_KEY,))
+        conn.commit()                                       # the advisory lock is the session's; no transaction stays open
+        try:
+            target = _applied(conn, fp)
+            if target is None:
+                for attempt in range(APPLY_TRIES):
+                    try:
+                        target = _apply_all(conn, fp)
+                        conn.commit()
+                        break
+                    except (psycopg.errors.LockNotAvailable, psycopg.errors.DeadlockDetected) as e:
+                        conn.rollback()                     # releases every table lock this run took
+                        if attempt == APPLY_TRIES - 1:
+                            raise
+                        wait = min(30.0, 1.0 + attempt)
+                        log.warning("schema: %s while applying the DDL (live workers hold the tables); retrying in %.0f s", type(e).__name__, wait)
+                        time.sleep(wait)
+            ensure_partitions(conn)
+            conn.commit()
+            return target
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (_LOCK_KEY,))
+            conn.commit()
 
 
 def _partition_name(base: str, start: datetime, granularity: str) -> str:

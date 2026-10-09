@@ -43,7 +43,7 @@ from ..db.connection import transaction
 from ..execution import ledger
 from ..execution.broker_paper import PaperBroker
 from ..ops.reset import activity_dir, fly_state_dir
-from ..train import fly_calibrate, fly_governance as gov, fly_selector
+from ..train import fly_calibrate, fly_governance as gov, fly_selector, selector, strategies
 from ..train.decisions import X_COLS
 from . import handover, paper_trading
 
@@ -144,7 +144,8 @@ class FlyBook:
         b = self.brain
         if b is not None:        # another chain's book: the Solana book's fly and plastic memory, this chain's own lines and tags
             self.boot_id = b.boot_id; self.fly = b.fly; self.connectome_name = b.connectome_name; self.capture_ok = False
-            self.idx = b.idx; self.names = b.names; self.holds = b.holds; self.H = b.H
+            self.teacher_models = b.teacher_models; self.idx = b.idx; self.names = b.names; self.holds = b.holds; self.H = b.H
+            self.teacher_live, self.teacher_groups = b.teacher_live, b.teacher_groups
             self.cfg = b.cfg; self.alpha = b.alpha; self.half_life = b.half_life; self.bank = b.bank
             net = self.fly.net
         else:
@@ -155,6 +156,7 @@ class FlyBook:
             except Exception:
                 self.connectome_name = ""
             self.capture_ok = True
+            self.teacher_models = self._teacher_models(boot)
             self.idx = np.asarray([X_COLS.index(c) for c in self.fly.cols], dtype=int)
             self.names = list(self.fly.strategies); self.holds = {k: float(self.fly.rules[k]["hold_min"]) * 60.0 for k in self.names}
             self.H = max(self.holds.values())
@@ -189,6 +191,46 @@ class FlyBook:
             with transaction() as conn:
                 conn.execute("UPDATE fly_scored SET state = 'dropped', x = NULL WHERE state = 'pending' AND chain = %s AND bootstrap_id IS DISTINCT FROM %s",
                              (self.chain, self.boot_id))
+
+    teacher_live: dict | None = None
+    teacher_groups: set = set()
+
+    def _teacher_models(self, boot: dict) -> dict | None:
+        """The stack that taught this fly (its snapshot's ``teacher_snapshot``: the holdout-blind copy when that is what
+        taught it), whose final decision on each scored row is stored as ``teacher_allow`` -- the match calibration
+        rule's budget. None (with a warning) when the fly was taught by a refit stack or the snapshot is gone."""
+        meta = boot.get("meta") or {}
+        sid = meta.get("teacher_snapshot")
+        if sid is None:
+            if fly_calibrate.RULE == "match":
+                log.warning("fly #%s names no teacher snapshot: the match rule keeps its bootstrap line", self.boot_id)
+            return None
+        try:
+            m = selector.load_snapshot(int(sid))
+        except Exception:
+            log.exception("fly #%s: teacher snapshot #%s could not be loaded", self.boot_id, sid)
+            return None
+        blind = getattr(m, "blind", None) or {}
+        models = blind["models"] if "blind to the calibration week" in str(meta.get("teacher") or "") and blind.get("models") else getattr(m, "stack", None)
+        live = getattr(m, "stack", None)                         # the gate: the teacher's full stack, as its selector book trades it
+        if live and live.get("strategies") and all(c in X_COLS for v in live["strategies"].values() for c in v["cols"]):
+            self.teacher_live = live
+            self.teacher_groups = set((getattr(m, "metrics", None) or {}).get("groups") or [])
+        if not models or not models.get("strategies") or any(c not in X_COLS for v in models["strategies"].values() for c in v["cols"]):
+            log.warning("fly #%s: teacher #%s has no usable strategy stack", self.boot_id, sid)
+            return None
+        return models
+
+    def _teacher_allow(self, X: np.ndarray, t: float) -> dict[str, np.ndarray]:
+        """Per strategy: would the teacher trade each row (trigger, line and every filter)? Empty when unknown."""
+        if self.teacher_models is None:
+            return {}
+        try:
+            per = strategies.decide_all(self.teacher_models, X, X_COLS, t)
+            return {k: np.asarray(v["allow"], bool) for k, v in per.items()}
+        except Exception:
+            log.exception("teacher decisions failed for this minute (the fly still trades)")
+            return {}
 
     def _read_state(self) -> dict | None:
         if not self.state_path.exists():
@@ -288,7 +330,8 @@ class FlyBook:
             d = scored["decision"]
             st = paper_trading.trade_minute(ctx, book=self.BOOK, run_id=self.run_id, beat_no=self.beat_no, broker=self.broker, kind=self.KIND, mints=ctx.mints, infos=ctx.infos,
                                             scores=d["score"], threshold=d["threshold"], table=None, horizon_s=self.holds[self.names[0]], holds=d["hold_s"],
-                                            strategies=d["strategy"], tables=d["tables"])
+                                            strategies=d["strategy"], tables=d["tables"], flat=config.FLY_SIZING == "flat",
+                                            allow=d.get("allow"), reasons=d.get("reason"))
             out.update({k: v for k, v in st.items() if k != "entries"}); out["stage"] = "trading"
             if self.live and handover.state(conn, self.chain) is not None:
                 out["live"] = self._live(ctx, st)
@@ -378,8 +421,9 @@ class FlyBook:
         self._capture(H, trig, ctx.t_start); del H
         if not self.nu_set:
             self.bank.estimate_nu(Y[:, 0], u0, k); self.nu_set = True
-        t = ctx.t_start; ts = datetime.fromtimestamp(t, timezone.utc); rows = []
-        V = np.full((n, len(self.names)), -np.inf)
+        t = ctx.t_start; ts = datetime.fromtimestamp(t, timezone.utc); rows = []; ta = self._teacher_allow(ctx.X, t)
+        V = np.full((n, len(self.names)), -np.inf); F = np.full((n, len(self.names)), np.nan)
+        td = self._teacher_decision(ctx) if config.FLY_TEACHER_GATE and self.teacher_live is not None else None
         for j, name in enumerate(self.names):
             loc = np.flatnonzero(trig[:, j])
             if not len(loc):
@@ -388,10 +432,16 @@ class FlyBook:
             with torch.no_grad():
                 sc, _ = self.bank.predict(Y[li, j], u0[li], k[li], s=np.full(len(loc), j)); sc = sc[0]
                 fr = self.bank.frozen(Y[li, j], u0[li], s=np.full(len(loc), j))
-            v, f = sc.float().cpu().numpy(), fr.float().cpu().numpy(); V[loc, j] = v
+            v, f = sc.float().cpu().numpy(), fr.float().cpu().numpy(); V[loc, j] = v; F[loc, j] = f
             line, fline = self.lines["plastic"][name], self.lines["frozen"][name]
-            rows += [(ts, ctx.mints[i], name, int(self.holds[name] // 60), ctx.X[i].tolist(), float(v[q]), float(f[q]), line, fline, self.boot_id) for q, i in enumerate(loc)]
-            w = plastic.row_weights(sc[None], torch.tensor([line], dtype=sc.dtype, device=sc.device))
+            al = ta.get(name)
+            rows += [(ts, ctx.mints[i], name, int(self.holds[name] // 60), ctx.X[i].tolist(), float(v[q]), float(f[q]), line, fline, self.boot_id,
+                      None if al is None else bool(al[i])) for q, i in enumerate(loc)]
+            if td is not None:   # gated: its decisions are the teacher's trades of this strategy (before its own vetoes), so it learns from those
+                mine = np.array([td["strategy"][i] == name and bool(td["allow"][i]) for i in loc], dtype=np.float32)
+                w = torch.as_tensor(mine[None], dtype=sc.dtype, device=sc.device)
+            else:
+                w = plastic.row_weights(sc[None], torch.tensor([line], dtype=sc.dtype, device=sc.device))
             self.pending.push([(t, ctx.mints[i], name) for i in loc], np.full(len(loc), t), t + self.holds[name] + LABEL_LAG_S, Y[li, j], u0[li], k[li], w, s=j)
             for i in loc:
                 m = ctx.mints[i]; self.watch[m] = self.watch.get(m, 0) + 1
@@ -400,14 +450,47 @@ class FlyBook:
                     q_.append(b)
         if rows:
             with conn.cursor() as cur:
-                cur.executemany("INSERT INTO fly_scored (ts, mint, strategy, hold_min, x, score, frozen_score, line, frozen_line, bootstrap_id, chain) "
-                                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ts, mint, strategy) DO NOTHING", [r + (self.chain,) for r in rows])
+                cur.executemany("INSERT INTO fly_scored (ts, mint, strategy, hold_min, x, score, frozen_score, line, frozen_line, bootstrap_id, teacher_allow, chain) "
+                                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ts, mint, strategy) DO NOTHING", [r + (self.chain,) for r in rows])
         if self.chain == "sol":
             self.fly.lines = dict(self.lines["plastic"]); self.fly.sizings = {k: list(v) for k, v in self.sizing["plastic"].items()}
         else:                                                    # the shared model decides this chain's rows on this chain's lines
             self.fly.chain_lines[self.chain] = dict(self.lines["plastic"]); self.fly.chain_sizings[self.chain] = {k: list(v) for k, v in self.sizing["plastic"].items()}
+        if td is not None:
+            d = self._gated(ctx, V, F, td)
+            return {"decision": d, "picks": int(d["allow"].sum())}
         d = fly_selector.fly_decide(self.fly, ctx.X, X_COLS, np.where(np.isfinite(V), V, -np.inf))
         return {"decision": d, "picks": int(sum(1 for x in d["strategy"] if x is not None))}
+
+    def _teacher_decision(self, ctx) -> dict:
+        """The deployed selector's decision on this minute's rows, with its live fail-closed rules."""
+        from .selector_session import fail_closed
+        return fail_closed(self.teacher_groups, ctx.infos, strategies.decide(self.teacher_live, ctx.X, X_COLS, ctx.t_start))
+
+    def _gated(self, ctx, V: np.ndarray, F: np.ndarray, td: dict | None = None) -> dict:
+        """The fly's decision under its teacher: each row's strategy, trigger, line, win filter, gates, dump veto and
+        fail-closed rules are the deployed selector's (agent/selector_session.fail_closed), so a fresh bootstrap trades the
+        selector's set; the fly drops a teacher trade only where its learning has moved its score more than
+        ``FLY_LEARNED_VETO`` below its bootstrap score. A row the teacher blocks is recorded with the teacher's reason."""
+        n = len(ctx.mints)
+        td = td if td is not None else self._teacher_decision(ctx)
+        strat = np.full(n, None, dtype=object); score = np.full(n, -1.0); hold = np.zeros(n); thr = np.full(n, np.inf)
+        tables = [[] for _ in range(n)]; allow = np.zeros(n, bool); reason = np.full(n, "", dtype=object)
+        for i in range(n):
+            s_ = td["strategy"][i]
+            if s_ is None or s_ not in self.names:
+                continue
+            j = self.names.index(s_); v, f = V[i, j], F[i, j]
+            # the selector's own score, line and sizing table for the row: a gated fly buy is sized exactly as the selector
+            # sizes it (agent/sizing.size_position; FLY_SIZING=kelly: the same Kelly band, fraction and caps; flat: flat)
+            strat[i] = s_; score[i] = float(td["score"][i]); thr[i] = float(td["threshold"][i]); hold[i] = self.holds[s_]; tables[i] = td["tables"][i]
+            if not td["allow"][i]:
+                reason[i] = f"selector: {td['reason'][i]}"
+            elif np.isfinite(v) and np.isfinite(f) and v < f - config.FLY_LEARNED_VETO:
+                reason[i] = f"learned veto: score {v:.3f} < bootstrap {f:.3f} - {config.FLY_LEARNED_VETO:g}"
+            else:
+                allow[i] = True; reason[i] = "trade"
+        return {"strategy": strat, "score": score, "hold_s": hold, "threshold": thr, "tables": tables, "allow": allow, "reason": reason}
 
     def _capture(self, H: torch.Tensor, trig: np.ndarray, t: float) -> None:
         """The console's brain view: this minute's mean activity over the rows some strategy's trigger fired on (every
@@ -431,16 +514,28 @@ class FlyBook:
 
     def _calibrate(self, conn, now: float) -> None:
         day = datetime.fromtimestamp(now, timezone.utc).date()
+        rule = fly_calibrate.RULE
         for name in self.names:
-            rows = self._resolved(conn, now - fly_calibrate.WINDOW_DAYS * 86400.0, "ts, mint, score, frozen_score, label", name)
+            rows = self._resolved(conn, now - fly_calibrate.WINDOW_DAYS * 86400.0, "ts, mint, score, frozen_score, label, teacher_allow", name)
+            target = None
+            if rule == "match":
+                # the teacher's trades over the same rows are the budget; rows scored before it was recorded cannot count
+                rows = [r for r in rows if r["teacher_allow"] is not None]
+                if not rows:
+                    log.info("fly %s: no scored rows with the teacher's decision yet; the line stays %.4f", name, self.lines["plastic"][name])
+                    continue
             if not rows:
                 continue
             ts = np.array([r["ts"].timestamp() for r in rows]); mint = np.array([r["mint"] for r in rows]); lab = np.array([r["label"] for r in rows], dtype=np.float64)
+            if rule == "match":
+                al = np.array([bool(r["teacher_allow"]) for r in rows]) & np.isfinite(lab)
+                target = len(fly_calibrate.taken_idx(ts, mint, self.holds[name], np.flatnonzero(al)))
             for arm, col in (("plastic", "score"), ("frozen", "frozen_score")):
                 cal = fly_calibrate.calibrate(ts, mint, self.holds[name], np.array([r[col] for r in rows], dtype=np.float64), lab,
-                                              prev_line=self.lines[arm][name], prev_sizing=self.sizing[arm][name])
+                                              prev_line=self.lines[arm][name], prev_sizing=self.sizing[arm][name], rule=rule, target_trades=target)
                 if cal.changed:
-                    record_event("info", "fly", f"{name} {arm} line {self.lines[arm][name] * 100:+.2f}% → {cal.line * 100:+.2f}%", {"trades": cal.trades, "mean": cal.mean, "total": cal.total})
+                    record_event("info", "fly", f"{name} {arm} line {self.lines[arm][name] * 100:+.2f}% → {cal.line * 100:+.2f}%",
+                                 {"trades": cal.trades, "mean": cal.mean, "total": cal.total, "rule": rule, "teacher_trades": target})
                 self.lines[arm][name], self.sizing[arm][name] = cal.line, cal.sizing
                 conn.execute("INSERT INTO fly_calibrations (day, arm, line, sizing, trades, total, mean, window_days) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
                              "ON CONFLICT (day, arm) DO UPDATE SET line = EXCLUDED.line, sizing = EXCLUDED.sizing, trades = EXCLUDED.trades, total = EXCLUDED.total, mean = EXCLUDED.mean",

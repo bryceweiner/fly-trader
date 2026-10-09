@@ -369,37 +369,44 @@ class RhExecutor:
         return out
 
     def _settle_tx(self, tx: dict) -> None:
-        w = self.wallet; rpc = w.rpc
-        rc = rpc.receipt(tx["hash"])
-        if rc is not None and rc.get("blockNumber"):
+        settle_tx(self.wallet, tx)
+
+
+def settle_tx(w, tx: dict) -> None:
+    """Settle one of ``w``'s transactions that has no applied receipt (``recover``; rh/withdraw.settle_pending): its
+    receipt recorded once mined; 'replaced' when something else took its nonce; under ``REBROADCAST_S`` old, the same
+    bytes rebroadcast; otherwise cancelled at its nonce (the original recorded if it wins the race). Under the wallet's lock."""
+    rpc = w.rpc
+    rc = rpc.receipt(tx["hash"])
+    if rc is not None and rc.get("blockNumber"):
+        with transaction() as conn:
+            w.record_receipt(conn, int(tx["id"]), rc)
+        return
+    if rpc.tx_count(w.address, "latest") > int(tx["nonce"]):          # something else took the nonce (a replacement or a cancel)
+        with transaction() as conn:
+            conn.execute("UPDATE rh_txs SET status = 'replaced', applied_at = now(), updated_at = now() WHERE id = %s", (tx["id"],))
+        return
+    age = (datetime.now(timezone.utc) - tx["created_at"]).total_seconds()
+    if age < REBROADCAST_S:
+        try:
+            rpc.send_raw(tx["raw"])
+        except EvmRpcError as e:
+            if "known" not in (e.message or "").lower():
+                log.warning("rebroadcast of %s failed: %s", tx["hash"], e)
+        rc = w.wait(tx["hash"], timeout_s=60.0)
+        if rc is not None:
             with transaction() as conn:
                 w.record_receipt(conn, int(tx["id"]), rc)
             return
-        if rpc.tx_count(w.address, "latest") > int(tx["nonce"]):          # something else took the nonce (a replacement or a cancel)
-            with transaction() as conn:
-                conn.execute("UPDATE rh_txs SET status = 'replaced', applied_at = now(), updated_at = now() WHERE id = %s", (tx["id"],))
-            return
-        age = (datetime.now(timezone.utc) - tx["created_at"]).total_seconds()
-        if age < REBROADCAST_S:
-            try:
-                rpc.send_raw(tx["raw"])
-            except EvmRpcError as e:
-                if "known" not in (e.message or "").lower():
-                    log.warning("rebroadcast of %s failed: %s", tx["hash"], e)
-            rc = w.wait(tx["hash"], timeout_s=60.0)
-            if rc is not None:
-                with transaction() as conn:
-                    w.record_receipt(conn, int(tx["id"]), rc)
-                return
-        c = w.cancel(int(tx["nonce"]), int(tx["max_fee_wei"] or 0))
-        with transaction() as conn:
-            conn.execute("UPDATE rh_txs SET intent_id = %s, position_id = %s WHERE id = %s", (tx["intent_id"], tx["position_id"], c["id"]))
-        rc_c = w.wait(c["hash"], timeout_s=120.0)
-        rc = rpc.receipt(tx["hash"])
-        with transaction() as conn:
-            if rc is not None and rc.get("blockNumber"):                   # the original won the race after all
-                w.record_receipt(conn, int(tx["id"]), rc)
-            else:
-                conn.execute("UPDATE rh_txs SET status = 'replaced', applied_at = now(), updated_at = now() WHERE id = %s", (tx["id"],))
-            if rc_c is not None:
-                w.record_receipt(conn, int(c["id"]), rc_c)
+    c = w.cancel(int(tx["nonce"]), int(tx["max_fee_wei"] or 0))
+    with transaction() as conn:
+        conn.execute("UPDATE rh_txs SET intent_id = %s, position_id = %s WHERE id = %s", (tx["intent_id"], tx["position_id"], c["id"]))
+    rc_c = w.wait(c["hash"], timeout_s=120.0)
+    rc = rpc.receipt(tx["hash"])
+    with transaction() as conn:
+        if rc is not None and rc.get("blockNumber"):                   # the original won the race after all
+            w.record_receipt(conn, int(tx["id"]), rc)
+        else:
+            conn.execute("UPDATE rh_txs SET status = 'replaced', applied_at = now(), updated_at = now() WHERE id = %s", (tx["id"],))
+        if rc_c is not None:
+            w.record_receipt(conn, int(c["id"]), rc_c)

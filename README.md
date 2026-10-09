@@ -36,7 +36,8 @@ connectome they run on. The training pipeline lives on [`master`](https://github
 
 ## Requirements
 
-- Docker (Desktop on macOS/Windows, or Engine + Compose v2 on Linux). ~2 GB of disk for the image and database.
+- Docker (Desktop on macOS/Windows, or Engine + Compose v2 on Linux). ~2 GB of disk for the image and database
+  (Robinhood Chain, if you turn it on, adds ~30 GB for its full history; see below).
 - A [Helius](https://dashboard.helius.dev) API key (free tier is enough) and a [Jupiter](https://portal.jup.ag) API key.
   Optional: a second Solana RPC from another provider as `SIGNER_RPC_URL`, so the checks above do not rely on Helius
   alone.
@@ -129,24 +130,25 @@ not scale: at most `SIGNER_MAX_BUY_SOL` (1) per buy, `SIGNER_DAILY_BUY_SOL` (10)
 
 The same engine also trades Robinhood Chain: tokens launched on Pons that graduated into Uniswap v4 pools.
 
-- **Paper by default, in ETH.** The `rh_stream` worker starts with the others and indexes Pons launches, graduations
-  and swaps into 1-minute rows (a backfill from `RH_START_DAY`, then live). The Robinhood Chain books
+- **Off by default; turn it on with `RH_ENABLED=1` and `ENVIO_API_TOKEN` in `.env`** (an Envio HyperSync token; the
+  free tier works). The `rh_stream` worker then starts with the others and indexes Pons launches, graduations and swaps
+  into 1-minute rows: a backfill from `RH_START_DAY` (default 2026-08-04, ~30 GB; ~40 days back is enough to trade),
+  then live, with RH minutes landing ~15-25 s after they close. If HyperSync fails, the official RPC carries the feed
+  until it is back.
+- **Paper, in ETH.** The Robinhood Chain books
   (`paper_rh_selector`, `paper_rh_fly`) keep their money in native ETH (`RH_CAPITAL_ETH`, 5 SOL's worth at build time)
   and pay Pons' hook fee, price impact and gas. They have their own kill switch and circuit (Safety & wallet →
   Robinhood Chain trading rails) and their own handover. The console's chain picker switches Overview and Trades
   between the two chains, and the **Robinhood Chain** page shows the indexer, the quote-asset prices and the ETH wallet.
-- **The RH books start only once a combined model passes the RH replay verdict.** The selector and the fly are trained
-  on both chains' rows together, and the replay judges each chain on its own trades. Until a model trained that way
-  has passed on Robinhood Chain, the RH books do not trade (Solana does not wait for them).
+- **One model for both chains.** The shipped selector and fly were trained on both chains' rows together, and the
+  replay judged each chain on its own trades; a chain's books trade only where its verdict passed. With RH off the same
+  models trade Solana alone.
 - **Live** needs `RH_LIVE_ENABLED=1`, `RH_BOT_PRIVATE_KEY` (in `.env` only, never in the image) and the address it
   derives to as `RH_BOT_ADDRESS`, plus a funded wallet (ETH on Robinhood Chain, chain 4663). Then
   `docker compose restart fly`. As on Solana, the fly trades the wallet only after it has won the RH paper race.
 - `RH_ENABLED=0` turns all of it off.
 
-> **TODO:** RH corpus parts (the Robinhood Chain training data) will ship here once they are built. Until then this
-> branch carries no RH training data, and the shipped fly and selector were trained on Solana alone: a model release
-> trained on both chains (`tools/make_seed.py` on the development line) has to replace them before the RH books, or this
-> branch's definitions, can admit a model.
+RH training data does not ship: an install that turns RH on builds its own from the stream, as Solana does.
 
 ## NVIDIA GPU
 

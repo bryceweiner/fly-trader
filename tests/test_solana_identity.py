@@ -1,5 +1,4 @@
-"""Solana behaviour pinned before Robinhood Chain was added (branch rh-memecoins, 2026-09-28; on rh-distribution the
-fixture was captured from the distribution's own code, which has no label-size cap and no flat sizing).
+"""Solana behaviour pinned before Robinhood Chain was added (branch rh-memecoins, 2026-09-28).
 
 Every shared function the second chain touches — decision rows, labels and eligibility (train/decisions.build), the
 feature engine (market/features.TokenState), trading costs (market/exit_cost), sizing (agent/sizing) and the live
@@ -66,18 +65,20 @@ def _costs():
     fees = np.array([exit_cost.fee_fraction(v, m) for v in (0.02, 0.1, 0.5, 2.0) for m in (50.0, 500.0, 5000.0, 1e5, None)])
     full = np.array([exit_cost.exit_cost_fraction(v, q, m, lbl) for v in (0.05, 0.5, 3.0) for q in (10.0, 100.0, None)
                      for m in (100.0, 30000.0) for lbl in ("Pump.fun Amm", "Meteora DLMM")])
-    return grid, fees, full
+    lsz = np.array([exit_cost.label_size(q) for q in (None, 1.0, 10.0, 25.0, 1000.0)])
+    return grid, fees, full, lsz
 
 
 def _sizes():
     table = [{"lo": 0.0, "n": 100, "mean": 0.02, "win": 0.5, "kelly": 0.3}, {"lo": 0.01, "n": 100, "mean": 0.05, "win": 0.6, "kelly": 0.7}]
     out = []
-    for tab in (table, []):
-        for bank in (0.5, 5.3, 50.0, 500.0):
-            for cash in (0.31, 2.0, bank):
-                for resq in (None, 3.0, 40.0, 1000.0):
-                    for sc in (0.1, 0.105, 0.2):
-                        out.append(sizing.size_position(sc, 0.1, tab, bank, cash, resq)[0])
+    for flat in (False, True):
+        for tab in (table, []):
+            for bank in (0.5, 5.3, 50.0, 500.0):
+                for cash in (0.31, 2.0, bank):
+                    for resq in (None, 3.0, 40.0, 1000.0):
+                        for sc in (0.1, 0.105, 0.2):
+                            out.append(sizing.size_position(sc, 0.1, tab, bank, cash, resq, flat=flat)[0])
     return np.array(out)
 
 
@@ -106,7 +107,7 @@ def _compute(db_conn, tmp_path):
     for h in HOLDS:
         out[f"fwd_h{h}"] = np.asarray(ds.fwd_h[h], np.float64)
     out["features"] = _features_stream()
-    out["cost_grid"], out["fees"], out["exit_full"] = _costs()
+    out["cost_grid"], out["fees"], out["exit_full"], out["label_size"] = _costs()
     out["sizes"] = _sizes()
     out["engine_x"], out["engine_info"] = _engine_vectors(db_conn)
     return out

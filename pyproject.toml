@@ -13,8 +13,6 @@ dependencies = [
   "scikit-learn>=1.5",
   "scipy",
   "joblib",
-  "skops>=0.16",
-  "zstandard",
   "solders>=0.21",
   "base58",
   "websockets>=12",
@@ -24,9 +22,14 @@ dependencies = [
   "streamlit>=1.40",
   "altair",
   "psutil",
+  "kalshi-python-async>=3.10,<3.11",
+  "cryptography",
+  "aiohttp",
   "coincurve>=20",           # secp256k1: vault claim signatures (EIP-191 / EIP-1271)
   "pycryptodome>=3.20",      # keccak-256 for EIP-55 checksums and Robinhood Chain log topics
   "huggingface_hub>=1.0",    # vault backups to a storage bucket; tools/publish_release.py
+  "skops>=0.16",
+  "zstandard>=0.25.0",
 ]
 
 [project.optional-dependencies]

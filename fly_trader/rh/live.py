@@ -122,7 +122,8 @@ class RhLiveMirror:
             _, stale = A.base_mark(conn, quote)
             if stale:
                 skipped.append((mint, "base mark stale")); continue
-            size, why = sizing.size_position(e["score"], e.get("threshold", 0.0), e.get("table") or [], bankroll, cash, e["info"]["resq"], market=RH)
+            size, why = sizing.size_position(e["score"], e.get("threshold", 0.0), e.get("table") or [], bankroll, cash, e["info"]["resq"],
+                                             flat=config.FLY_SIZING == "flat", market=RH)
             if blocked or size <= 0:
                 skipped.append((mint, blocked or why)); continue
             if self.ex.submit(RhRequest(kind="buy", token=mint, quote_asset=quote, amount_in=int(size * A.WEI), slippage_bps=config.SLIPPAGE_ENTRY_BPS,

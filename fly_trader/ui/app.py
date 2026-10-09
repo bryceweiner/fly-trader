@@ -15,6 +15,7 @@ import streamlit as st
 
 st.set_page_config(page_title="fly-trader", page_icon="🪰", layout="wide")
 
+from fly_trader import config
 from fly_trader.ops.supervisor import get_supervisor
 from fly_trader.ui.common import status_strip
 
@@ -30,16 +31,28 @@ def _autostart_once() -> None:
 
 
 _autostart_once()
-pages = [
-    st.Page("app_pages/overview.py", title="Overview", icon=":material/dashboard:", default=True),
-    st.Page("app_pages/trades.py", title="Trades", icon=":material/swap_horiz:"),
-    st.Page("app_pages/model.py", title="Model & training", icon=":material/psychology:"),
-    st.Page("app_pages/data.py", title="Data pipelines", icon=":material/database:"),
-    st.Page("app_pages/rh.py", title="Robinhood Chain", icon=":material/link:", url_path="rh"),
-    st.Page("app_pages/processes.py", title="Processes", icon=":material/settings_applications:"),
-    st.Page("app_pages/safety.py", title="Safety & wallet", icon=":material/shield:"),
-    st.Page("app_pages/vault.py", title="$FLY vault", icon=":material/savings:", url_path="vault"),
-]
+pages = {
+    "Memecoins": [
+        st.Page("app_pages/overview.py", title="Overview", icon=":material/dashboard:", default=True),
+        st.Page("app_pages/trades.py", title="Trades", icon=":material/swap_horiz:"),
+        st.Page("app_pages/model.py", title="Model & training", icon=":material/psychology:"),
+        st.Page("app_pages/data.py", title="Data pipelines", icon=":material/database:"),
+        st.Page("app_pages/rh.py", title="Robinhood Chain", icon=":material/link:", url_path="rh"),
+    ],
+    "Prediction markets": [
+        st.Page("app_pages/kalshi_overview.py", title="Kalshi overview", icon=":material/visibility:", url_path="kalshi"),
+        st.Page("app_pages/kalshi_trades.py", title="Kalshi trades", icon=":material/receipt_long:", url_path="kalshi-trades"),
+        st.Page("app_pages/kalshi_model.py", title="Kalshi model & training", icon=":material/neurology:", url_path="kalshi-model"),
+        st.Page("app_pages/kalshi_data.py", title="Kalshi data", icon=":material/database:", url_path="kalshi-data"),
+    ],
+    "System": [
+        st.Page("app_pages/processes.py", title="Processes", icon=":material/settings_applications:"),
+        st.Page("app_pages/safety.py", title="Safety & wallet", icon=":material/shield:"),
+        st.Page("app_pages/vault.py", title="$FLY vault", icon=":material/savings:", url_path="vault"),
+    ],
+}
+if not config.KALSHI_API_KEY_ID:     # the distribution ships Kalshi dormant: its pages appear once it is set up
+    pages.pop("Prediction markets")
 page = st.navigation(pages, position="top")
 status_strip()
 try:

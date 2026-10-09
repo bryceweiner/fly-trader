@@ -89,7 +89,8 @@ class LiveMirror:
         for e in entries:
             if e["mint"] in held_mints:
                 skipped.append((e["mint"], "held")); continue
-            size, why = sizing.size_position(e["score"], e.get("threshold", line), e.get("table") or table or [], bankroll, cash, e["info"]["resq"])
+            size, why = sizing.size_position(e["score"], e.get("threshold", line), e.get("table") or table or [], bankroll, cash, e["info"]["resq"],
+                                             flat=config.FLY_SIZING == "flat")
             if blocked or size <= 0:
                 skipped.append((e["mint"], blocked or why)); continue
             if self.worker.submit(ExecRequest(decision_id=e["decision_id"], mint=e["mint"], pool=e["info"]["pool"], side="buy", amount_in=int(size * config.LAMPORTS_PER_SOL),
@@ -115,7 +116,7 @@ class LiveMirror:
             vault_nav.mark(conn, m1, snap.lamports + vault_payout.cached_balance(), int(round(gross_v * config.LAMPORTS_PER_SOL)),
                            int(round(exit_cost * config.LAMPORTS_PER_SOL)))
             ix = vault_nav.status(conn, since=rebase)
-            killed = rails.check_drawdown(conn, ix["value"], ix["peak"])
+            killed = rails.check_drawdown(conn, ix["value"], ix["peak"], unit="index")
         else:
             killed = rails.check_drawdown(conn, wealth, peak)
         panic = False

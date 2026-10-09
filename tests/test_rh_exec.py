@@ -267,7 +267,7 @@ def test_unexplained_outflow_trips_circuit_3(chain):
 
 def test_mirror_sizes_rh_entries_and_respects_circuit_3(chain, monkeypatch):
     from fly_trader.rh.live import RhLiveMirror
-    monkeypatch.setattr(config, "MAX_POSITION_SOL", 1.0)          # a table-less entry: 1 SOL in ETH, capped at the RH label size
+    monkeypatch.setattr(config, "FLY_SIZING", "flat")
     ex = chain.ex(); m = RhLiveMirror(600.0, executor=ex)
     now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     with transaction() as conn:

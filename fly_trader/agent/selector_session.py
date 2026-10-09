@@ -61,6 +61,19 @@ def chain_deployable(model, chain: str) -> tuple[bool, str]:
     return bool(c.get("deployable")), f"{chain} holdout: {c.get('n', 0)} trades, mean {(c.get('mean') or 0) * 100:+.2f}% (random {(c.get('random_mean') or 0) * 100:+.2f}%)"
 
 
+def fail_closed(groups: set, infos: list, d: dict) -> dict:
+    """The selector's live fail-closed rules on a ``strategies.decide`` result (in place): rows whose inputs training had
+    but live lacks are blocked. Shared by the fly's teacher gate (agent/fly_session.py), so both books obey the same rules."""
+    for k, i in enumerate(infos):
+        if not d["allow"][k]:
+            continue
+        if "skill" in groups and i.get("skill_missing"):
+            d["allow"][k] = False; d["reason"][k] = "fail closed: no wallet-skill table for today"
+        elif "rug" in groups and i.get("age_h") is not None and not i.get("curve_known"):
+            d["allow"][k] = False; d["reason"][k] = "fail closed: curve facts not known yet"
+    return d
+
+
 class SelectorBook:
     def __init__(self, chain: str = "sol"):
         from .. import markets
@@ -129,15 +142,7 @@ class SelectorBook:
         if not (getattr(self.model, "stack", None) or {}).get("strategies") or not len(ctx.mints):
             return None
         d = self.model.decide(ctx.X, X_COLS, ctx.t_start)
-        groups = set((getattr(self.model, "metrics", None) or {}).get("groups") or [])
-        for k, i in enumerate(ctx.infos):
-            if not d["allow"][k]:
-                continue
-            if "skill" in groups and i.get("skill_missing"):
-                d["allow"][k] = False; d["reason"][k] = "fail closed: no wallet-skill table for today"
-            elif "rug" in groups and i.get("age_h") is not None and not i.get("curve_known"):
-                d["allow"][k] = False; d["reason"][k] = "fail closed: curve facts not known yet"
-        return d
+        return fail_closed(set((getattr(self.model, "metrics", None) or {}).get("groups") or []), ctx.infos, d)
 
     def on_minute(self, ctx) -> dict:
         conn = ctx.conn

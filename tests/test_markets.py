@@ -28,5 +28,5 @@ def test_pinned_rh_constants_are_the_solana_sizes_in_eth():
     k = config.RH_ETH_PER_SOL
     assert k > 0
     assert config.RH_CAPITAL_ETH == pytest.approx(5.0 * k, rel=1e-5)
-    assert config.RH_LABEL_SIZE_ETH == pytest.approx(0.5 * k, rel=1e-5)          # 0.5 SOL (the distribution has no LABEL_SIZE_SOL default)
+    assert config.RH_LABEL_SIZE_ETH == pytest.approx(config.LABEL_SIZE_SOL * k, rel=1e-5)
     assert config.RH_MIN_POSITION_ETH == pytest.approx(config.MIN_POSITION_SOL * k, rel=1e-5)

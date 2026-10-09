@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-from .. import markets
+from .. import config, markets
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..market.exit_cost import PUMP_SUPPLY
@@ -98,6 +98,9 @@ class MinuteEngine:
 
     def __init__(self, books: list | None = None, live: bool = False, market=None):
         self.spec = market or markets.SOL; self.rh = self.spec.chain != "sol"
+        # how old a minute may be and still be traded: Solana's feed flushes within seconds; the RH stream's minutes land
+        # ~2–3 min late (confirmations, the index pass, the price marks), so on RH "the current minute" never arrives
+        self.trade_lag_s = float(config.RH_TRADE_LAG_S) if self.rh else 0.0
         self.books = list(books or []); self.live = live
         self.states: dict[str, MintState] = {}
         self.meta_cache: dict[str, dict] = {}; self.last_sweep = time.time(); self.last_minute: float | None = None
@@ -105,6 +108,10 @@ class MinuteEngine:
 
     def has_book(self, name: str) -> bool:
         return any(b.name == name for b in self.books)
+
+    def tradeable(self, minute: float, m1: float) -> bool:
+        """Whether minute ``minute`` (its end, epoch s) is recent enough to trade at wall-clock minute ``m1``."""
+        return int(m1) - self.trade_lag_s <= int(minute) <= int(m1)
 
     def my_books(self) -> list:
         return [b for b in self.books if getattr(b, "chain", "sol") == self.spec.chain]
@@ -389,9 +396,9 @@ def main(stop_event: threading.Event | None = None, live: bool = False) -> None:
                     continue
                 for minute in range(int(engine.last_minute) + 60, int(upto) + 1, 60):
                     try:
-                        st = engine.run_minute(float(minute), trade=(minute == int(m1)))   # missed minutes update features (and the fly's learning) only
+                        st = engine.run_minute(float(minute), trade=engine.tradeable(minute, m1))   # older minutes update features (and the fly's learning) only
                         n_min += 1
-                        if minute == int(m1) and n_min % 10 == 0:
+                        if engine.tradeable(minute, m1) and n_min % 10 == 0:
                             log.info("%s minute %s: traded %d eligible %d | %s", engine.spec.chain, st["minute"], st.get("mints_traded", 0), st.get("eligible", 0),
                                      " | ".join(f"{b.name}: picks {(st.get(b.name) or {}).get('picks')} open {(st.get(b.name) or {}).get('open')} wealth {(st.get(b.name) or {}).get('wealth')}"
                                                 for b in engine.my_books()))

@@ -15,12 +15,22 @@ from .. import config
 log = logging.getLogger(__name__)
 
 MIN_RANGE, MAX_RANGE, START_RANGE = 250, 20_000, 5_000
+MAX_RANGE_FAST = 50_000          # HyperSync answers whole ranges in one paginated query; ~0.04 busy days of logs held at once
 PAUSE_S = 0.8                    # between RPC requests: the public endpoint answers 429 above ~1 request/s
 BACKOFF_S = 3.0
 
 
+def fast() -> bool:
+    """A log source without the public endpoint's ~1 request/s limit (a dedicated RPC or HyperSync)."""
+    return bool(config.RH_RPC_URL_LOGS or config.env_str("ENVIO_API_TOKEN"))
+
+
+def max_range() -> int:
+    return MAX_RANGE_FAST if config.env_str("ENVIO_API_TOKEN") else MAX_RANGE
+
+
 def pause() -> None:
-    time.sleep(PAUSE_S if not config.RH_RPC_URL_LOGS else 0.05)
+    time.sleep(PAUSE_S if not fast() else 0.05)
 
 
 def cursor(conn, name: str, default: int) -> tuple[int, int]:
@@ -45,7 +55,7 @@ def next_range(done_through: int, rng: int, head: int) -> tuple[int, int] | None
 
 
 def grow(rng: int) -> int:
-    return min(MAX_RANGE, int(rng * 1.5) + 1)
+    return min(max_range(), int(rng * 1.5) + 1)
 
 
 def shrink(rng: int) -> int:

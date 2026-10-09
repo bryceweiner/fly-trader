@@ -123,6 +123,10 @@ RH_DDL: list[str] = [
     "ALTER TABLE rh_swaps ADD COLUMN IF NOT EXISTS fee_frac double precision",
     # when a receipt's fee was recorded: the reconciler counts gas by it (updated_at moves on later status changes)
     "ALTER TABLE rh_txs ADD COLUMN IF NOT EXISTS fee_at timestamptz",
+    # a pool's hook fee + tax is fixed at launch (measured: 1,665 of 1,732 pools vary < 0.05 points): read from its first
+    # FEE_OBS swaps' HookFeeCollected logs, then applied to its later swaps without fetching their fee logs (rh/index.py)
+    "ALTER TABLE rh_pools ADD COLUMN IF NOT EXISTS hook_fee double precision",
+    "ALTER TABLE rh_pools ADD COLUMN IF NOT EXISTS fee_obs int NOT NULL DEFAULT 0",
     "ALTER TABLE rh_tokens ADD COLUMN IF NOT EXISTS curve_indexed boolean NOT NULL DEFAULT false",
     "ALTER TABLE rh_assets ADD COLUMN IF NOT EXISTS ref_path jsonb",
     "ALTER TABLE positions ADD COLUMN IF NOT EXISTS chain text NOT NULL DEFAULT 'sol'",

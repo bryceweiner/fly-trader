@@ -1,0 +1,342 @@
+"""A local dry run of the whole $FLY vault on this Mac: chain, contracts, relay, the fly's vault worker, and the site.
+
+    .venv/bin/python tools/vault_demo.py up        # start everything with an empty vault (about a minute)
+                                                   # --seed-holders: two test holders lock 300k and 100k at start
+    .venv/bin/python tools/vault_demo.py up --paper   # the same, but the vault shares the RUNNING fly's paper book
+                                                     # (paper_fly in the fly_trader database): its real NAV, positions,
+                                                     # trades and closed-trade profit, just no real SOL
+    .venv/bin/python tools/vault_demo.py status
+    .venv/bin/python tools/vault_demo.py down
+    .venv/bin/python tools/vault_demo.py fund-evm 0xYourMetaMaskAddress   # 100 local ETH + 1M test $FLY
+    .venv/bin/python tools/vault_demo.py fund-sol YourPhantomAddress      # 2 local SOL (not needed to claim)
+    .venv/bin/python tools/vault_demo.py profit 0.2                       # live-style only: 0.2 SOL of outside profit
+
+Wallets for hands-on testing (use fresh test accounts, never your real ones):
+  MetaMask  add network  RPC http://127.0.0.1:8545  chain id 46630  currency ETH
+  Phantom   Settings > Developer settings > Testnet mode, then a custom RPC http://127.0.0.1:8899
+  The site  needs a Reown project id for its Connect button: VITE_REOWN_PROJECT_ID=<id> in the environment when you run
+            `up`, or the id in .vault-demo/reown_project_id (allowlist localhost:5173 in the Reown dashboard)
+
+What runs (state and logs in .vault-demo/, gitignored):
+  anvil        chain id 46630 on :8545 (stands in for Robinhood testnet), Multicall3 at its canonical address
+  contracts    MockFLY + FlyVault + timelock (withdraw delay 5 min); empty unless --seed-holders
+  relay        web/wsgi.py on :8612 (claim domain localhost:5173, devnet)
+  treasury     the real Squads v4 program (dumped from mainnet once, cached) on the local validator: a multisig owned by a
+               throwaway "owner" key (standing in for your Solflare), L1 (trading float refill) and L2 (claims), created
+               by the owner page's own code (web/src/lib/squads.ts)
+  vault fly    fly_trader.vault.worker against the chain above and Solana DEVNET with throwaway keys and an in-process
+               signer; its own database fly_vault_demo; settlement every 5 minutes; no trading (the paper fly is untouched)
+  site         Vite dev server on :5173 (testnet build pointed at anvil, relay proxied); owner.html reads the local validator
+
+SOL (on a local solana-test-validator standing in for devnet): a throwaway "funder" deposits 1 SOL into the TREASURY;
+the fly's trading wallet also gets a direct airdrop, which counts as profit for the lockers. The fly refills its float
+from the treasury through L1 and pays claims from it through L2. To try owner.html by hand, import the printed owner
+secret into a test wallet on localnet.
+"""
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import httpx
+
+REPO = Path(__file__).resolve().parents[1]
+D = REPO / ".vault-demo"
+PY = str(REPO / ".venv" / "bin" / "python")
+ANVIL = "http://127.0.0.1:8545"
+RELAY_PORT = 8612
+DEVNET = "http://127.0.0.1:8899"          # a local solana-test-validator: unlimited airdrops
+SQUADS = "SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf"
+SQUADS_CONFIG = "BSTq9w3kZwNwpBXJEvTZz2G9ZTNyKBvoSeXMvwb4cNZr"   # the program's config account (seeds multisig, program_config)
+DB = "fly_vault_demo"
+PAPER_BOOK = "paper_fly"
+VAULT_TABLES = ("vault_allocations", "vault_settlements", "vault_claims", "vault_flows", "vault_kv", "vault_nav", "vault_events", "vault_scan")
+SECRET = "demo-relay-secret-not-for-production"
+# anvil's public test accounts (well known; never fund them on a real chain)
+ACCTS = ["0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+         "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+         "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"]
+
+
+def sh(*a, env=None, cwd=None, check=True) -> str:
+    r = subprocess.run(list(a), cwd=cwd, env={**os.environ, **(env or {})}, capture_output=True, text=True)
+    if check and r.returncode:
+        raise SystemExit(f"{' '.join(a[:3])}… failed:\n{r.stdout[-800:]}\n{r.stderr[-800:]}")
+    return r.stdout.strip()
+
+
+def spawn(name: str, args: list, env=None, cwd=None) -> int:
+    log = open(D / f"{name}.log", "a")
+    p = subprocess.Popen(args, cwd=cwd, env={**os.environ, **(env or {})}, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    (D / f"{name}.pid").write_text(str(p.pid))
+    return p.pid
+
+
+def wait_http(url: str, what: str, tries: int = 60, method: str = "GET", body=None) -> None:
+    for _ in range(tries):
+        try:
+            r = httpx.request(method, url, json=body, timeout=3)
+            if r.status_code < 500:
+                return
+        except httpx.HTTPError:
+            pass
+        time.sleep(1)
+    raise SystemExit(f"{what} did not come up ({url})")
+
+
+def sol_keys() -> dict:
+    from solders.keypair import Keypair
+    import base58
+    f = D / "sol_keys.json"
+    keys = json.loads(f.read_text()) if f.exists() else {}
+    if all(n in keys for n in ("fly", "payout", "funder", "owner")):
+        return keys
+    for n in ("fly", "payout", "funder", "owner"):
+        if n in keys:
+            continue
+        kp = Keypair()
+        keys[n] = {"secret": base58.b58encode(bytes(kp)).decode(), "pubkey": str(kp.pubkey())}
+    f.write_text(json.dumps(keys)); f.chmod(0o600)
+    for n in ("fly", "payout"):
+        (D / f"{n}_key").write_text(keys[n]["secret"] + "\n"); (D / f"{n}_key").chmod(0o600)
+    return keys
+
+
+def airdrop(pubkey: str, sol: float) -> bool:
+    for attempt in range(4):
+        try:
+            r = httpx.post(DEVNET, json={"jsonrpc": "2.0", "id": 1, "method": "requestAirdrop", "params": [pubkey, int(sol * 1e9)]}, timeout=20).json()
+            if r.get("result"):
+                return True
+        except httpx.HTTPError:
+            pass
+        time.sleep(5 * (attempt + 1))
+    return False
+
+
+def balance(pubkey: str) -> int:
+    r = httpx.post(DEVNET, json={"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pubkey]}, timeout=20).json()
+    return int(r["result"]["value"])
+
+
+def transfer(secret: str, to: str, lamports: int) -> str:
+    import base58, base64
+    from solders.hash import Hash
+    from solders.keypair import Keypair
+    from solders.message import MessageV0
+    from solders.pubkey import Pubkey
+    from solders.system_program import TransferParams, transfer as tx_transfer
+    from solders.transaction import VersionedTransaction
+    kp = Keypair.from_bytes(base58.b58decode(secret))
+    bh = httpx.post(DEVNET, json={"jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": []}, timeout=20).json()["result"]["value"]["blockhash"]
+    msg = MessageV0.try_compile(kp.pubkey(), [tx_transfer(TransferParams(from_pubkey=kp.pubkey(), to_pubkey=Pubkey.from_string(to), lamports=lamports))], [], Hash.from_string(bh))
+    tx = VersionedTransaction(msg, [kp])
+    r = httpx.post(DEVNET, json={"jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
+                                 "params": [base64.b64encode(bytes(tx)).decode(), {"encoding": "base64"}]}, timeout=20).json()
+    return r.get("result") or str(r.get("error"))
+
+
+def paper_mode() -> bool:
+    return (D / "paper").exists()
+
+
+def fly_env(dep: dict, keys: dict) -> dict:
+    db = "fly_trader" if paper_mode() else DB
+    return {"VAULT_BOOK": PAPER_BOOK if paper_mode() else "live", "DATABASE_URL": f"postgresql:///{db}", "VAULT_ENABLED": "1", "VAULT_CLUSTER": "devnet", "VAULT_SOLANA_RPC_URL": DEVNET,
+            "SOLANA_CLUSTER": "devnet", "LIVE_ENABLED": "0", "BOT_PRIVATE_KEY": "", "BOT_PRIVATE_KEY_FILE": str(D / "fly_key"), "PAYOUT_PRIVATE_KEY_FILE": str(D / "payout_key"),
+            "FUNDING_ADDRESSES": keys["funder"]["pubkey"], "RH_CHAIN_ID": "46630", "RH_RPC_URL": ANVIL,
+            "VAULT_ADDRESS": dep["vault"], "VAULT_TIMELOCK": dep["timelock"], "VAULT_START_BLOCK": "0", "VAULT_PERIOD_S": "300",
+            "RELAY_URL": f"http://127.0.0.1:{RELAY_PORT}", "RELAY_KEY_ID": "k1", "RELAY_SECRET": SECRET,
+            "VAULT_SITE_DOMAIN": "localhost:5173", "VAULT_SITE_URI": "http://localhost:5173/vault.html",
+            "GAS_RESERVE_SOL": "0.01", "TELEGRAM_BOT_TOKEN": "", "LOG_DIR": str(D / "fly-logs"),
+            "SIGNER_RPC_URL": DEVNET, "SIGNER_DB": str(D / "signer.sqlite"), "TREASURY_FLOAT_SOL": "0.5", "TOPUP_MIN_SOL": "0.05",
+            **({"VAULT_MULTISIG": t["multisig"], "VAULT_LIMIT_TRADING": t["l1"], "VAULT_LIMIT_PAYOUT": t["l2"]}
+               if (t := treasury()) else {})}
+
+
+def treasury() -> dict | None:
+    f = D / "treasury.json"
+    return json.loads(f.read_text()) if f.exists() else None
+
+
+def squads_files() -> tuple[Path, Path]:
+    """The Squads program and its config account, dumped from mainnet once (read-only) and cached."""
+    sq = D / "squads"; sq.mkdir(exist_ok=True)
+    so, acct = sq / "squads.so", sq / "program_config.json"
+    if not so.exists() or not acct.exists():
+        sys.path.insert(0, str(REPO))
+        from fly_trader import config
+        url = config.helius_http_url() if config.HELIUS_API_KEY else "https://api.mainnet-beta.solana.com"
+        sh("solana", "program", "dump", "-u", url, SQUADS, str(so))
+        sh("solana", "account", "-u", url, SQUADS_CONFIG, "--output", "json", "-o", str(acct))
+    return so, acct
+
+
+def setup_treasury(keys: dict, fund_lamports: int) -> dict:
+    """Multisig + L1 + L2 through the owner page's code (web/src/lib/squads.setup.test.ts)."""
+    f = D / "treasury.json"
+    f.write_text(json.dumps({"rpc": DEVNET, "owner": keys["owner"]["secret"], "trading": keys["fly"]["pubkey"], "payout": keys["payout"]["pubkey"],
+                             "l1_lamports": 500_000_000, "l2_lamports": 1_000_000_000, "fund_lamports": fund_lamports}))
+    sh("npx", "vitest", "run", "src/lib/squads.setup.test.ts", env={"SQUADS_SETUP": str(f)}, cwd=REPO / "web")
+    t = json.loads(f.read_text())
+    if "multisig" not in t:
+        raise SystemExit("treasury setup did not complete (see web/src/lib/squads.setup.test.ts)")
+    return t
+
+
+def reown_id() -> str:
+    f = D / "reown_project_id"
+    return (os.environ.get("VITE_REOWN_PROJECT_ID") or (f.read_text().strip() if f.exists() else "")).strip()
+
+
+def fund_evm(addr: str) -> None:
+    dep = json.loads((D / "deployment.json").read_text())
+    sh("cast", "rpc", "anvil_setBalance", addr, hex(100 * 10**18), "--rpc-url", ANVIL)
+    sh("cast", "send", dep["fly"], "mint(address,uint256)", addr, "1000000000000000000000000", "--rpc-url", ANVIL, "--private-key", ACCTS[0])
+    print(f"{addr}: 100 ETH and 1,000,000 mFLY on the local chain (46630). MockFLY is {dep['fly']}; the vault is {dep['vault']}")
+
+
+def fund_sol(addr: str) -> None:
+    print(f"{addr}: airdrop {'ok' if airdrop(addr, 2) else 'FAILED'} (2 local SOL)")
+
+
+def profit(sol: float) -> None:
+    if paper_mode():
+        raise SystemExit("paper mode: profit comes from the running fly's closed trades; use `up` without --paper to inject it")
+    from solders.keypair import Keypair
+    import base58
+    kp = Keypair()
+    airdrop(str(kp.pubkey()), sol + 0.01)
+    time.sleep(3)
+    keys = sol_keys()
+    print("gift tx:", transfer(base58.b58encode(bytes(kp)).decode(), keys["fly"]["pubkey"], int(sol * 1e9))[:16], "… (counted as profit; settles within 5 min)")
+
+
+def up(paper: bool = False, seed_holders: bool = False) -> None:
+    D.mkdir(exist_ok=True)
+    (D / "paper").unlink(missing_ok=True)
+    if paper:
+        (D / "paper").write_text(PAPER_BOOK)
+    # 1. chains: a local Solana validator (plays devnet) and anvil (plays Robinhood testnet)
+    so, acct = squads_files()
+    spawn("solana", [str(Path.home() / ".local/share/solana/install/active_release/bin/solana-test-validator"),
+                     "--reset", "--quiet", "--ledger", str(D / "ledger"), "--rpc-port", "8899",
+                     "--bpf-program", SQUADS, str(so), "--account", SQUADS_CONFIG, str(acct)])
+    wait_http(DEVNET, "solana validator", method="POST", body={"jsonrpc": "2.0", "id": 1, "method": "getHealth"}, tries=90)
+    # Phantom's "Solana Localnet" uses localhost, which browsers often resolve to ::1; the validator listens on IPv4 only
+    spawn("ipv6", [PY, str(REPO / "tools" / "ipv6_forward.py"), "8899", "8900"])
+    spawn("anvil", ["anvil", "--chain-id", "46630", "--port", "8545", "--block-time", "1", "--silent"])
+    wait_http(ANVIL, "anvil", method="POST", body={"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []})
+    mc = "0xcA11bde05977b3631167028862bE2a173976CA11"
+    code = sh("cast", "code", mc, "--rpc-url", "https://rpc.mainnet.chain.robinhood.com")
+    sh("cast", "rpc", "anvil_setCode", mc, code, "--rpc-url", ANVIL)
+    # 2. contracts (withdraw delay 5 min, timelock 10 min)
+    sh("forge", "script", "script/DeployTestnet.s.sol", "--rpc-url", ANVIL, "--private-key", ACCTS[0], "--broadcast",
+       env={"WITHDRAW_DELAY": "300", "TIMELOCK_DELAY": "600"}, cwd=REPO / "contracts")
+    dep = json.loads((REPO / "contracts" / "deployments" / "46630.json").read_text())
+    dep = {"vault": dep["vault"], "timelock": dep["timelock"], "fly": dep.get("token") or dep.get("fly")}
+    (D / "deployment.json").write_text(json.dumps(dep, indent=1))
+    holders = []
+    for i, (pk, amt) in enumerate(zip(ACCTS[1:], ("300000", "100000") if seed_holders else ())):
+        a = sh("cast", "wallet", "address", pk); holders.append(a)
+        sh("cast", "send", dep["fly"], "mint(address,uint256)", a, "1000000000000000000000000", "--rpc-url", ANVIL, "--private-key", pk)
+        sh("cast", "send", dep["fly"], "approve(address,uint256)", dep["vault"], "1000000000000000000000000", "--rpc-url", ANVIL, "--private-key", pk)
+        sh("cast", "send", dep["vault"], "lock(uint256)", amt + "000000000000000000", "--rpc-url", ANVIL, "--private-key", pk)
+        time.sleep(3)
+    # 3. database for the demo fly
+    if paper:                                  # the running fly's own database: only the vault_* tables are touched
+        sh("psql", "-d", "fly_trader", "-qc", "TRUNCATE " + ", ".join(VAULT_TABLES))
+    else:
+        subprocess.run(["createdb", DB], capture_output=True)
+        sh(PY, "-c", "from fly_trader.db import schema; schema.apply_schema()", env={"DATABASE_URL": f"postgresql:///{DB}"}, cwd=REPO)
+    # 4. relay
+    rd = D / "relay"; rd.mkdir(exist_ok=True)
+    (rd / "relay.json").write_text(json.dumps({"keys": {"k1": SECRET}, "db_path": str(rd / "relay.sqlite3"), "domain": "localhost:5173",
+                                               "uri": "http://localhost:5173/vault.html", "chain_id": 46630, "sol_chain": "devnet",
+                                               "claim_ttl_s": 900, "min_lamports": 2000000, "client_ip_header": None}))
+    spawn("relay", [PY, "-c", "import sys; sys.path.insert(0, 'web'); from wsgiref.simple_server import make_server; import wsgi; "
+                              f"make_server('127.0.0.1', {RELAY_PORT}, wsgi.application).serve_forever()"],
+          env={"FLY_RELAY_CONFIG": str(rd / "relay.json")}, cwd=REPO)
+    wait_http(f"http://127.0.0.1:{RELAY_PORT}/api/account?evm=0x" + "00" * 20, "relay")
+    # 5. the treasury (owner = a throwaway key standing in for Solflare), then devnet SOL: 1 SOL deposit from the
+    #    funder into the treasury, 0.25 SOL straight to the fly's trading wallet (= profit for lockers)
+    keys = sol_keys()
+    (D / "treasury.json").unlink(missing_ok=True)
+    airdrop(keys["owner"]["pubkey"], 10)
+    airdrop(keys["fly"]["pubkey"], 0.05)                  # fees for its first refill (L1 then keeps the float)
+    time.sleep(5)
+    t = setup_treasury(keys, 5_000_000_000 if paper else 0)   # paper: the owner funds claims; there is no deposit
+    got = False if paper else airdrop(keys["funder"]["pubkey"], 1.5)
+    time.sleep(15)
+    if got and balance(keys["funder"]["pubkey"]) > 1_100_000_000:
+        print("deposit tx:", transfer(keys["funder"]["secret"], t["treasury"], 1_000_000_000)[:20], "… (into the treasury)")
+    elif not paper:
+        print("WARNING: devnet airdrop to the funder failed (rate limit); fund", keys["funder"]["pubkey"], "at faucet.solana.com")
+    if not paper and not airdrop(keys["fly"]["pubkey"], 0.25):
+        print("WARNING: devnet airdrop to the fly failed; send devnet SOL to", keys["fly"]["pubkey"], "to create profit")
+    # 6. the vault fly (vault worker only, its own database)
+    (D / "fly-logs").mkdir(exist_ok=True)
+    env = fly_env(dep, keys)
+    start = "int(time.time())" if paper else "int(time.time()) - 600"      # paper: profit counts from now on
+    sh(PY, "-c", f"from fly_trader.vault import state; import time; state.put('vault_started_at', {start})", env=env, cwd=REPO)
+    spawn("fly", [PY, "-c", "from fly_trader.vault import worker; worker.main()"], env=env, cwd=REPO)
+    # 7. the site
+    web_env = {"VITE_NETWORK": "testnet", "VITE_EVM_RPC": ANVIL, "VITE_VAULT_ADDRESS": dep["vault"], "VITE_TIMELOCK_ADDRESS": dep["timelock"],
+               "VITE_FLY_ADDRESS": dep["fly"], "VITE_RELAY_PROXY": f"http://127.0.0.1:{RELAY_PORT}",
+               "VITE_REOWN_PROJECT_ID": reown_id(), "VITE_SOLANA_RPC": DEVNET}
+    spawn("site", ["npx", "vite", "--port", "5173", "--strictPort", "--host", "localhost"], env=web_env, cwd=REPO / "web")
+    wait_http("http://localhost:5173/vault.html", "site")
+    print(json.dumps({"site": "http://localhost:5173/vault.html", "trading": "http://localhost:5173/trading.html",
+                      "owner_page": "http://localhost:5173/owner.html",
+                      "chain": ANVIL + " (id 46630)", **dep, "holders": holders, "fly_wallet": keys["fly"]["pubkey"], "payout_key": keys["payout"]["pubkey"],
+                      "treasury": t["treasury"], "multisig": t["multisig"], "l1": t["l1"], "l2": t["l2"],
+                      "owner": keys["owner"]["pubkey"], "owner_secret (test key: import into a localnet wallet to try owner.html)": keys["owner"]["secret"],
+                      "funder": keys["funder"]["pubkey"], "logs": str(D)}, indent=1))
+
+
+def down() -> None:
+    for pid_file in D.glob("*.pid"):
+        try:
+            os.killpg(int(pid_file.read_text()), signal.SIGTERM)
+        except (ProcessLookupError, ValueError, PermissionError):
+            pass
+        pid_file.unlink()
+    if paper_mode():
+        subprocess.run(["psql", "-d", "fly_trader", "-qc", "TRUNCATE " + ", ".join(VAULT_TABLES)], capture_output=True)
+        (D / "paper").unlink(missing_ok=True)
+    subprocess.run(["dropdb", "--if-exists", DB], capture_output=True)
+    for f in ("relay/relay.sqlite3", "relay/relay.sqlite3-wal", "relay/relay.sqlite3-shm", "sol_keys.json", "fly_key", "payout_key", "vault.log", "treasury.json", "signer.sqlite", "signer.sqlite-wal", "signer.sqlite-shm"):
+        (D / f).unlink(missing_ok=True)
+    (REPO / "contracts" / "deployments" / "46630.json").unlink(missing_ok=True)
+    print("demo stopped and wiped")
+
+
+def status() -> None:
+    for pid_file in sorted(D.glob("*.pid")):
+        pid = int(pid_file.read_text())
+        alive = subprocess.run(["kill", "-0", str(pid)], capture_output=True).returncode == 0
+        print(f"{pid_file.stem:6} {pid} {'running' if alive else 'DEAD'}")
+    try:
+        s = httpx.get(f"http://127.0.0.1:{RELAY_PORT}/api/stats", timeout=3).json()
+        print(json.dumps({k: s.get(k) for k in ("fly", "wallet", "ledger", "vault", "settlement")}, indent=1)[:2500])
+    except Exception as e:
+        print("relay:", type(e).__name__)
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "up":
+        up(paper="--paper" in sys.argv, seed_holders="--seed-holders" in sys.argv)
+    elif cmd == "fund-evm":
+        fund_evm(sys.argv[2])
+    elif cmd == "fund-sol":
+        fund_sol(sys.argv[2])
+    elif cmd == "profit":
+        profit(float(sys.argv[2]))
+    else:
+        {"down": down, "status": status}.get(cmd, lambda: print(__doc__))()

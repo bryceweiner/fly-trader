@@ -24,6 +24,8 @@ def _boot(ds, start_day):
 
 
 def test_replay_learns_only_from_known_labels_and_judges_with_the_deploy_rule(monkeypatch):
+    from fly_trader import config
+    monkeypatch.setattr(config, "FLY_TEACHER_GATE", False)   # the learning mechanics; the synthetic teacher allows no row (see the gated test)
     ds = _market_ds(days=16, per_day=600); fly, boot = _boot(ds, 9)
     seen = []
     real = plastic.PlasticBank.update
@@ -83,6 +85,28 @@ def test_unresolved_rows_are_not_trades_and_a_nan_verdict_still_stores():
     assert json.loads(json.dumps(prog._finite({"frozen": {"n": 3195, "mean": float("nan")}})))["frozen"]["mean"] is None
 
 
+def test_the_replay_writes_its_trades_with_the_sizing_table_in_force(monkeypatch, tmp_path):
+    """Sizing rules are judged on the fly's own out-of-sample trades: the replay keeps them, one position per token,
+    each with its margin over the line in force, its return, its pool's reserve and the table the book sized it with."""
+    import json
+    ds = _market_ds(days=14, per_day=400); ds.cols = list(ds.cols) + ["log_liquidity_sol"]
+    ds.X = np.c_[ds.X, np.full(len(ds.y), np.log1p(200.0))].astype(ds.X.dtype)
+    ds.fwd_h = {30: ds.fwd_pess.copy()}
+    order = np.argsort(ds.ts, kind="stable"); ts_o = ds.ts[order]
+    scores = np.linspace(-1, 1, len(order), dtype=np.float32)[None, None, :]
+    t_mid = float(np.median(ds.ts)); old, new = [{"lo": 0.0, "kelly": 0.1}], [{"lo": 0.0, "kelly": 0.4}]
+    monkeypatch.setattr(fly_replay, "TRADES_DIR", tmp_path)
+    path = fly_replay._dump_trades(ds, order, ts_o, scores, {}, {"s": [(-math.inf, old), (t_mid, new)]}, [0], [0.0], [30], ["s"],
+                                   np.ones(len(order), bool), ds.day[order], list(ds.days[:7]))
+    d = json.loads(open(path).read()); tr = d["trades"]
+    assert tr and all(t["margin"] >= 0 and t["strategy"] == "s" and t["hold_s"] == 1800 for t in tr)
+    assert [t["ts"] for t in tr] == sorted(t["ts"] for t in tr) and all(abs(t["resq"] - 100.0) < 1e-3 for t in tr)
+    assert all(d["tables"][t["table"]] == (new if t["ts"] >= t_mid else old) for t in tr)
+    by = {}
+    for t in tr:                                                        # one position per token until its hold has passed
+        assert t["ts"] >= by.get(t["mint"], -math.inf); by[t["mint"]] = t["ts"] + t["hold_s"]
+
+
 def test_every_configuration_shares_the_frozen_flys_line(monkeypatch):
     """Per-configuration lines let the frozen arm take 4,216 selection-half trades to the chosen arm's 2,609 with the
     weights no more than 5 % apart: the arms traded different slices because of their lines, not their weights. One line,
@@ -90,7 +114,7 @@ def test_every_configuration_shares_the_frozen_flys_line(monkeypatch):
     from types import SimpleNamespace
     calls = []
 
-    def fake_cal(ts, mint, hold_s, sc, y, prev_line=None, prev_sizing=None):
+    def fake_cal(ts, mint, hold_s, sc, y, prev_line=None, prev_sizing=None, **kw):
         calls.append(len(sc)); return SimpleNamespace(line=float(np.mean(sc)), sizing=[{"lo": 0.0, "kelly": 0.1}])
     monkeypatch.setattr(fly_replay.fly_calibrate, "calibrate", fake_cal)
     n, C, NS = 200, 3, 2
@@ -104,3 +128,47 @@ def test_every_configuration_shares_the_frozen_flys_line(monkeypatch):
         assert lines[0, s] == pytest.approx(np.mean(scores[0, s]))           # the frozen configuration's scores
         assert (lines[:, s] == lines[0, s]).all() and all(line_log[(c, s)][-1] == (float(ts[-1]) + 61.0, lines[0, s]) for c in range(C))
         assert all(sizings[c][s] == sizings[0][s] for c in range(C))
+
+
+def test_the_match_rule_runs_the_replay_on_the_teachers_trade_budget(monkeypatch):
+    """The match rule sizes each window's line to the teacher's own trades: the bootstrap and every daily recalibration
+    get that budget from the bootstrap's teacher."""
+    seen = []
+    real = fly_replay.fly_calibrate.calibrate
+
+    def spy(*a, **kw):
+        seen.append(kw.get("target_trades")); return real(*a, **kw)
+    monkeypatch.setattr(fly_replay.fly_calibrate, "RULE", "match")
+    monkeypatch.setattr(fly_replay.fly_calibrate, "calibrate", spy)
+    ds = _market_ds(days=16, per_day=600); fly, boot = _boot(ds, 9)
+    assert fly.teacher is not None and all(v["rule"] == "match" for v in boot["calibration"]["per_strategy"].values())
+    out = fly_replay.run(ds=ds, fly=fly, boot=boot, start_day=9, configs=[(0.0, math.inf), (1e-3, 3.0)], save_verdict=False)
+    assert seen and all(t is not None and t >= 0 for t in seen) and "reason" in out
+
+
+def test_the_gate_asks_whether_the_edge_is_real_not_whether_it_traded_a_lot():
+    """selector.deploy_decision's 100-trade floor failed the teacher-matched fly (92 trades at +10.1 %, 58 % winners)
+    and passed the hungry one (1,607 at +2.0 %). The fly's gate resamples whole days instead."""
+    rng = np.random.default_rng(0)
+    days = np.repeat(np.arange(30), 3); good = rng.normal(0.10, 0.25, len(days))
+    p = fly_replay.edge_p(good, days)
+    ok, why = fly_replay.gate({"n": len(good), "mean": float(good.mean())}, {"mean": -0.05}, p)
+    assert ok and p < fly_replay.EDGE_P, why
+    noise = rng.normal(0.002, 0.25, len(days)); pn = fly_replay.edge_p(noise, days)
+    assert not fly_replay.gate({"n": len(noise), "mean": float(noise.mean())}, {"mean": -0.05}, pn)[0]
+    assert "too few" in fly_replay.gate({"n": 12, "mean": 0.2}, {"mean": -0.05}, 0.0)[1]
+    assert fly_replay.edge_p(np.array([0.1, 0.2]), np.array([1, 1])) is None           # one day cannot be resampled
+
+
+def test_a_gated_replay_learns_and_trades_only_what_its_teacher_allows(monkeypatch):
+    """With the teacher gate a fly whose teacher allows nothing neither trades nor learns: every decision is the teacher's."""
+    from fly_trader import config
+    monkeypatch.setattr(config, "FLY_TEACHER_GATE", True)
+    ds = _market_ds(days=16, per_day=600); fly, boot = _boot(ds, 9)
+    assert not fly_selector.teacher_allowed(fly.teacher, ds.X, ds.ts, list(fly.strategies)).any()     # this teacher allows no row
+    seen = []
+    real = plastic.PlasticBank.update
+    monkeypatch.setattr(plastic.PlasticBank, "update", lambda self, tags, r, t: seen.append(len(tags)) or real(self, tags, r, t))
+    out = fly_replay.run(ds=ds, fly=fly, boot=boot, start_day=9, configs=[(0.0, math.inf), (1e-3, 3.0)], save_verdict=False)
+    assert sum(seen) == 0                                                              # nothing it would trade: nothing to learn from
+    assert all(t["trades"] == 0 for t in out["configs"]) and out["passed"] is False and "no strategy" in out["reason"]   # no trades: no pass

@@ -31,8 +31,15 @@ log = logging.getLogger(__name__)
 CURSOR = "rh"
 IDS_PER_REQUEST = 200
 TOKENS_PER_REQUEST = 200
+FEE_OBS = 20                           # hook-fee logs read per pool before its fee is taken as known
+TOKENS_PER_REQUEST_BULK = 5000         # HyperSync: bounded by its 2 MB request body, not a log cap
+IDS_PER_REQUEST_BULK = 5000            # 66-char pool ids: ~0.35 MB of filter per request
+LIVE_SPAN_BULK = 20_000                # an index range this small is live: PoolManager events unfiltered (one query)
 TX_BATCH = 100
 TRANSFER = abi.event_topic("Transfer(address,address,uint256)")
+PONS_TOPICS = [[pons.TOPIC[k] for k in (*pons.FACTORY_EVENTS, "Launched", *pons.HOOK_EVENTS) if k != "HookFeeCollected"]]
+V4_TOPICS0 = [v4.TOPIC["Initialize"], v4.TOPIC["Swap"], v4.TOPIC["ModifyLiquidity"]]
+FEE_TOPIC = pons.TOPIC["HookFeeCollected"]
 PONS_DECIMALS = 18                          # every Pons launch mints 1e9 × 1e18 raw
 STABLES = ("USDG", "USDC", "USDT", "PYUSD", "USDE")
 
@@ -83,7 +90,8 @@ def _get_logs(rpc, addresses, lo, hi, topics):
             mid = (lo + hi) // 2
             return _get_logs(rpc, addresses, lo, mid, topics) + _get_logs(rpc, addresses, mid + 1, hi, topics)
         raise
-    scan.pause()
+    if not getattr(rpc, "served_last", False):                # a read answered from a live pass's memory needs no pause
+        scan.pause()
     return out
 
 
@@ -189,8 +197,8 @@ def apply_pons(conn, rpc, events: list[dict]) -> dict:
 def apply_v4(conn, rpc, logs: list[dict], fees: list[dict]) -> dict:
     """v4 logs of Pons pools (+ their hook fees) → rh_swaps / rh_liquidity / rh_pools state."""
     pools = {r["pool_id"]: dict(r) for r in conn.execute(
-        "SELECT p.pool_id, p.token, p.token_is_0, p.quote_asset, a.decimals AS qdec FROM rh_pools p JOIN rh_assets a ON a.asset = p.quote_asset WHERE p.is_pons").fetchall()}
-    fee_q: dict[tuple, list] = {}
+        "SELECT p.pool_id, p.token, p.token_is_0, p.quote_asset, p.hook_fee, a.decimals AS qdec FROM rh_pools p JOIN rh_assets a ON a.asset = p.quote_asset WHERE p.is_pons").fetchall()}
+    fee_q: dict[tuple, list] = {}; observed: dict[str, int] = {}
     for f in fees:
         fee_q.setdefault((f["tx_hash"], f["pool_id"]), []).append(f)
     evs = [v4.decode(x) for x in _order(logs)]
@@ -204,8 +212,9 @@ def apply_v4(conn, rpc, logs: list[dict], fees: list[dict]) -> dict:
     transfers = []
     if swaps:
         lo_b, hi_b = min(s_["block"] for s_ in swaps), max(s_["block"] for s_ in swaps)
-        for i in range(0, len(toks), TOKENS_PER_REQUEST):
-            transfers += _get_logs(rpc, toks[i:i + TOKENS_PER_REQUEST], lo_b, hi_b, [TRANSFER])
+        per = TOKENS_PER_REQUEST_BULK if hasattr(rpc, "hs") else TOKENS_PER_REQUEST
+        for i in range(0, len(toks), per):
+            transfers += _get_logs(rpc, toks[i:i + per], lo_b, hi_b, [TRANSFER])
     senders = traders_from_transfers(transfers, swaps, {k: v["token"] for k, v in pools.items()})
     n = {"swaps": 0, "liquidity": 0}
     last_state: dict[str, dict] = {}
@@ -233,6 +242,9 @@ def apply_v4(conn, rpc, logs: list[dict], fees: list[dict]) -> dict:
                 net = abs(tok_amt) if fee["currency"] == p["token"] else abs(q_amt)          # the fee is taken from the incoming currency
                 taken = fee["fee_raw"] + fee["tax_raw"]
                 fee_frac = taken / (net + taken) if net + taken > 0 else None
+                observed[e["pool_id"]] = observed.get(e["pool_id"], 0) + 1
+            elif p.get("hook_fee") is not None:
+                fee_frac = float(p["hook_fee"])                                  # the pool's measured, fixed fee
             resq_q = v4.quote_reserve(e["sqrt_price_x96"], e["liquidity"], ti0, qdec)
             conn.execute(
                 "INSERT INTO rh_swaps (block, log_index, tx_hash, block_hash, ts, pool_id, token, trader, side, token_raw, quote_raw, hook_fee_raw, hook_tax_raw, "
@@ -240,6 +252,11 @@ def apply_v4(conn, rpc, logs: list[dict], fees: list[dict]) -> dict:
                 (e["block"], e["log_index"], e["tx_hash"], e["block_hash"], e["ts"], e["pool_id"], p["token"], senders.get((e["tx_hash"], e["pool_id"])), side, abs(tok_amt),
                  abs(q_amt), fee["fee_raw"] if fee else None, fee["tax_raw"] if fee else None, e["sqrt_price_x96"], e["liquidity"], e["tick"], price_q, resq_q, fee_frac))
             last_state[e["pool_id"]] = e; n["swaps"] += 1
+    for pid, k in observed.items():                                          # a pool's fee is known once FEE_OBS swaps showed it
+        r = conn.execute("UPDATE rh_pools SET fee_obs = fee_obs + %s WHERE pool_id = %s RETURNING fee_obs, hook_fee", (k, pid)).fetchone()
+        if r and r["fee_obs"] >= FEE_OBS and r["hook_fee"] is None:
+            conn.execute("UPDATE rh_pools SET hook_fee = (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY fee_frac) FROM rh_swaps "
+                         "WHERE pool_id = %s AND hook_fee_raw IS NOT NULL AND fee_frac IS NOT NULL) WHERE pool_id = %s", (pid, pid))
     for pid, e in last_state.items():
         conn.execute("UPDATE rh_pools SET sqrt_price_x96 = %s, liquidity = %s, tick = %s, updated_block = %s WHERE pool_id = %s",
                      (e["sqrt_price_x96"], e["liquidity"], e["tick"], e["block"], pid))
@@ -248,18 +265,28 @@ def apply_v4(conn, rpc, logs: list[dict], fees: list[dict]) -> dict:
 
 def step(conn, rpc, lo: int, hi: int) -> dict:
     """Index blocks lo..hi (inclusive) into ``conn`` (the caller commits with the cursor)."""
-    pons_topics = [[pons.TOPIC[k] for k in (*pons.FACTORY_EVENTS, "Launched", *pons.HOOK_EVENTS)]]
-    main = _get_logs(rpc, [config.PONS_FACTORY, config.PONS_ROUTER, config.PONS_HOOK], lo, hi, pons_topics)
+    topics0 = V4_TOPICS0
+    bulk = hasattr(rpc, "hs")                                     # HyperSync: no per-query cap, so no pool-id chunks
+    main = _get_logs(rpc, [config.PONS_FACTORY, config.PONS_ROUTER, config.PONS_HOOK], lo, hi, PONS_TOPICS)
     evs = [pons.decode(x) for x in _order(main)]
     evs = [e for e in evs if e is not None]
-    fill_timestamps(rpc, [e for e in evs if e["event"] != "HookFeeCollected"], lo, hi)      # fees are matched to swaps, never timed
-    fees = [e for e in evs if e["event"] == "HookFeeCollected"]
-    n = apply_pons(conn, rpc, [e for e in evs if e["event"] != "HookFeeCollected"])
+    fill_timestamps(rpc, evs, lo, hi)
+    n = apply_pons(conn, rpc, evs)
     ids = [r["pool_id"] for r in conn.execute("SELECT pool_id FROM rh_pools WHERE is_pons ORDER BY pool_id").fetchall()]
-    v4_logs = []
-    topics0 = [v4.TOPIC["Initialize"], v4.TOPIC["Swap"], v4.TOPIC["ModifyLiquidity"]]
-    for i in range(0, len(ids), IDS_PER_REQUEST):
-        v4_logs += _get_logs(rpc, [config.V4_POOL_MANAGER], lo, hi, [topics0, ids[i:i + IDS_PER_REQUEST]])
+    need = [r["pool_id"] for r in conn.execute("SELECT pool_id FROM rh_pools WHERE is_pons AND hook_fee IS NULL ORDER BY pool_id").fetchall()]
+    fee_topic = [FEE_TOPIC]
+    v4_logs, fee_logs = [], []
+    if bulk and hi - lo + 1 <= LIVE_SPAN_BULK:                     # a live range: every PoolManager event, matched to Pons pools here
+        mine = set(ids)                                             # (10k+ pool ids make a ~0.7 MB filter; HyperSync caps bodies at 2 MB)
+        v4_logs = [g for g in _get_logs(rpc, [config.V4_POOL_MANAGER], lo, hi, [topics0]) if len(g["topics"]) > 1 and g["topics"][1].lower() in mine]
+    else:
+        per = IDS_PER_REQUEST_BULK if bulk else IDS_PER_REQUEST
+        for i in range(0, len(ids), per):                           # swaps of every Pons pool, in id chunks
+            v4_logs += _get_logs(rpc, [config.V4_POOL_MANAGER], lo, hi, [topics0, ids[i:i + per]])
+    per = IDS_PER_REQUEST_BULK if bulk else IDS_PER_REQUEST
+    for i in range(0, len(need), per):                            # hook fees only of pools whose fee is not known yet
+        fee_logs += _get_logs(rpc, [config.PONS_HOOK], lo, hi, [fee_topic, need[i:i + per]])
+    fees = [e for e in (pons.decode(x) for x in _order(fee_logs)) if e is not None and e["event"] == "HookFeeCollected"]
     n.update(apply_v4(conn, rpc, v4_logs, fees))
     n["hook_fees"] = len(fees)
     return n
@@ -273,12 +300,13 @@ def start_block(rpc) -> int:
     return block_at(rpc, datetime.fromisoformat(config.RH_START_DAY).replace(tzinfo=timezone.utc).timestamp())
 
 
-def run_once(rpc: RhRpc | None = None, *, head_margin: int | None = None, max_ranges: int = 1) -> dict:
-    """Advance the cursor by up to ``max_ranges`` ranges, each ending at most ``head − head_margin`` (RH_CONFIRMATIONS).
+def run_once(rpc: RhRpc | None = None, *, head_margin: int | None = None, max_ranges: int = 1, head: int | None = None) -> dict:
+    """Advance the cursor by up to ``max_ranges`` ranges, each ending at most ``head − head_margin`` (RH_CONFIRMATIONS);
+    ``head``: the last block to index, already settled (a live pass's fetched range, rh/prefetch.py).
     Returns {through, head, ranges, counts}."""
     rpc = rpc or logs_rpc()
     margin = config.RH_CONFIRMATIONS if head_margin is None else head_margin
-    head = rpc.block_number() - margin
+    head = rpc.block_number() - margin if head is None else head
     total: dict = {}; done = 0
     with transaction() as conn:
         at, rng = scan.cursor(conn, CURSOR, -1)

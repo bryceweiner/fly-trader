@@ -144,7 +144,8 @@ def _cmd_fly_replay(args):
     from .logging_setup import setup
     from .train import fly_replay
     setup("train"); _use_device(args)
-    out = fly_replay.main(days=args.days, start_day=args.start_day if args.start_day is not None else fly_replay.DEFAULT_START)
+    out = fly_replay.main(days=args.days, start_day=args.start_day if args.start_day is not None else fly_replay.DEFAULT_START,
+                          only_chains=tuple(args.chains.split(",")) if args.chains else None)
     print(json.dumps({k: out.get(k) for k in ("S", "passed", "reason", "alpha", "half_life_days", "evaluation", "random", "frozen", "plastic_beats_frozen")}, indent=1, default=str))
 
 
@@ -183,6 +184,69 @@ def _cmd_worker(args):
     procs.worker_cli(args.action, args.name)
 
 
+def _cmd_kalshi_history(args):
+    from .kalshi import history
+    history.main()
+
+
+def _cmd_kalshi_build(args):
+    from .kalshi import mature
+    mature.main()
+
+
+def _cmd_kalshi_train_selector(args):
+    from .kalshi import selector
+    from .logging_setup import setup
+    setup("kalshi_train")
+    out = selector.main(days=args.days, holdout_days=args.holdout_days)
+    print(json.dumps({k: out.get(k) for k in ("snapshot_id", "deployable", "deploy_reason")}, indent=1, default=str))
+
+
+def _cmd_kalshi_train_fly(args):
+    from .kalshi import fly
+    from .logging_setup import setup
+    setup("kalshi_train"); _use_device(args)
+    out = fly.main(days=args.days, epochs=args.epochs)
+    print(json.dumps({k: out.get(k) for k in ("snapshot_id", "S", "lines", "calibration", "diagnostics", "gates_ok", "gate_failures", "teacher")}, indent=1, default=str))
+
+
+def _cmd_kalshi_fly_replay(args):
+    from .kalshi import fly_replay
+    from .logging_setup import setup
+    setup("kalshi_train"); _use_device(args)
+    out = fly_replay.main(days=args.days, start_day=args.start_day if args.start_day is not None else fly_replay.DEFAULT_START,
+                          only_chains=tuple(args.chains.split(",")) if args.chains else None)
+    print(json.dumps({k: out.get(k) for k in ("S", "passed", "reason", "alpha", "half_life_days", "evaluation", "random", "frozen", "plastic_beats_frozen")}, indent=1, default=str))
+
+
+def _cmd_kalshi_train(args):
+    from .kalshi import pipeline
+    pipeline.main()
+
+
+def _cmd_kalshi_stream(args):
+    from .kalshi import stream
+    stream.main()
+
+
+def _cmd_kalshi_run(args):
+    from .kalshi import engine
+    engine.main()
+
+
+def _cmd_kalshi_subaccount(args):
+    from .kalshi import client
+    if args.action == "create":
+        print(f"subaccount {client.subaccount_create()} created and written to .env")
+    else:
+        print(json.dumps(client.rest().subaccount_balances(), indent=1, default=str))
+
+
+def _cmd_kalshi_fund(args):
+    from .kalshi import client
+    print(json.dumps(client.fund(args.usd), indent=1, default=str))
+
+
 def _cmd_rh_backfill(args):
     from .rh import stream
     stream.main()
@@ -196,6 +260,45 @@ def _cmd_rh_status(args):
 def _cmd_rh_probe(args):
     from .rh import probe
     print(json.dumps(probe.run(sample=args.sample), indent=1, default=str))
+
+
+def _cmd_rh_wallet(args):
+    from .rh import smoke
+    if args.action == "new":
+        print(f"RH bot wallet {smoke.new_key()} written to .env (RH_BOT_PRIVATE_KEY, RH_BOT_ADDRESS). Fund it with ETH on Robinhood Chain.")
+    else:
+        from . import config
+        from .rh.rpc import RhRpc
+        addr = (config.RH_BOT_ADDRESS or "").lower()
+        print(json.dumps({"address": addr or None, "eth": RhRpc().get_balance(addr) / 1e18 if addr else None,
+                          "live_prerequisites_missing": config.rh_live_prerequisites_missing()}, indent=1))
+
+
+def _cmd_rh_smoke(args):
+    if not args.yes:
+        raise SystemExit("rh-smoke sends real Robinhood Chain transactions: pass --yes")
+    from .rh import smoke
+    print(json.dumps(smoke.run(args.size, args.cap), indent=1, default=str))
+
+
+def _cmd_kalshi_status(args):
+    from .kalshi import client
+    print(json.dumps(client.status(), indent=1, default=str))
+
+
+def _cmd_kalshi_pause(args):
+    from .agent import rails
+    rails.set_entries_paused(True, rails.KALSHI_CIRCUIT)
+
+
+def _cmd_kalshi_resume(args):
+    from .agent import rails
+    rails.set_entries_paused(False, rails.KALSHI_CIRCUIT)
+
+
+def _cmd_kalshi_reset_circuit(args):
+    from .agent import rails
+    rails.reset_circuit(kill=args.kill, circuit_id=rails.KALSHI_CIRCUIT)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -226,6 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
     fr.add_argument("--start-day", type=int, default=None,
                     help="day index of the bootstrap (the selector teaches on the days before it); default: train/fly_replay.DEFAULT_START, "
                          "the earliest day that leaves the teacher's walk-forward enough days in each half")
+    fr.add_argument("--chains", default=None, help="store the verdict of these chains only (comma list, e.g. rh); the others keep theirs")
     fr.set_defaults(fn=_cmd_fly_replay)
     bc = sub.add_parser("backtest-corpus"); bc.add_argument("--max-tokens", type=int, default=None); bc.add_argument("--days", type=int, default=None)
     bc.add_argument("--fees", default="0.003,0.0055"); bc.add_argument("--only", default=None); bc.add_argument("--universe", default="graduation", choices=["graduation", "mature"]); bc.set_defaults(fn=_cmd_backtest_corpus)
@@ -249,10 +353,37 @@ def build_parser() -> argparse.ArgumentParser:
     from .vault import cli as vault_cli
     vault_cli.add(sub)
     wk = sub.add_parser("worker"); wk.add_argument("action", choices=["start", "stop", "status"]); wk.add_argument("name", nargs="?"); wk.set_defaults(fn=_cmd_worker)
+    # ---- Kalshi prediction markets (fly_trader/kalshi) ----
+    ks = sub.add_parser("kalshi-subaccount", help="create the fly's dedicated Kalshi subaccount (writes KALSHI_SUBACCOUNT to .env) or list balances")
+    ks.add_argument("action", choices=["create", "list"]); ks.set_defaults(fn=_cmd_kalshi_subaccount)
+    kf = sub.add_parser("kalshi-fund", help="move dollars from the primary Kalshi account into the fly's subaccount"); kf.add_argument("--usd", type=float, required=True); kf.set_defaults(fn=_cmd_kalshi_fund)
     sub.add_parser("rh-backfill", help="the Robinhood Chain index from Pons V2's deployment to the head, then live (the rh_stream worker)").set_defaults(fn=_cmd_rh_backfill)
     sub.add_parser("rh-status", help="Robinhood Chain index cursors, row counts and stream status").set_defaults(fn=_cmd_rh_status)
     rp = sub.add_parser("rh-probe", help="read-only check of the Robinhood Chain path: contracts, Kyber / v4 routability and gas on recent Pons graduates")
     rp.add_argument("--sample", type=int, default=12); rp.set_defaults(fn=_cmd_rh_probe)
+    rw = sub.add_parser("rh-wallet", help="new: create the RH bot key in .env (refuses to replace one); show: its address, ETH and what live trading still needs")
+    rw.add_argument("action", choices=["new", "show"]); rw.set_defaults(fn=_cmd_rh_wallet)
+    rs = sub.add_parser("rh-smoke", help="three tiny real RH round trips (Kyber, v4 fallback, non-ETH quote) booked and reconciled to the wei")
+    rs.add_argument("--size", type=float, default=0.002); rs.add_argument("--cap", type=float, default=0.01); rs.add_argument("--yes", action="store_true")
+    rs.set_defaults(fn=_cmd_rh_smoke)
+    sub.add_parser("kalshi-status", help="exchange status, subaccount balance, resting orders, positions, settlements").set_defaults(fn=_cmd_kalshi_status)
+    sub.add_parser("kalshi-history", help="the Kalshi corpus worker: dataset seed, settled markets, candles, trades").set_defaults(fn=_cmd_kalshi_history)
+    sub.add_parser("kalshi-build", help="build the Kalshi feature parts from the corpus").set_defaults(fn=_cmd_kalshi_build)
+    kts = sub.add_parser("kalshi-train-selector", help="fit the Kalshi strategy stack walk-forward and save it"); kts.add_argument("--days", type=int, default=None)
+    kts.add_argument("--holdout-days", type=int, default=None, help="last days withheld from every fit and scored once (default 21)")
+    kts.set_defaults(fn=_cmd_kalshi_train_selector)
+    ktf = sub.add_parser("kalshi-train-fly", help="bootstrap the Kalshi fly (optic lobes) from the deployable Kalshi selector")
+    ktf.add_argument("--days", type=int, default=None); ktf.add_argument("--epochs", type=int, default=None); ktf.add_argument("--device", default=None)
+    ktf.set_defaults(fn=_cmd_kalshi_train_fly)
+    kfr = sub.add_parser("kalshi-fly-replay", help="bootstrap the Kalshi fly once, let it learn from settlements over the corpus, judge it")
+    kfr.add_argument("--days", type=int, default=None); kfr.add_argument("--device", default=None); kfr.add_argument("--start-day", type=int, default=None)
+    kfr.set_defaults(fn=_cmd_kalshi_fly_replay)
+    sub.add_parser("kalshi-train", help="the Kalshi training pipeline worker (selector weekly, fly bootstrap when needed)").set_defaults(fn=_cmd_kalshi_train)
+    sub.add_parser("kalshi-stream", help="the Kalshi live feed worker (websocket → kalshi_minutes / kalshi_quotes)").set_defaults(fn=_cmd_kalshi_stream)
+    sub.add_parser("kalshi-run", help="the Kalshi trading engine worker (the visual fly's paper arms, live mirror behind KALSHI_LIVE_ENABLED)").set_defaults(fn=_cmd_kalshi_run)
+    sub.add_parser("kalshi-pause-entries").set_defaults(fn=_cmd_kalshi_pause)
+    sub.add_parser("kalshi-resume-entries").set_defaults(fn=_cmd_kalshi_resume)
+    kr = sub.add_parser("kalshi-reset-circuit"); kr.add_argument("--kill", action="store_true"); kr.set_defaults(fn=_cmd_kalshi_reset_circuit)
     return p
 
 

@@ -138,3 +138,26 @@ def test_a_non_eth_minute_without_a_mark_is_not_written(minute_db, monkeypatch):
     with transaction() as conn:
         _swap(conn, 9, t0 + 5, MEME2, "p2", "bob", 1, 50 * 10 ** 6, 2e-6, 9000.0)
         assert minutes.aggregate(conn, t0, t0 + 60) == []
+
+
+def test_rh_skill_tables_are_written_before_their_day_and_today_falls_back(tmp_path, monkeypatch):
+    from datetime import date, timedelta
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from fly_trader.rh import wallet_skill as rws
+    from fly_trader.train import wallet_skill as ws
+    monkeypatch.setattr(rws, "DAY_DIR", tmp_path / "day"); monkeypatch.setattr(rws, "SKILL_DIR", tmp_path / "skill")
+    monkeypatch.setattr(ws, "skill_config", lambda: {"h": 10, "L": 3})
+    (tmp_path / "day").mkdir()
+    d0 = date(2026, 10, 1)
+    for k in range(5):                                                    # wallet days 10-01 .. 10-05
+        pq.write_table(pa.table({"wallet": ["0xw1", "0xw2"], "h": [10, 10], "n": [1, 1], "sol": [1.0, 2.0], "sol_m": [0.1, -0.1]}),
+                       tmp_path / "day" / f"{(d0 + timedelta(days=k)).isoformat()}.parquet")
+    n = rws.daily(through=date(2026, 10, 9))
+    made = sorted(f.stem for f in (tmp_path / "skill").glob("*.parquet"))
+    assert n == len(made) and made[-1] == "2026-10-08"                       # 10-08's window ends 10-05: written ahead of its day
+    assert "2026-10-09" not in made                                         # 10-09 needs 10-06, not there yet
+    assert ws.table_version(tmp_path / "skill" / "2026-10-08.parquet") == "h10-L3" and rws.daily(through=date(2026, 10, 9)) == 0
+    rws._TODAY.update(key=None, table=None)
+    t = rws.load_today()                                                   # today (real clock) has no table here: the newest on disk
+    assert t == {"0xw1": t["0xw1"], "0xw2": t["0xw2"]} and set(t) == {"0xw1", "0xw2"}

@@ -41,13 +41,25 @@ def _entry(name: str):
     if name == "vault":                        # the $FLY vault: flows, settlement, claims, public stats (fly_trader/vault)
         from ..vault import worker
         return worker.main
+    if name == "kalshi_history":               # the Kalshi corpus: settled markets, candles, trades, feature rows (kalshi/history.py)
+        from ..kalshi import history
+        return history.main
     if name == "rh_stream":                    # Robinhood Chain: the Pons / Uniswap v4 index, marks and minutes (rh/stream.py)
         from ..rh import stream as rh_stream
         return rh_stream.main
+    if name == "kalshi_stream":                # the Kalshi live feed (kalshi/stream.py)
+        from ..kalshi import stream
+        return stream.main
+    if name == "kalshi_runner":                # the Kalshi trading engine (kalshi/engine.py)
+        from ..kalshi import engine
+        return engine.main
+    if name == "kalshi_train":                 # the Kalshi training pipeline (kalshi/pipeline.py)
+        from ..kalshi import pipeline
+        return pipeline.main
     raise KeyError(name)
 
 
-WORKERS = ("discover", "runner", "train", "replay", "pumpstream", "rh_stream", "vault")
+WORKERS = ("discover", "runner", "train", "replay", "pumpstream", "rh_stream", "vault", "kalshi_stream", "kalshi_runner", "kalshi_history", "kalshi_train")
 REPLACE_WAIT_S = 20.0        # how long a new console waits for the one it replaces to finish winding down (its workers flush on stop)
 
 

@@ -71,19 +71,56 @@ def hop_price(h: dict, sqrt_price_x96: int) -> float:
     return p10 if h["token_in"] == h["token0"] else (1.0 / p10 if p10 > 0 else float("nan"))
 
 
-def _swap_logs(rpc, h: dict, lo: int, hi: int) -> list[dict]:
+SWAP_V3 = abi.event_topic("Swap(address,address,int256,int256,uint160,uint128,int24)")      # Uniswap v3 and Slipstream pools
+
+
+def _logs(rpc, addresses, lo: int, hi: int, topics) -> list[dict]:
     from .index import _get_logs
+    return _get_logs(rpc, addresses, lo, hi, topics)
+
+
+def _swap_logs(rpc, h: dict, lo: int, hi: int) -> list[dict]:
     if _is_id(h["pool"]):
-        return _get_logs(rpc, [h["emitter"]], lo, hi, [None, h["pool"]])
-    return _get_logs(rpc, [h["emitter"]], lo, hi, [abi.event_topic("Swap(address,address,int256,int256,uint160,uint128,int24)")])
+        return _logs(rpc, [h["emitter"]], lo, hi, [None, h["pool"]])
+    return _logs(rpc, [h["emitter"]], lo, hi, [SWAP_V3])
 
 
-def scan_asset(conn, rpc, asset: str, hops: list[dict], lo: int, hi: int, state: dict, times) -> int:
+def fetch_pool_logs(rpc, pools: dict, lo: int, hi: int) -> dict:
+    """Swap logs of every reference pool in ``pools`` (``_hop_key`` → hop) over lo..hi, in as few queries as the venues
+    allow: one for all the standalone pool contracts (one address list, one Swap topic) and one per singleton manager
+    (its pool ids as the topic-1 list). 2026-10-07: 69 pools queried one by one made a live pass take 1–3.5 min."""
+    out = {k: [] for k in pools}
+    plain = sorted({h["emitter"].lower() for h in pools.values() if not _is_id(h["pool"])})
+    if plain:
+        for g in _logs(rpc, plain, lo, hi, [SWAP_V3]):
+            k = (g["address"].lower(), g["address"].lower())
+            if k in out:
+                out[k].append(g)
+    managers: dict[str, list[str]] = {}
+    for h in pools.values():
+        if _is_id(h["pool"]):
+            managers.setdefault(h["emitter"].lower(), []).append(h["pool"].lower())
+    for em, ids in sorted(managers.items()):
+        for g in _logs(rpc, [em], lo, hi, [None, sorted(set(ids))]):
+            tp = g.get("topics") or []
+            k = (em, tp[1].lower()) if len(tp) > 1 else None
+            if k in out:
+                out[k].append(g)
+    return out
+
+
+def _hop_key(h: dict) -> tuple[str, str]:
+    return h["emitter"].lower(), h["pool"].lower()
+
+
+def scan_asset(conn, rpc, asset: str, hops: list[dict], lo: int, hi: int, state: dict, times, logs_by_hop: dict | None = None) -> int:
     """Minute closes of ``asset`` over blocks lo..hi → rh_base_prices. ``state`` carries each hop's last (t, sqrtP) across
-    ranges; ``times(blocks) -> {block: ts}`` times the swaps. Returns minutes written."""
+    ranges; ``times(blocks) -> {block: ts}`` times the swaps. ``logs_by_hop``: swap logs already fetched per hop
+    (``_hop_key``), shared by every asset whose path uses that pool. Returns minutes written."""
     per_hop = []
     for i, h in enumerate(hops):
-        logs = [g for g in _swap_logs(rpc, h, lo, hi) if len(g["data"]) >= 2 + 64 * 3]
+        got = logs_by_hop[_hop_key(h)] if logs_by_hop is not None else _swap_logs(rpc, h, lo, hi)
+        logs = [g for g in got if len(g["data"]) >= 2 + 64 * 3 and lo <= int(g["blockNumber"], 16) <= hi]
         ts = times(sorted({int(g["blockNumber"], 16) for g in logs})) if logs else {}
         seq = sorted((ts[int(g["blockNumber"], 16)], int(g["logIndex"], 16), v4.sqrt_price_word(g)) for g in logs)
         per_hop.append(seq)
@@ -122,19 +159,29 @@ def base_eth(conn, asset: str | None, ts) -> tuple[float | None, bool]:
     return float(r["price_eth"]), bool(r["stale"]) or age > STALE_S
 
 
-def run_once(max_ranges: int = 1) -> dict:
-    """Advance every traded quote asset's price cursor (``price:<asset>``) toward the index cursor."""
+def run_once(max_ranges: int = 1, rpc=None) -> dict:
+    """Advance every traded quote asset's price cursor (``price:<asset>``) toward the index cursor, all in lockstep: each
+    round takes the range after the laggard's cursor, fetches every distinct reference pool's swaps in it once (the
+    stock paths share USDG → WETH), times them once, and moves every asset whose cursor is inside the range."""
     from . import blocktime
-    rpc = logs_rpc(); out = {}
+    rpc = rpc or logs_rpc(); out: dict = {}          # the stream's (one connection, a live pass's memory), not a new one per pass
     with transaction() as conn:
         top = conn.execute("SELECT block, detail FROM rh_scan WHERE name = 'rh'").fetchone()
-        assets = conn.execute("SELECT DISTINCT a.asset, a.decimals, a.ref_path FROM rh_assets a JOIN rh_pools p ON p.quote_asset = a.asset "
-                              "WHERE p.is_pons AND a.class <> 'eth'").fetchall()
+        rows = conn.execute("SELECT DISTINCT a.asset, a.decimals, a.ref_path FROM rh_assets a JOIN rh_pools p ON p.quote_asset = a.asset "
+                            "WHERE p.is_pons AND a.class <> 'eth'").fetchall()
     if not top:
         return out
     through = int(top["block"])
     start = int(((top["detail"] or {}).get("start_block")) or config.RH_START_BLOCK or through)      # where the index began
-    for a in assets:
+    with transaction() as conn:          # every price cursor in one read: a pass every few seconds cannot afford ~4 queries per asset
+        curs = {r["name"]: r for r in conn.execute("SELECT name, block, range_blocks, detail FROM rh_scan WHERE name LIKE 'price:%%'").fetchall()}
+    assets = []
+    for a in rows:
+        c = curs.get(f"price:{a['asset']}")
+        if a["ref_path"] and c is not None:                      # the usual case: path known, cursor exists
+            hops = json.loads(a["ref_path"]) if isinstance(a["ref_path"], str) else a["ref_path"]
+            assets.append({"asset": a["asset"], "hops": hops, "at": int(c["block"]), "rng": int(c["range_blocks"]), "state": (c["detail"] or {}).get("state", {})})
+            continue
         try:
             with transaction() as conn:
                 hops = a["ref_path"] if a["ref_path"] else discover(conn, rpc, a["asset"], int(a["decimals"]))
@@ -146,16 +193,37 @@ def run_once(max_ranges: int = 1) -> dict:
                 at, rng = scan.cursor(conn, f"price:{a['asset']}", first - 1)
                 r = conn.execute("SELECT detail FROM rh_scan WHERE name = %s", (f"price:{a['asset']}",)).fetchone()
                 state = ((r["detail"] or {}) if r else {}).get("state", {})
-            for _ in range(max_ranges):
-                nr = scan.next_range(at, rng, through)
-                if nr is None:
-                    break
-                lo, hi = nr
-                with transaction() as conn:
-                    n = scan_asset(conn, rpc, a["asset"], hops, lo, hi, state, lambda bs, lo=lo, hi=hi: blocktime.times(rpc, lo, hi, bs))
-                    at = hi; rng = scan.grow(rng)
-                    scan.set_cursor(conn, f"price:{a['asset']}", at, rng, {"state": state})
-                out[a["asset"]] = out.get(a["asset"], 0) + n
+            assets.append({"asset": a["asset"], "hops": hops, "at": at, "rng": rng, "state": state})
         except Exception as e:
             log.warning("rh prices %s: %s", a["asset"], str(e)[:200])
+    for _ in range(max_ranges):
+        active = [a for a in assets if a["at"] < through]
+        if not active:
+            break
+        lo = min(a["at"] for a in active) + 1
+        rng = min(a["rng"] for a in active if a["at"] + 1 == lo)
+        hi = min(through, lo + rng - 1)
+        group = [a for a in active if a["at"] < hi]
+        try:
+            pools = {}
+            for a in group:
+                for h in a["hops"]:
+                    pools.setdefault(_hop_key(h), h)
+            logs = fetch_pool_logs(rpc, pools, lo, hi)
+            ts = {int(g["blockNumber"], 16): int(g["blockTimestamp"], 16) for got in logs.values() for g in got
+                  if int(g.get("blockTimestamp") or "0x0", 16)}                    # HyperSync logs carry their block's time
+            blocks = sorted({int(g["blockNumber"], 16) for got in logs.values() for g in got} - set(ts))
+            if blocks:
+                ts.update(blocktime.times(rpc, lo, hi, blocks))
+            with transaction() as conn:
+                for a in group:
+                    n = scan_asset(conn, rpc, a["asset"], a["hops"], a["at"] + 1, hi, a["state"], lambda bs: {b: ts[b] for b in bs}, logs)
+                    a["at"] = hi; a["rng"] = scan.grow(rng)
+                    scan.set_cursor(conn, f"price:{a['asset']}", hi, a["rng"], {"state": a["state"]})
+                    out[a["asset"]] = out.get(a["asset"], 0) + n
+        except Exception as e:
+            log.warning("rh prices %s..%s: %s", lo, hi, str(e)[:200])
+            for a in group:
+                a["rng"] = scan.shrink(a["rng"])
+            break
     return out

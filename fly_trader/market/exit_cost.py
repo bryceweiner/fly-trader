@@ -78,16 +78,11 @@ def exit_cost_fraction(value_sol: float, res_quote_sol: float | None, mcap_sol: 
     return min(1.0, fee_fraction(value_sol, mcap_sol, pool_fee, program_label) + impact_fraction(value_sol, res_quote_sol, program_label))
 
 
-def _sol_label_size() -> float:
-    """Solana's label size on the distribution: ``LABEL_SIZE_SOL``, or (0) the sizing rule's own ceiling."""
-    return float(config.LABEL_SIZE_SOL or config.MAX_POSITION_FRACTION * config.CAPITAL_SOL)
-
-
 def label_size(res_quote_sol, market=None) -> float:
-    """The size every label is priced at (``cost_at_size``'s default): the market's label size (Solana ``LABEL_SIZE_SOL``
-    or the sizing ceiling; RH ``RH_LABEL_SIZE_ETH``, also the largest RH buy), or ``MAX_POOL_SHARE`` of a shallower pool.
+    """The size every label is priced at (``cost_at_size``'s default) and so the largest position any edge was measured
+    at: the market's label size (``LABEL_SIZE_SOL``; RH ``RH_LABEL_SIZE_ETH``), or ``MAX_POOL_SHARE`` of a shallower pool.
     Unknown liquidity: the label size."""
-    ls = market.label_size() if market is not None and market.chain == "rh" else _sol_label_size()
+    ls = float(config.LABEL_SIZE_SOL) if market is None else market.label_size()
     r = float(res_quote_sol) if res_quote_sol is not None and math.isfinite(float(res_quote_sol)) and float(res_quote_sol) > 0 else None
     return ls if r is None else float(min(ls, config.MAX_POOL_SHARE * r))
 
@@ -98,15 +93,15 @@ def cost_at_size(ec_0p1, res_quote_sol, size_sol: float | None = None, market=No
 
     Impact is ``value/(value+reserves)``, so the stored feature understates a real exit. The fee part (pool, platform,
     network) is recovered from the stored value and only impact recomputed, so a feature part never has to be rebuilt.
-    ``size_sol`` defaults to the sizing rule's own ceiling (``LABEL_SIZE_SOL`` when set) and is capped by ``MAX_POOL_SHARE``
-    of the pool, exactly as agent/sizing.py caps a live buy. ``market`` (fly_trader/markets.RH): the stored value was priced at
+    ``size_sol`` defaults to ``LABEL_SIZE_SOL`` and is capped by ``MAX_POOL_SHARE`` of the pool (``label_size``), which
+    is also the largest buy agent/sizing.py makes. ``market`` (fly_trader/markets.RH): the stored value was priced at
     0.1 SOL's worth of ETH (0.1·K) with one swap's gas ``RH_TX_FEE_ETH``, and the label size is ``RH_LABEL_SIZE_ETH``.
     Unknown liquidity costs 1.0: a position that cannot be exited. Takes scalars or arrays."""
     ec = np.clip(np.asarray(ec_0p1, dtype=float), 0.0, 1.0)
     r = np.asarray(res_quote_sol, dtype=float)
     ok = np.isfinite(r) & (r > 0)
     rh = market is not None and market.chain == "rh"
-    want = size_sol if size_sol is not None else (market.label_size() if rh else _sol_label_size())
+    want = size_sol if size_sol is not None else (market.label_size() if rh else config.LABEL_SIZE_SOL)
     sz = np.maximum(np.minimum(want, config.MAX_POOL_SHARE * np.where(ok, r, 0.0)), 1e-9)
     tx = config.RH_TX_FEE_ETH if rh else TX_FEE_LAMPORTS / config.LAMPORTS_PER_SOL
     ref = 0.1 * market.k() if rh else 0.1                                     # the size the stored feature was priced at

@@ -60,6 +60,17 @@ HOLD_MIN = 120
 MIN_RESQ_SOL, MIN_VOL_15M_SOL = 10.0, 5.0
 
 
+def day_ords(ds) -> np.ndarray:
+    """The rows' days as proleptic ordinals (int32), computed once per set: comparing tens of millions of date objects
+    (``np.isin`` sorts them) cost minutes per walk-forward block on the Kalshi corpus."""
+    o = getattr(ds, "_day_ord", None)
+    if o is None or len(o) != len(ds.day):
+        uniq = {}
+        o = np.fromiter((uniq.setdefault(d, d.toordinal()) for d in ds.day), dtype=np.int32, count=len(ds.day))
+        ds._day_ord = o
+    return o
+
+
 @dataclass
 class DecisionSet:
     X: np.ndarray          # [N, F] float32, raw (not standardized)
@@ -79,7 +90,7 @@ class DecisionSet:
 
     @property
     def days(self) -> list[date]:
-        return sorted(set(self.day.tolist()))
+        return [date.fromordinal(int(o)) for o in np.unique(day_ords(self))]
 
     def subset(self, mask: np.ndarray) -> "DecisionSet":
         """The rows of ``mask`` (e.g. the days before a bootstrap), labels for every hold included."""

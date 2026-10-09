@@ -23,7 +23,11 @@ WORKERS: dict[str, list[str]] = {
     "train": ["train-selector"],
     "replay": ["replay-pull"],
     "pumpstream": ["pumpstream"],
+    "kalshi_stream": ["kalshi-stream"],
     "rh_stream": ["rh-backfill"],
+    "kalshi_runner": ["kalshi-run"],
+    "kalshi_history": ["kalshi-history"],
+    "kalshi_train": ["kalshi-train"],
 }
 PYTHON = str(config.REPO_ROOT / ".venv" / "bin" / "python")
 

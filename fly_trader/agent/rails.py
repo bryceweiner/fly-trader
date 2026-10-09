@@ -1,9 +1,9 @@
 """Risk rails outside the model. KillSwitch (−KILL_SWITCH_DRAWDOWN from peak wealth → no entries), CircuitBreaker
 (CIRCUIT_THRESHOLD consecutive execution failures), the rolling 24 h notional ledger, and PauseEntries (console
 toggle). State lives in circuit_state / circuit_events / notional_ledger; the trading engine reads it before entries.
-One circuit per trading type: ``circuit_id`` 1 is the Solana memecoin live book (the default everywhere), 3 the Robinhood
-Chain memecoin live book (``RH_CIRCUIT``, fly_trader/rh; 2 is the development line's Kalshi circuit, unused here);
-``check_drawdown`` takes the drawdown limit of the caller's type.
+One circuit per trading type: ``circuit_id`` 1 is the memecoin live book (the default everywhere), 2 the Kalshi live
+books (``KALSHI_CIRCUIT``, fly_trader/kalshi), 3 the Robinhood Chain memecoin live book (``RH_CIRCUIT``,
+fly_trader/rh); ``check_drawdown`` takes the drawdown limit of the caller's type.
 """
 from __future__ import annotations
 
@@ -81,11 +81,18 @@ def check_drawdown(conn, wealth: float, peak: float, circuit_id: int = SOLANA_CI
 
 
 def kill_rebase_at(conn, circuit_id: int = SOLANA_CIRCUIT):
-    """When the kill switch was last cleared: peaks are measured from marks after it, so clearing really re-bases.
-    (Before this, the live book recomputed its peak from every wealth mark ever and re-tripped the next minute.)"""
-    r = conn.execute("SELECT max(ts) AS ts FROM circuit_events WHERE kind = 'reset' AND (detail->>'kill')::boolean "
+    """When the kill switch was last cleared, or money last withdrawn from the live wallet: peaks are measured from marks
+    after it, so clearing really re-bases and a withdrawal is never a drawdown. (Before this, the live book recomputed its
+    peak from every wealth mark ever and re-tripped the next minute.)"""
+    r = conn.execute("SELECT max(ts) AS ts FROM circuit_events WHERE ((kind = 'reset' AND (detail->>'kill')::boolean) OR kind = 'withdrawal') "
                      "AND COALESCE((detail->>'circuit')::int, 1) = %s", (circuit_id,)).fetchone()
     return r["ts"] if r else None
+
+
+def record_withdrawal(conn, detail: dict, circuit_id: int = SOLANA_CIRCUIT) -> None:
+    """The operator took money out of a live wallet (chain/withdraw.py, rh/withdraw.py): ``kill_rebase_at`` re-bases the
+    live book's peak at it."""
+    _event(conn, "withdrawal", detail, circuit_id)
 
 
 def check_book_drawdown(conn, book: str, wealth: float, peak: float, drawdown: float | None = None, unit: str = "SOL") -> bool:

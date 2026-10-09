@@ -49,3 +49,30 @@ def test_a_losing_line_never_wins_even_when_it_is_the_only_one_with_enough_trade
     assert cal.line == 0.0406 and not cal.changed                                                       # the bootstrap's line survives the bad day
     assert any(t["trades"] >= 100 and t["total"] < 0 for t in cal.lines)                                # the losing candidate was there and was refused
     assert fly_calibrate.calibrate(ts, mint, 1800.0, scores, rets).line == fly_calibrate.MIN_EV           # no previous line: the floor, never the loser
+
+
+def test_the_selector_rule_prefers_a_selective_line_over_volume():
+    """Fly #133's week: the total rule took 414 trades at +2.8 % over 115 at +7.3 %; its teacher took 13 at +8.5 %.
+    The selector's objective asks for the profit-factor bar (and winners) before total profit."""
+    from fly_trader.train import fly_calibrate as fc
+    rng = np.random.default_rng(0); n = 3000
+    ts = np.arange(n) * 3600.0; mint = np.array([f"m{i}" for i in range(n)], dtype=object)      # one row per token: every row is a trade
+    sc = rng.uniform(0, 0.2, n)
+    r = np.where(sc > 0.15, rng.normal(0.08, 0.05, n), rng.normal(0.004, 0.10, n))            # a strong tail, a thin broad middle
+    tot = fc.calibrate(ts, mint, 60.0, sc, r, rule="total", min_trades=100)
+    sel = fc.calibrate(ts, mint, 60.0, sc, r, rule="selector", min_trades=100)
+    assert sel.line > tot.line and sel.mean > tot.mean and sel.trades < tot.trades
+    none = fc.calibrate(ts, mint, 60.0, sc, -np.abs(r), rule="selector", prev_line=0.123, min_trades=100)
+    assert none.line == 0.123                                                                    # nothing meets the bar: the line stays
+
+
+def test_the_match_rule_takes_as_many_trades_as_the_teacher():
+    from fly_trader.train import fly_calibrate as fc
+    rng = np.random.default_rng(1); n = 2000
+    ts = np.sort(rng.uniform(0, 7 * 86400, n)); mint = np.array([f"m{i % 300}" for i in range(n)], dtype=object)
+    sc = rng.normal(size=n); r = rng.normal(0.0, 0.1, n)
+    for target in (1, 13, 120):
+        c = fc.calibrate(ts, mint, 4 * 3600.0, sc, r, rule="match", target_trades=target)
+        assert 0 < c.trades <= target and c.trades >= 0.8 * target                             # as selective as the teacher, give or take a re-entry
+    with pytest.raises(ValueError):
+        fc.calibrate(ts, mint, 60.0, sc, r, rule="match")                                        # the budget must be given
