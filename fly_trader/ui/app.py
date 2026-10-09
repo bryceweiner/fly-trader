@@ -15,6 +15,7 @@ import streamlit as st
 
 st.set_page_config(page_title="fly-trader", page_icon="🪰", layout="wide")
 
+from fly_trader import config
 from fly_trader.ops.supervisor import get_supervisor
 from fly_trader.ui.common import status_strip
 
@@ -50,6 +51,8 @@ pages = {
         st.Page("app_pages/vault.py", title="$FLY vault", icon=":material/savings:", url_path="vault"),
     ],
 }
+if not config.KALSHI_API_KEY_ID:     # the distribution ships Kalshi dormant: its pages appear once it is set up
+    pages.pop("Prediction markets")
 page = st.navigation(pages, position="top")
 status_strip()
 try:
