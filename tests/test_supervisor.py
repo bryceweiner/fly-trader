@@ -78,3 +78,25 @@ def test_a_new_console_waits_for_the_one_it_replaces(monkeypatch, db_conn):
         row = conn.execute("SELECT stopped_at FROM processes WHERE id = %s", (rid,)).fetchone()
     assert row["stopped_at"] is not None and seen["calls"] >= 3             # waited, saw it go, closed the row
     assert sup.start("pumpstream", started_by="test"); sup.stop("pumpstream", grace_s=5)
+
+
+def test_rh_stream_autostarts_with_an_autostart_row_from_before_robinhood_chain(monkeypatch, db_conn):
+    """The shipped autostart names rh_stream; an older install's row does not, and the feed still starts while RH is on."""
+    import json
+    from fly_trader import config
+    started = []
+    monkeypatch.setattr(S.Supervisor, "start", lambda self, n, started_by="console": started.append(n) or True)
+    monkeypatch.setattr(S.Supervisor, "alive", lambda self, n: False)
+    with db_conn.cursor() as cur:
+        cur.execute("INSERT INTO ui_settings (key, value) VALUES ('autostart', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    (json.dumps({"pumpstream": True, "runner": True, "vault": False}),))
+    db_conn.commit()
+    try:
+        monkeypatch.setattr(config, "RH_ENABLED", True)
+        assert set(S.Supervisor().autostart()) == {"pumpstream", "runner", "rh_stream"}
+        started.clear(); monkeypatch.setattr(config, "RH_ENABLED", False)
+        assert set(S.Supervisor().autostart()) == {"pumpstream", "runner"}
+    finally:
+        with db_conn.cursor() as cur:
+            cur.execute("DELETE FROM ui_settings WHERE key = 'autostart'")
+        db_conn.commit()

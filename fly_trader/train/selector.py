@@ -54,10 +54,10 @@ def _skill_version() -> str:
 
 def _rh_version() -> dict:
     """The Robinhood Chain half of the combined dataset: its aggregation, skill space and cost constants (a model trained
-    before RH rows existed, or on other RH definitions, is not current)."""
+    before RH rows existed, or on other RH definitions, is not current). Not RH_ENABLED: whether an install indexes and
+    trades RH is its own choice, and a combined model trades Solana alone (until 2026-10-10 an install with RH off
+    computed "chains": "sol", refused the shipped combined models and crash-looped at boot)."""
     from .. import config
-    if not config.RH_ENABLED:
-        return {"chains": "sol"}
     from ..rh.corpus import RH_AGG_VERSION
     from ..rh.wallet_skill import skill_version as rh_skill
     return {"chains": "sol+rh-1", "rh_agg": RH_AGG_VERSION, "rh_skill": rh_skill(),

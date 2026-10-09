@@ -82,3 +82,12 @@ def test_rejudging_one_chain_keeps_the_others_verdict():
     assert m["chains"]["sol"] == {"passed": True, "reason": "sol ok"}                     # Solana keeps its verdict
     assert m["chains"]["rh"]["passed"] and m["chains"]["rh"]["S"] == "2026-09-10" and m["passed"]
     assert fly_replay.merge_chains({"value": {**old, "data": {"v": 0}}}, new, ("rh",)) is new      # other definitions: replaced whole
+
+
+def test_model_currency_does_not_depend_on_rh_enabled(monkeypatch):
+    """An install that switches RH off still accepts the combined models (it trades Solana with them alone)."""
+    from fly_trader import config
+    from fly_trader.train import selector
+    monkeypatch.setattr(config, "RH_ENABLED", True); on = selector._rh_version()
+    monkeypatch.setattr(config, "RH_ENABLED", False); off = selector._rh_version()
+    assert on == off and on["chains"] == "sol+rh-1"

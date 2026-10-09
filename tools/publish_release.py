@@ -63,8 +63,8 @@ def stage(worktree: Path, dest: Path) -> list[dict]:
     out = []
     for rel in sorted(set(files)):
         src = worktree / rel
-        if not src.is_file() or src.is_symlink():
-            continue
+        if not src.is_file() or src.is_symlink() or Path(rel).name.startswith(".git"):
+            continue                                    # .gitignore & co.: fly_update refuses them, and HF honours an uploaded .gitignore
         if not fly_update.PATH_RE.match(rel):
             raise SystemExit(f"path not allowed in a release: {rel}")
         dst = dest / rel; dst.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(src, dst)
