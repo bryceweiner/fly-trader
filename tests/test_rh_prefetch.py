@@ -1,6 +1,7 @@
 """A live RH pass reads its logs once (rh/prefetch.py): eth_getLogs coverage and matching, the index step and the price
-scan answered from memory (only the swappers' Transfers go out), HyperSync's multi-selection query, and the next pass
-timed to the moment a minute can be written."""
+scan answered from memory (only the swappers' Transfers go out), HyperSync's multi-selection query, the RPC taking a pass
+over while HyperSync fails and handing it back, the RPC's span halving under its log cap, and the next pass timed to the
+moment a minute can be written."""
 import json
 from pathlib import Path
 
@@ -16,8 +17,11 @@ ETH = "0x" + "00" * 20
 
 
 @pytest.fixture(autouse=True)
-def _no_pacing(monkeypatch):
+def _fresh_state(monkeypatch):
     monkeypatch.setattr(config, "RH_HYPERSYNC_RPM", 1e6)
+    prefetch._STATE.update(down_until=0.0, down_since=None, last_error=None, rpc_span=prefetch.RPC_SPAN)
+    yield
+    prefetch._STATE.update(down_until=0.0, down_since=None, last_error=None, rpc_span=prefetch.RPC_SPAN)
 
 
 def _log(addr, topics, block, li=0, data="0x"):
@@ -113,6 +117,54 @@ def test_the_price_scan_reads_from_memory(monkeypatch):
     finally:
         with transaction() as conn:
             conn.execute("DELETE FROM rh_pools"); conn.execute("UPDATE rh_assets SET ref_path = NULL WHERE asset = %s", ("0x" + "c1" * 20,))
+
+
+class FailingHs:
+    height = 0
+
+    def __init__(self):
+        self.fail = True; self.asked = 0
+
+    def get_logs_sel(self, sels, lo, hi, upto=False, tries=3, all_blocks=False):
+        self.asked += 1
+        if self.fail:
+            raise H.HyperSyncError("HyperSync failed 3 times: ConnectTimeout")
+        return [], hi, {}
+
+
+def test_hypersync_failing_moves_live_passes_to_the_rpc_and_back(monkeypatch):
+    monkeypatch.setattr(prefetch, "selections", lambda conn: [H.selection([config.V4_POOL_MANAGER], [index.V4_TOPICS0])])
+    events = []
+    monkeypatch.setattr(prefetch, "record_event", lambda level, src, msg, detail=None: events.append((level, msg)))
+    asked = []
+    monkeypatch.setattr(prefetch.RhRpc, "get_logs_multi", lambda self, a, lo, hi, t=None: asked.append((tuple(a), lo, hi, t)) or [_log(config.V4_POOL_MANAGER, [index.V4_TOPICS0[1], "0xid"], lo)])
+    hs = FailingHs(); rpc = FakeRpc(hs=hs)
+    pre = prefetch.fetch(rpc, 1000, 5000)
+    assert pre.source == "rpc" and (pre.lo, pre.hi) == (1000, 1000 + prefetch.RPC_SPAN - 1) and prefetch.hypersync_down()
+    assert asked == [((config.V4_POOL_MANAGER.lower(),), 1000, 1399, None)]     # one read, every address, any topic
+    assert pre.get_logs_multi([config.V4_POOL_MANAGER], 1000, 1399, [index.V4_TOPICS0]) and asked[1:] == []
+    assert [e[0] for e in events] == ["warning"]
+    pre2 = prefetch.fetch(rpc, 1400, 5000)                                     # inside the cooldown HyperSync is not asked
+    assert pre2.source == "rpc" and hs.asked == 1 and len(events) == 1
+    prefetch._STATE["down_until"] = 0.0; hs.fail = False                       # the cooldown is over and HyperSync answers
+    pre3 = prefetch.fetch(rpc, 1800, 5000)
+    assert pre3.source == "hypersync" and (pre3.lo, pre3.hi) == (1800, 5000) and not prefetch.hypersync_down()
+    assert [e[0] for e in events] == ["warning", "info"]
+
+
+def test_the_rpc_span_halves_under_its_log_cap(monkeypatch):
+    monkeypatch.setattr(prefetch, "selections", lambda conn: [H.selection([config.V4_POOL_MANAGER], [index.V4_TOPICS0])])
+    monkeypatch.setattr(prefetch, "record_event", lambda *a, **k: None)
+    spans = []
+
+    def rpc_logs(self, a, lo, hi, t=None):
+        spans.append(hi - lo + 1)
+        if hi - lo + 1 > 100:
+            raise RuntimeError("evm rpc eth_getLogs error -32005: query exceeds limit of 10000 results")
+        return []
+    monkeypatch.setattr(prefetch.RhRpc, "get_logs_multi", rpc_logs)
+    pre = prefetch.fetch(FakeRpc(hs=None), 0, 10_000)
+    assert spans == [400, 200, 100] and pre.hi == 99 and prefetch._STATE["rpc_span"] == 200     # back up once a read succeeds
 
 
 def test_the_next_pass_starts_when_a_minute_can_be_written(monkeypatch):

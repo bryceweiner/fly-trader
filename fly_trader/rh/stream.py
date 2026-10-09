@@ -3,7 +3,8 @@
 Each pass: the index cursor advances (rh/index.py; many ranges while backfilling, one near the head), the quote assets'
 marks follow it (rh/prices.py), the complete minutes are written (rh/minutes.py), and the graduated launches' meta
 (rh/meta.py) is refreshed. ``rh_stream_status.flushed_through`` gates the engine's RH minutes, as pumpstream_status gates
-Solana's. Near the head a pass reads its logs in one HyperSync query (rh/prefetch.py) and the next pass starts as soon as the next minute can be written (``_wait_s``), at most ``RH_STREAM_POLL_S`` later.
+Solana's. Near the head a pass reads its logs in one query (rh/prefetch.py: HyperSync, or the RPC while HyperSync fails)
+and the next pass starts as soon as the next minute can be written (``_wait_s``), at most ``RH_STREAM_POLL_S`` later.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from .rpc import logs_rpc
 log = logging.getLogger(__name__)
 BACKFILL_RANGES = 20            # ranges per pass while far behind (then a status write)
 LIVE_LAG_BLOCKS = 5_000         # closer than this to the head counts as live
+RPC_CATCHUP_S = 3.0             # between catch-up passes while HyperSync is down (each reads ~2-3 times from the public RPC)
 
 
 def _status(**kv) -> None:
@@ -64,7 +66,7 @@ def one_pass(rpc, skill=None) -> dict:
     behind = head - (at if r else 0)
     lap("head")
     src = rpc; pre = None
-    if r is not None and at >= 0 and behind <= LIVE_LAG_BLOCKS and hasattr(rpc, "hs"):
+    if r is not None and at >= 0 and (behind <= LIVE_LAG_BLOCKS or prefetch.hypersync_down()):
         rng = scan.next_range(at, int(r["range_blocks"] or scan.START_RANGE), head - config.RH_CONFIRMATIONS)
         if rng is not None:                                     # one query for everything the pass reads (rh/prefetch.py)
             pre = src = prefetch.fetch(rpc, *rng); lap("logs")
@@ -86,7 +88,7 @@ def one_pass(rpc, skill=None) -> dict:
     out = {"head": head, "index_through": ix.get("through"), "behind_blocks": head - (ix.get("through") or 0), "index": ix.get("counts"), "prices": px,
            "minutes": mn, "meta": mt, "corpus": cp, "mode": "backfill" if behind > LIVE_LAG_BLOCKS else "live", "timings_s": tm,
            "logs_from": pre.source if pre is not None else ("hypersync" if hasattr(rpc, "hs") else "rpc"),
-           "memory_reads": {"served": pre.served, "passed": pre.passed} if pre is not None else None}
+           "memory_reads": {"served": pre.served, "passed": pre.passed} if pre is not None else None, "hypersync": prefetch.status() or None}
     _status(**{k: v for k, v in out.items() if k != "minutes"}, minutes_through=mn.get("through"))
     return out
 
@@ -105,6 +107,8 @@ def main(stop_event: threading.Event | None = None) -> None:
             out = one_pass(rpc)                                     # the pass writes and loads the day's skill table itself
             if out["mode"] == "backfill":
                 log.info("rh backfill: through %s, %s blocks behind, %s", out["index_through"], out["behind_blocks"], out["index"])
+                if out.get("logs_from") == "rpc" and prefetch.hypersync_down():
+                    stop.wait(RPC_CATCHUP_S)                          # catching up on the public RPC: under its rate limit
                 continue
         except Exception as e:
             log.exception("rh_stream pass failed: %s", str(e)[:200]); _status(error=str(e)[:300])
