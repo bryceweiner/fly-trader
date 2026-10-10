@@ -56,6 +56,10 @@ def main(out: Path) -> None:
         sel_id = pin if pin is not None else (selector.latest_current(conn) or {}).get("id")
         if sel_id is None:
             raise SystemExit("no deployed selector: pin one (ui_settings.pinned_selector_snapshot) or train one that qualifies")
+        taught_by = (fly.get("meta") or {}).get("teacher_snapshot")
+        if taught_by is not None and int(taught_by) != int(sel_id):        # its gate would have no teacher on an install
+            raise SystemExit(f"fly #{fly['id']} was taught by selector #{taught_by}, not the selector being shipped (#{sel_id}): pin its "
+                             "teacher, or bootstrap a fly from the shipped selector")
         rows = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM brain_snapshots WHERE id = ANY(%s)", ([int(fly["id"]), int(sel_id)],)).fetchall()}
         verdict = conn.execute("SELECT value FROM ui_settings WHERE key = 'fly_replay'").fetchone()
         has_rh = conn.execute("SELECT to_regclass('rh_assets') IS NOT NULL AS ok").fetchone()["ok"]

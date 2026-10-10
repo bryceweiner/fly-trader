@@ -120,6 +120,14 @@ def try_start(live: bool = False, chain: str = "sol", brain: "FlyBook | None" = 
         return None, f"fly book failed to start: {type(e).__name__}: {e}"
 
 
+def no_teacher(n: int) -> dict:
+    """The decision when the teacher gate is on (FLY_TEACHER_GATE) but the fly's teacher could not be loaded: no row is
+    allowed, each recorded with why. A fresh install once lost the teacher's snapshot id (ops/release.remap_teacher)."""
+    return {"strategy": np.full(n, None, dtype=object), "score": np.full(n, -1.0), "hold_s": np.zeros(n), "threshold": np.full(n, np.inf),
+            "tables": [[] for _ in range(n)], "allow": np.zeros(n, bool),
+            "reason": np.full(n, "fail closed: the fly's teacher (the selector that taught it) is not loaded", dtype=object)}
+
+
 class FlyBook:
     def __init__(self, boot: dict, verdict: dict, live: bool = False, chain: str = "sol", brain: "FlyBook | None" = None):
         self.live = live; self.done = False; self.mirror = None
@@ -423,7 +431,8 @@ class FlyBook:
             self.bank.estimate_nu(Y[:, 0], u0, k); self.nu_set = True
         t = ctx.t_start; ts = datetime.fromtimestamp(t, timezone.utc); rows = []; ta = self._teacher_allow(ctx.X, t)
         V = np.full((n, len(self.names)), -np.inf); F = np.full((n, len(self.names)), np.nan)
-        td = self._teacher_decision(ctx) if config.FLY_TEACHER_GATE and self.teacher_live is not None else None
+        gated = config.FLY_TEACHER_GATE
+        td = self._teacher_decision(ctx) if gated and self.teacher_live is not None else None
         for j, name in enumerate(self.names):
             loc = np.flatnonzero(trig[:, j])
             if not len(loc):
@@ -440,6 +449,8 @@ class FlyBook:
             if td is not None:   # gated: its decisions are the teacher's trades of this strategy (before its own vetoes), so it learns from those
                 mine = np.array([td["strategy"][i] == name and bool(td["allow"][i]) for i in loc], dtype=np.float32)
                 w = torch.as_tensor(mine[None], dtype=sc.dtype, device=sc.device)
+            elif gated:          # the gate is on but its teacher is not loaded: nothing to learn from until it is
+                w = torch.zeros((1, len(loc)), dtype=sc.dtype, device=sc.device)
             else:
                 w = plastic.row_weights(sc[None], torch.tensor([line], dtype=sc.dtype, device=sc.device))
             self.pending.push([(t, ctx.mints[i], name) for i in loc], np.full(len(loc), t), t + self.holds[name] + LABEL_LAG_S, Y[li, j], u0[li], k[li], w, s=j)
@@ -459,6 +470,8 @@ class FlyBook:
         if td is not None:
             d = self._gated(ctx, V, F, td)
             return {"decision": d, "picks": int(d["allow"].sum())}
+        if gated:                # never the ungated fly: it bought what the selector rejected and lost (2026-10-08)
+            return {"decision": no_teacher(n), "picks": 0}
         d = fly_selector.fly_decide(self.fly, ctx.X, X_COLS, np.where(np.isfinite(V), V, -np.inf))
         return {"decision": d, "picks": int(sum(1 for x in d["strategy"] if x is not None))}
 

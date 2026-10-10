@@ -43,6 +43,16 @@ def _set(conn, key: str, value) -> None:
                  (key, json.dumps(value, default=str)))
 
 
+def remap_teacher(note: dict, new_ids: dict[int, int]) -> dict | None:
+    """The fly names its teacher by the snapshot id it had where it was trained (``teacher_snapshot``); an install gives
+    the shipped selector a fresh id. The note naming the teacher's id here, or None when nothing changes. Without it a
+    fresh install's fly found no teacher, and its gate (agent/fly_session) had nothing to apply (2026-10-10 boot test)."""
+    t = note.get("teacher_snapshot")
+    if t is None or int(t) not in new_ids or new_ids[int(t)] == int(t):
+        return None
+    return {**note, "teacher_snapshot": new_ids[int(t)]}
+
+
 def apply_release(release_dir: Path, bootstrap: bool = False) -> dict:
     """Install the release at ``release_dir``. ``bootstrap``: first boot (also writes autostart if absent)."""
     import sys
@@ -104,6 +114,15 @@ def apply_release(release_dir: Path, bootstrap: bool = False) -> dict:
                 r = conn.execute("INSERT INTO brain_snapshots (path, sha256, kind, note, promoted_by) VALUES (%s,%s,%s,%s,'release') RETURNING id",
                                  (str(placed[snap["sha256"]]), snap["sha256"], snap["kind"], note)).fetchone()
             ids[snap["sha256"]] = int(r["id"])
+        new_ids = {int(s["source_id"]): ids[s["sha256"]] for s in seed["snapshots"] if s.get("source_id") is not None}
+        for snap in seed["snapshots"]:
+            if snap["kind"] != "fly_selector":
+                continue
+            r = conn.execute("SELECT note FROM brain_snapshots WHERE id = %s", (ids[snap["sha256"]],)).fetchone()
+            note = r["note"] if isinstance(r["note"], dict) else json.loads(r["note"] or "{}")
+            fixed = remap_teacher(note, new_ids)
+            if fixed is not None:
+                conn.execute("UPDATE brain_snapshots SET note = %s WHERE id = %s", (json.dumps(fixed, default=str), ids[snap["sha256"]]))
         _set(conn, "fly_replay", v)
         pin = seed.get("pinned_selector_sha256")
         if pin:
