@@ -360,6 +360,11 @@ class StackTeacher:
         self.threshold = self.lines[self.strategies[0]] if self.strategies else selector.MIN_EV
         self.combine = models.get("combine", "score"); self.eps: dict = {}
 
+    def raw_scores(self, X: np.ndarray, ts, names: list[str]) -> np.ndarray:
+        """[B, S] its own score of each row per strategy (NaN off the trigger): the starting score of a fly that scores as
+        its teacher plus a learned correction (config.FLY_SCORE = teacher)."""
+        return teacher_scores(self.models, X, ts, names, self.cols)
+
     def targets(self, X: np.ndarray, ts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """(targets [B, S] with NaN off each strategy's candidates, allowed [B, S])."""
         from . import strategies
@@ -675,6 +680,27 @@ def bootstrap(ds: DecisionSet, S: date, epochs: int = EPOCHS, stop: threading.Ev
              S, fly.strategies, {k: round(v, 4) for k, v in fly.lines.items()}, comb["trades"], f"{comb['mean'] * 100:+.2f}%" if comb["mean"] is not None else "-",
              diag["mbon_share"] * 100, diag["mbon_saturated"] * 100, "ok" if ok else "; ".join(why))
     return fly, info
+
+
+def verdict_version() -> dict:
+    """What a replay verdict holds for: the bootstrap's definitions (``FLY_VERSION``) and how the fly scores a row
+    (config.FLY_SCORE; "own" is what FLY_VERSION alone meant until 2026-10-11, so its verdicts stay valid for it)."""
+    return FLY_VERSION if config.FLY_SCORE == "own" else {**FLY_VERSION, "score": config.FLY_SCORE}
+
+
+def teacher_scores(models: dict, X: np.ndarray, ts, names: list[str], cols: list[str], chunk: int = 200_000) -> np.ndarray:
+    """[B, S]: the teacher stack's own score of each row for each of the fly's strategies (its predicted net return; NaN
+    where that strategy's trigger does not fire) -- the starting score of the fly when config.FLY_SCORE = teacher."""
+    from . import strategies
+    X = np.atleast_2d(X); out = np.full((len(X), len(names)), np.nan)
+    tsa = np.broadcast_to(np.asarray(ts, dtype=np.float64), (len(X),))
+    for i in range(0, len(X), chunk):
+        per = strategies.decide_all(models, X[i:i + chunk], cols, tsa[i:i + chunk])
+        for j, k in enumerate(names):
+            if k in per:
+                sc = per[k]["score"]
+                out[i:i + chunk, j] = np.where(per[k]["trig"] & np.isfinite(sc), np.clip(sc, -1.0, 1.0), np.nan)
+    return out
 
 
 def is_current(meta: dict | None, version: dict | None = None) -> bool:

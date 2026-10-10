@@ -179,6 +179,10 @@ class FlyBook:
         self.pending = plastic.PendingTags(net.n_kc, net.k_active)
         self.bars: dict[str, deque] = {}; self.watch: dict[str, int] = {}
         own = {k: self.fly.line_for(k, self.chain) for k in self.names}; own_s = {k: list(self.fly.sizing_for(k, self.chain)) for k in self.names}
+        if config.FLY_SCORE == "teacher" and self.teacher_live:   # it scores on its teacher's scale: it starts on its teacher's lines and bands
+            ts_ = self.teacher_live.get("strategies") or {}
+            own = {k: float(ts_[k]["line"]) if k in ts_ else v for k, v in own.items()}
+            own_s = {k: list(ts_[k].get("sizing") or v) if k in ts_ else v for k, v in own_s.items()}
         self.lines = {"plastic": dict(own), "frozen": dict(own)}
         self.sizing = {"plastic": {k: list(v) for k, v in own_s.items()}, "frozen": {k: list(v) for k, v in own_s.items()}}
         self.applied_through = -math.inf; self.learning_frozen = False; self.checks_paused_until = {k: 0.0 for k in self.names}
@@ -187,6 +191,9 @@ class FlyBook:
         s = self._read_state()
         if b is not None:
             self.nu_set = True                                   # the shared memory is the Solana book's to load and save
+        if s and s.get("bootstrap_id") == self.boot_id and s.get("cfg") == self.cfg and s.get("score", "own") != config.FLY_SCORE:
+            self._archive_state(s)                               # learned under another scoring: it starts from its bootstrap
+            s = None
         if s and s.get("bootstrap_id") == self.boot_id and s.get("cfg") == self.cfg:
             if b is None:
                 self.bank.load_state(s["bank"])
@@ -249,8 +256,18 @@ class FlyBook:
             log.exception("fly state unreadable; starting from the bootstrap")
             return None
 
+    def _archive_state(self, s: dict) -> None:
+        """Keep a state learned under another scoring mode beside the new one (never loaded again)."""
+        try:
+            dst = self.state_path.with_name(f"{self.state_path.stem}_{s.get('score', 'own')}_{time.strftime('%Y%m%dT%H%M%S')}.pt")
+            os.replace(self.state_path, dst)
+            record_event("info", "fly", f"fly state learned with FLY_SCORE={s.get('score', 'own')} set aside: the fly starts from its bootstrap",
+                         {"path": str(dst), "drift": None})
+        except OSError:
+            log.exception("could not set the old fly state aside")
+
     def _state(self) -> dict:
-        return {"bootstrap_id": self.boot_id, "cfg": self.cfg, "bank": self.bank.state() if self.brain is None else None, "lines": self.lines, "sizing": self.sizing,
+        return {"bootstrap_id": self.boot_id, "cfg": self.cfg, "score": config.FLY_SCORE, "bank": self.bank.state() if self.brain is None else None, "lines": self.lines, "sizing": self.sizing,
                 "applied_through": self.applied_through, "learning_frozen": self.learning_frozen, "checks_paused_until": self.checks_paused_until,
                 "race_started_at": self.race_started_at, "last_day": self.last_day, "last_hour": self.last_hour, "rollbacks": self.rollbacks,
                 "saved_at": time.time()}
@@ -274,9 +291,23 @@ class FlyBook:
             groups.setdefault((r["ts"].timestamp(), r["strategy"]), []).append(r)
         for (t, name), rs in sorted(groups.items()):
             j = self.names.index(name)
-            Y, u0, k = self.fly.parts_all(np.asarray([r["x"] for r in rs], dtype=np.float32))
-            w = plastic.row_weights(torch.tensor([[float(r["score"]) for r in rs]]), torch.tensor([float(rs[0]["line"])]))
-            self.pending.push([(t, r["mint"], name) for r in rs], np.full(len(rs), t), t + self.holds[name] + LABEL_LAG_S, Y[:, j], u0, k, w, s=j)
+            Xr = np.asarray([r["x"] for r in rs], dtype=np.float32)
+            Y, u0, k = self.fly.parts_all(Xr[:, self.idx])
+            tv = self._teacher_scores(Xr, t); loc = np.arange(len(rs))
+            if tv is not None:
+                loc = loc[np.isfinite(tv[:, j])]
+                if not len(loc):
+                    continue
+                rs = [rs[i] for i in loc]; Xr = Xr[loc]; li = torch.as_tensor(loc, device=Y.device); Y, u0, k = Y[li], u0[li], k[li]
+            y = self._head(Y[:, j], tv, loc, j, u0)
+            if config.FLY_TEACHER_GATE and self.teacher_live is not None:      # gated: it learns from its teacher's trades, as live
+                d = strategies.decide(self.teacher_live, Xr, X_COLS, t)
+                w = torch.tensor([[float(d["strategy"][i] == name and bool(d["allow"][i])) for i in range(len(rs))]])
+            elif config.FLY_TEACHER_GATE:
+                w = torch.zeros((1, len(rs)))
+            else:
+                w = plastic.row_weights(torch.tensor([[float(r["score"]) for r in rs]]), torch.tensor([float(rs[0]["line"])]))
+            self.pending.push([(t, r["mint"], name) for r in rs], np.full(len(rs), t), t + self.holds[name] + LABEL_LAG_S, y, u0, k, w, s=j)
             for r in rs:
                 self.watch[r["mint"]] = self.watch.get(r["mint"], 0) + 1
 
@@ -432,15 +463,21 @@ class FlyBook:
         t = ctx.t_start; ts = datetime.fromtimestamp(t, timezone.utc); rows = []; ta = self._teacher_allow(ctx.X, t)
         V = np.full((n, len(self.names)), -np.inf); F = np.full((n, len(self.names)), np.nan)
         gated = config.FLY_TEACHER_GATE
+        if config.FLY_SCORE == "teacher" and self.teacher_live is None:      # it starts from its teacher's score: none, no score
+            return {"decision": no_teacher(n), "picks": 0}
         td = self._teacher_decision(ctx) if gated and self.teacher_live is not None else None
+        tv = self._teacher_scores(ctx.X, t)
         for j, name in enumerate(self.names):
             loc = np.flatnonzero(trig[:, j])
+            if tv is not None:
+                loc = loc[np.isfinite(tv[loc, j])]                   # a candidate its teacher scores
             if not len(loc):
                 continue
             li = torch.as_tensor(loc, device=Y.device)
+            y = self._head(Y[li, j], tv, loc, j, u0[li])
             with torch.no_grad():
-                sc, _ = self.bank.predict(Y[li, j], u0[li], k[li], s=np.full(len(loc), j)); sc = sc[0]
-                fr = self.bank.frozen(Y[li, j], u0[li], s=np.full(len(loc), j))
+                sc, _ = self.bank.predict(y, u0[li], k[li], s=np.full(len(loc), j)); sc = sc[0]
+                fr = self.bank.frozen(y, u0[li], s=np.full(len(loc), j))
             v, f = sc.float().cpu().numpy(), fr.float().cpu().numpy(); V[loc, j] = v; F[loc, j] = f
             line, fline = self.lines["plastic"][name], self.lines["frozen"][name]
             al = ta.get(name)
@@ -453,7 +490,7 @@ class FlyBook:
                 w = torch.zeros((1, len(loc)), dtype=sc.dtype, device=sc.device)
             else:
                 w = plastic.row_weights(sc[None], torch.tensor([line], dtype=sc.dtype, device=sc.device))
-            self.pending.push([(t, ctx.mints[i], name) for i in loc], np.full(len(loc), t), t + self.holds[name] + LABEL_LAG_S, Y[li, j], u0[li], k[li], w, s=j)
+            self.pending.push([(t, ctx.mints[i], name) for i in loc], np.full(len(loc), t), t + self.holds[name] + LABEL_LAG_S, y, u0[li], k[li], w, s=j)
             for i in loc:
                 m = ctx.mints[i]; self.watch[m] = self.watch.get(m, 0) + 1
                 q_ = self.bars.setdefault(m, deque(maxlen=BAR_KEEP)); b = ctx.bars.get(m)
@@ -474,6 +511,20 @@ class FlyBook:
             return {"decision": no_teacher(n), "picks": 0}
         d = fly_selector.fly_decide(self.fly, ctx.X, X_COLS, np.where(np.isfinite(V), V, -np.inf))
         return {"decision": d, "picks": int(sum(1 for x in d["strategy"] if x is not None))}
+
+    def _teacher_scores(self, X: np.ndarray, t) -> np.ndarray | None:
+        """[B, S] the teacher's own score of each row per strategy (NaN off its trigger) when the fly scores as its teacher
+        plus its learned correction (config.FLY_SCORE = teacher), else None."""
+        if config.FLY_SCORE != "teacher" or self.teacher_live is None:
+            return None
+        return fly_selector.teacher_scores(self.teacher_live, X, t, self.names, X_COLS)
+
+    def _head(self, y_own: torch.Tensor, tv: np.ndarray | None, loc: np.ndarray, j: int, u0: torch.Tensor) -> torch.Tensor:
+        """The head output the bank scores with: the fly's own decoder output, or (FLY_SCORE = teacher) the one under which
+        its frozen score is the teacher's score exactly (PlasticBank.head_for), so only its learning moves it."""
+        if tv is None:
+            return y_own
+        return self.bank.head_for(torch.as_tensor(tv[loc, j], dtype=torch.float32, device=self.bank.dev), u0, s=np.full(len(loc), j))
 
     def _teacher_decision(self, ctx) -> dict:
         """The deployed selector's decision on this minute's rows, with its live fail-closed rules."""
@@ -599,7 +650,7 @@ class FlyBook:
         d = fly_state_dir(); d.mkdir(parents=True, exist_ok=True)
         path = d / f"snap_{datetime.fromtimestamp(now, timezone.utc).strftime('%Y%m%dT%H%M')}.pt"
         torch.save({"bank": self.bank.state(), "bootstrap_id": self.boot_id, "lines": self.lines, "sizing": self.sizing}, path)
-        note = {"bootstrap_id": self.boot_id, "data": fly_selector.FLY_VERSION, "good": good, "checks": checks,
+        note = {"bootstrap_id": self.boot_id, "data": fly_selector.FLY_VERSION, "score": config.FLY_SCORE, "good": good, "checks": checks,
                 "drift": max((c["drift"] for c in checks.values()), default=0.0), "ic24": {k: c.get("ic") for k, c in checks.items()}}
         return int(conn.execute("INSERT INTO brain_snapshots (run_id, path, kind, note) VALUES (%s,%s,'fly_plastic',%s) RETURNING id",
                                 (self.run_id, str(path), json.dumps(note, default=str))).fetchone()["id"])
@@ -628,7 +679,7 @@ class FlyBook:
                               (datetime.fromtimestamp(now - ROLLBACK_MIN_AGE_S, timezone.utc),)).fetchall():
             n = json.loads(r["note"] or "{}")
             ok = n.get("good") or not ((n.get("checks") or {}).get(name) or {}).get("triggers")
-            if ok and n.get("bootstrap_id") == self.boot_id and Path(r["path"]).exists():
+            if ok and n.get("bootstrap_id") == self.boot_id and n.get("score", "own") == config.FLY_SCORE and Path(r["path"]).exists():
                 target = r; break
         if target is not None:
             snap = plastic.PlasticBank(self.fly.net, [(0.0, math.inf)], fly_selector.SCALE, learn=self.bank.learn.cpu().numpy(), read=self.bank.read.cpu().numpy())

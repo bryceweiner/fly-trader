@@ -157,6 +157,12 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
     gate = None
     if config.FLY_TEACHER_GATE and allowed is not None:        # the fly buys only what its teacher buys, as the live fly (agent/fly_session._gated)
         gate = np.zeros((len(ds.y), NS), bool); gate[order] = allowed
+    tsc = None
+    if config.FLY_SCORE == "teacher":                         # it scores as its teacher plus its learned correction (agent/fly_session._score)
+        if not hasattr(getattr(fly, "teacher", None), "raw_scores"):
+            raise RuntimeError("FLY_SCORE=teacher needs the bootstrap's teacher stack (fly.teacher)")
+        prog.update("fly replay: the teacher's scores, the fly's starting point", 0, 1, force=True)
+        tsc = fly.teacher.raw_scores(ds.X[order], ds.ts[order], names)
     pending = plastic.PendingTags(fly.net.n_kc, fly.net.k_active)
     labels = [torch.tensor(_labels(ds, h), dtype=torch.float32) for h in holds_min]
     starts = np.flatnonzero(np.r_[True, ts_o[1:] != ts_o[:-1]]); ends = np.r_[starts[1:], n]
@@ -192,11 +198,15 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
                     _governance(ds, order, ts_o, scores, lines, line_log, bank, now, lags, holds_min, gov_counts, slots=slots)
             for s_ in range(NS):
                 loc = np.flatnonzero(trig[lo:hi, s_])
+                if tsc is not None:
+                    loc = loc[np.isfinite(tsc[s0 + loc, s_])]           # a candidate the teacher scores (its own trigger fired)
                 if not len(loc):
                     continue
                 li = torch.as_tensor(lo + loc, device=Y.device)
+                y = (bank.head_for(torch.as_tensor(tsc[s0 + loc, s_], dtype=torch.float32, device=bank.dev), u0[li], s=np.full(len(loc), s_))
+                     if tsc is not None else Y[li, s_])                   # frozen = the teacher's score exactly; learning adds to it
                 with torch.no_grad():
-                    sc, _ = bank.predict(Y[li, s_], u0[li], k[li], s=np.full(len(loc), s_))
+                    sc, _ = bank.predict(y, u0[li], k[li], s=np.full(len(loc), s_))
                 scores[:, s_, s0 + loc] = sc.float().cpu().numpy()
                 if s0 >= live_from:
                     if gate is not None:     # gated, as the live fly: it learns from its teacher's trades of this strategy (agent/fly_session._score)
@@ -207,9 +217,9 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
                         w = plastic.row_weights(sc, torch.tensor(ln, dtype=sc.dtype, device=sc.device))
                     keep = np.flatnonzero((w > 0).any(0).cpu().numpy())      # a row no configuration would trade teaches none of them
                     if len(keep):
-                        kl = loc[keep]; ki = torch.as_tensor(lo + kl, device=Y.device)
+                        kl = loc[keep]; ki = torch.as_tensor(lo + kl, device=Y.device); kk = torch.as_tensor(keep, device=y.device)
                         pending.push([(int(order[s0 + j]), s_) for j in kl], ts_o[s0 + kl], now + lags[s_],
-                                     Y[ki, s_], u0[ki], k[ki], w[:, torch.as_tensor(keep, device=w.device)], s=s_)
+                                     y[kk], u0[ki], k[ki], w[:, torch.as_tensor(keep, device=w.device)], s=s_)
         if g == 0 or (g1 // 50) != (g // 50):
             prog.update("fly replay: learning from the market", int(b), n, day=str(datetime.fromtimestamp(float(ts_o[b - 1]), timezone.utc).date()),
                         updates=n_updates, pending=len(pending), drift=[round(float(x), 4) for x in bank.drift()], eta_s=(n - b) * (time.time() - t0) / max(b, 1))
@@ -470,7 +480,7 @@ def _verdict(ds, order, ts_o, live_from, scores, line_log, configs, bank, gov_co
 
     out = {"S": str(S), "selection_days": [str(sel_days[0]), str(sel_days[-1])] if sel_days else None, "evaluation_days": [str(ev_days[0]), str(ev_days[-1])] if ev_days else None,
            "strategies": names, "per_strategy": per_strategy, "configs": per_strategy[names[0]]["configs"],
-           "bootstrap": {k: boot.get(k) for k in ("lines", "calibration", "diagnostics", "gates_ok", "gate_failures")}, "data": fly_selector.FLY_VERSION,
+           "bootstrap": {k: boot.get(k) for k in ("lines", "calibration", "diagnostics", "gates_ok", "gate_failures")}, "data": fly_selector.verdict_version(),
            "secs": secs, "finished_at": datetime.now(timezone.utc).isoformat(), "learning": _learning_series(learn or {})}
     ev0, rnd0 = judge([0] * len(names))
     out["frozen"] = {**ev0["pooled"], "random": rnd0}
@@ -568,7 +578,7 @@ def verdict() -> dict | None:
     with transaction() as conn:
         r = conn.execute("SELECT value FROM ui_settings WHERE key = %s", (KEY,)).fetchone()
     v = (r["value"] if isinstance(r["value"], dict) else json.loads(r["value"] or "{}")) if r else None
-    return v if v and v.get("data") == fly_selector.FLY_VERSION else None
+    return v if v and v.get("data") == fly_selector.verdict_version() else None
 
 
 def main(days: int | None = None, start_day: int = START_DAY, stop_event: threading.Event | None = None, only_chains: tuple | None = None) -> dict:
