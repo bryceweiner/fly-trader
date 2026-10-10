@@ -187,6 +187,12 @@ class PlasticBank:
         m = torch.tanh(u)
         return (y_dn[None] + (((m - self.mu) / self.sigma) * self._read(s, len(y_dn))) @ self.c) / self.scale, m
 
+    def head_for(self, target: torch.Tensor, u0: torch.Tensor, s=None) -> torch.Tensor:
+        """The head output under which the frozen score (D = 0) is exactly ``target`` (net-return units) [B]: with it,
+        ``predict`` is ``target`` plus the plastic change of the MBON readout, and ``update`` learns the error of that
+        sum -- the fly that scores as its teacher plus a learned correction (config.FLY_SCORE = teacher)."""
+        return target * self.scale - (((torch.tanh(u0) - self.mu) / self.sigma) * self._read(s, len(target))) @ self.c
+
     def frozen(self, y_dn: torch.Tensor, u0: torch.Tensor, s=None) -> torch.Tensor:
         """The shadow: the bootstrap fly's score (D = 0) [B]."""
         return (y_dn + (((torch.tanh(u0) - self.mu) / self.sigma) * self._read(s, len(y_dn))) @ self.c) / self.scale

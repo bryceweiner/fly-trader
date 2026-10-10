@@ -13,6 +13,14 @@ from tests.test_fly_distill import _graph, _market_ds
 
 
 @pytest.fixture(autouse=True)
+def _own_scoring(monkeypatch):
+    """These synthetic teachers have no strategy stack: the fly scores with its own distilled head (FLY_SCORE=own);
+    tests/test_fly_residual.py covers the teacher-scoring fly."""
+    from fly_trader import config
+    monkeypatch.setattr(config, "FLY_SCORE", "own")
+
+
+@pytest.fixture(autouse=True)
 def quiet(monkeypatch):
     monkeypatch.setattr(fly_selector.prog, "update", lambda *a, **k: None)
     monkeypatch.setattr(fly_replay.prog, "update", lambda *a, **k: None)

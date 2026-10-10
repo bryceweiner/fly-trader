@@ -11,6 +11,14 @@ from fly_trader.train import decisions, fly_replay, fly_selector, strategies
 from tests.test_fly_distill import _graph, _market_ds
 
 
+@pytest.fixture(autouse=True)
+def _own_scoring(monkeypatch):
+    """The synthetic teachers here have no strategy stack: the fly scores with its own head (tests/test_fly_residual.py
+    covers the teacher-scoring fly)."""
+    from fly_trader import config
+    monkeypatch.setattr(config, "FLY_SCORE", "own")
+
+
 def test_unit_bearing_trigger_is_exactly_rescaled_on_rh_rows(monkeypatch):
     monkeypatch.setattr(config, "RH_ETH_PER_SOL", 0.05)
     cols = ["log_org_vol_15m", "chain_rh"]

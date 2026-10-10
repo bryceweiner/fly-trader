@@ -122,6 +122,11 @@ FLY_SIZING = env_str("FLY_SIZING", "kelly")
 # only drop a teacher trade, never add one (2026-10-08: ungated, the fly bought rows the selector rejected and lost).
 FLY_TEACHER_GATE = env_bool("FLY_TEACHER_GATE", True)
 FLY_LEARNED_VETO = env_float("FLY_LEARNED_VETO", 0.02)
+# How the fly scores a row. teacher: its teacher's own score plus what its mushroom body has learned (the plastic change of
+# its KC->MBON synapses, zero at bootstrap), so it starts exactly as the selector and its learning only corrects the
+# selector. own: its distilled copy of the selector (until 2026-10-11): that copy ranked the selector's top 1 % of
+# candidates only ~0.6-correlated, so its own judgement at the line was half noise (fly #157 and #251 alike).
+FLY_SCORE = env_str("FLY_SCORE", "teacher")
 DEVICE = env_str("DEVICE", "auto")          # auto (CUDA, else MPS, else CPU) | cpu | cuda | cuda:N | mps  — brain/device.py
 NT_SIGN_MODE = env_str("NT_SIGN_MODE", "shiu")  # shiu | flybrain
 CELL_TYPES_SOURCE = env_str("CELL_TYPES_SOURCE", "annotations")  # annotations | flybrain
