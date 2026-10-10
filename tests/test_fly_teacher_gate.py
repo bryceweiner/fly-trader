@@ -51,3 +51,16 @@ def test_the_replay_judges_the_same_gated_fly(monkeypatch):
     assert ok.tolist() == [True, False, False, False, False]      # the teacher's row below the fly's line: taken; the fly's best rows the teacher rejects: not;
     #                                                                 a learned veto (0.05 < 0.08 - 0.02): dropped; outside the judged half: not
     assert fly_replay._gated_ok(ds, order, None, np.zeros((2, 1, n)), None, 1, 0, Sf, Lf, mask_pos, None, None, None, 0.1).tolist() == (Sf >= Lf).tolist()   # no gate: its line
+
+
+def test_without_its_teacher_the_gated_fly_enters_nothing():
+    d = fly_session.no_teacher(4)
+    assert not d["allow"].any() and all(r.startswith("fail closed") for r in d["reason"]) and np.isinf(d["threshold"]).all()
+
+
+def test_a_release_keeps_the_fly_pointing_at_its_teacher():
+    from fly_trader.ops.release import remap_teacher
+    note = {"teacher_snapshot": 154, "lines": {"ev": 0.16}}
+    assert remap_teacher(note, {154: 1, 157: 2}) == {"teacher_snapshot": 1, "lines": {"ev": 0.16}}   # the shipped selector's id here
+    assert remap_teacher({"teacher_snapshot": 1}, {154: 1, 157: 2}) is None                          # already remapped (a re-applied release)
+    assert remap_teacher({"lines": {}}, {154: 1}) is None and remap_teacher({"teacher_snapshot": 154}, {154: 154}) is None
