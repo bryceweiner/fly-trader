@@ -4,3 +4,5 @@
 #
 # One line per key: <principal> namespaces="fly-trader-release" <public key>   (principals: bryce, bryce-recovery)
 # docs/vault/RUNBOOK.md section 0 makes these keys; tools/publish_release.py refuses to publish unless its key is here.
+bryce namespaces="fly-trader-release" ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBOX93IUOXvObMvOyCzT4CYwqL//jJKbjOCm5ZHqfsGE3MpS6B/MeovW+XSjk1vXL0gUfS3v3cMaiIPs++LASFeg=
+bryce-recovery namespaces="fly-trader-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILR8F0AAO/jveVruQofn9rvzqoWf8KD/F4XzhRN89Jlq
