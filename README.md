@@ -1,11 +1,11 @@
 # fly-trader — distribution
 
-**A fruit-fly connectome that trades Solana memecoins with your money.**
+**A fruit-fly connectome that trades memecoins with your money: on Solana, and on Robinhood Chain if you turn it on.**
 
 > ## ⚠️ Read this first
 >
-> This software signs real transactions from a wallet you fund. It buys tokens that graduated from pump.fun, holds them
-> for about two hours, and sells. **It can lose everything in that wallet, quickly.** The model was trained on a few
+> This software signs real transactions from a wallet you fund. It buys tokens that graduated from pump.fun (and, if
+> you turn Robinhood Chain on, from Pons), holds them for two to four hours, and sells. **It can lose everything in that wallet, quickly.** The model was trained on a few
 > months of data; the market it trades is adversarial and changes. Nothing here is a claim of profit, and nothing here is
 > financial advice. Run it only with money you can lose entirely, on a wallet used for nothing else. MIT licence — no
 > warranty of any kind. See [LICENSE](LICENSE).
@@ -18,10 +18,12 @@ connectome they run on. The training pipeline lives on [`master`](https://github
 - Every minute it scores every PumpSwap token that graduated from pump.fun at least six hours ago, from live 1-minute
   candles (a token needs that much history before its features mean anything).
 - The fly — the FlyWire *Drosophila* central brain (41,756 neurons) as a rate network on its real signed synapses —
-  predicts each token's net return over the next 240 minutes. It was taught by a gradient-boosted selector; it then keeps
-  learning from what its own trades earn, through plasticity at its mushroom body's KC→MBON synapses.
-- It buys when the predicted return clears its own buy line, sizes the position from measured certainty (a quarter
-  of the growth-optimal bet, capped), holds 240 minutes, sells.
+  starts as the gradient-boosted selector that taught it: it scores every token with the selector's own prediction of
+  its net return. Its mushroom body's KC→MBON synapses then learn, from what the trades earn, a correction to that
+  prediction, and can veto a selector buy they have learned to distrust.
+- It buys only what the selector buys (the selector's strategy, buy line and filters), sizes the position exactly as the
+  selector does (a quarter of the growth-optimal bet for its score band, capped), holds two to four hours (the
+  strategy's hold), sells.
 - **Every transaction is checked before it is signed** (`fly_trader/signer`): swaps go only through Jupiter's own
   routes, each one is simulated first and refused if it would spend more than ordered, deliver the token anywhere but
   your wallet, touch another holding, or return far less value than it costs; buys are capped per trade, per day and per
@@ -45,6 +47,13 @@ connectome they run on. The training pipeline lives on [`master`](https://github
 - Any 64-bit CPU: the fly scores about as fast on 16 CPU threads as on a GPU (its forward pass is a memory-bound
   scatter over a million synapses). An NVIDIA GPU is used when you start it with the CUDA override (see below). Apple
   GPUs are not reachable from inside Docker.
+
+> ### ⚠️ Robinhood Chain needs an Envio HyperSync API token
+>
+> Robinhood Chain is off by default. To trade it, create a token in the [Envio dashboard](https://envio.dev/app/api-tokens)
+> (personal accounts get one free), put it in `.env` as `ENVIO_API_TOKEN`, and set `RH_ENABLED=1`. Its feed reads the
+> chain's logs from [Envio HyperSync](https://envio.dev/pricing/hypersync); the public Robinhood Chain RPC is far too slow
+> to index its history. Without a token, leave Robinhood Chain off: Solana trades either way.
 
 ## Start trading
 
