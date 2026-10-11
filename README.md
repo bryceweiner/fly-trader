@@ -1,9 +1,9 @@
 # fly-trader
 
-**A fruit-fly connectome that trades Solana memecoins.**
+**A fruit-fly connectome that trades memecoins on Solana and Robinhood Chain, and Kalshi prediction markets.**
 Website: [fly-trader.app](https://fly-trader.app) · Token: $FLY (coming soon) · X community: coming soon
 
-fly-trader trains the central brain of the [FlyWire](https://flywire.ai) adult *Drosophila* connectome (41,756 neurons, 1.04 M synapses; FAFB v783) to trade PumpSwap tokens that graduated from [pump.fun](https://pump.fun). A gradient-boosted selector learns which tokens to buy from 1-minute market data at real trading costs; the fly is then trained to make the same calls through its own wiring. Every decision is journaled to Postgres.
+fly-trader trains the central brain of the [FlyWire](https://flywire.ai) adult *Drosophila* connectome (41,756 neurons, 1.04 M synapses; FAFB v783) to trade memecoins once they graduate: PumpSwap tokens from [pump.fun](https://pump.fun) on Solana, and Uniswap v4 tokens from Pons on Robinhood Chain. A gradient-boosted selector learns which tokens to buy from 1-minute market data at real trading costs, on both chains' rows together. The fly starts as that selector: it scores every token with the selector's own prediction and buys only what the selector buys. Its mushroom body then learns, from what those trades earn, where the selector is wrong. A second trading type trades [Kalshi](https://kalshi.com) prediction markets with its own fly. Every decision is journaled to Postgres.
 
 It is an experiment. No performance is claimed. The fly trades a paper book; once it has earned the selector's seat (the handover) and signing is allowed (`LIVE_ENABLED=1` and the live prerequisites), its decisions also trade the bot wallet. Live execution is default-deny.
 
@@ -20,17 +20,18 @@ Jupiter Tokens v2 ─────▶ token stats (history for future inputs)
 | Piece | Where | What |
 |---|---|---|
 | Market data | `fly_trader/ingest/replay_pull.py`, `pumpstream.py` | Every PumpSwap trade of pump.fun tokens, from the free hourly archive (training) and the live stream (trading), aggregated to the same 1-minute candles |
+| Robinhood Chain | `fly_trader/rh` | Pons launches that graduated into Uniswap v4 pools: its own indexer on Envio HyperSync (the official RPC when HyperSync fails), the quote assets' ETH prices and the same 1-minute rows, in ETH; its own books, bankroll and circuit; live swaps through KyberSwap with a Uniswap v4 fallback |
 | Features | `fly_trader/market/features.py`, `train/mature.py` | One engine for training and trading: returns, volatility, order flow, volume, liquidity, trade counts, age, drawdowns, launch facts and creator history |
 | Costs | `fly_trader/market/exit_cost.py` | Measured, not assumed: the PumpSwap pool fee by market cap (1.25 % → 0.30 %), Jupiter's 10 bps, the network fee, and constant-product price impact |
 | Selector | `fly_trader/train/selector.py`, `decisions.py` | Gradient-boosted model of each minute's net return over the strategy's hold. Walk-forward over the whole archive; the buy line is chosen on the first half of the held-out days and judged on the second; it trades only if that half made money after costs and beat random picks |
-| Fly | `fly_trader/train/fly_selector.py`, `brain/connectome.py` | The FlyWire central brain as a rate network on its real, signed synapses: features enter the sensory neurons, a decoder reads the descending neurons; trained to reproduce the selector's predictions, then traded identically |
+| Fly | `fly_trader/train/fly_selector.py`, `brain/connectome.py`, `brain/plastic.py` | The FlyWire central brain as a rate network on its real, signed synapses: features enter the sensory neurons, and the mushroom body's KC→MBON synapses stay plastic. It scores each token as its selector does plus the correction those synapses learn from realized returns (zero at the start), buys only what the selector buys and sizes as it does; its learning can veto a selector buy, never add one |
 | Sizing | `fly_trader/agent/sizing.py` | Position size from the model's measured certainty: a fraction of the growth-optimal bet for its score band, capped by the bankroll and the pool's depth |
 | Pipeline | `fly_trader/train/pipeline.py` | Every 7 days (or on request): retrain the selector, then the fly from it; the trading engine switches models without a restart. After the handover the weekly schedule stops; training runs only on request |
 | Trading engine | `fly_trader/agent/selector_session.py`, `fly_session.py` | Scores every eligible token once a minute, buys, holds for the model's hold time, sells; kill switch, pause and reserve rails |
 | Live mirror | `fly_trader/agent/fly_live.py`, `handover.py` | After the handover the fly's entries also trade the wallet; kill switch, circuit breaker, a pause when live fills trail the paper book |
 | Signer | `fly_trader/signer` | The only code that signs. It simulates every swap and refuses one that would overspend, deliver elsewhere, touch another holding or return far less value; buys are capped per trade, per day and per minute; swaps go through Jupiter's Metis routes only. In-process here; on the vault server it is a separate container that alone holds the keys |
 | Model files | `fly_trader/train/model_io.py` | Fly checkpoints load weights-only and selectors are skops files: a model file cannot run code |
-| $FLY vault | `fly_trader/vault`, `web/`, `contracts/` | The hosted vault fly (only with `VAULT_ENABLED`): Squads treasury custody, weekly settlement, SOL claims ([docs/vault/SPEC.md](docs/vault/SPEC.md), [RUNBOOK.md](docs/vault/RUNBOOK.md)); its server files are on the `distribution` branch under `deploy/` |
+| $FLY vault | `fly_trader/vault`, `web/`, `contracts/` | The hosted vault fly (only with `VAULT_ENABLED`): Squads treasury custody, weekly settlement, SOL and ETH claims ([docs/vault/SPEC.md](docs/vault/SPEC.md), [RUNBOOK.md](docs/vault/RUNBOOK.md)); its server files are on the `distribution` branch under `deploy/` |
 | Kalshi | `fly_trader/kalshi` | A second trading type: prediction markets (`KALSHI_*` in `.env.example`) |
 | Console | `fly_trader/ui/app.py` | One Streamlit app that runs every worker as an in-process thread and shows what the system is doing |
 
@@ -44,6 +45,15 @@ Jupiter Tokens v2 ─────▶ token stats (history for future inputs)
 - Python 3.13 and [uv](https://docs.astral.sh/uv/)
 - PostgreSQL 15+ (`brew install postgresql@17`)
 - A Jupiter API key (token stats; swaps); a Helius API key (RPC; also the signer's unless `SIGNER_RPC_URL` is set) and a funded wallet only for live execution
+- **An Envio HyperSync API token for Robinhood Chain** (see below)
+
+> [!IMPORTANT]
+> **Robinhood Chain needs an Envio HyperSync API token.** Robinhood Chain is on by default (`RH_ENABLED=1`), and its feed
+> reads the chain's logs from [Envio HyperSync](https://envio.dev/pricing/hypersync); the public Robinhood Chain RPC is
+> far too slow to index its history. Create a token in the [Envio dashboard](https://envio.dev/app/api-tokens) (personal
+> accounts get one free) and put it in `.env` as `ENVIO_API_TOKEN`. On a paid plan, raise `RH_HYPERSYNC_RPM` to its
+> limit (Starter: 100). Without a token, set `RH_ENABLED=0`: Solana trades either way. Indexing the full history from
+> 2026-08-04 takes about 30 GB of disk.
 
 ## Install
 
@@ -109,6 +119,10 @@ Every knob is an environment variable read by `fly_trader/config.py`; `.env.exam
 | `DEVICE` | `auto` | where the fly runs: `auto` (CUDA if present, else MPS, else CPU), `cpu`, `cuda`, `cuda:1`, `mps`; a missing backend falls back to the CPU with a warning |
 | `DEVICE_MEMORY_GB` | measured | caps the memory batch sizes are derived from (a shared GPU, a container limit) |
 | `LIVE_ENABLED` | `0` | signing on mainnet |
+| `RH_ENABLED` | `1` | index Robinhood Chain and paper-trade it (needs `ENVIO_API_TOKEN`) |
+| `ENVIO_API_TOKEN` | — | Envio HyperSync token: Robinhood Chain's logs |
+| `RH_HYPERSYNC_RPM` | `40` | HyperSync queries a minute (the free tier's fair use; Starter: 100) |
+| `RH_LIVE_ENABLED` | `0` | signing Robinhood Chain transactions |
 
 ## CLI reference
 
