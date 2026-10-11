@@ -1,0 +1,131 @@
+# Changelog
+
+Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
+ships signed releases built from this development line.
+
+## 2026-10-11: Robinhood Chain, and a fly that starts as its selector
+
+Not yet published to Hugging Face. Ships fly #157 (network) with selector #154, both trained on Solana and Robinhood
+Chain rows together.
+
+### Upgrading
+
+- **Docker installs from before October 2026 must rebuild once:** `git pull && docker compose up -d --build`. The old
+  image cannot verify signed releases, so it stops updating after this release. Data, the fly's learned state and
+  open positions are kept.
+- **Robinhood Chain is off by default** in the distribution. To turn it on, set `RH_ENABLED=1` and `ENVIO_API_TOKEN` (an
+  Envio HyperSync token; the free tier works) in `.env`.
+  - Indexing the full history from 2026-08-04 takes about 30 GB.
+  - Setting `RH_START_DAY` about 40 days back is enough to trade.
+- **New settings:**
+  - `FLY_SCORE` (default `teacher`), `FLY_TEACHER_GATE` (default on), `FLY_LEARNED_VETO` (default 0.02) and `FLY_SIZING`
+    (default `kelly`).
+  - Robinhood Chain: `ENVIO_API_TOKEN`, `RH_*`, and optionally `QUICKNODE_RH_API_URL` for transactions.
+
+### The fly
+
+- **It scores as its selector plus what it has learned** (`FLY_SCORE=teacher`).
+  - On the first day its score equals the selector's exactly, verified live to 3e-8 on every row.
+  - Its learnable mushroom-body pathway (the plastic KC→MBON synapses) adds a correction, learned from realized returns,
+    that starts at zero.
+  - It therefore learns only where the selector is wrong.
+  - The earlier fly was a distilled copy of the selector, accurate overall but not at the buy line: it ranked the
+    selector's top 1 % of candidates only about 0.6-correlated.
+- **It buys only what the selector buys** (`FLY_TEACHER_GATE`).
+  - The selector's trigger, buy line, win filter, dump veto and fail-closed rules decide every row.
+  - The fly's learning can drop a selector trade (a learned veto: its score more than 0.02 below its starting score) but
+    can never add one.
+  - Ungated, the fly had bought rows the selector rejected; those rows averaged −25.9 % per trade.
+- **It sizes each buy exactly as the selector sizes it** (`FLY_SIZING=kelly`): the selector's score, buy line and Kelly
+  table for that row.
+- **It learns from the selector's trades,** live and in the replay, after a restart too. It no longer learns from rows
+  above its own buy line.
+- **It never trades without its teacher.** A fly whose selector cannot be loaded enters nothing. A release install now
+  points the fly at the shipped selector's new database id. Before that fix, the Docker boot test found a fresh install
+  running the fly ungated.
+- **Replay verdict** (2026-09-24 to 10-09, the fly against the selector itself):
+  - Solana +3.78 % per trade over 308 trades.
+  - Robinhood Chain +2.66 % over 1,477 trades (selector +2.63 %).
+  - Random picks lost 4.4–4.6 %.
+- **Smaller changes:**
+  - The fly calibrates on days its teacher never saw.
+  - A NaN mean can no longer pass the deploy gate.
+  - A second chain's teacher gets 28 days of its own data before the replay starts.
+  - `fly-replay --chains` re-judges one chain and keeps the others' verdicts.
+
+### Robinhood Chain (new)
+
+- **Pons memecoins traded beside pump.fun.** It trades tokens launched on Pons V2 after they graduate into Uniswap v4 pools
+  with the Pons hook.
+  - Each chain has its own books in its own unit (Robinhood Chain in ETH), with its own bankroll, kill switch, handover
+    and verdict.
+  - One selector and one fly cover both chains. A chain trades only if its own replay verdict passed.
+- **Its own indexer.** It reads launches, graduations, swaps, the base assets' prices and 1-minute rows.
+  - Logs come from Envio HyperSync, in one query per pass.
+  - Minutes land about 15–25 s after they close (they took 35–95 s at first).
+  - If HyperSync fails, the official RPC carries the feed until it recovers.
+  - RH minutes up to 240 s old are still traded (`RH_TRADE_LAG_S`).
+- **Live trading** (`RH_LIVE_ENABLED=0` by default):
+  - Swaps route through KyberSwap, with a Uniswap v4 fallback.
+  - One transaction is in flight at a time, booked from measured balances.
+  - It recovers after a crash and is reconciled against the chain.
+  - It has its own circuit breaker (circuit 3).
+  - `fly-trader rh-smoke` runs a tiny mainnet round trip.
+  - A QuickNode endpoint (`QUICKNODE_RH_API_URL`), if set, carries transactions. Its free plan caps log queries at 5
+    blocks, so logs stay on HyperSync.
+- **Costs:** the Pons hook fee and creator tax (0.99 % per side at the median), price impact and gas.
+- **Console:**
+  - A chain picker switches the Overview and Trades pages.
+  - A Robinhood Chain page shows the indexer, quote-asset prices and the ETH wallet.
+  - Safety & wallet shows both chains' bot wallets in USD and withdraws only to your own wallets.
+
+### $FLY vault
+
+- Robinhood Chain profit is paid to lockers in ETH, beside the SOL pot.
+- **Custody:** a Squads treasury with spending limits and a key-isolated signer container. Claims are paid from a
+  separate payout wallet, and code releases are delayed.
+- **Nothing published helps trade ahead of the fly.** The trading wallet's address, open positions and settlement
+  timing are not shown.
+- **Audits:** red-team tests, mutation testing, Echidna and Halmos proofs.
+  - Fixed: a claim double-pay on resume.
+  - Added: Kyber calldata and fee checks, and relay griefing limits.
+
+### Docker distribution
+
+- Runs the development line's code again, merged instead of hand-ported (it had fallen about 35 commits behind).
+- **Signed releases only.**
+  - The container installs a release only if its manifest is signed by a key in `release/allowed_signers`, its number
+    is higher than the installed one, and every file matches its hash.
+  - Releases carry no `.git*` file and no model they do not name.
+  - Startup removes model files an earlier release left behind.
+- **Models are accepted whether or not Robinhood Chain is on.** Before release, an install with RH off would have
+  rejected the combined models and crash-looped at boot.
+- The Robinhood Chain reference table ships in the seed.
+- Kalshi ships dormant: no worker starts, and its pages appear only once `KALSHI_API_KEY_ID` is set.
+
+### Kalshi prediction markets (development line)
+
+- Under development, not traded in the distribution. Covers:
+  - an outcome-blind event corpus
+  - a selector judged by a weekly sign test
+  - maker and taker arms
+  - a visual fly
+
+### Fixes
+
+- **Schema changes no longer deadlock live workers.** An unchanged schema is skipped, and a changed one waits at most
+  5 s for a lock, then retries.
+- **The RH paper books had made no trades.** A day's wallet-skill table did not exist yet when its minutes were scored.
+  Tables are now written ahead of their day, and the stream falls back to the newest one.
+- **HyperSync could stall for 76 s.** A dead server address hung new connections; connections now time out in 5 s and
+  are kept alive.
+- **The RH price scan ran about 270 queries per pass.** It now reads every price cursor at once.
+
+## 2026-09-24: Fly #107 taught by selector #100
+
+- The selector was retrained on real fees, and the fly was bootstrapped from it.
+- The container keeps itself current from Hugging Face.
+
+## 2026-09-22: First distribution
+
+- Fire-and-forget trading in Docker, with the fly, its teacher selector and their connectome.
