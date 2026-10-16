@@ -137,11 +137,17 @@ class HttpSolanaRpc:
 
     # ---- generic ----
     def call(self, method: str, params: list | None = None):
+        if method == "sendTransaction":
+            from ..netguard import refuse_broadcast
+            refuse_broadcast(self._url, "a Solana transaction")       # never from a test run (fly_trader/netguard.py)
         payload = {"jsonrpc": "2.0", "id": self._next_id(), "method": method, "params": params or []}
         return self._post(payload, method, _request_summary(method, params))
 
     def batch(self, calls: list[tuple[str, list | None]]) -> list:
         """Send several calls in one HTTP request; results in call order. Raises on the first error."""
+        if any(m == "sendTransaction" for m, _ in calls):
+            from ..netguard import refuse_broadcast
+            refuse_broadcast(self._url, "a Solana transaction")       # never from a test run (fly_trader/netguard.py)
         if not calls:
             return []
         payload = [{"jsonrpc": "2.0", "id": self._next_id(), "method": m, "params": p or []} for m, p in calls]
