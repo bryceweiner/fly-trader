@@ -127,7 +127,7 @@ FLY_LEARNED_VETO = env_float("FLY_LEARNED_VETO", 0.02)
 # selector. own: its distilled copy of the selector (until 2026-10-11): that copy ranked the selector's top 1 % of
 # candidates only ~0.6-correlated, so its own judgement at the line was half noise (fly #157 and #251 alike).
 FLY_SCORE = env_str("FLY_SCORE", "teacher")
-DEVICE = env_str("DEVICE", "auto")          # auto (CUDA, else MPS, else CPU) | cpu | cuda | cuda:N | mps  — brain/device.py
+DEVICE = env_str("DEVICE", "auto")          # auto (CUDA/ROCm, else MPS, else CPU) | cpu | cuda[:N] | rocm[:N] | mps  — brain/device.py
 NT_SIGN_MODE = env_str("NT_SIGN_MODE", "shiu")  # shiu | flybrain
 CELL_TYPES_SOURCE = env_str("CELL_TYPES_SOURCE", "annotations")  # annotations | flybrain
 

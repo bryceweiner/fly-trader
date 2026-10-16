@@ -43,7 +43,7 @@ from pathlib import Path
 
 CONF = Path(os.environ.get("FLY_UPDATE_CONF", "/etc/fly/update.json"))
 PATH_RE = re.compile(r"^(?!.*\.\.)(?!/)[A-Za-z0-9_.\-/]+$")
-INFRA = ("Dockerfile", "docker-compose.yml", "docker-compose.cuda.yml", ".dockerignore", "docker/", "deploy/")
+INFRA = ("Dockerfile", "docker-compose.yml", "docker-compose.cuda.yml", "docker-compose.rocm.yml", ".dockerignore", "docker/", "deploy/")
 # what models/ and seed/ may hold: nothing a loader could execute (fly_trader/train/model_io.SAFE_SUFFIXES)
 MODEL_SUFFIXES = {".pt", ".skops", ".npz", ".json", ".bin", ".parquet", ".txt", ".sha256", ""}
 SEED_SUFFIXES = {".json", ".sql"}

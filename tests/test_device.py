@@ -1,7 +1,8 @@
-"""One resolver for CPU, CUDA and MPS (a named backend that is missing falls back with one warning), batch sizes from
+"""One resolver for CPU, CUDA, ROCm and MPS (a named backend that is missing falls back with one warning), batch sizes from
 free memory and the graph's size (reproducing the measured calibration), and the network's arithmetic agreeing with
 the CPU on whichever accelerator this machine has."""
 import logging
+import types
 
 import numpy as np
 import pytest
@@ -11,7 +12,7 @@ from fly_trader.brain import device, plastic
 from fly_trader.train.fly_selector import SCALE, FlyNet
 from tests.test_fly_plastic import _graph
 
-ACCELERATORS = [d for d in ("cuda", "mps") if device._available(d)]
+ACCELERATORS = [d for d in ("cuda", "mps") if device._available(d)]                    # cuda: an AMD GPU too, on a ROCm build
 
 
 def test_resolve_honours_the_name_and_falls_back_with_one_warning(caplog, monkeypatch):
@@ -26,9 +27,31 @@ def test_resolve_honours_the_name_and_falls_back_with_one_warning(caplog, monkey
         assert sum("not available" in r.message for r in caplog.records) == 2               # once per name: cached
     with caplog.at_level(logging.WARNING, logger="fly_trader.brain.device"):
         assert device.resolve("tpu").type == "cpu"
-    assert any("not cpu, cuda, mps or auto" in r.message for r in caplog.records)
+    assert any("not cpu, cuda, rocm, mps or auto" in r.message for r in caplog.records)
     monkeypatch.setattr(device.config, "DEVICE", "cpu"); device.reset()
     assert device.resolve().type == "cpu"                                                    # the default reads config.DEVICE
+    device.reset()
+
+
+def test_rocm_names_the_amd_gpu_a_rocm_build_drives_through_torch_cuda(caplog, monkeypatch):
+    monkeypatch.setattr(torch.version, "hip", "7.2.53211", raising=False)                  # a ROCm build with two AMD GPUs
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    device.reset()
+    assert device.resolve("rocm") == torch.device("cuda") and device.resolve("ROCm:1") == torch.device("cuda", 1)
+    assert device.resolve("hip:1") == torch.device("cuda", 1) and device.resolve("cuda:1") == torch.device("cuda", 1)
+    assert device.resolve("auto") == torch.device("cuda")
+    with caplog.at_level(logging.WARNING, logger="fly_trader.brain.device"):
+        assert device.resolve("rocm:5") == torch.device("cuda")
+    assert any("only 2 ROCm device(s) present; using rocm:0" in r.message for r in caplog.records)
+    gpu = types.SimpleNamespace(name="AMD Radeon 8060S Graphics", gcnArchName="gfx1151:xnack-", is_integrated=True,
+                                total_memory=96 * 2**30)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i: gpu)
+    assert device.describe(torch.device("cuda", 0)) == "rocm:0 (AMD Radeon 8060S Graphics, gfx1151, integrated, 96 GB)"
+    monkeypatch.setattr(torch.version, "hip", None); device.reset()                          # a CUDA build: rocm is missing
+    with caplog.at_level(logging.WARNING, logger="fly_trader.brain.device"):
+        assert device.resolve("rocm").type == "cpu" and device.resolve("cuda").type == "cuda"
+    assert any("not a ROCm build" in r.message and "rocm72" in r.message for r in caplog.records)
     device.reset()
 
 

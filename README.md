@@ -60,7 +60,7 @@ Jupiter Tokens v2 ─────▶ token stats (history for future inputs)
 ```bash
 git clone https://github.com/bryceweiner/fly-trader.git
 cd fly-trader
-uv sync --extra dev           # macOS: the Apple-GPU torch from PyPI. Elsewhere add one: --extra cpu | --extra cu126 | --extra cu130
+uv sync --extra dev           # macOS: the Apple-GPU torch from PyPI. Elsewhere add one: --extra cpu | cu126 | cu130 (NVIDIA) | rocm72 (AMD)
 cp .env.example .env          # paste your keys; leave LIVE_ENABLED=0
 createdb fly_trader
 uv run fly-trader init-db
@@ -127,7 +127,7 @@ Every knob is an environment variable read by `fly_trader/config.py`; `.env.exam
 | `HANDOVER_DAYS` / `HANDOVER_MIN_TRADES` / `HANDOVER_BEAT_SELECTOR` | `14` / `30` / `1` | when the fly takes the selector's seat and trades the wallet |
 | `SIGNER_RPC_URL` | Helius | the signer's own RPC; another provider is safer (it simulates every swap) |
 | `SIGNER_MAX_BUY_SOL` / `SIGNER_DAILY_BUY_SOL` / `SIGNER_SWAPS_PER_MIN` | `1` / `10` / `6` | the signer's limits |
-| `DEVICE` | `auto` | where the fly runs: `auto` (CUDA if present, else MPS, else CPU), `cpu`, `cuda`, `cuda:1`, `mps`; a missing backend falls back to the CPU with a warning |
+| `DEVICE` | `auto` | where the fly runs: `auto` (a CUDA or ROCm GPU if present, else MPS, else CPU), `cpu`, `cuda`, `cuda:1`, `rocm`, `rocm:1`, `mps`; a missing backend falls back to the CPU with a warning |
 | `DEVICE_MEMORY_GB` | measured | caps the memory batch sizes are derived from (a shared GPU, a container limit) |
 | `LIVE_ENABLED` | `0` | signing on mainnet |
 | `RH_ENABLED` | `1` | index Robinhood Chain and paper-trade it (needs `ENVIO_API_TOKEN`) |
