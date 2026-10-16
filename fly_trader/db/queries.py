@@ -2,11 +2,53 @@
 from __future__ import annotations
 
 import json
+import threading
+from contextlib import contextmanager
+
+import psycopg
 
 from .connection import connect
 
+_tls = threading.local()
+
+
+def reuse_connection_in_this_thread() -> None:
+    """Keep one autocommit connection per thread for ``q``/``q1`` (the console's topic threads read every second; a fresh
+    connection per query would churn ~30 connections a second). Other threads keep a connection per call."""
+    _tls.reuse = True
+
+
+def _reused():
+    conn = getattr(_tls, "conn", None)
+    if conn is None or conn.closed:
+        conn = _tls.conn = connect(autocommit=True)
+    return conn
+
+
+@contextmanager
+def read_connection():
+    """A connection for reads that need one (functions taking ``conn``): this thread's reused one when it keeps one."""
+    if getattr(_tls, "reuse", False):
+        yield _reused()
+        return
+    with connect() as conn:
+        yield conn
+
 
 def q(sql: str, params=None) -> list[dict]:
+    if getattr(_tls, "reuse", False):
+        for attempt in (0, 1):
+            try:
+                return [dict(r) for r in _reused().execute(sql, params).fetchall()]
+            except psycopg.OperationalError:
+                conn = getattr(_tls, "conn", None)
+                if attempt or (conn is not None and not conn.closed and not conn.broken):
+                    raise                             # a cancelled query, a deadlock, a lock timeout: the connection is fine
+                try:                                  # the server dropped the idle connection: open a new one once
+                    conn.close()
+                except Exception:
+                    pass
+                _tls.conn = None
     with connect() as conn:
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
 

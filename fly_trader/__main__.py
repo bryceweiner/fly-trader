@@ -1,5 +1,5 @@
 """fly-trader command line. Every command is a thin wrapper over library functions that the
-Streamlit console also calls. Always run as ``.venv/bin/python -m fly_trader <command>``."""
+operator console also calls. Always run as ``.venv/bin/python -m fly_trader <command>``."""
 from __future__ import annotations
 
 import argparse
@@ -77,7 +77,7 @@ def _cmd_reset_training(args):
 
 def _cmd_ui(args):
     from .ops.supervisor import run_console
-    run_console(port=args.port)
+    run_console(port=args.port, host=args.host, observe=args.observe)
 
 
 def _cmd_verify_fills(args):
@@ -340,7 +340,11 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("reset-circuit"); r.add_argument("--kill", action="store_true"); r.set_defaults(fn=_cmd_reset_circuit)
     sub.add_parser("pause-entries").set_defaults(fn=_cmd_pause)
     sub.add_parser("resume-entries").set_defaults(fn=_cmd_resume)
-    u = sub.add_parser("ui"); u.add_argument("--port", type=int, default=8501); u.set_defaults(fn=_cmd_ui)
+    u = sub.add_parser("ui", help="the operator console: hosts the workers and serves the dashboard on 127.0.0.1:PORT")
+    u.add_argument("--port", type=int, default=8501)
+    u.add_argument("--host", default=None, help="address to bind (default CONSOLE_HOST, else 127.0.0.1; the container binds 0.0.0.0)")
+    u.add_argument("--observe", action="store_true", help="serve the dashboard without hosting workers (a preview next to a running console; controls are refused)")
+    u.set_defaults(fn=_cmd_ui)
     rt = sub.add_parser("reset-training"); rt.add_argument("--no-archive", action="store_true"); rt.set_defaults(fn=_cmd_reset_training)
     sub.add_parser("verify-fills").set_defaults(fn=_cmd_verify_fills)
     sub.add_parser("close-empty-atas").set_defaults(fn=_cmd_close_atas)

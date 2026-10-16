@@ -4,7 +4,6 @@ while live positions are open); the signed transaction recorded before broadcast
 flow, whichever path records its receipt, so the reconciler still matches the chain; a confirmed withdrawal re-bases its
 own kill switch only; the Safety page shows both wallets in USD and sends one withdrawal per dialog."""
 import base64
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -27,7 +26,6 @@ from fly_trader.rh.wallet import RhWallet
 
 LAM, WEI = config.LAMPORTS_PER_SOL, 10 ** 18
 SYSTEM = "11111111111111111111111111111111"
-UI = Path(__file__).resolve().parents[1] / "fly_trader" / "ui"
 
 
 # ---------------------------------------------------------------- Solana
@@ -283,43 +281,3 @@ def test_the_executors_recovery_books_a_pending_withdrawal_too(rh):
     rh.c.receipts.update(rh.c.hidden)
     RhExecutor(w, start=False)                                                             # recover() on start
     assert _flows() == [WEI // 10]
-
-
-# ---------------------------------------------------------------- the console page
-def _summary(chain, address, native, px):
-    return {"chain": chain, "unit": "SOL" if chain == "sol" else "ETH", "address": address, "native": native, "error": None, "n_open": 0,
-            "positions": 0.0, "marked_at": None, "price_usd": px, "price_at": None, "native_usd": native * px, "positions_usd": 0.0, "total_usd": native * px}
-
-
-def test_safety_page_shows_both_wallets_in_usd_and_sends_one_withdrawal_per_dialog(db_conn, monkeypatch):
-    import streamlit as st
-    from streamlit.testing.v1 import AppTest
-    from fly_trader.ops import wallets
-    st.cache_data.clear()
-    sol_addr, to = str(Keypair().pubkey()), str(Keypair().pubkey())
-    fake = {"sol": _summary("sol", sol_addr, 2.0, 100.0), "rh": _summary("rh", "0x" + "ab" * 20, 0.5, 2600.0)}
-    sent = []
-    monkeypatch.setattr(config, "RH_ENABLED", True); monkeypatch.setattr(config, "FUNDING_ADDRESSES", [])
-    monkeypatch.setattr(wallets, "summary", lambda chain: fake[chain])
-    monkeypatch.setattr(wallets, "address", lambda chain: fake[chain]["address"])
-    at = AppTest.from_file(str(UI / "app_pages" / "safety.py"), default_timeout=60).run()
-    assert not at.exception, [e.value for e in at.exception]
-    shown = {(m.label, m.value) for m in at.metric}
-    assert {("Balance", "$200.00"), ("Balance", "$1,300.00")} <= shown
-    assert at.button(key="sol_withdraw").disabled                                          # no FUNDING_ADDRESSES: nowhere to send
-    monkeypatch.setattr(config, "FUNDING_ADDRESSES", [to])
-    monkeypatch.setattr(wallets, "withdraw_blockers", lambda chain: [])
-    monkeypatch.setattr(wallets, "limits", lambda chain, dest: {"balance": 2 * LAM, "fee": 5_000, "keep": 0, "n_open": 0, "max": 2 * LAM - 5_000, "to_balance": LAM})
-    monkeypatch.setattr(wallets, "withdraw", lambda chain, amt, dest: sent.append((chain, amt, dest)) or {"status": "confirmed", "tx": "sig", "amount": amt, "to": dest})
-    at.run()
-    at.button(key="sol_withdraw").click().run()
-    assert not at.exception, [e.value for e in at.exception]
-    assert at.selectbox(key="sol_wd_to").options == [to] and at.button(key="sol_wd_go").disabled  # no amount yet
-    at.number_input(key="sol_wd_amt").set_value(0.5).run()
-    assert not at.button(key="sol_wd_go").disabled and at.button(key="sol_wd_go").label == "Withdraw 0.500000 SOL"
-    at.button(key="sol_wd_go").click().run()
-    assert not at.exception, [e.value for e in at.exception]
-    assert sent == [("sol", 0.5, to)] and any("Sent 0.500000 SOL" in s.value for s in at.success)
-    assert not [b for b in at.button if b.key == "sol_wd_go"]                              # the result replaces the form: no second send
-    at.button(key="sol_wd_close").click().run()
-    assert "withdraw_open" not in at.session_state and not [b for b in at.button if b.key == "sol_wd_close"]

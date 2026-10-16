@@ -13,3 +13,4 @@ __pycache__
 *.pyc
 .agents
 .claude
+console/node_modules

@@ -28,3 +28,63 @@ def db_conn():
     finally:
         conn.rollback()
         conn.close()
+
+
+class FakeSupervisor:
+    """The console's view of the Supervisor in tests: worker state you set, and every control call recorded."""
+
+    def __init__(self):
+        from fly_trader.ops.supervisor import WORKERS
+        self.alive_set: set[str] = set()
+        self.calls: list[tuple] = []
+        self.pid = os.getpid()
+        self.autostarted = True
+        self.workers = WORKERS
+
+    def status(self) -> dict:
+        return {n: {"alive": n in self.alive_set, "started_at": None, "stopped_at": None, "error": None, "stopping": False} for n in self.workers}
+
+    def alive(self, name: str) -> bool:
+        return name in self.alive_set
+
+    def external(self) -> dict:
+        return {}
+
+    def start(self, name: str, started_by: str = "console") -> bool:
+        self.calls.append(("start", name, started_by)); self.alive_set.add(name); return True
+
+    def request_stop(self, name: str, by: str = "console") -> bool:
+        self.calls.append(("request_stop", name)); return name in self.alive_set
+
+    def stop(self, name: str, grace_s: float = 90.0) -> bool:
+        self.calls.append(("stop", name)); self.alive_set.discard(name); return True
+
+    def log_tail(self, name: str, n: int = 60) -> str:
+        return ""
+
+
+@pytest.fixture
+def fake_sup(monkeypatch):
+    """Point the console (fly_trader.ui.runtime.sup) at a FakeSupervisor."""
+    from fly_trader.ui import runtime
+    s = FakeSupervisor()
+    monkeypatch.setattr(runtime, "sup", lambda: s)
+    return s
+
+
+@pytest.fixture
+def console(fake_sup):
+    """A TestClient on the console app (no workers hosted). ``console.act(name, body)`` POSTs an action with the
+    console's CSRF header; ``console.topic(name, **params)`` reads a topic."""
+    from fastapi.testclient import TestClient
+    from fly_trader.ui.server import create_app
+    import json as _json
+    from fly_trader.ui import runtime
+    hosted = runtime.HOSTS_WORKERS
+    app = create_app(hosts_workers=False)
+    with TestClient(app, base_url="http://localhost") as c:
+        c.act = lambda name, body=None: c.post(f"/api/action/{name}", json=body or {}, headers={"X-Fly-Console": "1"})
+        c.topic = lambda topic_name, **params: c.get(f"/api/topic/{topic_name}", params={"params": _json.dumps(params)} if params else None)
+        c.sup = fake_sup
+        yield c
+    runtime.HOSTS_WORKERS = hosted

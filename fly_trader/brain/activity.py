@@ -1,4 +1,4 @@
-"""The fly's network activity per trade minute, kept as files for the console's 3D view (``ui/brain3d``).
+"""The fly's network activity per trade minute, kept as files for the console's 3D view (``ui/api/brain.py``, ``console/src/brain``).
 
 ``agent/fly_session.py`` writes one file per scored minute: the mean activity over the rows it scored, one int8 per
 neuron (value / 127 = the rate after the last propagation step, in −1..1), named by the minute's UTC stamp so a sorted

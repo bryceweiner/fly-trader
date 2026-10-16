@@ -56,6 +56,7 @@ LABEL_LAG_S = 60.0
 ROLLBACK_PAUSE_S, ROLLBACK_LIMIT, ROLLBACK_WINDOW_S, ROLLBACK_MIN_AGE_S = 86400.0, 3, 7 * 86400.0, 86400.0
 SNAP_HOURLY_DAYS, SCORED_KEEP_DAYS = 7, 35
 COMMAND_KEY = "fly_command"
+COMMAND_MAX_AGE_S = 600.0          # an operator command older than this (queued while the engine was down) is dropped
 
 
 def send_command(cmd: str) -> None:
@@ -663,6 +664,13 @@ class FlyBook:
         v = r["value"] if isinstance(r["value"], dict) else json.loads(r["value"])
         conn.execute("DELETE FROM ui_settings WHERE key = %s", (COMMAND_KEY,))
         cmd = v.get("cmd")
+        try:
+            age = datetime.now(timezone.utc).timestamp() - datetime.fromisoformat(v["at"]).timestamp()
+        except (KeyError, TypeError, ValueError):
+            age = 0.0
+        if age > COMMAND_MAX_AGE_S:          # queued while the engine was down: an operator's click must not land days later
+            record_event("warning", "fly", f"ignored a stale operator command {cmd!r} ({age / 60:.0f} min old)")
+            return
         if cmd == "pause":
             self.learning_frozen = True; record_event("info", "fly", "learning paused by the operator")
         elif cmd == "resume":
