@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -63,11 +64,22 @@ def sh(*args, cwd=None, check=True, capture=True) -> str:
 
 
 def previous(repo: str) -> tuple[int, str | None]:
-    """(seq, sha256 of release.json) of the release currently on HF, or (0, None)."""
+    """(seq, sha256 of release.json) of the release currently on HF, or (0, None) when HF has none (404). Any other failure
+    stops the publish: treating an unreadable release as "none" would publish seq 1 again, which every server refuses."""
+    import ssl
     try:
-        raw = urllib.request.urlopen(f"https://huggingface.co/{repo}/resolve/main/release.json", timeout=30).read()
-    except Exception:
-        return 0, None
+        import certifi                       # python.org's Python on macOS ships without root certificates
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ctx = ssl.create_default_context()
+    try:
+        raw = urllib.request.urlopen(f"https://huggingface.co/{repo}/resolve/main/release.json", timeout=30, context=ctx).read()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return 0, None
+        raise SystemExit(f"cannot read the current release from Hugging Face: HTTP {e.code}")
+    except OSError as e:
+        raise SystemExit(f"cannot read the current release from Hugging Face: {e}")
     return int(json.loads(raw)["seq"]), hashlib.sha256(raw).hexdigest()
 
 
