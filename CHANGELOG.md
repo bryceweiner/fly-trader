@@ -19,6 +19,25 @@ The Streamlit console is replaced by a web dashboard served by the same single p
 - **New:** `fly-trader ui --observe --port 8599` serves the dashboard without hosting workers (a preview next to a running
   console; its controls are refused).
 
+### Live money
+
+- **The wallet can trade before the handover:** `LIVE_WITHOUT_HANDOVER=1` mirrors the fly's teacher-gated buys (the
+  selector's buys and sizes, less what the fly's learning vetoes) onto the wallet as soon as signing is allowed, on
+  Solana and Robinhood Chain, whoever holds the seat. The race still decides the seat. The default (0) keeps the old rule.
+- **`fly-trader reset-paper`:** zeroes the paper race books' stats when live funds arrive, so they restart from
+  `CAPITAL_SOL` / `RH_CAPITAL_ETH`. Their trades, fills, decisions and wealth marks are archived first. What the fly
+  learned, its race clock, the live books and Kalshi are kept.
+- **The console says live when it trades live:**
+  - Overview's narrative, headline numbers and wealth chart follow the live book.
+  - Trades opens on the live book.
+  - The Safety page's money rows say what the wallet does.
+  - The race card's "racing for" counts from the fly's own race clock, so a paper reset does not restart it.
+- **Fixed:** `tools/publish_release.py` read the current release over TLS without root certificates (python.org's macOS
+  Python) and counted the failure as "no release", so it would have published release 1 again. It now uses certifi and
+  stops on anything but a 404.
+- **Fixed:** a SIGTERM killed the worker threads mid-step: uvicorn re-raises the signal once the server stops. The
+  console now stops them in the app's shutdown and waits for them to flush.
+
 ### The console
 
 - **One process, as before.** `fly-trader ui` still starts the worker threads and stops them on exit; it now serves a React

@@ -27,6 +27,8 @@ type Summary = {
   pnl_spark: number[]
   dd_spark: number[]
   wealth_help: string
+  live: boolean
+  label: string
 }
 type Top = { mint: string; token: string; score: number }
 type Minute = {
@@ -51,7 +53,7 @@ type Minute = {
 type RaceBook = { book: string; title: string; pnl: number | null; n: number; daily: number[] }
 type Race = { hidden: boolean; unit: string; handover?: boolean; success?: string | null; caption?: string | null; metrics?: RaceBook[]; series?: Series[]; days?: string[] }
 type Position = { mint: string; token: string; strategy: string; held_min: number; exits_in_min: number; cost: number; ret: number | null }
-type Book = { unit: string; history: [string, number][]; positions: Position[] }
+type Book = { unit: string; history: [string, number][]; positions: Position[]; live?: boolean; book?: string; title?: string; sub?: string }
 
 /** Python's %g: significant digits, trailing zeros dropped, an exponent outside 1e-4..1e±digits. */
 function g(x: number | null | undefined, digits = 6): string {
@@ -82,7 +84,7 @@ function SummaryPanel() {
         return (
           <>
             <WidgetGrid>
-              <Widget label="Paper wealth" icon="wealth" value={amount(d.wealth, u)} help={d.wealth_help} spark={d.spark.length > 1 ? d.spark : null}
+              <Widget label={d.label} icon="wealth" value={amount(d.wealth, u)} color={d.live ? 'magenta' : null} help={d.wealth_help} spark={d.spark.length > 1 ? d.spark : null}
                 delta={d.wealth !== null ? `${signed(d.wealth - d.capital, 4)} ${u} since start` : null} />
               <Widget label="Realized P&L" icon="pnl" value={amount(d.pnl, u, 4, true)} help="Closed trades, after fees and price impact."
                 spark={d.pnl_spark.length > 1 ? d.pnl_spark : null} />
@@ -98,7 +100,7 @@ function SummaryPanel() {
                 <Card title="In plain words" icon="bx-message-square-detail" className="flex-fill"><Md text={d.narrative} /></Card>
               </div>
               <div className="col-12 col-xl-4 d-flex">
-                <Card title="Win rate" icon="target" sub="closed trades of the selector book that made money" className="flex-fill" bodyClass="pb-0">
+                <Card title="Win rate" icon="target" sub={d.live ? 'closed live trades that made money' : 'closed trades of the selector book that made money'} className="flex-fill" bodyClass="pb-0">
                   <RadialGauge value={winRate} label="winners" display={winRate === null ? '—' : `${Math.round(winRate * 100)}%`} height={210} />
                   <RowGroup items={[{ label: 'closed', value: int(d.closed) }, { label: 'winners', value: int(d.wins) }, { label: `realized ${u}`, value: num(d.pnl ?? 0, 3, true) }]} />
                 </Card>
@@ -198,7 +200,7 @@ function BookPanel() {
   return (
     <div className="row gx-4">
       <div className="col-12 col-xl-7 d-flex">
-        <Card title="Paper wealth" icon="wealth" sub="the selector book since it started" className="flex-fill">
+        <Card title={b.data?.title ?? 'Paper wealth'} icon="wealth" sub={b.data?.sub ?? 'the selector book since it started'} className="flex-fill">
           <Loaded state={b} height={260}>
             {(d) => d.history.length ? <LineChart series={[{ name: 'wealth', data: d.history }]} height={280} yFormat={(v) => `${v.toFixed(2)} ${d.unit}`} /> : <Caption>No marks yet.</Caption>}
           </Loaded>

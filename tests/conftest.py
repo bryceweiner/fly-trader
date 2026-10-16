@@ -5,6 +5,9 @@ import os
 os.environ["DATABASE_URL"] = "postgresql:///fly_trader_test"
 for _name in ("RH_RPC_URL_TX", "QUICKNODE_RH_API_URL", "QUICKNODE_RH_API_KEY"):   # no test reaches the real transaction endpoint
     os.environ[_name] = ""
+for _name in ("LIVE_ENABLED", "RH_LIVE_ENABLED", "KALSHI_LIVE_ENABLED", "LIVE_WITHOUT_HANDOVER"):   # nor runs with the operator's
+    os.environ[_name] = "0"                                                                   # live switches from .env
+os.environ["RH_CAPITAL_ETH"] = ""      # empty = the code's pinned default, not the operator's wallet balance (load_dotenv never overrides)
 
 import pytest  # noqa: E402
 

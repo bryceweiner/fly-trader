@@ -94,7 +94,12 @@ refused. A checkout with older `.joblib` selectors converts them once: `uv run f
 The trading engine trades the paper book as soon as a model qualifies. After the handover (`HANDOVER_*`) the fly's
 entries also trade the wallet when `LIVE_ENABLED=1` and the live prerequisites are met (`CAPITAL_SOL`,
 `MAX_POSITION_SOL`, `GAS_RESERVE_SOL`, a bot key, `JUPITER_API_KEY`, `HELIUS_API_KEY`, `SOLANA_CLUSTER=mainnet-beta`).
-Every transaction is signed by `fly_trader/signer` (in-process here), which checks and simulates it first:
+With `LIVE_WITHOUT_HANDOVER=1` the wallet trades as soon as signing is allowed, whoever holds the seat: the fly's
+teacher-gated buys (the selector's buys and sizes, less what its learning vetoes) are mirrored onto it, and the race goes
+on deciding the seat. When live funds arrive, `uv run fly-trader reset-paper` (engine stopped) zeroes the paper race
+books so they restart from `CAPITAL_SOL` / `RH_CAPITAL_ETH` (set those to the wallets' balances); what the fly learned
+and its race clock are kept. Every transaction is signed by `fly_trader/signer` (in-process here), which checks and
+simulates it first:
 
 ```bash
 uv run fly-trader wallet new              # appends BOT_PRIVATE_KEY to .env (refuses if the name is already there), prints the pubkey

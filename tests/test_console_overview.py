@@ -101,7 +101,11 @@ def test_narrative_says_what_the_streamlit_page_said(monkeypatch):
     paras = overview.narrative(_state(live_money=True, handover={"at": "x"}, training=True, train_status={"stage": "training", "step": 3, "total": 10})).split("\n\n")
     assert paras[0].endswith("Trades spend real SOL from the bot wallet.")
     assert paras[1].endswith(" **It trades because you pinned it** (Model page); unpin it to let a current model take over.")
-    assert paras[2].startswith("**The plastic fly** holds the seat: ") and paras[3] == "Training is running: training (3/10)."
+    assert paras[0].startswith("**Trading every minute.** The selector races the fly on paper with model **#154**")
+    assert paras[2].startswith("**The plastic fly** holds the seat and trades the bot wallet live; its paper book is the mirror.") and paras[3] == "Training is running: training (3/10)."
+    live = overview.narrative(_state(live_money=True)).split("\n\n")                   # live money without the handover (LIVE_WITHOUT_HANDOVER)
+    assert "The selector picks what the bot wallet trades, live, with model **#154**" in live[0] and "paper trading" not in live[0]
+    assert live[-1].startswith("**The plastic fly** trades the bot wallet live: it buys what the selector buys") and live[-1].endswith("races the selector for the seat.")
     rh = overview.narrative(_state(market=markets.RH, fly={}, trading_why="The trading engine is stopped.")).split("\n\n")
     assert "graduated Pons pool on Robinhood Chain (prices in ETH" in rh[0] and f"a pool of at least {markets.RH.min_resq():.3g} ETH" in rh[0]
     assert rh[-1] == "**The trading engine is stopped.** Start the trading engine on the Processes page to trade."

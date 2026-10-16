@@ -332,11 +332,23 @@ def _rows(rows) -> list[dict]:
     return [{"setting": s, "value": v, "meaning": m} for s, v, m in rows]
 
 
+def _money(live_on: bool, unit: str) -> tuple[str, str]:
+    """What the Money row says: live without waiting for the seat (LIVE_WITHOUT_HANDOVER), or paper until the handover."""
+    if live_on and config.LIVE_WITHOUT_HANDOVER:
+        return ("live: the wallet trades whoever holds the seat", f"The fly's teacher-gated buys (the selector's, less what its learning vetoes) trade the "
+                f"{unit} wallet now; the paper books keep running as mirrors and the race still decides the seat.")
+    return ("paper, then live once the fly holds the seat" if not live_on else "live once the fly holds the seat",
+            f"The race runs on paper books; after the handover the fly also trades the {unit} wallet, its paper book as the mirror.")
+
+
 def _sol_settings() -> list[dict]:
-    return _rows([("Money", "paper, then live once the fly holds the seat", "The race runs on paper books; after the handover the fly also trades the bot wallet, its paper book as the mirror."),
-                  ("LIVE_ENABLED", "1" if config.LIVE_ENABLED else "0", "Allows signing real transactions: the fly trades the bot wallet once it holds the selector's seat."),
+    mv, mm = _money(config.LIVE_ENABLED, "SOL")
+    return _rows([("Money", mv, mm),
+                  ("LIVE_ENABLED", "1" if config.LIVE_ENABLED else "0", "Allows signing real transactions" + (": the wallet trades now (LIVE_WITHOUT_HANDOVER=1)."
+                   if config.LIVE_WITHOUT_HANDOVER else ": the fly trades the bot wallet once it holds the selector's seat.")),
+                  ("LIVE_WITHOUT_HANDOVER", "1" if config.LIVE_WITHOUT_HANDOVER else "0", "1: live money trades whoever holds the seat; 0: only once the fly has won it."),
                   ("Cluster", config.SOLANA_CLUSTER, "Solana network for live orders."),
-                  ("Starting capital", f"{config.CAPITAL_SOL:g} SOL", "Paper books start here."),
+                  ("Starting capital", f"{config.CAPITAL_SOL:g} SOL", "Paper books start here (`fly-trader reset-paper` restarts them from it when live funds arrive)."),
                   ("Position sizing", f"{config.KELLY_FRACTION:g} × Kelly", "Each buy is sized from how certain the model is: this share of the growth-optimal bet for its score band."),
                   ("Largest position", f"{config.MAX_POSITION_FRACTION:.0%} of the bankroll", "Bankroll = wealth at cost minus the gas reserve."),
                   ("Pool share cap", f"{config.MAX_POOL_SHARE:.0%} of the pool", "Bounds the price impact of larger buys."),
@@ -348,11 +360,12 @@ def _sol_settings() -> list[dict]:
 
 def _rh_settings() -> list[dict]:
     missing = config.rh_live_prerequisites_missing()
-    return _rows([("Money", "paper; live mirror " + ("on" if not missing else "gated: " + ", ".join(missing)), "The RH race runs on paper books in ETH; after the RH handover the fly also trades the ETH wallet."),
+    mv, mm = _money(not missing and config.LIVE_ENABLED, "ETH")
+    return _rows([("Money", mv if not missing else "paper; live gated: " + ", ".join(missing), mm),
                   ("RH_LIVE_ENABLED", "1" if config.RH_LIVE_ENABLED else "0", "Allows signing real Robinhood Chain transactions (live_rh)."),
                   ("Chain", f"{config.RH_EXPECTED_CHAIN_ID}" + (" (testnet)" if config.RH_TESTNET else ""), "The guard refuses any other chain id."),
                   ("Bot address", config.RH_BOT_ADDRESS or "not set", "RH_BOT_PRIVATE_KEY must derive to it."),
-                  ("Starting capital", f"{config.RH_CAPITAL_ETH:g} ETH", "The USD value of 5 SOL at build time."),
+                  ("Starting capital", f"{config.RH_CAPITAL_ETH:g} ETH", "The RH paper books start here."),
                   ("Largest buy", f"{config.RH_LABEL_SIZE_ETH:g} ETH", "The label size (0.5 SOL in USD at build time): no RH buy is bigger."),
                   ("Smallest position", f"{config.RH_MIN_POSITION_ETH:g} ETH", "Smaller sized buys are skipped."),
                   ("Gas reserve", f"{config.RH_GAS_RESERVE_ETH:g} ETH", "Never spent on positions."),
