@@ -141,6 +141,9 @@ RESET_ON_START = env_bool("RESET_ON_START", True)  # wipe the paper book and its
 HANDOVER_DAYS = env_int("HANDOVER_DAYS", 14)                        # days of racing first; 0 = as soon as the trades are in
 HANDOVER_MIN_TRADES = env_int("HANDOVER_MIN_TRADES", 30)            # closed paper_fly trades required
 HANDOVER_BEAT_SELECTOR = env_bool("HANDOVER_BEAT_SELECTOR", True)   # and realized P&L at least the paper selector's over the window
+# Trade the wallet as soon as signing is allowed, without waiting for the handover: the fly's teacher-gated decisions (the
+# selector's buys and sizes, less what its learning vetoes) are mirrored onto the wallet whoever holds the seat.
+LIVE_WITHOUT_HANDOVER = env_bool("LIVE_WITHOUT_HANDOVER", False)
 
 
 def helius_http_url() -> str:

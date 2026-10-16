@@ -75,6 +75,19 @@ def _cmd_reset_training(args):
     print(json.dumps(reset_training_state(reason="cli", archive=not args.no_archive), indent=1))
 
 
+def _cmd_reset_paper(args):
+    """Zero the paper race books' stats (ops/reset.reset_paper_books), refused while a trading engine holds its lock."""
+    from .db.queries import q1
+    from .agent.runner import RUNNER_LOCK_KEY
+    held = q1("SELECT 1 AS held FROM pg_locks WHERE locktype = 'advisory' AND granted AND objsubid = 1 AND classid = %s::oid AND objid = %s::oid "
+              "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())", (RUNNER_LOCK_KEY >> 32, RUNNER_LOCK_KEY & 0xFFFFFFFF))
+    if held:
+        raise SystemExit("the trading engine is running: stop the console (or the runner) first")
+    from .ops.reset import reset_paper_books
+    chains = [c.strip() for c in args.chain.split(",") if c.strip()]
+    print(json.dumps(reset_paper_books(chains, reason=args.reason), indent=1, default=str))
+
+
 def _cmd_ui(args):
     from .ops.supervisor import run_console
     run_console(port=args.port, host=args.host, observe=args.observe)
@@ -345,6 +358,8 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--host", default=None, help="address to bind (default CONSOLE_HOST, else 127.0.0.1; the container binds 0.0.0.0)")
     u.add_argument("--observe", action="store_true", help="serve the dashboard without hosting workers (a preview next to a running console; controls are refused)")
     u.set_defaults(fn=_cmd_ui)
+    rp = sub.add_parser("reset-paper", help="zero the paper race books' stats (they restart from CAPITAL_SOL / RH_CAPITAL_ETH); the fly's learning is kept")
+    rp.add_argument("--chain", default="sol,rh"); rp.add_argument("--reason", default="live funds arrived"); rp.set_defaults(fn=_cmd_reset_paper)
     rt = sub.add_parser("reset-training"); rt.add_argument("--no-archive", action="store_true"); rt.set_defaults(fn=_cmd_reset_training)
     sub.add_parser("verify-fills").set_defaults(fn=_cmd_verify_fills)
     sub.add_parser("close-empty-atas").set_defaults(fn=_cmd_close_atas)

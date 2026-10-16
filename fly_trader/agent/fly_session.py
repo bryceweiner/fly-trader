@@ -373,7 +373,7 @@ class FlyBook:
                                             strategies=d["strategy"], tables=d["tables"], flat=config.FLY_SIZING == "flat",
                                             allow=d.get("allow"), reasons=d.get("reason"))
             out.update({k: v for k, v in st.items() if k != "entries"}); out["stage"] = "trading"
-            if self.live and handover.state(conn, self.chain) is not None:
+            if self.trades_live(conn):
                 out["live"] = self._live(ctx, st)
         else:
             out["stage"] = "learning (not trading this minute)" if ctx.trade else "catching up"
@@ -388,12 +388,18 @@ class FlyBook:
                 cur.executemany("UPDATE fly_scored SET label = %s, state = %s, resolved_at = now(), x = NULL WHERE ts = %s AND mint = %s AND strategy = %s", learned.pop("keys"))
         learned.pop("keys", None)
         out["checks"] = self.last_checks; out["updated_at"] = datetime.now(timezone.utc).isoformat()
+        out["race_started_at"] = self.race_started_at          # the console's "racing for N days" (the race outlives a paper reset)
         conn.execute("INSERT INTO ui_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
                      (self.status_key, json.dumps({**out, "chain": self.chain}, default=str)))
         return out
 
+    def trades_live(self, conn) -> bool:
+        """Mirror this minute on the wallet: the runner may sign, and the fly holds the seat or LIVE_WITHOUT_HANDOVER says
+        live money trades whoever holds it (the signing gates in ``_live`` still apply)."""
+        return bool(self.live) and (config.LIVE_WITHOUT_HANDOVER or handover.state(conn, self.chain) is not None)
+
     def _live(self, ctx, st: dict) -> dict:
-        """The fly holds the seat: mirror this minute on the bot wallet (agent/fly_live.py) while signing is allowed."""
+        """Mirror this minute on the bot wallet (agent/fly_live.py, rh/live.py) while signing is allowed."""
         if self.chain != "sol":
             from ..rh import live as rh_live                     # Robinhood Chain: the ETH wallet (rh/live.py)
             return rh_live.minute(self, ctx, st)

@@ -6,7 +6,7 @@ from ... import markets
 from ...db.queries import q, q1
 from ...ops.wallets import explorer
 from ..hub import TopicError, topic
-from ..state import labels, market_param
+from ..state import system_state, labels, market_param
 
 # The decision log's "Show" pills → the decision kinds each covers (the selector's, the fly's and the older generic kinds).
 KINDS = {"Bought": ("selector_enter", "fly_enter", "enter"), "Sold": ("selector_exit", "fly_exit", "exit"), "Not taken": ("blocked",)}
@@ -30,7 +30,8 @@ def books(params: dict) -> dict:
     mk = market_param(params)
     seen = [r["book"] for r in q("SELECT DISTINCT book FROM positions UNION SELECT DISTINCT book FROM fills ORDER BY 1")]
     out = list(mk.books) + [b for b in seen if b not in mk.books and markets.for_book(b) is mk]
-    return {"chain": mk.chain, "unit": mk.unit, "books": out, "default": mk.selector_book,
+    live = bool(system_state(mk)["live_money"])                  # while live money trades, the page opens on the live book
+    return {"chain": mk.chain, "unit": mk.unit, "books": out, "default": mk.live_book if live else mk.selector_book, "live": live,
             "help": f"{mk.selector_book} is the selector's paper book, {mk.fly_book} the fly's, {mk.live_book} the bot wallet; amounts in {mk.unit}."}
 
 

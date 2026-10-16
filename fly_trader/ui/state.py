@@ -268,7 +268,8 @@ def system_state(market: markets.MarketSpec | None = None) -> dict:
     else:
         from ..chain.cluster_guard import signing_allowed
         signing = signing_allowed()
-    live_money = bool(ho) and runner and fly.get("stage") == "trading" and signing      # the fly holds the seat and may sign (agent/fly_live.py, rh/live.py)
+    seat = bool(ho) or config.LIVE_WITHOUT_HANDOVER           # the fly holds the seat, or live money trades whoever holds it
+    live_money = seat and runner and fly.get("stage") == "trading" and signing      # and may sign (agent/fly_live.py, rh/live.py)
     return {"market": m, "workers": ws, "runner": runner, "trading": trading, "trading_why": why, "live_money": live_money,
             "fly": fly, "fly_at": fly_at, "handover": ho or None, "replay": rp or None,
             "model": loaded_model() if runner else None, "latest": latest_snapshot("selector"), "deployable": latest_snapshot("selector", deployable=True),

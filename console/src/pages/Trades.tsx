@@ -17,7 +17,7 @@ type Show = (typeof SHOW)[number]
 const ACTION_COLOR: Record<string, string> = { Bought: 'green', Sold: 'violet', 'Not taken': 'orange' }
 const DONUT = ['#ffffff', 'rgba(255,255,255,0.6)', 'rgba(255,255,255,0.35)', 'rgba(255,255,255,0.18)', '#ff2fb9', '#8b5cf6', '#b6ff3b', '#3d9bff']
 
-type Books = { chain: string; unit: string; books: string[]; default: string; help: string }
+type Books = { chain: string; unit: string; books: string[]; default: string; help: string; live?: boolean }
 type Summary = {
   chain: string; book: string; unit: string
   metrics: { n: number; pnl: number | null; avg_ret: number | null; wins: number; win_rate: number | null; open: number; open_cost: number }
@@ -59,8 +59,8 @@ export default function Trades() {
   const { chain, market } = useApp()
   const [rawView, setView] = useStored<View>('trades_view', 'Closed trades')
   const view: View = VIEWS.includes(rawView) ? rawView : 'Closed trades'
-  const [stored, setBook] = useStored<string>('trades_book', '')
   const b = useTopic<Books>('trades.books', { chain })
+  const [stored, setBook] = useStored<string>(b.data?.live ? 'trades_book:live' : 'trades_book', '')   // live money: a fresh default, the live book
   const books = b.data?.books ?? market?.books ?? []
   const fallback = b.data?.default ?? market?.selector_book ?? 'paper_selector'
   const book = books.includes(stored) ? stored : fallback       // the chain's selector book when the remembered one is another chain's

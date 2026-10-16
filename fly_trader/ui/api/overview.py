@@ -1,4 +1,4 @@
-"""Overview: what the system is doing in plain words, the paper book, this minute's scoring, the race between the selector
+"""Overview: what the system is doing in plain words, the book the money is in (live, else the selector's paper book), this minute's scoring, the race between the selector
 and the plastic fly, and the open positions. (The brain at the top of the page is ui/api/brain.py.)"""
 from __future__ import annotations
 
@@ -21,7 +21,9 @@ def narrative(s: dict) -> str:
         money = "No real money is at risk." if not s["live_money"] else f"Trades spend real {u} from the bot wallet."
         what = "graduated Pons pool on Robinhood Chain (prices in ETH, a non-ETH quote converted at the minute's base price)" if rh else "PumpSwap token"
         resq = f"{mk.min_resq():.3g}" if rh else mm.get("min_resq_sol", "—"); vol = f"{mk.min_vol_15m():.3g}" if rh else mm.get("min_vol_15m_sol", "—")
-        lines.append(f"**{s['trading_why']}** The selector is paper trading with model **#{m['id']}** (trained through {meta.get('trained_through', '—')}). "
+        who = ("The selector picks what the bot wallet trades, live," if s["live_money"] and not s["handover"]
+               else "The selector races the fly on paper" if s["live_money"] else "The selector is paper trading")
+        lines.append(f"**{s['trading_why']}** {who} with model **#{m['id']}** (trained through {meta.get('trained_through', '—')}). "
                      f"Every minute it predicts the net {meta.get('horizon_min', '—')}-minute return of each {what} that traded, at least {mm.get('min_age_h', '—')} hours "
                      f"past graduation, with a pool of at least {resq} {u} and {vol} {u} traded in the last 15 minutes, and buys those predicted to make at least "
                      f"**{pct(float(run.get('threshold') or meta.get('threshold') or 0), 1)}** — sized by how certain the "
@@ -32,8 +34,14 @@ def narrative(s: dict) -> str:
             lines[-1] += " **It trades because you pinned it** (Model page); unpin it to let a current model take over."
     fly = s["fly"]
     if fly.get("stage") and fly.get("stage") != "not trading":
-        lines.append("**The plastic fly** " + ("holds the seat" if s["handover"] else "races the selector on its own paper book")
-                     + f": it buys at a predicted {pct(fly.get('line'), 1)} and learns every minute from each scored token's realized return, two hours later.")
+        if s["live_money"]:
+            seat = ("holds the seat and trades the bot wallet live" if s["handover"] else
+                    "trades the bot wallet live: it buys what the selector buys and sizes it the same, unless its learning vetoes the row")
+            lines.append(f"**The plastic fly** {seat}; its paper book is the mirror. It learns every minute from each scored token's realized return, "
+                         "two hours later" + ("." if s["handover"] else ", and still races the selector for the seat."))
+        else:
+            lines.append("**The plastic fly** " + ("holds the seat" if s["handover"] else "races the selector on its own paper book")
+                         + f": it buys at a predicted {pct(fly.get('line'), 1)} and learns every minute from each scored token's realized return, two hours later.")
     else:
         lines.append(f"**{s['trading_why']}** Start the trading engine on the Processes page to trade.")
     if s["training"]:
@@ -70,9 +78,12 @@ def _series(rows: list[dict], books: list[str]) -> list[dict]:
 
 @topic("overview.summary", every=5)
 def summary(params: dict) -> dict:
-    """The narrative and the selector book's metrics: paper wealth, realized P&L, closed (wins), open, drawdown, with
-    sparklines (wealth and drawdown over the book's whole history, realized P&L cumulative over the last 180 trades)."""
-    mk = market_param(params); s = system_state(mk); BOOK = mk.selector_book; u = mk.unit; cap = mk.capital()
+    """The narrative and the money's metrics — the live book while live money trades, else the selector's paper book:
+    wealth, realized P&L, closed (wins), open, drawdown, with sparklines (wealth and drawdown over the book's whole
+    history, realized P&L cumulative over the last 180 trades)."""
+    mk = market_param(params); s = system_state(mk); live = bool(s["live_money"]); BOOK = mk.live_book if live else mk.selector_book; u = mk.unit
+    first = q1("SELECT wealth FROM wealth_marks WHERE book = %s ORDER BY ts LIMIT 1", (BOOK,)) if live else None
+    cap = float(first["wealth"]) if first and first.get("wealth") is not None else mk.capital()
     w = q1("SELECT wealth, exposure, n_open, drawdown FROM wealth_marks WHERE book = %s ORDER BY ts DESC LIMIT 1", (BOOK,)) or {}
     c = q1("SELECT count(*) AS n, sum(realized_sol) AS pnl, count(*) FILTER (WHERE realized_sol > 0) AS wins FROM positions WHERE book = %s AND status = 'closed'", (BOOK,)) or {}
     spark = [float(r["wealth"]) for r in marks([BOOK], points=180) if r["wealth"] is not None]      # the book since it started, thinned
@@ -85,8 +96,10 @@ def summary(params: dict) -> dict:
         base += r; pnl_spark.append(base)
     return {"market": market_info(mk), "narrative": narrative(s), "marked": bool(w), "wealth": w.get("wealth"), "exposure": w.get("exposure"),
             "n_open": int(w.get("n_open") or 0), "drawdown": w.get("drawdown"), "capital": cap, "closed": int(c.get("n") or 0), "pnl": c.get("pnl"),
-            "wins": int(c.get("wins") or 0), "spark": spark, "pnl_spark": pnl_spark, "dd_spark": dd_spark,
-            "wealth_help": f"Started at {cap:g} {u}; open positions valued net of exit costs."}
+            "wins": int(c.get("wins") or 0), "spark": spark, "pnl_spark": pnl_spark, "dd_spark": dd_spark, "live": live, "book": BOOK,
+            "label": "Live wealth" if live else "Paper wealth",
+            "wealth_help": (f"The bot wallet: {u} plus open positions net of exit costs; started at {cap:g} {u}." if live
+                            else f"Started at {cap:g} {u}; open positions valued net of exit costs.")}
 
 
 @topic("overview.minute", every=3)
@@ -118,7 +131,8 @@ def race(params: dict) -> dict:
                "AND closed_at >= %s GROUP BY 1, 2", (books, since)):
         if r["d"] in dates:
             daily[r["book"]][dates.index(r["d"])] = float(r["pnl"] or 0)
-    start = (q1("SELECT min(ts) AS t FROM wealth_marks WHERE book = %s", (mk.fly_book,)) or {}).get("t")
+    rs = fly.get("race_started_at")                          # the fly's own race clock (a paper reset does not restart the race)
+    start = datetime.fromtimestamp(float(rs), timezone.utc) if rs else (q1("SELECT min(ts) AS t FROM wealth_marks WHERE book = %s", (mk.fly_book,)) or {}).get("t")
     success = caption = None
     if ho:
         success = (f"The fly took the selector's seat {ago(ho.get('at'))}: {float(ho.get('fly_pnl_sol') or 0):+.4g} {u} vs {float(ho.get('selector_pnl_sol') or 0):+.4g} {u} "
@@ -128,7 +142,7 @@ def race(params: dict) -> dict:
         days = (datetime.now(timezone.utc) - start).total_seconds() / 86400 if start else 0.0
         caption = ("The fly takes the seat when its realized P&L over the last 14 days is at least the selector's, with at least 30 trades"
                    + (f" · racing for {days:.1f} days." if start else " · the race starts when the fly first trades."))
-    titles = ((mk.selector_book, "Selector · 14 days"), (mk.fly_book, "Fly · 14 days")) + (((mk.live_book, "Live · 14 days"),) if ho else ())
+    titles = ((mk.selector_book, "Selector · 14 days"), (mk.fly_book, "Fly · 14 days")) + (((mk.live_book, "Live · 14 days"),) if ho or s["live_money"] else ())
     return {"hidden": False, "unit": u, "handover": bool(ho), "success": success, "caption": caption,
             "metrics": [{"book": b, "title": t, "pnl": (pnl.get(b) or {}).get("pnl"), "n": int((pnl.get(b) or {}).get("n") or 0), "daily": daily[b]} for b, t in titles],
             "days": dates,
@@ -137,8 +151,9 @@ def race(params: dict) -> dict:
 
 @topic("overview.book", every=15)
 def book(params: dict) -> dict:
-    """The selector book: its whole wealth history and its open positions (held, exits in, cost, gross return)."""
-    mk = market_param(params); BOOK = mk.selector_book; u = mk.unit
+    """The money's book — live while live money trades, else the selector's paper book: its whole wealth history and
+    its open positions (held, exits in, cost, gross return)."""
+    mk = market_param(params); live = bool(system_state(mk)["live_money"]); BOOK = mk.live_book if live else mk.selector_book; u = mk.unit
     hist = _series(marks([BOOK]), [BOOK])
     rows = q("SELECT mint, opened_at, cost_sol, entry_price, last_mark_price, hold_s, strategy FROM positions WHERE book = %s AND status = 'open' ORDER BY opened_at", (BOOK,))
     out = []
@@ -150,4 +165,5 @@ def book(params: dict) -> dict:
             out.append({"mint": r["mint"], "token": names.get(r["mint"], r["mint"][:6]), "strategy": r["strategy"] or "—", "held_min": held,
                         "exits_in_min": max(0.0, (float(r["hold_s"]) / 60 if r["hold_s"] else hold) - held), "cost": float(r["cost_sol"]),
                         "ret": (float(r["last_mark_price"]) / float(r["entry_price"]) - 1) * 100 if r["entry_price"] and r["last_mark_price"] else None})
-    return {"unit": u, "history": hist[0]["data"] if hist else [], "positions": out}
+    return {"unit": u, "history": hist[0]["data"] if hist else [], "positions": out, "live": live, "book": BOOK,
+            "title": "Live wealth" if live else "Paper wealth", "sub": "the bot wallet since it started trading" if live else "the selector book since it started"}

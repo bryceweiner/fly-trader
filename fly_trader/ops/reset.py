@@ -12,11 +12,16 @@ re-arms it); wallet events, tokens, pools, market data, API logs, events, other 
 KC→MBON changes, scored minutes, calibrations, rollbacks, snapshots and its recorded network activity are archived and
 cleared; the bootstrap is kept). ``reset_training_state`` never touches the activity files either.
 
+``reset_paper_books`` zeroes the paper race books' stats when live money arrives (`fly-trader reset-paper`): their
+trades, fills, decisions, wealth marks and halts are archived and cleared so they start again from the wallet's funds
+(CAPITAL_SOL / RH_CAPITAL_ETH) — what the fly has learned, its race clock (in its state file), the live books and every
+other book are kept.
 ``reset_training_stats`` is the training-side counterpart, run at the start of every training run: the previous runs'
 walk-forward / iteration events and the console's training status are archived and cleared (models are kept).
 """
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 from datetime import datetime, timezone
@@ -77,6 +82,31 @@ def _wipe(conn, plan: list[tuple[str, str]], out_dir: Path | None) -> dict[str, 
     for t, where in plan:
         conn.execute(f"DELETE FROM {t} {where}")
     return counts
+
+
+PAPER_RACE_BOOKS = {"sol": ("paper_selector", "paper_fly"), "rh": ("paper_rh_selector", "paper_rh_fly")}
+
+
+def reset_paper_books(chains=("sol", "rh"), reason: str = "live funds arrived", archive: bool = True) -> dict:
+    """Archive and clear the paper race books of ``chains``: positions (open ones too), orders, fills, wealth marks, their
+    decisions (never one a live book references) and their halts. Run with the engine stopped; a paper book's cash is
+    derived from its capital and these rows (execution/ledger.py), so it restarts from the configured capital."""
+    books = [b for c in chains for b in PAPER_RACE_BOOKS[c]]
+    bl = _sql_list(books)
+    out_dir = config.PG_ARCHIVE_DIR / f"reset_paper_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    linked = (f"SELECT decision_id FROM orders WHERE book IN {bl} AND decision_id IS NOT NULL "
+              f"UNION SELECT entry_decision_id FROM positions WHERE book IN {bl} AND entry_decision_id IS NOT NULL "
+              f"UNION SELECT exit_decision_id FROM positions WHERE book IN {bl} AND exit_decision_id IS NOT NULL")
+    plan = [("decisions", f"WHERE (id IN ({linked}) OR detail->>'book' IN {bl} OR book_targets && ARRAY{books}::text[]) AND id NOT IN ({_LIVE_DECISIONS})"),
+            *[(t, f"WHERE book IN {bl}") for t in BOOK_TABLES],
+            ("wealth_marks", f"WHERE book IN {bl}"),
+            ("book_state", f"WHERE book IN {bl}")]
+    with transaction() as conn:
+        counts = _wipe(conn, plan, out_dir if archive else None)
+        conn.execute("INSERT INTO circuit_events (kind, detail) VALUES ('paper_reset', %s)", (json.dumps({"reason": reason, "books": books}),))
+    record_event("info", "reset", f"paper books reset ({reason}): {', '.join(books)}", {"archived_to": str(out_dir) if archive else None, "rows": counts})
+    log.info("paper books reset (%s): %s", reason, counts)
+    return {"archived_to": str(out_dir) if archive else None, "rows": counts, "books": books}
 
 
 def reset_training_state(reason: str = "runner start", archive: bool = True) -> dict:
