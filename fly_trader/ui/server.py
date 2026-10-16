@@ -56,6 +56,8 @@ def create_app(*, hosts_workers: bool = True) -> FastAPI:
             yield
         finally:
             app.state.hub.close()
+            if hosts_workers:
+                await stop_workers()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, default_response_class=JSONBytes)
     app.add_middleware(Guard)
@@ -108,6 +110,15 @@ def create_app(*, hosts_workers: bool = True) -> FastAPI:
     return app
 
 
+async def stop_workers() -> None:
+    """Stop every worker thread and wait for them to flush. Runs in the app's shutdown, because uvicorn re-raises the
+    SIGTERM it caught once the server has stopped: code after uvicorn.run() never runs on a signal."""
+    import asyncio
+    from ..ops import supervisor
+    if supervisor._SUP is not None:
+        await asyncio.to_thread(supervisor._SUP.stop_all)
+
+
 async def _in_thread(request: Request, fn, *args):
     """Run a read or a write in the hub's threads (psycopg is synchronous); refusals and errors become JSON with a status."""
     import asyncio
@@ -155,6 +166,6 @@ def run(port: int = 8501, host: str | None = None, observe: bool = False) -> Non
     app = create_app(hosts_workers=not observe)
     try:
         uvicorn.run(app, host=host, port=port, log_config=None, access_log=False, timeout_graceful_shutdown=5, ws_ping_interval=20)
-    finally:
+    finally:                     # reached when uvicorn fails to start; on SIGTERM/SIGINT the app's shutdown has stopped them
         if sup is not None:
             sup.stop_all()

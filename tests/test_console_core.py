@@ -246,3 +246,19 @@ def test_runs_elsewhere_sees_another_consoles_thread_and_cli_processes(db_conn, 
     finally:
         with transaction() as conn:
             conn.execute("DELETE FROM processes WHERE id = %s", (rid,))
+
+
+def test_the_workers_stop_in_the_apps_shutdown(monkeypatch):
+    """uvicorn re-raises the SIGTERM it caught after the server stops, so the workers must be stopped in the app's shutdown."""
+    from fastapi.testclient import TestClient
+    from fly_trader.ops import supervisor
+    from fly_trader.ui.server import create_app
+    stopped = []
+    monkeypatch.setattr(supervisor, "_SUP", type("S", (), {"stop_all": lambda self: stopped.append(True)})())
+    hosted = runtime.HOSTS_WORKERS
+    try:
+        with TestClient(create_app(hosts_workers=True), base_url="http://localhost"):
+            assert stopped == []
+        assert stopped == [True]
+    finally:
+        runtime.HOSTS_WORKERS = hosted
