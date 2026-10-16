@@ -53,6 +53,9 @@ class RhRpc(EvmRpc):
     def _batch(self, calls: list[tuple[str, list]]) -> list[Any]:
         if not calls:
             return []
+        if any(m == "eth_sendRawTransaction" for m, _ in calls):
+            from ..netguard import refuse_broadcast
+            refuse_broadcast(self.url, "a transaction")             # never from a test run (fly_trader/netguard.py)
         with self._lock:
             base = self._id + 1; self._id += len(calls)
         body = [{"jsonrpc": "2.0", "id": base + i, "method": m, "params": p} for i, (m, p) in enumerate(calls)]

@@ -107,6 +107,9 @@ class EvmRpc:
         self._id = 0
 
     def call(self, method: str, params: list | None = None) -> Any:
+        if method == "eth_sendRawTransaction":
+            from ..netguard import refuse_broadcast
+            refuse_broadcast(self.url, "a transaction")             # never from a test run (fly_trader/netguard.py)
         with self._lock:
             self._id += 1
             rid = self._id

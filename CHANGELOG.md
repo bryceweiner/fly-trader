@@ -35,6 +35,11 @@ The Streamlit console is replaced by a web dashboard served by the same single p
 - **Fixed:** `tools/publish_release.py` read the current release over TLS without root certificates (python.org's macOS
   Python) and counted the failure as "no release", so it would have published release 1 again. It now uses certifi and
   stops on anything but a 404.
+- **Fixed, after it burned 0.06 ETH:** a test run could spend real money. While `.env` had `RH_LIVE_ENABLED=1` and the
+  real RH key, a vault test that expected signing to be off paid two test claims of 0.03 ETH from the live RH wallet to its
+  placeholder address `0x1111…1111` (transactions `0x063cbd4f…` and `0x5fd55d3d…`). Now `fly_trader/netguard.py` refuses
+  every Solana or EVM broadcast and every Kalshi order, cancel or transfer from a test run unless it goes to a local test
+  chain. Tests never load the operator's signing keys or live switches.
 - **Fixed:** a SIGTERM killed the worker threads mid-step: uvicorn re-raises the signal once the server stops. The
   console now stops them in the app's shutdown and waits for them to flush.
 

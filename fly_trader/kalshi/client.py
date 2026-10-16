@@ -122,6 +122,9 @@ class KalshiRest:
 
     def request(self, method: str, path: str, params: dict | None = None, body: dict | None = None, timeout: float = 60.0) -> dict:
         """One paced, logged call. Raises ``KalshiApiError`` on HTTP >= 400 (429 is retried with backoff first)."""
+        if method.upper() != "GET":
+            from ..netguard import refuse_broadcast
+            refuse_broadcast(self.base, f"Kalshi {method} {path}")    # never from a test run (fly_trader/netguard.py)
         client = self._ensure()
         q = {k: v for k, v in (params or {}).items() if v is not None}
         url = self.base + path + (("?" + urlencode(q)) if q else "")

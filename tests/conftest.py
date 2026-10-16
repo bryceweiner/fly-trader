@@ -3,6 +3,9 @@ the refuse-production guard in fly_trader.db.connection can never see the real d
 import os
 
 os.environ["DATABASE_URL"] = "postgresql:///fly_trader_test"
+os.environ["FLY_TRADER_TESTING"] = "1"           # fly_trader/netguard.py: no transaction, order or transfer leaves a test run
+for _name in ("BOT_PRIVATE_KEY", "BOT_PRIVATE_KEY_FILE", "RH_BOT_PRIVATE_KEY"):   # and the operator's signing keys in .env
+    os.environ[_name] = ""                                                         # never load (empty = unset; .env never overrides)
 for _name in ("RH_RPC_URL_TX", "QUICKNODE_RH_API_URL", "QUICKNODE_RH_API_KEY"):   # no test reaches the real transaction endpoint
     os.environ[_name] = ""
 for _name in ("LIVE_ENABLED", "RH_LIVE_ENABLED", "KALSHI_LIVE_ENABLED", "LIVE_WITHOUT_HANDOVER"):   # nor runs with the operator's
