@@ -33,7 +33,7 @@ Jupiter Tokens v2 ─────▶ token stats (history for future inputs)
 | Model files | `fly_trader/train/model_io.py` | Fly checkpoints load weights-only and selectors are skops files: a model file cannot run code |
 | $FLY vault | `fly_trader/vault`, `web/`, `contracts/` | The hosted vault fly (only with `VAULT_ENABLED`): Squads treasury custody, weekly settlement, SOL and ETH claims ([docs/vault/SPEC.md](docs/vault/SPEC.md), [RUNBOOK.md](docs/vault/RUNBOOK.md)); its server files are on the `distribution` branch under `deploy/` |
 | Kalshi | `fly_trader/kalshi` | A second trading type: prediction markets (`KALSHI_*` in `.env.example`) |
-| Console | `fly_trader/ui/app.py` | One Streamlit app that runs every worker as an in-process thread and shows what the system is doing |
+| Console | `fly_trader/ui/server.py`, `console/` | One process (FastAPI) that runs every worker as an in-process thread and serves the React dashboard: live status over a WebSocket, every control behind a confirmation |
 
 ## Requirements
 
@@ -65,10 +65,16 @@ cp .env.example .env          # paste your keys; leave LIVE_ENABLED=0
 createdb fly_trader
 uv run fly-trader init-db
 uv run fly-trader build-connectome   # ~100 MB download, verifies 139,255 neurons / 2,698,236 edges
-uv run fly-trader ui                 # Streamlit console at http://localhost:8501
+uv run fly-trader ui                 # the console at http://localhost:8501 (bound to 127.0.0.1)
 ```
 
 The console starts the market feed, the history archive (downloads the archive and builds the training features), the trainer, the trading engine and the token-stats worker. Training starts once every archived day has its features.
+
+The console has no login: it binds to 127.0.0.1 and refuses requests that name another host or come from another site,
+so reach a remote one through an SSH tunnel (`ssh -L 8501:127.0.0.1:8501 host`) or set `CONSOLE_ALLOWED_HOSTS`. The
+dashboard ships built in `fly_trader/ui/static/console`; its source is `console/` (`npm ci && npm run build` after
+changing it, see [console/README.md](console/README.md)). `fly-trader ui --observe --port 8599` serves a second copy that
+hosts no workers, for a preview next to a running console.
 
 ## Train
 
@@ -127,7 +133,7 @@ Every knob is an environment variable read by `fly_trader/config.py`; `.env.exam
 ## CLI reference
 
 ```
-init-db  wallet {new,show} [--key-file]  ui [--port]  run  status  health  ready-for-restart  worker {start,stop,status} [name]
+init-db  wallet {new,show} [--key-file]  ui [--port] [--host] [--observe]  run  status  health  ready-for-restart  worker {start,stop,status} [name]
 pumpstream  replay-pull  refetch-pool-ids  discover [--once]  fit-wallet-skill [--days]
 assemble-replay  build-corpus-meta  build-mature  build-corpus-features  backtest-corpus [--max-tokens --days --fees --only --universe]
 train-selector [--days]  train-fly-selector [--days --epochs --device]  fly-replay [--days --device --start-day]

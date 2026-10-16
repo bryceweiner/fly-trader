@@ -337,7 +337,7 @@ uv run fly-trader init-db</pre>
         <li>
           <div>
             <h4>Open the console</h4>
-            <p>One Streamlit app starts and supervises every worker: discovery, capture, training, and the trading runner. Nothing runs outside it.</p>
+            <p>One process starts and supervises every worker (the market feed, training, the trading engine) and serves the operator dashboard. Nothing runs outside it.</p>
             <pre>uv run fly-trader ui</pre>
             <p>Then open <code>http://localhost:8501</code>, start the discover and capture workers, and let the tape fill for a few hours before training.</p>
           </div>

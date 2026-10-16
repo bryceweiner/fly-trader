@@ -1,4 +1,4 @@
-"""The KC→MBON synapses the fly has changed most, for the console's 3D view (``ui/brain3d``): pure functions over the
+"""The KC→MBON synapses the fly has changed most, for the console's 3D view (``ui/api/brain.py``, ``console/src/brain``): pure functions over the
 files the fly session writes, so the console never builds a network.
 
 ``PlasticBank.state()["D"]`` holds the learned change of each of the connectome's KC→MBON pairs, in the row-major

@@ -1,4 +1,4 @@
-"""Where each of the fly's neurons sits in the brain, for the console's 3D view (``ui/brain3d``).
+"""Where each of the fly's neurons sits in the brain, for the console's 3D view (``ui/api/brain.py``, ``console/src/brain``).
 
 The connectome artifact carries no positions. FlyWire's annotations TSV (``populations.ANNOTATIONS_TSV``) has a soma
 centroid for most neurons and a point on the neuron for nearly all, in FAFB voxels (4 nm × 4 nm × 40 nm). This joins
@@ -25,7 +25,7 @@ EXCLUDE = ("VISUAL",)
 POS_COLS = ["pos_x", "pos_y", "pos_z"]
 SOMA_COLS = ["soma_x", "soma_y", "soma_z"]
 BIN, META = "geometry.bin", "geometry.json"
-FULL_BIN, FULL_META = "geometry_full.bin", "geometry_full.json"         # every neuron: the scene both flies are drawn into (ui/brain3d)
+FULL_BIN, FULL_META = "geometry_full.bin", "geometry_full.json"         # every neuron: the scene both flies are drawn into (console/src/brain)
 FLY_EXCLUDES = {"memecoin": EXCLUDE, "kalshi": None}                     # None: brain/connectome.VISUAL_SUB (the memecoin afferents), resolved lazily
 
 

@@ -51,6 +51,7 @@ from .strategies import effective
 log = logging.getLogger(__name__)
 NAME, KIND = "kalshi_fly", "kalshi_fly"
 STATUS_KEY, COMMAND_KEY = "kalshi_fly_status", "kalshi_fly_command"
+COMMAND_MAX_AGE_S = 600.0          # an operator command older than this (queued while the engine was down) is dropped
 SNAP_KIND = "kalshi_fly_plastic"
 LABEL_LAG_S = 60.0
 REARM_S, UNKNOWN_AFTER_S = 3600.0, 7 * 86400.0
@@ -488,6 +489,13 @@ class KalshiFlyBook:
         v = r["value"] if isinstance(r["value"], dict) else json.loads(r["value"])
         conn.execute("DELETE FROM ui_settings WHERE key = %s", (COMMAND_KEY,))
         cmd = v.get("cmd")
+        try:
+            age = datetime.now(timezone.utc).timestamp() - datetime.fromisoformat(v["at"]).timestamp()
+        except (KeyError, TypeError, ValueError):
+            age = 0.0
+        if age > COMMAND_MAX_AGE_S:          # queued while the engine was down: an operator's click must not land days later
+            record_event("warning", NAME, f"ignored a stale operator command {cmd!r} ({age / 60:.0f} min old)")
+            return
         if cmd == "pause":
             self.learning_frozen = True; record_event("info", NAME, "learning paused by the operator")
         elif cmd == "resume":

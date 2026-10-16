@@ -1,8 +1,8 @@
 """In-process supervisor: every worker is a thread inside the console process. Nothing is spawned.
 
-The Supervisor is a process-wide singleton (get_supervisor()) shared by `fly-trader ui` (which
-starts autostart workers before handing the main thread to Streamlit) and by the Streamlit script
-runs (which import the same module). Each worker runs its ordinary entry point with a stop event;
+The Supervisor is a process-wide singleton (get_supervisor()) owned by `fly-trader ui`, which
+starts the autostart workers and then serves the console (fly_trader/ui/server.py) in the main
+thread; the console's API reads and controls the same instance. Each worker runs its ordinary entry point with a stop event;
 stopping sets the event and joins. Start/stop are recorded in `processes` (pid = this process,
 cmd = ['thread', name]) and `events`, so the audit trail is unchanged.
 """
@@ -229,25 +229,8 @@ def get_supervisor() -> Supervisor:
         return _SUP
 
 
-def run_console(port: int = 8501) -> None:
-    """`fly-trader ui`: start autostart workers in THIS process, then run Streamlit in the main thread."""
-    from .. import config
-    from ..db import schema
-    schema.apply_schema()           # idempotent: tables added to the schema exist before any worker uses them
-    sup = get_supervisor()
-    try:
-        started = sup.autostart()
-    except Exception as e:
-        started = []; log.exception("autostart failed: %s", scrub(str(e)))
-    log.info("console pid=%d autostarted=%s", os.getpid(), started)
-    app = str(config.REPO_ROOT / "fly_trader" / "ui" / "app.py")
-    from streamlit.web import bootstrap
-    flag_options = {"server.port": port, "server.headless": True, "browser.gatherUsageStats": False,
-                    "server.fileWatcherType": "none", "logger.level": "warning",
-                    "server.enableStaticServing": True}       # ui/static/brain: the 3D view's neuron geometry, fetched once
-
-    bootstrap.load_config_options(flag_options)      # the CLI does this before run(); without it port/headless/watcher flags are ignored
-    try:
-        bootstrap.run(app, False, [], flag_options)
-    finally:
-        sup.stop_all()
+def run_console(port: int = 8501, host: str | None = None, observe: bool = False) -> None:
+    """`fly-trader ui`: start autostart workers in THIS process, then serve the console in the main thread
+    (fly_trader/ui/server.py); every worker is stopped when it exits."""
+    from ..ui.server import run
+    run(port=port, host=host, observe=observe)

@@ -49,7 +49,7 @@ class _ScrubFilter(logging.Filter):
 
 class _ThreadFilter(logging.Filter):
     """Keep records from the worker thread and its helper threads (``<name>-*``); accept MainThread only when the worker itself
-    runs in the main thread (CLI use), never the console's Streamlit server thread."""
+    runs in the main thread (CLI use), never the console's web server or its request threads."""
 
     def __init__(self, name: str):
         super().__init__()

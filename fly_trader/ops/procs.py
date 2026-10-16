@@ -1,4 +1,4 @@
-"""Worker processes: started detached (their own session) so Streamlit reruns/restarts never kill them.
+"""Worker processes started from the CLI (`fly-trader worker start`), detached in their own session so a console restart never kills them.
 PIDs and commands are recorded in `processes`; liveness is checked with psutil, not trusted from the row."""
 from __future__ import annotations
 
@@ -123,13 +123,6 @@ def tail_log(name: str, lines: int = 60) -> str:
         f.seek(max(0, size - 64000))
         data = f.read().decode("utf-8", "replace")
     return "\n".join(data.splitlines()[-lines:])
-
-
-def run_streamlit(port: int = 8501) -> None:
-    app = config.REPO_ROOT / "fly_trader" / "ui" / "app.py"
-    cmd = [PYTHON, "-m", "streamlit", "run", str(app), "--server.port", str(port), "--server.headless", "true",
-           "--browser.gatherUsageStats", "false"]
-    os.execv(PYTHON, cmd)
 
 
 def worker_cli(action: str, name: str | None) -> None:

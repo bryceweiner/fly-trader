@@ -3,10 +3,56 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## 2026-10-17: A new operator console
+
+The Streamlit console is replaced by a web dashboard served by the same single process.
+
+### Upgrading
+
+- **Nothing to do for Docker installs:** the self-updater installs the new dependencies (FastAPI and uvicorn instead of
+  Streamlit) from `uv.lock`, and the dashboard ships pre-built, so no Node is needed. Open <http://localhost:8501> as before.
+- **Bare-metal installs:** `uv sync` (add your torch extra), then `uv run fly-trader ui`. The console now binds to
+  `127.0.0.1` by default; Streamlit listened on every interface. Set `CONSOLE_HOST` to change it. Inside a container it
+  binds the container's interface, so the published port still works.
+- **A remote console** (the vault server) is still reached through an SSH tunnel. Requests that name a host other than
+  `localhost`/`127.0.0.1` are refused; list extra names in `CONSOLE_ALLOWED_HOSTS` if you reach it another way.
+- **New:** `fly-trader ui --observe --port 8599` serves the dashboard without hosting workers (a preview next to a running
+  console; its controls are refused).
+
+### The console
+
+- **One process, as before.** `fly-trader ui` still starts the worker threads and stops them on exit; it now serves a React
+  dashboard (Dashtreme's horizontal layout with the fly-trader colours) from FastAPI.
+- **Live without reloading.** Every panel is pushed over one WebSocket the moment it changes. Each panel is computed once
+  for all open tabs.
+- **Every page of the old console, with nothing lost:** Overview, Trades, Model & training, Data pipelines, Robinhood
+  Chain, the four Kalshi pages, Processes, Safety & wallet and the $FLY vault keep their routes (`/vault`, `/kalshi`, …).
+- **States are colour widgets** at the top of every page (paper or live, trading, selector, fly, training, feed).
+  Charts, gauges and datatables (paging, search, copy, CSV, print) replace the Streamlit tables.
+- **New:**
+  - A fly decision inspector: click any token for the fly's score against its teacher's and the buy line over time, what
+    it bought and why, and the synapses it has learned most.
+  - A live fly ticker, with a toast for every live-money buy, sell and fill.
+  - Brain playback: replay the last 24 hours of the fly's activity, and click a neuron to follow its history.
+  - Global search (token, mint, Kalshi ticker, transaction signature), a notifications bell, and a Logs page that tails
+    every worker's log file.
+- **Safer controls.**
+  - Every state-changing button asks for confirmation and says what it will do.
+  - The server enforces the rules the old console only showed: no reset while its engine runs, one withdrawal at a time
+    per chain, the withdrawal re-planned and its blockers re-checked on the server.
+  - The console refuses requests from other sites. A web page open in the same browser cannot press its buttons.
+- **Fixed:**
+  - The Kalshi model page no longer stops with an error after its first panel.
+  - The vault worker has a card on Processes.
+  - A dormant Kalshi (no `KALSHI_API_KEY_ID`) hides its status, worker cards and safety panels, and the console no longer
+    shows part of the Kalshi key.
+  - "Re-bootstrap" starts the trainer when it is not running.
+  - A feed that runs as a CLI process no longer shows as stale.
+
 ## 2026-10-11: Robinhood Chain, and a fly that starts as its selector
 
-Not yet published to Hugging Face. Ships fly #157 (network) with selector #154, both trained on Solana and Robinhood
-Chain rows together.
+Published to Hugging Face as signed release 1. Ships fly #157 (network) with selector #154, both trained on Solana and
+Robinhood Chain rows together.
 
 ### Upgrading
 
