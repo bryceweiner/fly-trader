@@ -1,9 +1,11 @@
-"""Where the fly runs: one resolver for CPU, NVIDIA CUDA and Apple MPS, and the batch sizes each can afford.
+"""Where the fly runs: one resolver for CPU, NVIDIA CUDA, AMD ROCm and Apple MPS, and the batch sizes each can afford.
 
-``config.DEVICE`` names it: ``auto`` (CUDA if present, else MPS, else CPU), ``cpu``, ``cuda`` / ``cuda:1``, ``mps``. A
-backend that is named but not available falls back to the CPU with one warning. Everything that builds or loads a
-network (``train/fly_selector.py``, ``brain/connectome.py``) resolves through here, so the graph, the parameters and the
-plastic bank always share a device.
+``config.DEVICE`` names it: ``auto`` (a CUDA or ROCm GPU if present, else MPS, else CPU), ``cpu``, ``cuda`` / ``cuda:1``,
+``rocm`` / ``rocm:1`` (``hip`` is the same), ``mps``. A ROCm build of torch drives AMD GPUs through ``torch.cuda``: its
+device is ``cuda`` and every CUDA call below (memory, seeding, the cache) is HIP underneath, so ``rocm`` names that
+device, and ``cuda`` on a ROCm build means the AMD GPU. A backend that is named but not available falls back to the CPU
+with one warning. Everything that builds or loads a network (``train/fly_selector.py``, ``brain/connectome.py``)
+resolves through here, so the graph, the parameters and the plastic bank always share a device.
 
 Batch sizes come from memory, not constants. A forward pass scatters activity across the connectome's ~1.04 M edges
 for every row of a batch (``FlyNet._propagate``: ``index_select`` over the edges, then ``index_add``), so its memory is
@@ -29,11 +31,20 @@ FIXED_BYTES = 512 * 2**20                       # allocator and workspace overhe
 BUDGET_SHARE = 0.6                              # of the free memory: leave room for the data and the rest of the process
 MEMORY_GB_ENV = "DEVICE_MEMORY_GB"              # override the measured free memory (a shared GPU, a container limit)
 MIN_ROWS = 32
+ALIASES = {"rocm": "cuda", "hip": "cuda"}       # torch's device for each name that is not one itself
+BACKEND = {"cuda": "CUDA", "rocm": "ROCm", "hip": "ROCm", "mps": "MPS"}
+
+
+def is_rocm() -> bool:
+    """This torch is a ROCm (HIP) build: ``torch.cuda`` and the ``cuda`` device then mean an AMD GPU."""
+    return getattr(torch.version, "hip", None) is not None
 
 
 def _available(kind: str) -> bool:
     if kind == "cuda":
-        return torch.cuda.is_available()
+        return torch.cuda.is_available()                                    # NVIDIA, or AMD on a ROCm build
+    if kind in ("rocm", "hip"):
+        return is_rocm() and torch.cuda.is_available()
     if kind == "mps":
         return bool(getattr(torch.backends, "mps", None)) and torch.backends.mps.is_available()
     return kind == "cpu"
@@ -43,26 +54,30 @@ def _available(kind: str) -> bool:
 def _resolve(name: str) -> torch.device:
     name = (name or "auto").strip().lower()
     if name == "auto":
-        for kind in ("cuda", "mps"):
+        for kind in ("cuda", "mps"):                                        # cuda: NVIDIA, or AMD on a ROCm build
             if _available(kind):
                 return torch.device(kind)
         return torch.device("cpu")
-    kind = name.split(":")[0]
-    if kind in ("cuda", "mps"):
+    kind, sep, index = name.partition(":")
+    if kind in BACKEND:
         if _available(kind):
             try:
-                dev = torch.device(name)
-                if kind == "cuda" and dev.index is not None and dev.index >= torch.cuda.device_count():
-                    log.warning("DEVICE=%s but only %d CUDA device(s) present; using cuda:0", name, torch.cuda.device_count())
+                dev = torch.device(ALIASES.get(kind, kind) + sep + index)
+                if dev.type == "cuda" and dev.index is not None and dev.index >= torch.cuda.device_count():
+                    gpu = "rocm" if is_rocm() else "cuda"
+                    log.warning("DEVICE=%s but only %d %s device(s) present; using %s:0", name, torch.cuda.device_count(),
+                                BACKEND[gpu], gpu)
                     return torch.device("cuda")
                 return dev
             except RuntimeError as e:
                 log.warning("DEVICE=%s is not a valid device (%s); using the CPU", name, e)
                 return torch.device("cpu")
-        log.warning("DEVICE=%s but %s is not available on this machine; using the CPU", name, kind.upper())
+        why = (f"torch {torch.__version__} is not a ROCm build (uv sync --extra rocm72; TORCH_INDEX=rocm72 in Docker)"
+               if kind in ("rocm", "hip") and not is_rocm() else f"{BACKEND[kind]} is not available on this machine")
+        log.warning("DEVICE=%s but %s; using the CPU", name, why)
         return torch.device("cpu")
     if kind != "cpu":
-        log.warning("DEVICE=%r is not cpu, cuda, mps or auto; using the CPU", name)
+        log.warning("DEVICE=%r is not cpu, cuda, rocm, mps or auto; using the CPU", name)
     return torch.device("cpu")
 
 
@@ -83,6 +98,10 @@ def describe(dev: torch.device | None = None) -> str:
     if dev.type == "cuda":
         i = dev.index if dev.index is not None else torch.cuda.current_device()
         p = torch.cuda.get_device_properties(i)
+        if is_rocm():                                                       # gcnArchName: "gfx1151:xnack-", the ISA then its features
+            arch = (getattr(p, "gcnArchName", "") or "?").split(":")[0]
+            shared = ", integrated" if getattr(p, "is_integrated", False) else ""
+            return f"rocm:{i} ({p.name}, {arch}{shared}, {p.total_memory / 2**30:.0f} GB)"
         return f"cuda:{i} ({p.name}, {p.total_memory / 2**30:.0f} GB)"
     if dev.type == "mps":
         return "mps (Apple GPU, unified memory)"
@@ -90,8 +109,9 @@ def describe(dev: torch.device | None = None) -> str:
 
 
 def free_bytes(dev: torch.device | None = None) -> int:
-    """Memory a batch may draw on: the card's free memory on CUDA, the host's on MPS (unified) and CPU; the
-    ``DEVICE_MEMORY_GB`` environment variable overrides the measurement."""
+    """Memory a batch may draw on: the card's free memory on CUDA and ROCm (on an integrated AMD GPU, whatever share of
+    system memory the driver reports), the host's on MPS (unified) and CPU; the ``DEVICE_MEMORY_GB`` environment
+    variable overrides the measurement."""
     override = os.environ.get(MEMORY_GB_ENV)
     if override:
         try:
@@ -117,7 +137,7 @@ def rows_for(n_edges: int, n_neurons: int, dev: torch.device | None = None, *, c
 
 
 def seed_all(seed: int) -> None:
-    """Seed torch on every backend (``torch.manual_seed`` alone leaves other CUDA devices unseeded)."""
+    """Seed torch on every backend (``torch.manual_seed`` alone leaves other CUDA / ROCm devices unseeded)."""
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)

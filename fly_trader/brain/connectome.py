@@ -21,7 +21,7 @@ EFFERENT_POP = "DESCENDING"                                                     
 
 
 def resolve_device(name: str | None = None) -> torch.device:
-    """config.DEVICE (or ``name``) as a device — CPU, CUDA or MPS, with fallback to the CPU — through ``brain/device.py``,
+    """config.DEVICE (or ``name``) as a device — CPU, CUDA, ROCm or MPS, with fallback to the CPU — through ``brain/device.py``,
     the one resolver every network shares."""
     from .device import resolve
     return resolve(name)

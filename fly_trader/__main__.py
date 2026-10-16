@@ -334,11 +334,11 @@ def build_parser() -> argparse.ArgumentParser:
     ts_.set_defaults(fn=_cmd_train_selector)
     tf_ = sub.add_parser("train-fly-selector"); tf_.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
     tf_.add_argument("--epochs", type=int, default=None, help="cap on full passes over the distillation rows (default: until the fit stops improving)")
-    tf_.add_argument("--device", default=None, help="auto | cpu | cuda | cuda:N | mps (default: DEVICE from .env, auto)")
+    tf_.add_argument("--device", default=None, help="auto | cpu | cuda | cuda:N | rocm | rocm:N | mps (default: DEVICE from .env, auto)")
     tf_.set_defaults(fn=_cmd_train_fly_selector)
     fr = sub.add_parser("fly-replay", help="bootstrap the fly once, let it learn over the corpus, judge it (the gate before it trades)")
     fr.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
-    fr.add_argument("--device", default=None, help="auto | cpu | cuda | cuda:N | mps (default: DEVICE from .env, auto)")
+    fr.add_argument("--device", default=None, help="auto | cpu | cuda | cuda:N | rocm | rocm:N | mps (default: DEVICE from .env, auto)")
     fr.add_argument("--start-day", type=int, default=None,
                     help="day index of the bootstrap (the selector teaches on the days before it); default: train/fly_replay.DEFAULT_START, "
                          "the earliest day that leaves the teacher's walk-forward enough days in each half")
