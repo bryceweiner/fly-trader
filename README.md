@@ -45,8 +45,8 @@ connectome they run on. The training pipeline lives on [`master`](https://github
   alone.
 - 0.5 SOL you are prepared to lose. Not more: the caps below are sized for 0.5.
 - Any 64-bit CPU: the fly scores about as fast on 16 CPU threads as on a GPU (its forward pass is a memory-bound
-  scatter over a million synapses). An NVIDIA GPU is used when you start it with the CUDA override (see below). Apple
-  GPUs are not reachable from inside Docker.
+  scatter over a million synapses). An NVIDIA or AMD GPU is used when you start it with the CUDA or ROCm override (see
+  below). Apple GPUs are not reachable from inside Docker.
 
 > ### ⚠️ Robinhood Chain needs an Envio HyperSync API token
 >
@@ -173,6 +173,21 @@ The image is built with the CUDA 12.6 torch wheel (`TORCH_INDEX: cu126` in `dock
 newest drivers) and the container is given every GPU. `DEVICE=auto` in `.env` then resolves to the GPU; the console's
 Model & training page shows which device the fly is on. Batch sizes are derived from the card's free memory, so an 8 GB card works;
 on a shared card set `DEVICE_MEMORY_GB` in `.env` to what the fly may use.
+
+## AMD GPU
+
+Optional, as above. Linux x86-64 with the `amdgpu` kernel driver is all the host needs: the ROCm 7.2 runtime is inside
+the torch wheel. Start with the ROCm override instead of the plain command in step 3:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d --build
+```
+
+The image is built with the ROCm 7.2 torch wheel (`TORCH_INDEX: rocm72`, a much larger image than the CPU one), which
+covers gfx1030 (RX 6800/6900), gfx1100-1102 (RX 7000), gfx1103 (Radeon 780M), gfx1150/1151 (Ryzen AI 300 and Ryzen
+AI Max), gfx1200/1201 (RX 9000) and the Instinct cards. The container is given `/dev/kfd` and `/dev/dri`. `DEVICE=auto` resolves to the GPU
+and the Model & training page shows it as `rocm:0` with its architecture. An integrated GPU (Ryzen AI Max) uses system
+memory: set `DEVICE_MEMORY_GB` if the batch sizes derived from what the driver reports leave too little for the rest.
 
 ## Updates
 

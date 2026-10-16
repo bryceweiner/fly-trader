@@ -28,7 +28,7 @@ services:
       DATABASE_URL: postgresql://fly:fly@db:5432/fly_trader
       DATA_DIR: /app/data
       LOG_DIR: /app/logs
-      DEVICE: auto          # the CPU in this image; an NVIDIA GPU with docker-compose.cuda.yml
+      DEVICE: auto          # the CPU in this image; an NVIDIA GPU with docker-compose.cuda.yml, an AMD one with docker-compose.rocm.yml
       # Robinhood Chain is opt-in: set RH_ENABLED=1 in .env (it needs ENVIO_API_TOKEN and room for its history)
       RH_ENABLED: ${RH_ENABLED:-0}
     volumes:

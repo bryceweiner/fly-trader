@@ -37,8 +37,10 @@ COPY --from=ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d
 
 WORKDIR /app
 COPY . .
-# Which torch: TORCH_INDEX=cpu (default: any machine, ~200 MB) or cu126 / cu130 for an NVIDIA GPU (the CUDA runtime is
-# inside the wheel; the host needs only the driver and the NVIDIA Container Toolkit -- see docker-compose.cuda.yml).
+# Which torch: TORCH_INDEX=cpu (default: any machine, ~200 MB), cu126 / cu130 for an NVIDIA GPU (the CUDA runtime is
+# inside the wheel; the host needs only the driver and the NVIDIA Container Toolkit -- see docker-compose.cuda.yml), or
+# rocm72 for an AMD GPU (the ROCm runtime is inside the wheel; the host needs only the amdgpu driver --
+# docker-compose.rocm.yml).
 # It names the project extra that pins torch to that index. --frozen: exactly uv.lock with its hashes, never a fresh
 # resolution. The project installs editable: the package IS /app/fly_trader, so config.REPO_ROOT is /app.
 ARG TORCH_INDEX=cpu
