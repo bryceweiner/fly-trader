@@ -43,6 +43,10 @@ The Streamlit console is replaced by a web dashboard served by the same single p
 - **Fixed:** a SIGTERM killed the worker threads mid-step: uvicorn re-raises the signal once the server stops. The
   console now stops them in the app's shutdown and waits for them to flush.
 
+- **Trades by hour of day** on the Overview: a colourful 24-hour wheel per chain (Solana left, Robinhood Chain right),
+  Highcharts' variable-radius pie. Each hour is an equal slice and its radius is the trades entered in that hour, every
+  trade ever (the positions table plus every reset's archive), all books or live only, in UTC or local time.
+
 ### The console
 
 - **One process, as before.** `fly-trader ui` still starts the worker threads and stops them on exit; it now serves a React

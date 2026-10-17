@@ -35,3 +35,6 @@ cd console && npm run dev                    # http://localhost:5173, proxying /
   `fly_trader/ui/static/brain` on first use) with three.js, bundled.
 
 Pages live in `src/pages`, shared components in `src/components`, the fly's inspector and ticker in `src/fly`.
+
+Charts are ApexCharts, except the trades-by-hour wheel, which is Highcharts' variable-radius pie (`highcharts`). Highcharts
+is free for non-commercial use; commercial use needs a licence from Highsoft (highcharts.com/license).

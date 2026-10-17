@@ -2,12 +2,15 @@
 and the plastic fly, and the open positions. (The brain at the top of the page is ui/api/brain.py.)"""
 from __future__ import annotations
 
+import csv
 import math
+import re
 from datetime import datetime, timedelta, timezone
 
-from ... import config
+from ... import config, markets
 from ...agent.selector_session import pinned_snapshot
 from ...db.queries import q, q1
+from ..cache import ttl_cache
 from ..hub import topic
 from ..state import ago, backtest_line, labels, market_info, market_param, pct, system_state
 
@@ -167,3 +170,95 @@ def book(params: dict) -> dict:
                         "ret": (float(r["last_mark_price"]) / float(r["entry_price"]) - 1) * 100 if r["entry_price"] and r["last_mark_price"] else None})
     return {"unit": u, "history": hist[0]["data"] if hist else [], "positions": out, "live": live, "book": BOOK,
             "title": "Live wealth" if live else "Paper wealth", "sub": "the bot wallet since it started trading" if live else "the selector book since it started"}
+
+
+# ---------------------------------------------------------------- trades by hour of day
+def _hour_of(ts) -> int | None:
+    """The UTC hour of a timestamp: a datetime, or the text Postgres wrote into an archive ('2026-09-15 03:55:00+00')."""
+    if ts is None or ts == "":
+        return None
+    if isinstance(ts, str):
+        t = ts.strip().replace(" ", "T", 1)
+        if re.search(r"[+-]\d\d$", t):
+            t += ":00"
+        try:
+            ts = datetime.fromisoformat(t)
+        except ValueError:
+            return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc).hour
+
+
+def _num(v) -> float | None:
+    try:
+        return None if v is None or v == "" else float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _archive_signature() -> tuple:
+    """Every archived positions file (a reset archives what it deletes): path, mtime, size — the cache key."""
+    out = []
+    for p in sorted(config.PG_ARCHIVE_DIR.glob("*/positions.csv")):
+        try:
+            st = p.stat(); out.append((str(p), st.st_mtime, st.st_size))
+        except OSError:
+            continue
+    return tuple(out)
+
+
+@ttl_cache(None, maxsize=2)
+def _archived(signature: tuple) -> list[tuple[int, str, int, float | None]]:
+    """(id, book, UTC hour opened, realized) of every archived position: archives never change, a new reset adds a file."""
+    rows = []
+    for path, _mtime, _size in signature:
+        try:
+            with open(path, newline="") as f:
+                for r in csv.DictReader(f):
+                    h = _hour_of(r.get("opened_at"))
+                    if h is None or not r.get("id") or not r.get("book"):
+                        continue
+                    rows.append((int(r["id"]), r["book"], h, _num(r.get("realized_sol"))))
+        except (OSError, ValueError, csv.Error):
+            continue
+    return rows
+
+
+def _empty_hours() -> list[dict]:
+    return [{"hour": h, "trades": 0, "closed": 0, "wins": 0, "pnl": 0.0} for h in range(24)]
+
+
+def hour_buckets(rows, live_books: set[str]) -> dict[str, dict[str, list[dict]]]:
+    """``rows``: (book, UTC hour opened, realized or None). Per chain, 24 hourly buckets for every book ("all") and for the
+    live books alone ("live"): trades entered, how many closed, winners, realized P&L in the chain's unit."""
+    out: dict[str, dict[str, list[dict]]] = {}
+    for book, hour, realized in rows:
+        if hour is None or "kalshi" in book:
+            continue
+        chain = markets.for_book(book).chain
+        per = out.setdefault(chain, {"all": _empty_hours(), "live": _empty_hours()})
+        for scope in ("all", "live") if book in live_books else ("all",):
+            b = per[scope][hour]
+            b["trades"] += 1
+            if realized is not None:
+                b["closed"] += 1; b["pnl"] += realized; b["wins"] += int(realized > 0)
+    return out
+
+
+@topic("overview.hours", every=60)
+def hours(params: dict) -> dict:
+    """Every memecoin trade ever made — the positions table and every reset's archive (data/pg_archive/*/positions.csv) —
+    by the UTC hour it was entered, per chain (Solana, then Robinhood Chain when enabled), all books and live alone."""
+    seen: set[int] = set(); rows = []
+    for r in q("SELECT id, book, opened_at, realized_sol FROM positions WHERE opened_at IS NOT NULL"):
+        seen.add(int(r["id"])); rows.append((r["book"], _hour_of(r["opened_at"]), _num(r["realized_sol"])))
+    sig = _archive_signature()
+    for pid, book, h, realized in _archived(sig):
+        if pid not in seen:                     # a row both archived and still in the table (a failed delete) counts once
+            seen.add(pid); rows.append((book, h, realized))
+    enabled = markets.enabled()
+    per = hour_buckets(rows, {m.live_book for m in enabled})
+    return {"tz": "UTC", "archives": len(sig),
+            "chains": [{"chain": m.chain, "name": m.name, "unit": m.unit, **per.get(m.chain, {"all": _empty_hours(), "live": _empty_hours()})} for m in enabled]}
+
