@@ -6,12 +6,16 @@ ships signed releases built from this development line.
 ## 2026-10-17, release 5: Live orders go first, and live trades what paper trades
 
 Published to Hugging Face as signed release 5. Fly #157 and selector #154 are unchanged, and so are the definitions they
-were judged on: this release is code only.
+were judged on: no model or seed file changes.
 
 ### Upgrading
 
-- **Nothing to do:** the updater applies it like any code release. New columns are added on start: `fee_v` on the
-  Robinhood Chain swap and minute tables, `hook_fee_v` on its pools, and `outcome`, `fill` and `fill_score` on `fly_scored`.
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds it until `fly_update.py approve 5`. The release changes
+  infrastructure files: comments in `Dockerfile` and `docker-compose.yml`, the new `docker-compose.rocm.yml`, and the
+  updater itself.
+- **New columns are added on start:** `fee_v` on the Robinhood Chain swap and minute tables, `hook_fee_v` on its pools,
+  and `outcome`, `fill` and `fill_score` on `fly_scored`.
 - **Robinhood Chain installs:** TSLA-quoted coins were valued about 2,430× too high since 2026-09-05. TSLA's reference
   path ended at USDG, so its USD price was read as ETH.
   - The price scan now finds again any stored path that stops short of WETH, on its first pass, and prices these coins
