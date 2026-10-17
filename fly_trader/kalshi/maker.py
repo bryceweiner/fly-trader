@@ -39,9 +39,28 @@ def _set_status(conn, oid: int, status: str, reason: str | None = None) -> None:
     conn.execute("UPDATE kalshi_orders SET status = %s, error = COALESCE(%s, error), updated_at = now() WHERE id = %s", (status, reason, oid))
 
 
-def plan(conn, *, book: str, run_id: str, beat_id: int, ts: datetime, now: float, picks: list[dict], quotes: dict, metas: dict, maker_fee: dict | None = None) -> dict:
-    """One minute of the maker arm. ``picks``: [{ticker, side, p, edge, line, table, strategy}] with edge ≥ line (the
-    maker strategies'); ``quotes``: ticker → (yes_bid, yes_ask, ...); ``metas``: ticker → MarketMeta (close_ts, maker_fee)."""
+def plan(conn, **kw) -> dict:
+    """One minute of the maker arm: ``decide_plan`` (its arguments), then ``book_plan``."""
+    return book_plan(conn, decide_plan(conn, **kw))
+
+
+def book_plan(conn, d: dict) -> dict:
+    """Books ``d`` (``decide_plan``): its cancelled orders leave 'resting', its posts rest. After the live mirror has
+    mirrored them (live money first, CLAUDE.md)."""
+    for c in d["cancels"]:
+        _set_status(conn, c["order_row"], "canceled", "no longer picked")
+    for p in d["posted"]:
+        p["order_row"] = int(conn.execute("INSERT INTO kalshi_orders (book, decision_id, ticker, side, action, price_cents, count, tif, post_only, expiration_ts, status, fill_count, "
+                                          "remaining, fair_cents, margin_cents, strategy, request) VALUES (%s,%s,%s,%s,'buy',%s,%s,'good_till_canceled',true,%s,'resting',0,%s,%s,%s,%s,%s) "
+                                          "RETURNING id", p.pop("row")).fetchone()["id"])
+    return d
+
+
+def decide_plan(conn, *, book: str, run_id: str, beat_id: int, ts: datetime, now: float, picks: list[dict], quotes: dict, metas: dict, maker_fee: dict | None = None) -> dict:
+    """One minute of the maker arm, decided but not booked: every cancel, post and blocked pick is a ``decisions`` row;
+    ``cancels`` (the resting orders no longer picked) and ``posted`` are what the live mirror mirrors before
+    ``book_plan`` writes them. ``picks``: [{ticker, side, p, edge, line, table, strategy}] with edge ≥ line (the maker
+    strategies'); ``quotes``: ticker → (yes_bid, yes_ask, ...); ``metas``: ticker → MarketMeta (close_ts, maker_fee)."""
     have = resting(conn, book); by_key = {(o["ticker"], o["side"]): o for o in have}
     opens = P.open_positions(conn, book); held = {(p["ticker"], p["side"]) for p in opens}; held_markets = {p["ticker"] for p in opens}
     cash = P.cash_cents(conn, book); deployed = P.open_cost_cents(conn, book) + P.resting_cents(conn, book); bankroll = cash + deployed
@@ -57,11 +76,11 @@ def plan(conn, *, book: str, run_id: str, beat_id: int, ts: datetime, now: float
         if not (math.isfinite(bid) and math.isfinite(ask)) or not (1 <= bid < ask <= 99):
             continue
         wanted[key] = {**pk, "rest": rest_price(bid, ask), "bid": bid, "ask": ask, "close_ts": meta.close_ts, "maker_fee": bool(meta.maker_fee)}
-    posted, canceled, replaced = [], 0, 0
+    posted, cancels, replaced = [], [], 0
     # cancellations: no longer picked (a picked order keeps its price: see the module docstring)
     for key, o in by_key.items():
         if wanted.get(key) is None:
-            _set_status(conn, int(o["id"]), "canceled", "no longer picked"); canceled += 1
+            cancels.append({"order_row": int(o["id"]), "decision_id": o.get("decision_id"), "ticker": o["ticker"], "side": o["side"]})
             P.decision(conn, beat_id=beat_id, run_id=run_id, ts=ts, ticker=o["ticker"], side=o["side"], kind="kalshi_maker_cancel", edge=None, usd=float(o["price_cents"]) * float(o["count"]) / 100.0,
                        reason="no longer picked", detail={"order": int(o["id"]), "price_cents": o["price_cents"]}, book=book)
     n_rest = sum(1 for o in by_key.values() if o is not None)
@@ -89,15 +108,12 @@ def plan(conn, *, book: str, run_id: str, beat_id: int, ts: datetime, now: float
                          reason=f"{w.get('strategy') or 'ev'}: maker edge {edge:.3f} ≥ {w['line']:.3f}; {why}; {count} × {rest}c resting (bid {w['bid']:.0f}c, ask {w['ask']:.0f}c)",
                          detail={"edge": edge, "line": w["line"], "strategy": w.get("strategy"), "p": w.get("p"), "count": count, "rest_cents": rest, "fee_cents_each": fee1,
                                  "expiration_ts": exp_ts}, book=book)
-        oid = int(conn.execute("INSERT INTO kalshi_orders (book, decision_id, ticker, side, action, price_cents, count, tif, post_only, expiration_ts, status, fill_count, remaining, "
-                               "fair_cents, margin_cents, strategy, request) VALUES (%s,%s,%s,%s,'buy',%s,%s,'good_till_canceled',true,%s,'resting',0,%s,%s,%s,%s,%s) RETURNING id",
-                               (book, did, tk, side, rest, float(count), datetime.fromtimestamp(exp_ts, timezone.utc), float(count), float(w.get("p") or 0.0) * 100.0,
-                                float(w["ask"]) - rest, w.get("strategy"), json.dumps({"p": w.get("p"), "edge": edge, "line": w["line"], "bid": w["bid"], "ask": w["ask"]},
-                                                                                  default=str))).fetchone()["id"])
+        row = (book, did, tk, side, rest, float(count), datetime.fromtimestamp(exp_ts, timezone.utc), float(count), float(w.get("p") or 0.0) * 100.0, float(w["ask"]) - rest,
+               w.get("strategy"), json.dumps({"p": w.get("p"), "edge": edge, "line": w["line"], "bid": w["bid"], "ask": w["ask"]}, default=str))
         n_rest += 1; deployed += count * rest; cash -= count * rest
-        posted.append({"order_row": oid, "decision_id": did, "ticker": tk, "side": side, "price_cents": rest, "count": count, "expiration_ts": exp_ts, "p": w.get("p"), "edge": edge,
-                       "line": w["line"], "strategy": w.get("strategy"), "maker_fee": w["maker_fee"]})
-    return {"posted": posted, "canceled": canceled, "replaced": replaced, "resting": n_rest, "blocked": blocked}
+        posted.append({"order_row": None, "decision_id": did, "ticker": tk, "side": side, "price_cents": rest, "count": count, "expiration_ts": exp_ts, "p": w.get("p"), "edge": edge,
+                       "line": w["line"], "strategy": w.get("strategy"), "maker_fee": w["maker_fee"], "row": row})
+    return {"posted": posted, "cancels": cancels, "canceled": len(cancels), "replaced": replaced, "resting": n_rest, "blocked": blocked}
 
 
 def side_extremes(ex: tuple, side: str) -> tuple[float, float]:

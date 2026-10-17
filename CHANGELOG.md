@@ -3,6 +3,34 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## 2026-10-18, release 6: A restart never holds a sale back, and Kalshi orders go first
+
+Published to Hugging Face as signed release 6. Fly #157 and selector #154 are unchanged, and so are the definitions they
+were judged on: no model, seed or infrastructure file changes.
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 6`.
+
+### Live money
+
+- **A restart no longer holds a sale back.**
+  - The minute-boundary clock now starts with the trading engine. Before, it waited for the books to load and the
+    engine to warm up, about four minutes after a restart or an update.
+  - On start it sells at once anything that came due while the console was down.
+  - Each chain has one live mirror per process, made by whichever comes first: the clock, or the fly's first live
+    minute. A position without a hold of its own waits for the fly to load.
+- **Kalshi orders go first too** (Kalshi live trading is off by default).
+  - The fly's taker buys, maker posts and cancels, and a kill switch's liquidation go out the moment it has decided.
+  - Everything else comes after: the paper books' new positions and orders, their marks, the exchange's settlements
+    and fills, learning, calibration and state.
+  - A paper order the plan cancels cancels its live twin in the same step.
+  - The subaccount's cash is read before the orders only when there are taker buys.
+  - A kill switch tripped by a minute's wealth mark liquidates with the next minute's orders.
+  - The Kalshi feed announces a written minute at once, and the engine no longer waits 4 seconds for it.
+
 ## 2026-10-17, release 5: Live orders go first, and live trades what paper trades
 
 Published to Hugging Face as signed release 5. Fly #157 and selector #154 are unchanged, and so are the definitions they

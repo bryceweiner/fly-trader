@@ -116,3 +116,26 @@ def test_maker_arm_posts_keeps_cancels_adjudicates_and_expires(db_conn, monkeypa
     assert len(out8["posted"]) == 1
     adj = maker.adjudicate(db_conn, book=book, run_id=run, beat_id=beat, ts=m1, now=now + 3600, extremes={}, metas=metas)
     assert adj["expired"] == 1 and maker.resting(db_conn) == []
+
+
+def test_the_plans_write_no_paper_trade_until_booked(db_conn, monkeypatch):
+    """Live money first: the taker and maker plans are decided (decisions rows) without a paper trade; the live mirror
+    sends from them, then book_taker_entries / book_plan write the paper positions, the cancels and the resting orders."""
+    monkeypatch.setattr(config, "KALSHI_CAPITAL_USD", 100.0); monkeypatch.setattr(config, "KALSHI_MAKER_QUIET_MIN", 30.0); monkeypatch.setattr(config, "KALSHI_MAKER_TTL_H", 6.0)
+    run, beat, m1 = _beat(db_conn); now = m1.timestamp(); tbook, mbook = P.BOOKS["taker"], P.BOOKS["maker"]
+    pick = lambda tk, side: {"ticker": tk, "side": side, "p": 0.8, "edge": 0.06, "line": 0.02, "table": TABLE, "strategy": "favorite", "hold_s": 3600.0}
+    tk = P.plan_taker_entries(db_conn, book=tbook, run_id=run, beat_id=beat, ts=m1, picks=[pick("T1", "yes")], quotes={"T1": (70.0, 72.0, 40.0, 50.0)})
+    assert tk["entered"] == 1 and tk["entries"][0]["position_id"] is None and P.open_positions(db_conn, tbook) == []
+    assert P.book_taker_entries(db_conn, tk)["entries"][0]["position_id"] and [p["ticker"] for p in P.open_positions(db_conn, tbook)] == ["T1"]
+    metas = {"M1": MarketMeta("M1", close_ts=now + 2 * 86400, maker_fee=0.0), "M2": MarketMeta("M2", close_ts=now + 2 * 86400, maker_fee=0.0)}
+    quotes = {"M1": (69.0, 72.0), "M2": (40.0, 44.0)}
+    d = maker.decide_plan(db_conn, book=mbook, run_id=run, beat_id=beat, ts=m1, now=now, picks=[pick("M1", "yes")], quotes=quotes, metas=metas)
+    assert len(d["posted"]) == 1 and d["posted"][0]["order_row"] is None and maker.resting(db_conn, mbook) == []
+    first = maker.resting(db_conn, mbook) if maker.book_plan(db_conn, d) else []
+    assert [o["ticker"] for o in first] == ["M1"] and d["posted"][0]["order_row"] == first[0]["id"] and "row" not in d["posted"][0]
+    d2 = maker.decide_plan(db_conn, book=mbook, run_id=run, beat_id=beat, ts=m1, now=now + 60, picks=[pick("M2", "yes")], quotes=quotes, metas=metas)
+    assert [(c["ticker"], c["decision_id"]) for c in d2["cancels"]] == [("M1", first[0]["decision_id"])] and len(d2["posted"]) == 1 and d2["canceled"] == 1
+    assert [o["ticker"] for o in maker.resting(db_conn, mbook)] == ["M1"]                       # nothing written before the booking
+    maker.book_plan(db_conn, d2)
+    assert [o["ticker"] for o in maker.resting(db_conn, mbook)] == ["M2"]
+

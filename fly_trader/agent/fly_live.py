@@ -32,6 +32,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -55,14 +56,15 @@ MARK_WAIT_S = 2.0             # how long the wealth mark waits for a swap betwee
 
 
 class LiveMirror:
-    def __init__(self, horizon_s: float, broker=None, worker=None):
+    def __init__(self, horizon_s: float | None = None, broker=None, worker=None):
         if broker is None:
             from ..execution.broker_live import LiveBroker
             broker = LiveBroker()
         if worker is None:
             from ..execution.worker import ExecutionWorker
             worker = ExecutionWorker(broker)
-        self.broker, self.worker, self.H = broker, worker, float(horizon_s)
+        self.broker, self.worker = broker, worker
+        self.H = float(horizon_s) if horizon_s is not None else None   # the fly's longest hold, set once it runs (agent/live_first.mirror)
         self.last_sweep = 0.0
         self.sent: dict[int, dict] = {}       # decision id -> {"e": its paper entry, "ts": its minute, "tries": n}: a buy queued or in flight
         self.failed: dict[int, dict] = {}     # the same for a buy that failed without moving anything: sent again while it may be
@@ -112,8 +114,10 @@ class LiveMirror:
                                               max_slippage_bps=config.SLIPPAGE_FORCED_BPS, decimals=int(p.get("decimals") or 6), position_id=int(p["id"])))
 
     def _held(self, p: dict, m1: datetime) -> tuple[float, float]:
-        """(seconds held, its hold): from its entry decision's minute (paper's clock), not from its fill."""
-        return (m1 - (p.get("decision_ts") or p["opened_at"])).total_seconds(), float(p.get("hold_s") or self.H)
+        """(seconds held, its hold): from its entry decision's minute (paper's clock), not from its fill. A position that
+        carries no hold of its own takes the fly's longest, and none (never due) before the fly has run."""
+        H = p.get("hold_s") or self.H
+        return (m1 - (p.get("decision_ts") or p["opened_at"])).total_seconds(), float(H) if H else math.inf
 
     def _dead(self, p: dict, m1: datetime) -> bool:
         held, H = self._held(p, m1)

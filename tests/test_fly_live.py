@@ -344,31 +344,74 @@ def test_the_sales_due_go_out_at_the_boundary_once(db_conn, clean):
     assert [(r["mint"], r["beat_id"]) for r in rows] == [("LIVE_C1", None), ("LIVE_C3", beat), ("LIVE_C1", None)]
 
 
-def test_the_fly_sends_its_boundary_sales_only_while_it_may_trade_live(db_conn):
-    from fly_trader.agent import fly_session as fs
+def test_a_chains_boundary_sales_go_out_only_while_its_wallet_trades(db_conn, monkeypatch):
+    """The clock's sales need no fly book: the chain's mirror is made on demand (its book may still be loading)."""
     calls = []
-    mirror = SimpleNamespace(exits=lambda conn, m1, run_id: calls.append((m1, run_id)) or {"exited": 1})
-    me = SimpleNamespace(mirror=mirror, done=False, run_id="R", _signing=lambda: None, trades_live=lambda conn: True)
-    assert fs.FlyBook.live_exits(me, 1_800_000_000.0) == {"exited": 1} and calls == [(datetime.fromtimestamp(1_800_000_000.0, timezone.utc), "R")]
-    for blocked in ({"mirror": None}, {"done": True}, {"_signing": lambda: "LIVE_ENABLED=1"}, {"trades_live": lambda conn: False}):
-        assert fs.FlyBook.live_exits(SimpleNamespace(**{**vars(me), **blocked}), 1_800_000_060.0) is None
-    assert len(calls) == 1
+    stub = SimpleNamespace(exits=lambda conn, m1, run_id: calls.append((m1, run_id)) or {"exited": 1})
+    monkeypatch.setattr(live_first, "mirror", lambda chain, horizon_s=None: stub)
+    monkeypatch.setattr(live_first, "signing_refused", lambda chain: None); monkeypatch.setattr(live_first, "trades_live", lambda conn, chain, live: True)
+    assert live_first.chain_exits("sol", 1_800_000_000.0, True, "R") == {"exited": 1}
+    assert calls == [(datetime.fromtimestamp(1_800_000_000.0, timezone.utc), "R")]
+    assert live_first.chain_exits("sol", 1_800_000_060.0, False) is None                          # the runner may not sign
+    monkeypatch.setattr(live_first, "trades_live", lambda conn, chain, live: False)
+    assert live_first.chain_exits("sol", 1_800_000_060.0, True) is None                           # no seat, no LIVE_WITHOUT_HANDOVER
+    monkeypatch.setattr(live_first, "signing_refused", lambda chain: "LIVE_ENABLED=1")
+    assert live_first.chain_exits("rh", 1_800_000_060.0, True) is None and len(calls) == 1
 
 
-def test_the_live_clock_calls_every_live_book_and_survives_a_failure(monkeypatch):
+def test_the_clock_sends_every_live_chain_and_survives_a_failure(monkeypatch):
     monkeypatch.setattr(live_first, "record_event", lambda *a, **k: None)
     calls = []
 
-    class Live:
-        def __init__(self, name, fail=False):
-            self.name, self.fail = name, fail
-
-        def live_exits(self, m1):
-            calls.append((self.name, m1))
-            if self.fail:
-                raise RuntimeError("rpc down")
-            return {"exited": 1}
-    live_first.LiveClock([Live("fly_rh", fail=True), SimpleNamespace(name="selector"), Live("fly")]).tick(1_800_000_000.0)
-    assert calls == [("fly_rh", 1_800_000_000.0), ("fly", 1_800_000_000.0)]
+    def exits(chain, m1, live, run_id=None):
+        calls.append((chain, m1, live, run_id))
+        if chain == "rh":
+            raise RuntimeError("rpc down")
+        return {"exited": 1}
+    monkeypatch.setattr(live_first, "chain_exits", exits)
+    books = [SimpleNamespace(name="selector", chain="sol", run_id="S"), SimpleNamespace(name="fly", LIVE=True, chain="sol", run_id="F")]
+    live_first.LiveClock(books, ["rh", "sol"], True).tick(1_800_000_000.0)                    # the RH fly's book has not loaded yet
+    assert calls == [("rh", 1_800_000_000.0, True, None), ("sol", 1_800_000_000.0, True, "F")]
     assert live_first.may_mark(600.0 + 10) and not live_first.may_mark(600.0 + 58)
     assert live_first.mid_minute(600.0 + 25) and not live_first.mid_minute(600.0 + 5) and not live_first.mid_minute(600.0 + 45)
+
+
+def test_one_mirror_per_chain_whoever_makes_it_first_and_the_runner_stops_it(monkeypatch):
+    monkeypatch.setattr(live_first, "record_event", lambda *a, **k: None)
+    made = []
+
+    class Fake:
+        def __init__(self, horizon_s=None):
+            made.append(self); self.H, self.stopped = horizon_s, False
+
+        def stop(self):
+            self.stopped = True
+    monkeypatch.setattr(fly_live, "LiveMirror", Fake)
+    live_first.stop_mirrors()
+    got, go = [], threading.Event()
+
+    def make():
+        go.wait(5); got.append(live_first.mirror("sol"))
+    ts = [threading.Thread(target=make) for _ in range(4)]
+    for t in ts:
+        t.start()
+    go.set()
+    for t in ts:
+        t.join(5)
+    assert len(made) == 1 and all(g is made[0] for g in got) and made[0].H is None          # the clock's: no hold yet
+    assert live_first.mirror("sol", 14400.0) is made[0] and made[0].H == 14400.0            # the fly's first live minute sets it
+    live_first.stop_mirrors()
+    assert made[0].stopped and live_first.mirror_of("sol") is None
+
+
+def test_before_the_fly_runs_only_positions_with_their_own_hold_are_sold(db_conn, clean):
+    w = _Worker(); m1 = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
+    mirror = fly_live.LiveMirror(None, broker=SimpleNamespace(rpc=_Rpc(5 * config.LAMPORTS_PER_SOL), pubkey="PK"), worker=w)
+    with transaction() as conn:
+        for mint, hold in (("LIVE_H1", 600.0), ("LIVE_H2", None)):
+            conn.execute("INSERT INTO positions (book, mint, pool, opened_at, qty, cost_sol, entry_price, status, hold_s) VALUES ('live', %s, 'P', %s, 1000000, 0.2, 0.0000002, 'open', %s)",
+                         (mint, m1 - timedelta(seconds=7200), hold))
+        first = mirror.exits(conn, m1=m1, run_id=None)
+        mirror.H = 7200.0
+        second = mirror.exits(conn, m1=m1 + timedelta(minutes=1), run_id=None)
+    assert first["exited"] == 1 and second["exited"] == 1 and [r.mint for r in w.submitted] == ["LIVE_H1", "LIVE_H2"]

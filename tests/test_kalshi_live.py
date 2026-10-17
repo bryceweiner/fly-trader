@@ -134,3 +134,17 @@ def test_order_failures_feed_the_kalshi_circuit(setup, monkeypatch):
     assert out["taker"]["entered"] == 0 and rails.load_circuit(s.conn, rails.KALSHI_CIRCUIT).fail_count == 1
     assert s.conn.execute("SELECT status, error FROM kalshi_orders").fetchone()["status"] == "error"
     assert rails.load_circuit(s.conn, rails.SOLANA_CIRCUIT).fail_count == 0                    # the memecoin circuit is untouched
+
+
+def test_the_live_maker_cancels_what_the_plan_cancels_and_reads_no_cash_without_buys(setup):
+    """The decided maker plan names the paper orders it ends (``cancels``): the live order of the same decision is cancelled
+    in the minute's orders, before any paper row is written; with no taker buys the subaccount's cash is not read first."""
+    s = setup; mirror = L.KalshiLiveMirror(rest=s.rest); quotes = {"T2": (68.0, 70.0, 50.0, 50.0)}
+    post = {"posted": [{"order_row": None, "decision_id": s.did2, "ticker": "T2", "side": "yes", "price_cents": 69, "count": 3, "expiration_ts": s.m1.timestamp() + 3600,
+                        "strategy": "ev"}], "cancels": [], "canceled": 0, "replaced": 0}
+    mirror.orders(_ctx(s.conn, s.m1, quotes), run_id=s.run, beat_id=s.beat, taker_entries=[], maker_plan=post)
+    out = mirror.orders(_ctx(s.conn, s.m1 + timedelta(minutes=1), quotes), run_id=s.run, beat_id=s.beat, taker_entries=[],
+                        maker_plan={"posted": [], "cancels": [{"order_row": 1, "decision_id": s.did2, "ticker": "T2", "side": "yes"}], "canceled": 1, "replaced": 0})
+    assert out["maker"]["canceled"] == 1 and ("cancel", "ord1") in s.rest.calls and not [c for c in s.rest.calls if c[0] == "balance"]
+    assert s.conn.execute("SELECT status FROM kalshi_orders WHERE order_id = 'ord1'").fetchone()["status"] == "canceled"
+

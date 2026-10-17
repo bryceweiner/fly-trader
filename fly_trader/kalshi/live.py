@@ -1,6 +1,8 @@
 """Live execution for the Kalshi fly (books ``live_kalshi_taker`` / ``live_kalshi_maker``): the paper arms' decisions of
 each minute mirrored on the dedicated subaccount, only when ``KALSHI_LIVE_ENABLED=1`` and every prerequisite holds
-(config.kalshi_live_prerequisites_missing). Per minute:
+(config.kalshi_live_prerequisites_missing). Live money first (CLAUDE.md): ``orders`` runs the moment the fly has
+decided, before any paper trade of the minute is booked -- the kill switch's liquidation, the taker's buys, the maker's
+cancels and posts --, and ``after`` the minute's bookkeeping once the paper work is done (``minute``: both). Per minute:
 
 - taker: every paper taker entry becomes an IOC order at the walk's worst level for as many contracts as the paper fill,
   sized down to the subaccount's cash (the cap is never exceeded); the exchange's fill count, cost and fees open the live
@@ -12,7 +14,8 @@ each minute mirrored on the dedicated subaccount, only when ``KALSHI_LIVE_ENABLE
   result the stream wrote settles at 100c per winning contract when the exchange row is late;
 - wealth: subaccount cash + positions at the bid + resting collateral → ``wealth_marks`` per live book (USD); the kill
   switch (circuit 2, ``KALSHI_KILL_SWITCH_DRAWDOWN`` on the combined live wealth) blocks entries and, with
-  ``KILL_SWITCH_LIQUIDATE``, cancels every resting order and sells every position IOC at the bid;
+  ``KILL_SWITCH_LIQUIDATE``, from the next minute's orders cancels every resting order and sells every position IOC at
+  the bid;
 - gap: over the last ``GAP_TRADES`` settled live positions per arm, a mean return trailing the paper mirror's same
   decisions by more than ``GAP_MAX`` pauses entries (circuit 2) and raises an alert. Learning is unaffected.
 Order failures feed the circuit breaker (``rails.record_failure``, circuit 2); a tripped circuit blocks entries.
@@ -117,19 +120,39 @@ class KalshiLiveMirror:
 
     # ---- the minute ----
     def minute(self, ctx, *, run_id: str, beat_id: int, taker_entries: list, maker_plan: dict) -> dict:
+        """``orders`` then ``after`` in one call."""
+        out = self.orders(ctx, run_id=run_id, beat_id=beat_id, taker_entries=taker_entries, maker_plan=maker_plan)
+        return {**out, **self.after(ctx, run_id=run_id, beat_id=beat_id)}
+
+    def orders(self, ctx, *, run_id: str, beat_id: int, taker_entries: list, maker_plan: dict) -> dict:
+        """The minute's orders, the moment the fly has decided: with circuit 2's kill switch on and
+        ``KILL_SWITCH_LIQUIDATE``, the liquidation; the taker's IOC buys (the subaccount's cash is read only when there
+        are some); the maker's cancels (``maker_plan['cancels']``: the paper orders no longer picked) and posts."""
+        conn = ctx.conn
+        c = rails.load_circuit(conn, rails.KALSHI_CIRCUIT)
+        blocked = "kill switch" if c.kill_switch else "circuit tripped" if c.tripped else "paused" if c.entries_paused else None
+        out = {"stage": "trading live", "blocked": blocked, "liquidated": self.liquidate(conn, ctx, run_id, beat_id) if c.kill_switch and config.KILL_SWITCH_LIQUIDATE else 0}
+        if taker_entries and config.KALSHI_TAKER_LIVE and not blocked:
+            try:
+                self.cash_cents = self.balance_cents()
+            except Exception as e:
+                log.warning("kalshi balance: %s", e)
+        out["taker"] = self.taker(conn, ctx, run_id, beat_id, taker_entries, blocked) if config.KALSHI_TAKER_LIVE else {"skipped": "KALSHI_TAKER_LIVE=0"}
+        out["maker"] = self.maker(conn, ctx, run_id, beat_id, maker_plan, blocked) if config.KALSHI_MAKER_LIVE else {"skipped": "KALSHI_MAKER_LIVE=0"}
+        return out
+
+    def after(self, ctx, *, run_id: str, beat_id: int) -> dict:
+        """The minute's bookkeeping, once its orders are out and the paper books are written: the subaccount's cash, the
+        exchange's settlements, maker fills, the resting-order reconcile, the wealth marks and the kill switch on their peak
+        (its liquidation goes out with the next minute's orders), the gap monitor."""
         conn, m1, now = ctx.conn, ctx.m1, ctx.m1_epoch
         try:
             self.cash_cents = self.balance_cents()
         except Exception as e:
             log.warning("kalshi balance: %s", e)
-        out = {"stage": "trading live", "cash": (self.cash_cents or 0.0) / 100.0}
+        out = {"cash": (self.cash_cents or 0.0) / 100.0}
         out["settled"] = self.settlements(conn, ctx, run_id, beat_id)
         out["maker_fills"] = self.maker_fills(conn, ctx, run_id, beat_id)
-        c = rails.load_circuit(conn, rails.KALSHI_CIRCUIT)
-        blocked = "kill switch" if c.kill_switch else "circuit tripped" if c.tripped else "paused" if c.entries_paused else None
-        out["blocked"] = blocked
-        out["taker"] = self.taker(conn, ctx, run_id, beat_id, taker_entries, blocked) if config.KALSHI_TAKER_LIVE else {"skipped": "KALSHI_TAKER_LIVE=0"}
-        out["maker"] = self.maker(conn, ctx, run_id, beat_id, maker_plan, blocked) if config.KALSHI_MAKER_LIVE else {"skipped": "KALSHI_MAKER_LIVE=0"}
         if now - self.last_reconcile >= RECONCILE_S:
             self.last_reconcile = now; out["reconciled"] = self.reconcile(conn)
         wealth = 0.0
@@ -142,8 +165,7 @@ class KalshiLiveMirror:
                                                                (1.0 - wealth / peak) if peak > 0 else 0.0, wealth - (self.cash_cents or 0.0) / 100.0,
                                                                len(P.open_positions(conn, BOOKS["taker"])) + len(P.open_positions(conn, BOOKS["maker"]))))
         out["wealth"] = wealth
-        killed = rails.check_drawdown(conn, wealth, peak, rails.KALSHI_CIRCUIT, drawdown=config.KALSHI_KILL_SWITCH_DRAWDOWN, unit="USD")
-        out["liquidated"] = self.liquidate(conn, ctx, run_id, beat_id) if killed and config.KILL_SWITCH_LIQUIDATE else 0
+        out["killed"] = rails.check_drawdown(conn, wealth, peak, rails.KALSHI_CIRCUIT, drawdown=config.KALSHI_KILL_SWITCH_DRAWDOWN, unit="USD")
         out["gap"] = {arm: self.gap(conn, arm) for arm in BOOKS}
         return out
 
@@ -180,9 +202,12 @@ class KalshiLiveMirror:
 
     def maker(self, conn, ctx, run_id, beat_id, plan: dict, blocked: str | None) -> dict:
         book = BOOKS["maker"]; n_post = n_cancel = 0
-        # cancels and replaces first: the paper order rows that left 'resting' this minute carry the decision ids of the live orders to cancel
-        gone = conn.execute("SELECT o.decision_id, o.ticker FROM kalshi_orders o WHERE o.book = %s AND o.status IN ('canceled','replaced') AND o.updated_at >= %s",
-                            (MIRROR["maker"], ctx.m0)).fetchall()
+        # cancels first: each carries the decision id of the paper order it ends, which is the live order's too; a plan from
+        # before the decide/book split (kalshi/maker.plan) has none: the paper rows that left 'resting' this minute say it
+        gone = plan.get("cancels")
+        if gone is None:
+            gone = conn.execute("SELECT o.decision_id, o.ticker FROM kalshi_orders o WHERE o.book = %s AND o.status IN ('canceled','replaced') AND o.updated_at >= %s",
+                                (MIRROR["maker"], ctx.m0)).fetchall()
         for g in gone:
             for lo in conn.execute("SELECT id, order_id FROM kalshi_orders WHERE book = %s AND decision_id = %s AND status IN ('resting','submitted') AND order_id IS NOT NULL",
                                    (book, g["decision_id"])).fetchall():

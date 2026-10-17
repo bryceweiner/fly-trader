@@ -39,6 +39,7 @@ from . import data as D
 log = logging.getLogger(__name__)
 STATUS_KEY = "kalshi_stream_status"
 FLUSH_GRACE_S, FLUSH_FALLBACK_S = 2.0, 15.0
+FLUSH_CHECK_S = 0.25         # how often complete minutes are looked for: a written minute is published at once (live money first)
 QUOTE_FLUSH_S, STATUS_S, CATALOGUE_S, LIFECYCLE_S, ARCHIVE_S = 5.0, 5.0, 3600.0, 30.0, 3600.0
 PUBLIC_CHANNELS = ("ticker", "trade", "market_lifecycle_v2")
 PRIVATE_CHANNELS = ("fill", "user_orders")
@@ -407,12 +408,15 @@ async def _run(stop: threading.Event | None, agg: Aggregator) -> None:
                         else:
                             agg.ingest(e)
                     now = time.time()
-                    if now - last_flush >= 1.0:
+                    if now - last_flush >= FLUSH_CHECK_S:
+                        before = agg.flushed_through
                         try:
                             agg.flush(agg.flush_bound(now))
                         except Exception:
                             log.exception("minute flush failed; rows kept for the next attempt")
                         last_flush = now
+                        if agg.flushed_through != before:
+                            last_status = 0.0      # a minute was written: the engine hears of it now, not at the next 5 s status
                     if now - last_quotes >= QUOTE_FLUSH_S:
                         agg.write_quotes(); agg.write_settlements(); agg.write_private(); last_quotes = now
                     if now - last_life >= LIFECYCLE_S and agg.catalogue_todo and (bg["fetch"] is None or bg["fetch"].done()):

@@ -31,6 +31,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -70,12 +71,13 @@ def pool_of(conn, pool_id: str | None) -> dict | None:
 
 
 class RhLiveMirror:
-    def __init__(self, horizon_s: float, executor: RhExecutor | None = None):
+    def __init__(self, horizon_s: float | None = None, executor: RhExecutor | None = None):
         if executor is None:
             from .rpc import RhRpc
             from .wallet import RhWallet
             executor = RhExecutor(RhWallet(RhRpc()))
-        self.ex, self.H = executor, float(horizon_s)
+        self.ex = executor
+        self.H = float(horizon_s) if horizon_s is not None else None   # the fly's longest hold, set once it runs (agent/live_first.mirror)
         self.last_sweep = self.last_reconcile = 0.0
         self.sent: dict[int, dict] = {}       # decision id -> {"e": its paper entry, "ts": its minute, "tries": n}: a buy queued or in flight
         self.failed: dict[int, dict] = {}     # the same for a buy that failed without buying anything: sent again while it may be
@@ -133,8 +135,10 @@ class RhLiveMirror:
 
     def _held(self, p: dict, m1: datetime) -> tuple[float, float]:
         """(seconds held, its hold): from its entry decision's minute (paper's clock; an RH fill lands ~10 s after it, a
-        lagging minute later still)."""
-        return (m1 - (p.get("decision_ts") or p["opened_at"])).total_seconds(), float(p.get("hold_s") or self.H)
+        lagging minute later still). A position that carries no hold of its own takes the fly's longest, and none (never due)
+        before the fly has run."""
+        H = p.get("hold_s") or self.H
+        return (m1 - (p.get("decision_ts") or p["opened_at"])).total_seconds(), float(H) if H else math.inf
 
     def _dead(self, p: dict, m1: datetime) -> bool:
         held, H = self._held(p, m1)

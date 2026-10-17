@@ -120,14 +120,29 @@ def blocked_reason(conn, book: str) -> str | None:
     return None
 
 
-def taker_entries(conn, *, book: str, run_id: str, beat_id: int, ts: datetime, picks: list[dict], quotes: dict, orderbooks: dict | None = None, kind: str = "kalshi_taker") -> dict:
-    """The taker arm's entries for one minute. ``picks``: [{ticker, side, p, edge, line, table, strategy, hold_s}] at or above the
-    line; each is sized (``budget_cents``) and walked through its order book (``orderbooks[ticker]`` when held, else the top
-    of book) at ``p``; a fill is opened at its fee-inclusive VWAP with the walk's worst level as the limit (what the live
-    mirror submits as an IOC). One position per (market, side); the other side of a held market is skipped."""
+def taker_entries(conn, **kw) -> dict:
+    """The taker arm's entries for one minute: ``plan_taker_entries`` (its arguments), then ``book_taker_entries``."""
+    return book_taker_entries(conn, plan_taker_entries(conn, **kw))
+
+
+def book_taker_entries(conn, plan: dict) -> dict:
+    """Opens the paper positions of ``plan`` (``plan_taker_entries``): after the live mirror has sent its orders."""
+    for e, r in zip(plan["entries"], plan.pop("rows", [])):
+        e["position_id"] = open_position(conn, book=plan["book"], order_id=None, arm="taker", ts=plan["ts"], **r)
+    return plan
+
+
+def plan_taker_entries(conn, *, book: str, run_id: str, beat_id: int, ts: datetime, picks: list[dict], quotes: dict, orderbooks: dict | None = None,
+                       kind: str = "kalshi_taker") -> dict:
+    """The taker arm's entries for one minute, decided but not booked (live money first, CLAUDE.md: the live mirror buys
+    from ``entries`` before ``book_taker_entries`` opens the paper positions). ``picks``: [{ticker, side, p, edge, line,
+    table, strategy, hold_s}] at or above the line; each is sized (``budget_cents``) and walked through its order book
+    (``orderbooks[ticker]`` when held, else the top of book) at ``p``; a fill is planned at its fee-inclusive VWAP with the
+    walk's worst level as the limit (what the live mirror submits as an IOC). One position per (market, side); the other
+    side of a held market is skipped. Every entry and blocked pick is a ``decisions`` row."""
     opens = open_positions(conn, book); held = {(p["ticker"], p["side"]) for p in opens}; held_markets = {p["ticker"] for p in opens}
     cash = cash_cents(conn, book); deployed = open_cost_cents(conn, book); bankroll = cash + deployed
-    blocked = blocked_reason(conn, book); entries = []; n = 0
+    blocked = blocked_reason(conn, book); entries = []; rows = []; n = 0
     for pk in picks:
         tk, side = pk["ticker"], pk["side"]; edge = float(pk["edge"]); usd0 = 0.0
         if (tk, side) in held or tk in held_markets or blocked:
@@ -151,12 +166,12 @@ def taker_entries(conn, *, book: str, run_id: str, beat_id: int, ts: datetime, p
                        reason=f"{pk.get('strategy') or 'ev'}: edge {edge:.3f} ≥ {pk['line']:.3f}; {why}; {fill.quantity} × {fill.vwap_cents:.1f}c (limit {fill.limit_price_cents}c)",
                        detail={"edge": edge, "line": pk["line"], "strategy": pk.get("strategy"), "p": pk.get("p"), "contracts": fill.quantity, "vwap_cents": fill.vwap_cents,
                                "limit_price_cents": fill.limit_price_cents, "fee_cents": fee, "levels": fill.levels_taken, "budget_cents": size, "hold_s": pk.get("hold_s")}, book=book)
-        pid = open_position(conn, book=book, ticker=tk, side=side, contracts=float(fill.quantity), cost_cents=float(cost), fee_cents=float(fee), avg_price=cost / fill.quantity,
-                            decision_id=did, order_id=None, strategy=pk.get("strategy"), arm="taker", score=edge, line=pk["line"], ts=ts)
+        rows.append(dict(ticker=tk, side=side, contracts=float(fill.quantity), cost_cents=float(cost), fee_cents=float(fee), avg_price=cost / fill.quantity, decision_id=did,
+                         strategy=pk.get("strategy"), score=edge, line=pk["line"]))
         held.add((tk, side)); held_markets.add(tk); cash -= fill.cost_cents; deployed += fill.cost_cents; n += 1
-        entries.append({"position_id": pid, "decision_id": did, "ticker": tk, "side": side, "contracts": fill.quantity, "limit_price_cents": fill.limit_price_cents,
+        entries.append({"position_id": None, "decision_id": did, "ticker": tk, "side": side, "contracts": fill.quantity, "limit_price_cents": fill.limit_price_cents,
                         "vwap_cents": fill.vwap_cents, "cost_cents": fill.cost_cents, "p": pk.get("p"), "edge": edge, "line": pk["line"], "strategy": pk.get("strategy")})
-    return {"entered": n, "entries": entries, "blocked": blocked, "cash_cents": cash}
+    return {"entered": n, "entries": entries, "blocked": blocked, "cash_cents": cash, "book": book, "ts": ts, "rows": rows}
 
 
 def settle(conn, *, book: str, results: dict, ts: datetime, run_id: str | None = None, beat_id: int | None = None, payouts: dict | None = None) -> list[dict]:

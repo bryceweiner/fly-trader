@@ -3,19 +3,22 @@ engine and learning from every settlement (agent/fly_session.py for prediction m
 
 It starts once its design passed the replay (kalshi/fly_replay.verdict) and a deployable bootstrap exists
 (kalshi/fly.latest_deployable); the replay's chosen (α, half-life) per strategy is its mushroom body's learning rate
-and forgetting (brain/plastic.py). Each minute (kalshi/engine.py):
+and forgetting (brain/plastic.py). Each minute (kalshi/engine.py), live money first (CLAUDE.md): ``on_minute`` is the
+minute's live part, ``after_minute`` the rest, once the live orders are out.
 
-1. labels: tags whose market has now settled (the stream writes ``kalshi_markets.result``) teach the mushroom body the
-   outcome y ∈ {0, 1} of their side (δ = y − p̂); a tag due before its market resolved is re-armed hourly, and dropped
-   as unknown a week after close;
-2. calibration: at the first minute of each UTC day, every strategy's edge line and sizing, plastic and frozen, from the
+1. scoring (``on_minute``): eligible (market, minute, side) rows are scored by the plastic fly and its frozen shadow —
+   p̂ per strategy, the edge p̂ − the arm's fee-inclusive price — and tagged; only rows at or above the line teach it;
+2. trading (``on_minute``): the paper books' settlements and the maker's fills and expiries of the minute (what is still
+   held and still resting: the plan's inputs), then on fresh trade minutes the taker arm (kalshi/paper.plan_taker_entries)
+   and the maker arm (kalshi/maker.decide_plan) decided from the same decision, and the live mirror's orders on them
+   (kalshi/live.py) when ``KALSHI_LIVE_ENABLED`` and the prerequisites hold;
+3. after the live orders (``after_minute``): the scored rows stored (``kalshi_fly_scored``), the paper trades booked, the
+   books marked, the live mirror's bookkeeping, then labels: tags whose market has now settled (the stream writes
+   ``kalshi_markets.result``) teach the mushroom body the outcome y ∈ {0, 1} of their side (δ = y − p̂); a tag due before
+   its market resolved is re-armed hourly, and dropped as unknown a week after close;
+4. calibration: at the first minute of each UTC day, every strategy's edge line and sizing, plastic and frozen, from the
    rows resolved in the last seven days (``kalshi_fly_scored``; the taker label is the return at the effective ask, the
-   maker label the return of a bid one tick inside the ask when a later minute's ask reached it);
-3. scoring: eligible (market, minute, side) rows are scored by the plastic fly and its frozen shadow — p̂ per strategy,
-   the edge p̂ − the arm's fee-inclusive price — stored and tagged; only rows at or above the line teach it;
-4. trading (fresh stream, trade minutes): the taker arm (kalshi/paper.taker_entries) and the maker arm (kalshi/maker.plan
-   + adjudicate) from the same decision, then settlements and marks per book; the live mirror (kalshi/live.py) when
-   ``KALSHI_LIVE_ENABLED`` and the prerequisites hold.
+   maker label the return of a bid one tick inside the ask when a later minute's ask reached it).
 
 Hourly: learning statistics (``kalshi_fly_updates``), a snapshot of the plastic state (kind 'kalshi_fly_plastic'), the
 rollback checks (train/fly_governance.py; a third rollback in 7 days freezes learning and asks kalshi/pipeline.py for a
@@ -101,6 +104,7 @@ class KalshiFlyBook:
 
     def __init__(self, boot: dict, verdict: dict):
         self.done = False; self.mirror = None; self.verdict = verdict
+        self._phase: dict | None = None; self._scored_rows: list = []; self._activity: tuple | None = None   # the live part's, written after it
         self.state_path = kalshi_fly_state_dir() / "state.pt"
         self._load_bootstrap(boot)
         self.run_id = str(uuid.uuid4()); self.beat_no = 0
@@ -202,20 +206,15 @@ class KalshiFlyBook:
     def tickers_watched(self) -> set[str]:
         return set(self.watch)
 
+    LIVE = True                  # the engine runs this book's minute in two parts, its live orders first (kalshi/engine.py)
+
     def on_minute(self, ctx) -> dict:
-        conn, t_now = ctx.conn, ctx.t_start
+        """The minute's live part: commands, the fly's scores, the paper books' settlements and the maker's fills (what is
+        still held and resting: the plan's inputs), the taker and maker plans decided, and the live mirror's orders on them
+        (``_live``). ``after_minute`` books the paper trades, learns and writes the rest."""
+        conn = ctx.conn; self._phase = None
         self._commands(conn, ctx.m1_epoch)
-        learned = self._learn(conn, ctx)
-        day = int(t_now // 86400)
-        if self.last_day is None:
-            self.last_day = day
-        elif day > self.last_day:
-            self.last_day = day; self._calibrate(conn, ctx.m1_epoch)
         scored = self._score(conn, ctx)
-        drift = {k: float(self.bank.drift(j)[0]) if self.bank.learn.shape[0] > 1 else float(self.bank.drift()[0]) for j, k in enumerate(self.names)}
-        out = {"minute": ctx.m1.isoformat(), "eligible": len(ctx.keys), "markets_active": ctx.n_rows // 2, "picks": scored["picks"], "lines": self.lines["plastic"],
-               "frozen_lines": self.lines["frozen"], "arms": self.arms, "drift": max(drift.values()) if drift else 0.0, "drift_by_strategy": drift, "pending": len(self.pending),
-               "learned": learned, "learning_frozen": self.learning_frozen, "channels": self.cfg, "bootstrap": self.boot_id, "device": str(self.fly.net.dev)}
         self.beat_no += 1
         beat = conn.execute("INSERT INTO beats (run_id, ts, beat_no, n_slots_active, notes) VALUES (%s,%s,%s,%s,%s) RETURNING id",
                             (self.run_id, ctx.m1, self.beat_no, len(ctx.keys), json.dumps({"minute": ctx.m1.isoformat(), "markets_active": ctx.n_rows // 2}))).fetchone()["id"]
@@ -226,25 +225,56 @@ class KalshiFlyBook:
             books[arm] = {"settled": len(settled), "settled_pnl": sum(s["realized_cents"] for s in settled) / 100.0}
         adj = maker.adjudicate(conn, book=P.BOOKS["maker"], run_id=self.run_id, beat_id=beat, ts=ctx.m1, now=ctx.m1_epoch, extremes=ctx.extremes, metas=ctx.metas)
         books["maker"].update(filled=len(adj["filled"]), expired=adj["expired"])
-        live_plan = {"taker_entries": [], "maker": {"posted": [], "canceled": 0, "replaced": 0}}
+        tk = mk = live = None
         if ctx.trade and ctx.fresh:
-            tk = P.taker_entries(conn, book=P.BOOKS["taker"], run_id=self.run_id, beat_id=beat, ts=ctx.m1, picks=scored["taker"], quotes=ctx.quotes)
-            mk = maker.plan(conn, book=P.BOOKS["maker"], run_id=self.run_id, beat_id=beat, ts=ctx.m1, now=ctx.m1_epoch, picks=scored["maker"], quotes=ctx.quotes, metas=ctx.metas)
-            books["taker"].update(entered=tk["entered"], blocked=tk["blocked"]); books["maker"].update(posted=len(mk["posted"]), canceled=mk["canceled"], replaced=mk["replaced"], resting=mk["resting"])
-            live_plan = {"taker_entries": tk["entries"], "maker": mk}
-            out["stage"] = "trading"
-        else:
-            out["stage"] = "learning (not trading this minute)" if ctx.trade else "catching up"
-        for arm, book in P.BOOKS.items():
-            books[arm].update(P.mark(conn, book=book, quotes=ctx.quotes, ts=ctx.m1, beat_id=beat))
-        out["books"] = books
+            tk = P.plan_taker_entries(conn, book=P.BOOKS["taker"], run_id=self.run_id, beat_id=beat, ts=ctx.m1, picks=scored["taker"], quotes=ctx.quotes)
+            mk = maker.decide_plan(conn, book=P.BOOKS["maker"], run_id=self.run_id, beat_id=beat, ts=ctx.m1, now=ctx.m1_epoch, picks=scored["maker"], quotes=ctx.quotes,
+                                   metas=ctx.metas)
         if config.KALSHI_LIVE_ENABLED:
-            out["live"] = self._live(ctx, beat, live_plan)
+            live = self._live(ctx, beat, {"taker_entries": tk["entries"] if tk else [], "maker": mk or {"posted": [], "cancels": [], "canceled": 0, "replaced": 0}})
+        self._phase = {"m1": ctx.m1, "beat": beat, "scored": scored, "books": books, "tk": tk, "mk": mk, "live": live}
+        return {"minute": ctx.m1.isoformat(), "picks": scored["picks"], "live": live}
+
+    def after_minute(self, ctx) -> dict:
+        """The rest of the minute, once the live orders are out: the scored rows stored, the paper trades booked, the books
+        marked, the live mirror's bookkeeping, labels learned, the daily calibration, the hourly checks, state and status."""
+        conn = ctx.conn
+        ph = self._phase if self._phase is not None and self._phase["m1"] == ctx.m1 else None
+        self._phase = None
+        self._store_scored(conn)
+        out = {"minute": ctx.m1.isoformat(), "eligible": len(ctx.keys), "markets_active": ctx.n_rows // 2, "picks": ph["scored"]["picks"] if ph else 0}
+        if ph is not None:
+            books, beat = ph["books"], ph["beat"]
+            if ph["tk"] is not None:
+                tk = P.book_taker_entries(conn, ph["tk"]); mk = maker.book_plan(conn, ph["mk"])
+                books["taker"].update(entered=tk["entered"], blocked=tk["blocked"])
+                books["maker"].update(posted=len(mk["posted"]), canceled=mk["canceled"], replaced=mk["replaced"], resting=mk["resting"])
+                out["stage"] = "trading"
+            else:
+                out["stage"] = "learning (not trading this minute)" if ctx.trade else "catching up"
+            for arm, book in P.BOOKS.items():
+                books[arm].update(P.mark(conn, book=book, quotes=ctx.quotes, ts=ctx.m1, beat_id=beat))
+            out["books"] = books
+            if ph["live"] is not None:
+                out["live"] = {**ph["live"], **self._live_after(ctx, beat)}
+        else:
+            out["stage"] = "minute failed before its orders"
+        learned = self._learn(conn, ctx)
+        day = int(ctx.t_start // 86400)
+        if self.last_day is None:
+            self.last_day = day
+        elif day > self.last_day:
+            self.last_day = day; self._calibrate(conn, ctx.m1_epoch)
+        drift = {k: float(self.bank.drift(j)[0]) if self.bank.learn.shape[0] > 1 else float(self.bank.drift()[0]) for j, k in enumerate(self.names)}
+        out.update({"lines": self.lines["plastic"], "frozen_lines": self.lines["frozen"], "arms": self.arms, "drift": max(drift.values()) if drift else 0.0,
+                    "drift_by_strategy": drift, "pending": len(self.pending), "learned": learned, "learning_frozen": self.learning_frozen, "channels": self.cfg,
+                    "bootstrap": self.boot_id, "device": str(self.fly.net.dev)})
         hour = int(ctx.m1_epoch // 3600)
         if self.last_hour is None:
             self.last_hour = hour
         elif hour > self.last_hour:
             self.last_hour = hour; self._hourly(conn, ctx.m1_epoch)
+        self._write_capture()
         self._write_state()
         if learned.get("keys"):
             with conn.cursor() as cur:
@@ -258,6 +288,7 @@ class KalshiFlyBook:
         return out
 
     def _live(self, ctx, beat_id: int, plan: dict) -> dict:
+        """The live mirror's orders of the minute, in their own savepoint: a failure must not roll back the paper plan."""
         missing = config.kalshi_live_prerequisites_missing()
         if missing:
             return {"stage": "live gated: " + ", ".join(missing)}
@@ -266,10 +297,22 @@ class KalshiFlyBook:
             self.mirror = KalshiLiveMirror()
             record_event("info", "kalshi_live", "the Kalshi fly trades the subaccount", {"run_id": self.run_id, "subaccount": config.KALSHI_SUBACCOUNT})
         try:
-            return self.mirror.minute(ctx, run_id=self.run_id, beat_id=beat_id, taker_entries=plan["taker_entries"], maker_plan=plan["maker"])
+            with ctx.conn.transaction():
+                return self.mirror.orders(ctx, run_id=self.run_id, beat_id=beat_id, taker_entries=plan["taker_entries"], maker_plan=plan["maker"])
         except Exception as e:
-            log.exception("kalshi live mirror failed this minute")
+            log.exception("kalshi live orders failed this minute")
             return {"stage": "live error", "error": f"{type(e).__name__}: {e}"[:300]}
+
+    def _live_after(self, ctx, beat_id: int) -> dict:
+        """The live mirror's bookkeeping of the minute, in its own savepoint."""
+        if self.mirror is None:
+            return {}
+        try:
+            with ctx.conn.transaction():
+                return self.mirror.after(ctx, run_id=self.run_id, beat_id=beat_id)
+        except Exception as e:
+            log.exception("kalshi live bookkeeping failed this minute")
+            return {"bookkeeping": f"failed: {type(e).__name__}: {e}"[:300]}
 
     def finish(self) -> None:
         try:
@@ -391,10 +434,7 @@ class KalshiFlyBook:
                                       w[:, torch.as_tensor(qq, device=w.device)], s=j)
                     for q in qq:
                         tk = ctx.keys[loc[q]][0]; self.watch[tk] = self.watch.get(tk, 0) + 1
-        if rows:
-            with conn.cursor() as cur:
-                cur.executemany("INSERT INTO kalshi_fly_scored (ts, ticker, side, strategy, x, score, frozen_score, line, frozen_line, due_ts, bootstrap_id) "
-                                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ts, ticker, side, strategy) DO NOTHING", rows)
+        self._scored_rows = rows                                 # stored by after_minute (_store_scored): no row write before the live orders
         self.fly.lines = dict(self.lines["plastic"]); self.fly.sizings = {k_: list(v) for k_, v in self.sizing["plastic"].items()}
         picks = {"taker": [], "maker": []}
         for arm in ("taker", "maker"):
@@ -408,15 +448,34 @@ class KalshiFlyBook:
         return {**picks, "picks": len(picks["taker"]) + len(picks["maker"])}
 
     def _capture(self, H: torch.Tensor, trig: np.ndarray, t: float) -> None:
+        """This minute's mean activity for the 3D view, kept for ``_write_capture`` after the live orders."""
+        self._activity = None
         if not self.capture_ok:
             return
         try:
             sel = np.flatnonzero(trig.any(1)); n_c = int(len(sel))
             m = (H.index_select(0, torch.as_tensor(sel, device=H.device)) if n_c else H).mean(0)
-            activity.write(kalshi_activity_dir(), t, activity.quantise(m), n_rows=int(len(trig)), n_cand=n_c, connectome=self.connectome_name)
+            self._activity = (t, activity.quantise(m), int(len(trig)), n_c)
         except Exception:
             self.capture_ok = False
             log.exception("kalshi brain activity capture disabled for this session")
+
+    def _write_capture(self) -> None:
+        a, self._activity = self._activity, None
+        if a is None or not self.capture_ok:
+            return
+        try:
+            activity.write(kalshi_activity_dir(), a[0], a[1], n_rows=a[2], n_cand=a[3], connectome=self.connectome_name)
+        except Exception:
+            self.capture_ok = False
+            log.exception("kalshi brain activity capture disabled for this session")
+
+    def _store_scored(self, conn) -> None:
+        rows, self._scored_rows = self._scored_rows, []
+        if rows:
+            with conn.cursor() as cur:
+                cur.executemany("INSERT INTO kalshi_fly_scored (ts, ticker, side, strategy, x, score, frozen_score, line, frozen_line, due_ts, bootstrap_id) "
+                                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ts, ticker, side, strategy) DO NOTHING", rows)
 
     # ---- daily and hourly ----
     def _resolved(self, conn, since: float, cols: str, name: str) -> list[dict]:

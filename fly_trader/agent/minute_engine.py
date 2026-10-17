@@ -18,8 +18,9 @@ Live money first and fast over paper, always (CLAUDE.md, agent/live_first.py). A
 the fly) runs its minute in two parts: ``on_minute`` in the minute's live phase (``live_phase``: the features, then the
 fly scores, plans and sends the wallet's orders; committed at once), ``after_minute`` in its paper phase
 (``paper_phase``: its paper trades, learning and bookkeeping, then every other book's minute). The loop runs every
-chain's newest minute's live phase before any chain's paper phase, and calls ``idle`` on the books between minutes. The
-wallet's scheduled sales go out at the minute boundary from the live clock's own thread (``live_exits``).
+chain's newest minute's live phase before any chain's paper phase, and the live mirrors' idle bookkeeping between
+minutes. The wallet's scheduled sales go out at each minute boundary from the live clock's own thread
+(``live_first.chain_exits``), started with the runner: a restart never holds them behind the books loading or the warm-up.
 
 Books join when they qualify (checked every ``MODEL_CHECK_S``, mid-minute): the selector while it has a deployable
 model and has not handed its seat to a fly that is trading;
@@ -465,21 +466,23 @@ def main(stop_event: threading.Event | None = None, live: bool = False) -> None:
     lead = engines[0]; books: list = []
     for e in engines:
         e.books = books                                  # the same list object: admission and removal are seen by every engine
-    while not (stop_event is not None and stop_event.is_set()):
-        books += admit_books(lead, live)
-        if books:
-            break
-        log.info("trading engine waiting: no book qualifies yet")
-        (stop_event or threading.Event()).wait(MODEL_CHECK_S)
-    else:
-        return
-    m_start = math.floor(time.time() / 60) * 60
-    for e in engines:
-        e.warm_up(m_start); e.last_minute = m_start - 60
-    clock = live_first.LiveClock(books, stop_event).start()     # the wallet's scheduled sales at each boundary, from their own thread
-    last_check = time.time(); n_min = 0
-    last_release, last_stamp_check = release_stamp(), 0.0
+    # the wallet's scheduled sales at every boundary from the runner's first second, from their own thread: never behind
+    # the books loading or the engine warming up (agent/live_first.py)
+    clock = live_first.LiveClock(books, [m.chain for m in markets.enabled()], live, stop_event).start()
     try:
+        while not (stop_event is not None and stop_event.is_set()):
+            books += admit_books(lead, live)
+            if books:
+                break
+            log.info("trading engine waiting: no book qualifies yet")
+            (stop_event or threading.Event()).wait(MODEL_CHECK_S)
+        else:
+            return
+        m_start = math.floor(time.time() / 60) * 60
+        for e in engines:
+            e.warm_up(m_start); e.last_minute = m_start - 60
+        last_check = time.time(); n_min = 0
+        last_release, last_stamp_check = release_stamp(), 0.0
         while not (stop_event is not None and stop_event.is_set()):
             now = time.time(); m1 = math.floor(now / 60) * 60
             if now - last_stamp_check >= 15.0:
@@ -505,11 +508,7 @@ def main(stop_event: threading.Event | None = None, live: bool = False) -> None:
                              " | ".join(f"{b.name}: picks {(st.get(b.name) or {}).get('picks')} open {(st.get(b.name) or {}).get('open')} wealth {(st.get(b.name) or {}).get('wealth')}"
                                         for b in engine.my_books()))
             if not ran:                                  # between minutes: bookkeeping that waits for an idle wallet
-                for b in list(books):
-                    try:
-                        getattr(b, "idle", lambda: None)()
-                    except Exception:
-                        log.exception("%s: idle bookkeeping failed", b.name)
+                live_first.idle_mirrors()
             time.sleep(POLL_S)
     finally:
         clock.close()
@@ -518,3 +517,4 @@ def main(stop_event: threading.Event | None = None, live: bool = False) -> None:
                 b.finish()
             except Exception:
                 log.exception("%s: finish failed", b.name)
+        live_first.stop_mirrors()                       # each waits for its order in flight
