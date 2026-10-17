@@ -127,6 +127,18 @@ FLY_LEARNED_VETO = env_float("FLY_LEARNED_VETO", 0.02)
 # selector. own: its distilled copy of the selector (until 2026-10-11): that copy ranked the selector's top 1 % of
 # candidates only ~0.6-correlated, so its own judgement at the line was half noise (fly #157 and #251 alike).
 FLY_SCORE = env_str("FLY_SCORE", "teacher")
+# What the fly's mushroom body learns from (brain/plastic.py, agent/fly_session._learn). Its outcome pathway learns the
+# book's realized return of every row it traded (the market label only for a row it did not); its fill pathway learns
+# what the wallet's real fills added to that (live realized − outcome) at FLY_FILL_ALPHA (the share of a fill error one
+# update corrects), forgetting with FLY_FILL_HALF_LIFE_DAYS. The fill pathway is one compartment of each strategy's
+# channel, chosen once on the first scored minute: the one taking the least of the channel's learning that can still
+# lower a score by FLY_FILL_RANGE (on fly #157 the lightest ones reach only 0.2–2 %, the learned veto's own size).
+# FLY_FILL_PATHWAY=0: every own compartment learns the outcome alone.
+FLY_OUTCOME_FROM_BOOK = env_bool("FLY_OUTCOME_FROM_BOOK", True)
+FLY_FILL_PATHWAY = env_bool("FLY_FILL_PATHWAY", True)
+FLY_FILL_ALPHA = env_float("FLY_FILL_ALPHA", 0.02)
+FLY_FILL_HALF_LIFE_DAYS = env_float("FLY_FILL_HALF_LIFE_DAYS", 14.0)
+FLY_FILL_RANGE = env_float("FLY_FILL_RANGE", 0.05)
 DEVICE = env_str("DEVICE", "auto")          # auto (CUDA/ROCm, else MPS, else CPU) | cpu | cuda[:N] | rocm[:N] | mps  — brain/device.py
 NT_SIGN_MODE = env_str("NT_SIGN_MODE", "shiu")  # shiu | flybrain
 CELL_TYPES_SOURCE = env_str("CELL_TYPES_SOURCE", "annotations")  # annotations | flybrain

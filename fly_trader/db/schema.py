@@ -234,6 +234,13 @@ BASE_DDL: list[str] = [
     "CREATE INDEX IF NOT EXISTS fly_scored_state_ts_idx ON fly_scored (state, ts)",
     # would the fly's teacher have traded this row (its final decision)? the match calibration rule's budget (train/fly_calibrate.py)
     "ALTER TABLE fly_scored ADD COLUMN IF NOT EXISTS teacher_allow boolean",
+    # what the fly's two pathways learned from (agent/fly_session._learn): the outcome its outcome pathway learned (the
+    # book's realized return, else the label), the live fill residual its fill pathway learned (live realized − outcome)
+    # and the fill pathway's own score change when the row was scored; state 'awaiting_fill' keeps x until the live
+    # position closes
+    "ALTER TABLE fly_scored ADD COLUMN IF NOT EXISTS outcome real",
+    "ALTER TABLE fly_scored ADD COLUMN IF NOT EXISTS fill real",
+    "ALTER TABLE fly_scored ADD COLUMN IF NOT EXISTS fill_score real",
     """CREATE TABLE IF NOT EXISTS fly_calibrations (
         day date NOT NULL, arm text NOT NULL, line real, sizing jsonb, trades int, total real, mean real, window_days int,
         created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (day, arm))""",

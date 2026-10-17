@@ -5,8 +5,11 @@ bootstrap exists (``train/fly_selector.latest_deployable``); the replay's chosen
 learning rate and forgetting of its mushroom body (``brain/plastic.py``). Each minute (agent/minute_engine.py):
 
 1. bars: minute start, open, close and exit cost of every traded mint with a pending tag feed the label resolver;
-2. labels: tags whose exit minute has now been seen are resolved exactly as ``train/decisions.build`` labels a row
-   (``resolve_label``) and teach the mushroom body; a label that cannot be resolved is dropped;
+2. outcomes: tags whose exit minute has now been seen teach the mushroom body's outcome pathway what the row made --
+   the book's realized return when it traded the row, else its label (``resolve_label``, exactly as
+   ``train/decisions.build`` labels a row); a row the wallet bought too then teaches the fill pathway what the real fills
+   added (live realized − outcome) once its live position has closed (``fly_scored`` state 'awaiting_fill' until then);
+   a row with neither outcome nor label is dropped;
 3. calibration: at the first minute of each UTC day, the line and sizing of the plastic fly and of its frozen shadow
    (the bootstrap, D = 0) from their scores of the minutes resolved in the last seven days (``train/fly_calibrate.py``);
 4. scoring: eligible minutes are scored by the plastic fly and its shadow, stored (``fly_scored``: pending rows keep the
@@ -52,7 +55,11 @@ BOOK, KIND = "paper_fly", "fly"            # the Solana book's names (another ch
 BAR_KEEP = 270               # minutes of bars kept per watched mint (the longest strategy hold, 240, + next-open window + margin)
 NEXT_OPEN_S = 120.0          # entry at the next traded minute's open when it comes within two minutes (decisions.build)
 JUMP = 50.0
-LABEL_LAG_S = 60.0
+LABEL_LAG_S = 120.0          # a row teaches a minute after its exit minute: the book sells it in that minute, after the fly learns
+OUTCOME_WAIT_S = 600.0       # a traded row whose book position is still open waits up to this long past its hold, else its label
+FILL_RETRY_S = 60.0          # a row whose live position is still open is looked at again a minute later
+FILL_WAIT_S = 4 * 3600.0     # ... until this long after its hold (a live position unsold 3 h past its hold is a dead-bag)
+FILL_IC_DAYS, FILL_IC_MIN = 7, 30   # the fill pathway's check: its predictions against the fills it learned
 ROLLBACK_PAUSE_S, ROLLBACK_LIMIT, ROLLBACK_WINDOW_S, ROLLBACK_MIN_AGE_S = 86400.0, 3, 7 * 86400.0, 86400.0
 SNAP_HOURLY_DAYS, SCORED_KEEP_DAYS = 7, 35
 COMMAND_KEY = "fly_command"
@@ -174,10 +181,10 @@ class FlyBook:
             self.alpha = self.cfg[self.names[0]][0]; self.half_life = float(self.cfg[self.names[0]][1]) if self.cfg[self.names[0]][1] is not None else math.inf
             net = self.fly.net
             self.bank = plastic.PlasticBank(net, [(self.alpha, self.half_life)], fly_selector.SCALE, learn=net.learn.cpu().numpy(), read=net.read.cpu().numpy())
-            for j, k in enumerate(self.names):                      # each strategy's channel learns and forgets at its own replay-chosen rate
-                a, h = self.cfg[k]; cols = self.bank.learn[j]
-                self.bank.alpha[0, cols] = a; self.bank.half_life_s[0, cols] = float(h) * 86400.0 if h is not None else float("inf")
+            self._channel_rates()
         self.pending = plastic.PendingTags(net.n_kc, net.k_active)
+        self.pending_fill = plastic.PendingTags(net.n_kc, net.k_active); self.fill_base: dict[tuple, float] = {}    # rows waiting for their live fill: their outcome
+        self.fill_choice = False                                 # the fill pathways are chosen at the first scored minute (the Solana book's memory)
         self.bars: dict[str, deque] = {}; self.watch: dict[str, int] = {}
         own = {k: self.fly.line_for(k, self.chain) for k in self.names}; own_s = {k: list(self.fly.sizing_for(k, self.chain)) for k in self.names}
         if config.FLY_SCORE == "teacher" and self.teacher_live:   # it scores on its teacher's scale: it starts on its teacher's lines and bands
@@ -207,6 +214,34 @@ class FlyBook:
             with transaction() as conn:
                 conn.execute("UPDATE fly_scored SET state = 'dropped', x = NULL WHERE state = 'pending' AND chain = %s AND bootstrap_id IS DISTINCT FROM %s",
                              (self.chain, self.boot_id))
+        if b is None:                                            # its fill pathways: kept from the state, switched off, or chosen at the first scored minute
+            if bool(self.bank.fill.any()) and not config.FLY_FILL_PATHWAY:
+                self.bank.drop_fill(); self._channel_rates()
+                record_event("info", "fly", "fill pathways switched off (FLY_FILL_PATHWAY=0): their compartments learn outcomes again from the bootstrap")
+            elif bool(self.bank.fill.any()):
+                self._channel_rates(outcome=False)
+            self.fill_choice = config.FLY_FILL_PATHWAY and not bool(self.bank.fill.any())
+
+    def _channel_rates(self, outcome: bool = True) -> None:
+        """Each strategy's learning rates: its outcome pathway's the replay chose (``outcome``: set them; else they keep
+        the saved ones, raised by the energy their fill pathway took), its fill pathway's this run's configuration (no
+        replay has fills to choose them by)."""
+        for j, k in enumerate(self.names):
+            fc = self.bank.fill[j]
+            if outcome:
+                a, h = self.cfg[k]; cols = self.bank.learn[j] & ~fc
+                self.bank.alpha[0, cols] = a; self.bank.half_life_s[0, cols] = float(h) * 86400.0 if h is not None else float("inf")
+            self.bank.alpha[0, fc] = config.FLY_FILL_ALPHA; self.bank.half_life_s[0, fc] = config.FLY_FILL_HALF_LIFE_DAYS * 86400.0
+
+    def _choose_fill(self, u0: torch.Tensor, k: torch.Tensor) -> None:
+        """Choose the fill pathways on this minute's rows (brain/plastic.PlasticBank.choose_fill), once; the state keeps them."""
+        comp, names = plastic.net_compartments(self.fly.net)
+        info = self.bank.choose_fill(u0, k, comp, config.FLY_FILL_RANGE)
+        self._channel_rates(outcome=False); self.fill_choice = False
+        detail = {self.names[j]: {**v, "compartment": names[v["compartment"]] if comp is not None and 0 <= v["compartment"] < len(names) else v["compartment"]}
+                  for j, v in info.items()}
+        record_event("info", "fly", "fill pathways chosen: " + ", ".join(f"{n} {d['compartment']} (lowers by up to {d['lowers_by'] * 100:.1f} %, "
+                                                                           f"{d['energy_share'] * 100:.0f} % of its channel)" for n, d in detail.items()), detail)
 
     teacher_live: dict | None = None
     teacher_groups: set = set()
@@ -279,38 +314,60 @@ class FlyBook:
         torch.save(self._state(), tmp); os.replace(tmp, self.state_path)
 
     def _restore_tags(self, conn) -> None:
-        rows = conn.execute("SELECT ts, mint, strategy, x, score, line FROM fly_scored WHERE state = 'pending' AND bootstrap_id = %s AND chain = %s ORDER BY ts",
-                            (self.boot_id, self.chain)).fetchall()
-        rows = [r for r in rows if r["strategy"] in self.holds]
+        """Tags from ``fly_scored``: pending rows wait for their outcome again, 'awaiting_fill' rows (outcome learned) for
+        their live position to close; rows past their time are resolved without."""
+        rows = conn.execute("SELECT ts, mint, strategy, x, score, line, state, outcome FROM fly_scored WHERE state IN ('pending', 'awaiting_fill') "
+                            "AND bootstrap_id = %s AND chain = %s ORDER BY ts", (self.boot_id, self.chain)).fetchall()
+        rows = [r for r in rows if r["strategy"] in self.holds]; now = time.time()
+        waiting = [r for r in rows if r["state"] == "awaiting_fill"]; rows = [r for r in rows if r["state"] == "pending"]
         applied = [(r["ts"], r["mint"], r["strategy"]) for r in rows if r["ts"].timestamp() + self.holds[r["strategy"]] + LABEL_LAG_S <= self.applied_through]
-        if applied:
+        expired = [(r["ts"], r["mint"], r["strategy"]) for r in waiting
+                   if r["x"] is None or r["outcome"] is None or r["ts"].timestamp() + self.holds[r["strategy"]] + FILL_WAIT_S <= now]
+        if applied or expired:
             with conn.cursor() as cur:
-                cur.executemany("UPDATE fly_scored SET state = 'resolved', resolved_at = now(), x = NULL WHERE ts = %s AND mint = %s AND strategy = %s", applied)
+                cur.executemany("UPDATE fly_scored SET state = 'resolved', resolved_at = now(), x = NULL WHERE ts = %s AND mint = %s AND strategy = %s", applied + expired)
+        gone = set(expired)
         todo = [r for r in rows if r["ts"].timestamp() + self.holds[r["strategy"]] + LABEL_LAG_S > self.applied_through and r["x"] is not None]
-        groups: dict[tuple, list] = {}
-        for r in todo:
-            groups.setdefault((r["ts"].timestamp(), r["strategy"]), []).append(r)
-        for (t, name), rs in sorted(groups.items()):
-            j = self.names.index(name)
-            Xr = np.asarray([r["x"] for r in rs], dtype=np.float32)
-            Y, u0, k = self.fly.parts_all(Xr[:, self.idx])
-            tv = self._teacher_scores(Xr, t); loc = np.arange(len(rs))
-            if tv is not None:
-                loc = loc[np.isfinite(tv[:, j])]
-                if not len(loc):
+        fills = [r for r in waiting if (r["ts"], r["mint"], r["strategy"]) not in gone]
+        for queue, rs_all in ((self.pending, todo), (self.pending_fill, fills)):
+            groups: dict[tuple, list] = {}
+            for r in rs_all:
+                groups.setdefault((r["ts"].timestamp(), r["strategy"]), []).append(r)
+            for (t, name), rs in sorted(groups.items()):
+                parts = self._restored_parts(t, name, rs)
+                if parts is None:
                     continue
-                rs = [rs[i] for i in loc]; Xr = Xr[loc]; li = torch.as_tensor(loc, device=Y.device); Y, u0, k = Y[li], u0[li], k[li]
-            y = self._head(Y[:, j], tv, loc, j, u0)
-            if config.FLY_TEACHER_GATE and self.teacher_live is not None:      # gated: it learns from its teacher's trades, as live
-                d = strategies.decide(self.teacher_live, Xr, X_COLS, t)
-                w = torch.tensor([[float(d["strategy"][i] == name and bool(d["allow"][i])) for i in range(len(rs))]])
-            elif config.FLY_TEACHER_GATE:
-                w = torch.zeros((1, len(rs)))
-            else:
-                w = plastic.row_weights(torch.tensor([[float(r["score"]) for r in rs]]), torch.tensor([float(rs[0]["line"])]))
-            self.pending.push([(t, r["mint"], name) for r in rs], np.full(len(rs), t), t + self.holds[name] + LABEL_LAG_S, y, u0, k, w, s=j)
-            for r in rs:
-                self.watch[r["mint"]] = self.watch.get(r["mint"], 0) + 1
+                rs, y, u0, k, w, j = parts
+                keys = [(t, r["mint"], name) for r in rs]
+                if queue is self.pending:
+                    self.pending.push(keys, np.full(len(rs), t), t + self.holds[name] + LABEL_LAG_S, y, u0, k, w, s=j)
+                    for r in rs:
+                        self.watch[r["mint"]] = self.watch.get(r["mint"], 0) + 1
+                else:                                            # a traded row: it learns its fill whatever the teacher said
+                    self.pending_fill.push(keys, np.full(len(rs), t), now, y, u0, k, torch.ones_like(w), s=j)
+                    self.fill_base.update({key: float(r["outcome"]) for key, r in zip(keys, rs)})
+
+    def _restored_parts(self, t: float, name: str, rs: list):
+        """(rows kept, head output, MBON pre-activation, KC code, weight, strategy index) of stored rows of one minute and
+        strategy, recomputed from their feature vectors; None when the teacher scores none of them."""
+        j = self.names.index(name)
+        Xr = np.asarray([r["x"] for r in rs], dtype=np.float32)
+        Y, u0, k = self.fly.parts_all(Xr[:, self.idx])
+        tv = self._teacher_scores(Xr, t); loc = np.arange(len(rs))
+        if tv is not None:
+            loc = loc[np.isfinite(tv[:, j])]
+            if not len(loc):
+                return None
+            rs = [rs[i] for i in loc]; Xr = Xr[loc]; li = torch.as_tensor(loc, device=Y.device); Y, u0, k = Y[li], u0[li], k[li]
+        y = self._head(Y[:, j], tv, loc, j, u0)
+        if config.FLY_TEACHER_GATE and self.teacher_live is not None:      # gated: it learns from its teacher's trades, as live
+            d = strategies.decide(self.teacher_live, Xr, X_COLS, t)
+            w = torch.tensor([[float(d["strategy"][i] == name and bool(d["allow"][i])) for i in range(len(rs))]])
+        elif config.FLY_TEACHER_GATE:
+            w = torch.zeros((1, len(rs)))
+        else:
+            w = plastic.row_weights(torch.tensor([[float(r["score"]) for r in rs]]), torch.tensor([float(rs[0]["line"])]))
+        return rs, y, u0, k, w, j
 
     def maybe_reload(self) -> bool:
         """A newer deployable bootstrap (a re-bootstrap) replaces this one at once: D = 0, pending tags dropped, the book carries on.
@@ -374,7 +431,13 @@ class FlyBook:
                                             allow=d.get("allow"), reasons=d.get("reason"))
             out.update({k: v for k, v in st.items() if k != "entries"}); out["stage"] = "trading"
             if self.trades_live(conn):
-                out["live"] = self._live(ctx, st)
+                try:                     # its own savepoint: a wallet RPC timeout must not roll back the paper book's minute
+                    with conn.transaction():
+                        out["live"] = self._live(ctx, st)
+                except Exception as e:
+                    log.exception("%s: live minute %s failed; the paper minute stands", self.name, ctx.m1.isoformat())
+                    record_event("error", "fly_live", f"live minute failed: {type(e).__name__}: {str(e)[:160]}", {"chain": self.chain, "minute": ctx.m1.isoformat()})
+                    out["live"] = {"stage": f"live minute failed: {type(e).__name__}"}
         else:
             out["stage"] = "learning (not trading this minute)" if ctx.trade else "catching up"
         hour = int(ctx.m1_epoch // 3600)
@@ -383,10 +446,15 @@ class FlyBook:
         elif hour > self.last_hour:
             self.last_hour = hour; self._hourly(conn, ctx.m1_epoch)
         self._write_state()
-        if learned.get("keys"):
+        if learned.get("keys"):          # a row still waiting for its live fill keeps its features (tags survive restarts)
             with conn.cursor() as cur:
-                cur.executemany("UPDATE fly_scored SET label = %s, state = %s, resolved_at = now(), x = NULL WHERE ts = %s AND mint = %s AND strategy = %s", learned.pop("keys"))
-        learned.pop("keys", None)
+                cur.executemany("UPDATE fly_scored SET label = %s, state = %s, outcome = %s, resolved_at = now(), x = CASE WHEN %s = 'awaiting_fill' THEN x END "
+                                "WHERE ts = %s AND mint = %s AND strategy = %s", [(lb, st_, oc, st_, ts_, m, s_) for lb, st_, oc, ts_, m, s_ in learned.pop("keys")])
+        if learned.get("fill_keys"):
+            with conn.cursor() as cur:
+                cur.executemany("UPDATE fly_scored SET fill = %s, state = 'resolved', resolved_at = now(), x = NULL WHERE ts = %s AND mint = %s AND strategy = %s",
+                                learned.pop("fill_keys"))
+        learned.pop("keys", None); learned.pop("fill_keys", None)
         out["checks"] = self.last_checks; out["updated_at"] = datetime.now(timezone.utc).isoformat()
         out["race_started_at"] = self.race_started_at          # the console's "racing for N days" (the race outlives a paper reset)
         conn.execute("INSERT INTO ui_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
@@ -427,35 +495,105 @@ class FlyBook:
     # ---- learning ----
     @staticmethod
     def _empty_stats() -> dict:
-        return {"n": 0, "sum_delta": 0.0, "sum_abs": 0.0, "step": 0.0, "capped": 0, "unknown": 0}
+        return {"n": 0, "sum_delta": 0.0, "sum_abs": 0.0, "step": 0.0, "capped": 0, "unknown": 0, "fill_n": 0, "fill_sum_delta": 0.0}
 
     def _learn(self, conn, now: float) -> dict:
+        """Due tags teach the outcome pathway what their rows made: the book's realized return of a row it traded (a
+        position still open waits for its sale, up to ``OUTCOME_WAIT_S``), else the label. A row the wallet bought too
+        then teaches the fill pathway what the real fills added (live − outcome): at once when the live position has
+        closed, else from ``pending_fill`` once it does (never, past ``FILL_WAIT_S``)."""
         tags = self.pending.pop_due(now, device=self.bank.dev)
-        if tags is None:
-            return {"n": 0}
-        labels = np.array([np.nan if (lb := resolve_label(list(self.bars.get(m, ())), t, self.holds[name])) is None else lb for t, m, name in tags.keys], dtype=np.float64)
-        ok = np.isfinite(labels)
-        for t, m, _ in tags.keys:
-            c = self.watch.get(m, 0) - 1
-            if c > 0:
-                self.watch[m] = c
-            else:
-                self.watch.pop(m, None); self.bars.pop(m, None)
-        stats = {"n": int(ok.sum()), "unknown": int((~ok).sum())}
-        if ok.any():
-            tv = tags.subset(ok)
-            if self.learning_frozen:
-                self.bank.decay_to(now)
-            else:
-                st = self.bank.update(tv, torch.tensor(labels[ok], dtype=torch.float32), now)
+        waiting = self.pending_fill.pop_due(now, device=self.bank.dev)
+        stats: dict = {"n": 0, "unknown": 0}; keys: list = []; fill_keys: list = []
+        fill_on = bool(self.bank.fill.any())
+        if tags is not None:
+            book, live = self._outcomes(conn, tags.keys)
+            later = np.array([book.get(key, (None,))[0] == "open" and key[0] + self.holds[key[2]] + OUTCOME_WAIT_S > now for key in tags.keys], dtype=bool)
+            if config.FLY_OUTCOME_FROM_BOOK and later.any():     # its book has not sold it yet: its outcome next minute
+                h_ = tags.subset(later); self.pending.push(h_.keys, h_.ts, now + FILL_RETRY_S, h_.y_dn, h_.u0, h_.k, h_.w, s=h_.s)
+                tags = tags.subset(~later)
+        if tags is not None and len(tags):
+            labels = np.array([np.nan if (lb := resolve_label(list(self.bars.get(m, ())), t, self.holds[name])) is None else lb for t, m, name in tags.keys], dtype=np.float64)
+            r = np.array([b[1] if config.FLY_OUTCOME_FROM_BOOK and (b := book.get(key, (None, None)))[0] == "closed" and b[1] is not None else lb
+                          for key, lb in zip(tags.keys, labels)], dtype=np.float64)
+            ok = np.isfinite(r)
+            for t, m, _ in tags.keys:
+                c = self.watch.get(m, 0) - 1
+                if c > 0:
+                    self.watch[m] = c
+                else:
+                    self.watch.pop(m, None); self.bars.pop(m, None)
+            stats.update(n=int(ok.sum()), unknown=int((~ok).sum()))
+            if ok.any() and (st := self._teach(tags.subset(ok), r[ok], now, "outcome")) is not None:
                 stats.update(mean_delta=st["mean_delta"][0], mean_abs_delta=st["mean_abs_delta"][0], step=st["step"][0], capped=bool(st["capped"][0]))
                 h = self.hour_stats; h["n"] += stats["n"]; h["sum_delta"] += st["mean_delta"][0] * stats["n"]; h["sum_abs"] += st["mean_abs_delta"][0] * stats["n"]
                 h["step"] += st["step"][0]; h["capped"] += int(st["capped"][0])
-        self.hour_stats["unknown"] += stats["unknown"]
+            self.hour_stats["unknown"] += stats["unknown"]
+            lv = [live.get(key, (None, None)) for key in tags.keys]
+            now_fill = np.array([fill_on and ok[i] and lv[i][0] == "closed" and lv[i][1] is not None for i in range(len(tags))], dtype=bool)
+            wait = np.array([fill_on and ok[i] and lv[i][0] == "open" for i in range(len(tags))], dtype=bool)
+            if wait.any():                                       # the wallet has not sold it yet: its fill when it has
+                w_ = tags.subset(wait); self.pending_fill.push(w_.keys, w_.ts, now + FILL_RETRY_S, w_.y_dn, w_.u0, w_.k, w_.w, s=w_.s)
+                self.fill_base.update({key: float(r[i]) for i, key in enumerate(tags.keys) if wait[i]})
+            if now_fill.any():
+                res = np.array([lv[i][1] - r[i] for i in range(len(tags)) if now_fill[i]])
+                self._teach_fill(tags.subset(now_fill), res, now, stats)
+                fill_keys += [(float(v), datetime.fromtimestamp(key[0], timezone.utc), key[1], key[2]) for key, v in zip([k_ for k_, f in zip(tags.keys, now_fill) if f], res)]
+            keys = [(float(lb) if np.isfinite(lb) else None, ("awaiting_fill" if wait[i] else "resolved") if ok[i] else "unknown", float(r[i]) if ok[i] else None,
+                     datetime.fromtimestamp(t, timezone.utc), m, name) for i, ((t, m, name), lb) in enumerate(zip(tags.keys, labels))]
+        if waiting is not None:
+            _, live = self._outcomes(conn, waiting.keys)
+            lv = [live.get(key, (None, None)) for key in waiting.keys]; base = [self.fill_base.get(key) for key in waiting.keys]
+            done = np.array([b is not None and v[0] == "closed" and v[1] is not None for v, b in zip(lv, base)], dtype=bool)
+            again = np.array([b is not None and v[0] == "open" and key[0] + self.holds[key[2]] + FILL_WAIT_S > now for key, v, b in zip(waiting.keys, lv, base)], dtype=bool)
+            if again.any():
+                a_ = waiting.subset(again); self.pending_fill.push(a_.keys, a_.ts, now + FILL_RETRY_S, a_.y_dn, a_.u0, a_.k, a_.w, s=a_.s)
+            res = np.array([v[1] - b for v, b, d in zip(lv, base, done) if d])
+            if done.any():
+                self._teach_fill(waiting.subset(done), res, now, stats)
+            fills = iter(res)
+            for i, key in enumerate(waiting.keys):
+                if not again[i]:
+                    fill_keys.append((float(next(fills)) if done[i] else None, datetime.fromtimestamp(key[0], timezone.utc), key[1], key[2]))
+                    self.fill_base.pop(key, None)
+        if tags is None and waiting is None:
+            return {"n": 0}
         self.applied_through = now
-        stats["keys"] = [(float(lb) if np.isfinite(lb) else None, "resolved" if np.isfinite(lb) else "unknown", datetime.fromtimestamp(t, timezone.utc), m, name)
-                         for (t, m, name), lb in zip(tags.keys, labels)]
+        stats["keys"] = keys; stats["fill_keys"] = fill_keys
         return stats
+
+    def _teach(self, tags, r: np.ndarray, now: float, pathway: str) -> dict | None:
+        """One update of ``pathway`` (None while learning is frozen: the memory only decays)."""
+        if self.learning_frozen:
+            self.bank.decay_to(now)
+            return None
+        return self.bank.update(tags, torch.tensor(r, dtype=torch.float32), now, pathway=pathway)
+
+    def _teach_fill(self, tags, res: np.ndarray, now: float, stats: dict) -> None:
+        """The fill pathway learns the live fill residuals ``res`` of ``tags`` (rows the wallet traded: weight 1)."""
+        tags.w = torch.ones_like(tags.w)
+        st = self._teach(tags, res, now, "fill")
+        stats["fill_n"] = stats.get("fill_n", 0) + len(tags)
+        if st is not None:
+            stats["fill_mean_delta"] = st["mean_delta"][0]
+            self.hour_stats["fill_n"] += len(tags); self.hour_stats["fill_sum_delta"] += st["mean_delta"][0] * len(tags)
+
+    def _outcomes(self, conn, keys: list) -> tuple[dict, dict]:
+        """For scored rows (t, mint, strategy) this book bought: {key: (status, realized return once closed)} of its own
+        position and of the wallet's (the live mirror buys under the same decision, stamped at the row's minute end). The
+        return is realized / cost, as the live-vs-mirror gap counts it."""
+        if not keys:
+            return {}, {}
+        ts = sorted({datetime.fromtimestamp(t + 60.0, timezone.utc) for t, _, _ in keys}); mints = sorted({m for _, m, _ in keys})
+        rows = conn.execute("SELECT d.ts, d.mint, d.detail->>'strategy' AS strategy, p.book, p.status, p.realized_sol / NULLIF(p.cost_sol, 0) AS ret "
+                            "FROM decisions d JOIN positions p ON p.entry_decision_id = d.id AND p.book = ANY(%s) "     # an aborted RH buy (no tokens, gas only) was no trade
+                            "AND COALESCE(p.forced_exit_kind, '') <> 'aborted' WHERE d.kind = %s AND d.ts = ANY(%s) AND d.mint = ANY(%s)",
+                            ([self.BOOK, self.market.live_book], f"{self.KIND}_enter", ts, mints)).fetchall()
+        book: dict = {}; live: dict = {}
+        for r in rows:
+            key = (r["ts"].timestamp() - 60.0, r["mint"], r["strategy"])
+            (book if r["book"] == self.BOOK else live)[key] = (r["status"], float(r["ret"]) if r["status"] == "closed" and r["ret"] is not None else None)
+        return book, live
 
     def _score(self, conn, ctx) -> dict:
         n = len(ctx.mints); empty = {"strategy": np.full(n, None, dtype=object), "score": np.full(n, -1.0), "hold_s": np.zeros(n), "threshold": np.full(n, np.inf),
@@ -467,7 +605,10 @@ class FlyBook:
         self._capture(H, trig, ctx.t_start); del H
         if not self.nu_set:
             self.bank.estimate_nu(Y[:, 0], u0, k); self.nu_set = True
+        if self.fill_choice:
+            self._choose_fill(u0, k)
         t = ctx.t_start; ts = datetime.fromtimestamp(t, timezone.utc); rows = []; ta = self._teacher_allow(ctx.X, t)
+        fill_on = bool(self.bank.fill.any())
         V = np.full((n, len(self.names)), -np.inf); F = np.full((n, len(self.names)), np.nan)
         gated = config.FLY_TEACHER_GATE
         if config.FLY_SCORE == "teacher" and self.teacher_live is None:      # it starts from its teacher's score: none, no score
@@ -485,11 +626,12 @@ class FlyBook:
             with torch.no_grad():
                 sc, _ = self.bank.predict(y, u0[li], k[li], s=np.full(len(loc), j)); sc = sc[0]
                 fr = self.bank.frozen(y, u0[li], s=np.full(len(loc), j))
+                fd = self.bank.pathway_scores(y, u0[li], k[li], s=np.full(len(loc), j))[1][0].float().cpu().numpy() if fill_on else None
             v, f = sc.float().cpu().numpy(), fr.float().cpu().numpy(); V[loc, j] = v; F[loc, j] = f
             line, fline = self.lines["plastic"][name], self.lines["frozen"][name]
             al = ta.get(name)
             rows += [(ts, ctx.mints[i], name, int(self.holds[name] // 60), ctx.X[i].tolist(), float(v[q]), float(f[q]), line, fline, self.boot_id,
-                      None if al is None else bool(al[i])) for q, i in enumerate(loc)]
+                      None if al is None else bool(al[i]), None if fd is None else float(fd[q])) for q, i in enumerate(loc)]
             if td is not None:   # gated: its decisions are the teacher's trades of this strategy (before its own vetoes), so it learns from those
                 mine = np.array([td["strategy"][i] == name and bool(td["allow"][i]) for i in loc], dtype=np.float32)
                 w = torch.as_tensor(mine[None], dtype=sc.dtype, device=sc.device)
@@ -505,8 +647,8 @@ class FlyBook:
                     q_.append(b)
         if rows:
             with conn.cursor() as cur:
-                cur.executemany("INSERT INTO fly_scored (ts, mint, strategy, hold_min, x, score, frozen_score, line, frozen_line, bootstrap_id, teacher_allow, chain) "
-                                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ts, mint, strategy) DO NOTHING", [r + (self.chain,) for r in rows])
+                cur.executemany("INSERT INTO fly_scored (ts, mint, strategy, hold_min, x, score, frozen_score, line, frozen_line, bootstrap_id, teacher_allow, fill_score, chain) "
+                                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ts, mint, strategy) DO NOTHING", [r + (self.chain,) for r in rows])
         if self.chain == "sol":
             self.fly.lines = dict(self.lines["plastic"]); self.fly.sizings = {k: list(v) for k, v in self.sizing["plastic"].items()}
         else:                                                    # the shared model decides this chain's rows on this chain's lines
@@ -578,8 +720,9 @@ class FlyBook:
 
     # ---- daily and hourly ----
     def _resolved(self, conn, since_resolved: float, cols: str, name: str) -> list[dict]:
-        """A strategy's resolved rows whose labels became known after ``since_resolved`` (epoch s)."""
-        return conn.execute(f"SELECT {cols} FROM fly_scored WHERE state = 'resolved' AND label IS NOT NULL AND bootstrap_id = %s AND strategy = %s AND chain = %s "
+        """A strategy's resolved rows whose labels became known after ``since_resolved`` (epoch s); a row still waiting for
+        its live fill has its label."""
+        return conn.execute(f"SELECT {cols} FROM fly_scored WHERE state IN ('resolved', 'awaiting_fill') AND label IS NOT NULL AND bootstrap_id = %s AND strategy = %s AND chain = %s "
                             "AND ts >= %s ORDER BY ts", (self.boot_id, name, self.chain,
                                                          datetime.fromtimestamp(since_resolved - self.holds[name] - LABEL_LAG_S, timezone.utc))).fetchall()
 
@@ -617,19 +760,39 @@ class FlyBook:
         return float(self.bank.drift(j)[0]) if self.bank.learn.shape[0] > 1 else float(self.bank.drift()[0])
 
     def _checks(self, conn, now: float) -> dict:
-        """The rollback checks per strategy (its own trades, its own channel's drift)."""
+        """The rollback checks per strategy (its own trades, its own channel's drift). They judge the outcome pathway
+        against the market's labels, so its score here leaves out what the fill pathway adds (a fill veto drops trades
+        whose labels are fine: counted, it would read as the plastic fly trailing its shadow); ``_fill_checks`` judges that."""
         out = {}
         for j, name in enumerate(self.names):
-            rows = self._resolved(conn, now - gov.SHADOW_DAYS * 86400.0, "ts, mint, score, line, frozen_score, frozen_line, label", name)
+            rows = self._resolved(conn, now - gov.SHADOW_DAYS * 86400.0, "ts, mint, score, fill_score, line, frozen_score, frozen_line, label", name)
             if rows:
                 ts = np.array([r["ts"].timestamp() for r in rows]); mint = np.array([r["mint"] for r in rows]); lab = np.array([r["label"] for r in rows], dtype=np.float64)
-                g = lambda c: np.array([r[c] for r in rows], dtype=np.float64)
-                H = self.holds[name]
-                rp = gov.picks_returns(ts, mint, H, g("score"), g("line"), lab); rf = gov.picks_returns(ts, mint, H, g("frozen_score"), g("frozen_line"), lab)
+                g = lambda c: np.array([np.nan if r[c] is None else r[c] for r in rows], dtype=np.float64)
+                H = self.holds[name]; sc = g("score") - np.nan_to_num(g("fill_score"))
+                rp = gov.picks_returns(ts, mint, H, sc, g("line"), lab); rf = gov.picks_returns(ts, mint, H, g("frozen_score"), g("frozen_line"), lab)
                 recent = ts + H + LABEL_LAG_S > now - gov.IC_HOURS * 3600.0
-                out[name] = gov.check((rp, rf), (g("score")[recent], lab[recent]), self._drift(j))
+                out[name] = gov.check((rp, rf), (sc[recent], lab[recent]), self._drift(j))
             else:
                 out[name] = gov.check(None, None, self._drift(j))
+        return out
+
+    def _fill_checks(self, conn, now: float) -> dict:
+        """The fill pathways against the fills they learned (every chain: the memory is shared): over ``FILL_IC_DAYS``, a
+        strategy's fill pathway whose score changes correlate negatively with the live fill residuals that followed (at
+        least ``FILL_IC_MIN`` of them) goes back to its bootstrap."""
+        out: dict = {}
+        if not bool(self.bank.fill.any()):
+            return out
+        for j, name in enumerate(self.names):
+            rows = conn.execute("SELECT fill_score, fill FROM fly_scored WHERE fill IS NOT NULL AND fill_score IS NOT NULL AND bootstrap_id = %s AND strategy = %s "
+                                "AND ts >= %s", (self.boot_id, name, datetime.fromtimestamp(now - FILL_IC_DAYS * 86400.0, timezone.utc))).fetchall()
+            a = np.array([r["fill_score"] for r in rows], dtype=np.float64); b = np.array([r["fill"] for r in rows], dtype=np.float64)
+            ic = float(np.corrcoef(a, b)[0, 1]) if len(rows) >= 3 and a.std() > 0 and b.std() > 0 else None
+            out[name] = {"n": len(rows), "ic": ic, "drift": float(self.bank.drift(j, pathway="fill")[0])}
+            if len(rows) >= FILL_IC_MIN and ic is not None and ic < 0 and not self.learning_frozen:
+                self.bank.reset_columns(self.bank.fill[j]); out[name]["reset"] = True
+                record_event("warning", "fly", f"{name} fill pathway back to its bootstrap: its fill predictions ran against the fills (IC {ic:+.2f} over {len(rows)})", out[name])
         return out
 
     def _hourly(self, conn, now: float) -> None:
@@ -638,11 +801,13 @@ class FlyBook:
             self._handover_check(conn, now)
             return
         hour = datetime.fromtimestamp(math.floor(now / 3600) * 3600 - 3600, timezone.utc)
-        checks = self._checks(conn, now); self.last_checks = checks
+        checks = self._checks(conn, now); self.last_checks = checks; fills = self._fill_checks(conn, now)
         h = self.hour_stats; first = checks.get(self.names[0]) or {}
         conn.execute("INSERT INTO fly_updates (hour, n, mean_delta, mean_abs_delta, step, capped, drift, ic, detail) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (hour) DO NOTHING",
                      (hour, h["n"], h["sum_delta"] / h["n"] if h["n"] else None, h["sum_abs"] / h["n"] if h["n"] else None, h["step"], h["capped"],
-                      max((c["drift"] for c in checks.values()), default=0.0), first.get("ic"), json.dumps({"unknown": h["unknown"], "checks": checks}, default=str)))
+                      max((c["drift"] for c in checks.values()), default=0.0), first.get("ic"),
+                      json.dumps({"unknown": h["unknown"], "checks": checks, "fill": {"n": h["fill_n"], "mean_delta": h["fill_sum_delta"] / h["fill_n"] if h["fill_n"] else None,
+                                                                                     "checks": fills}}, default=str)))
         self.hour_stats = self._empty_stats()
         good = not any(c["triggers"] for c in checks.values())
         sid = self._snapshot(conn, now, good, checks)

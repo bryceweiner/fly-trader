@@ -44,14 +44,22 @@ def bank_D(path: str | Path) -> tuple[np.ndarray, int | None]:
     return D.detach().float().numpy(), (int(bid) if bid is not None else None)
 
 
+def bank_fill(path: str | Path) -> np.ndarray | None:
+    """Each strategy's fill pathway columns [S, J] saved with a state (brain/plastic.fill_channels); None before them."""
+    f = model_io.torch_load(path)["bank"].get("fill")
+    return None if f is None else f.numpy().astype(bool)
+
+
 def _round(x: float) -> float:
     return float(f"{x:.4g}")
 
 
 def top_pathways(D: np.ndarray, w0: np.ndarray, kc: np.ndarray, mbon: np.ndarray, learn: np.ndarray, strategies: list[str],
-                 n_app: int, n_av: int, top_k: int = TOP_K, D_ref: np.ndarray | None = None, mbon_offset: int = 0) -> list[dict]:
+                 n_app: int, n_av: int, top_k: int = TOP_K, D_ref: np.ndarray | None = None, mbon_offset: int = 0,
+                 fill: np.ndarray | None = None) -> list[dict]:
     """The ``top_k`` pairs by |change / base weight|; ``D_ref`` (an older snapshot) makes it the change since then.
-    ``mbon`` is reported as ``mbon_offset + column`` so a renderer can address the MBON as a graph index."""
+    ``mbon`` is reported as ``mbon_offset + column`` so a renderer can address the MBON as a graph index. ``fill``: each
+    strategy's fill pathway columns, whose pairs are reported as "<strategy> · fill"."""
     delta = np.asarray(D, dtype=np.float64) - (np.asarray(D_ref, dtype=np.float64) if D_ref is not None else 0.0)
     ratio = delta / np.maximum(np.asarray(w0, dtype=np.float64), 1e-6)
     nz = np.flatnonzero(delta != 0)
@@ -61,6 +69,8 @@ def top_pathways(D: np.ndarray, w0: np.ndarray, kc: np.ndarray, mbon: np.ndarray
     learn = np.asarray(learn, dtype=bool); owner = np.full(learn.shape[1], "shared", dtype=object); single = learn.sum(0) == 1
     for s, name in enumerate(strategies[:learn.shape[0]]):
         owner[learn[s] & single] = name
+        if fill is not None and s < len(fill):
+            owner[np.asarray(fill[s], dtype=bool) & learn[s] & single] = f"{name} · fill"
     def valence(j: int) -> str:
         return "approach" if j < n_app else "avoid" if j < n_app + n_av else "other"
     return [{"kc": int(kc[p]), "mbon": int(mbon_offset + mbon[p]), "delta": _round(delta[p]), "ratio": _round(ratio[p]),

@@ -20,6 +20,13 @@ The label arrives two hours after the decision, far beyond any biological eligib
 so each scored minute leaves a synaptic tag (``PendingTags``: its KC code, MBON pre-activation and descending output)
 that is captured when the label resolves (synaptic tag-and-capture, Frey & Morris 1997).
 
+Two teaching signals, two pathways (``PlasticBank.choose_fill``): each strategy's own compartments are split between
+an outcome pathway, whose dopamine is what the trade made (the book's realized return; the market label for a row it
+did not trade), and a fill pathway — one compartment — whose dopamine is what the wallet's real fills added to that
+(live realized − outcome: latency, slippage, fees, rent, failures). A row's score is its teacher's plus both pathways'
+changes, so a learned bad fill can veto a trade. Each pathway's prediction error is its own: the outcome pathway
+predicts the outcome (fill columns at their bootstrap), the fill pathway predicts the residual alone.
+
 ``PlasticBank`` holds ``C`` configurations side by side (the replay's grid; 1 live).
 """
 from __future__ import annotations
@@ -131,6 +138,20 @@ def assign_channels(comp: np.ndarray, km_mass: np.ndarray, c_sign: np.ndarray, n
     return learn, learn | free[None, :]
 
 
+def net_compartments(net) -> tuple[np.ndarray | None, list[str]]:
+    """([J] each MBON's mushroom-body compartment in the current connectome, −1: none; the compartments' names, their
+    dopamine-neuron clusters), or (None, []) when the connectome cannot be read or does not match the net."""
+    import logging
+    try:
+        from .connectome import Connectome
+        c = Connectome.load(device="cpu")
+        if c.mbon_compartment is not None and len(c.mbon_compartment) == net.learn.shape[1]:
+            return np.asarray(c.mbon_compartment, int), list(c.compartment_names)
+    except Exception:
+        logging.getLogger(__name__).exception("connectome unreadable")
+    return None, []
+
+
 def row_weights(scores: torch.Tensor, lines: torch.Tensor) -> torch.Tensor:
     """[C, B]: 1 where a configuration scored the row at or above its own line, else 0 — it learns from the outcome of
     its own decisions and nothing else.
@@ -148,7 +169,7 @@ class PlasticBank:
     τ½ = inf: no decay). The net is read, never modified."""
 
     def __init__(self, net, configs: list[tuple[float, float]], scale: float, nu: float = 1.0, beta_pot: float = 1.0, step_cap: float = STEP_CAP,
-                 learn: np.ndarray | None = None, read: np.ndarray | None = None):
+                 learn: np.ndarray | None = None, read: np.ndarray | None = None, fill: np.ndarray | None = None):
         self.net, self.scale, self.nu, self.beta_pot, self.step_cap = net, float(scale), float(nu), float(beta_pot), float(step_cap)
         dev = net.dev
         with torch.no_grad():
@@ -162,6 +183,9 @@ class PlasticBank:
         J = self.w0.shape[1]
         self.learn = torch.as_tensor(np.ones((1, J), bool) if learn is None else learn, device=dev)          # [S, J] per-strategy channels
         self.read = torch.as_tensor(np.ones((1, J), bool) if read is None else read, device=dev)
+        # [S, J] each strategy's fill pathway (choose_fill; all False: none, every own column learns outcomes as before)
+        self.fill = torch.as_tensor(np.zeros(tuple(self.learn.shape), bool) if fill is None else fill, device=dev) & self.learn
+        self.nu_fill = torch.ones(self.learn.shape[0], device=dev)                                          # [S] the fill pathways' ν
         self.alpha = torch.tensor([a for a, _ in self.configs], device=dev)[:, None].repeat(1, J)            # [C, J]: per-channel rates
         self.half_life_s = torch.tensor([h * DAY_S if math.isfinite(h) else float("inf") for _, h in self.configs], device=dev)[:, None].repeat(1, J)
         self.D = torch.zeros(C, *self.w0.shape, device=dev)
@@ -210,28 +234,101 @@ class PlasticBank:
         self.t_last = t if self.t_last is None else max(self.t_last, t)
 
     def estimate_nu(self, y_dn: torch.Tensor, u0: torch.Tensor, k: torch.Tensor) -> float:
-        """Median squared norm of one row's update direction at D = 0 (sets the scale ``α`` is measured in)."""
-        m = torch.tanh(u0)
-        g = self.c * self.gamma * (1.0 - m * m) / (self.sigma * self.scale)          # [B, J]
-        sq = ((k * k) @ self.mask * g * g).sum(1)
+        """Median squared norm of one row's update direction at D = 0 (sets the scale ``α`` is measured in); each fill
+        pathway's own ν is the same over its columns only, so its ``α`` is the share of a fill error one update corrects."""
+        sq = self._row_energy(u0, k).sum(1)
         v = float(sq.median()) if len(sq) else 0.0
         self.nu = v if v > 0 else 1.0
+        self.estimate_nu_fill(u0, k)
         return self.nu
 
-    def update(self, tags: Tags, r: torch.Tensor, t: float) -> dict:
-        """Capture ``tags`` with realized net returns ``r`` [B] at event time ``t``; returns per-configuration statistics."""
+    def _row_energy(self, u0: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        """[B, J] each column's share of one row's squared update norm at D = 0."""
+        m = torch.tanh(u0)
+        g = self.c * self.gamma * (1.0 - m * m) / (self.sigma * self.scale)          # [B, J]
+        return (k * k) @ self.mask * g * g
+
+    def estimate_nu_fill(self, u0: torch.Tensor, k: torch.Tensor) -> None:
+        """Each fill pathway's ν alone."""
+        per = self._row_energy(u0, k)
+        for s_ in range(self.fill.shape[0]):
+            if bool(self.fill[s_].any()) and len(per):
+                f = float(per[:, self.fill[s_]].sum(1).median())
+                self.nu_fill[s_] = f if f > 0 else 1.0
+
+    def choose_fill(self, u0: torch.Tensor, k: torch.Tensor, comp: np.ndarray | None, range_min: float) -> dict:
+        """Each strategy's fill pathway, from a sample of scored rows: of its own compartments (``comp`` [J]; None: every
+        MBON its own), the one taking the least of its update energy (``_row_energy``, the measure ν is taken in) among
+        those that can lower its score by at least ``range_min`` with their synapses at their bounds -- a weaker one could
+        never express a bad fill nor reach the learned veto (on fly #157 the lightest compartments reach 0.2–2 %); none
+        qualifying, the one that can lower it most. The outcome pathway keeps the rest with its rate raised by the energy
+        it gave up, so an update moves a row's outcome prediction as far as the whole channel's did; the fill pathway
+        gets its own ν. The chosen columns start from the bootstrap. Returns per strategy what was chosen."""
+        S, J = self.learn.shape
+        comp = np.asarray(comp, int) if comp is not None and len(comp) == J else np.arange(J)
+        per = self._row_energy(u0, k); approach = self.c > 0; B = len(u0); zero = torch.zeros(B, device=self.dev)
+        fill = torch.zeros_like(self.fill); out = {}
+        for s_ in range(S):
+            own = self.learn[s_].cpu().numpy(); ids = sorted(set(comp[own & (comp >= 0)].tolist()))
+            if len(ids) < 2:
+                continue
+            sv = np.full(B, s_); base = self.frozen(zero, u0, s=sv); e_own = float(per[:, self.learn[s_]].sum(1).median())
+            cand = []
+            for kk in ids:
+                cols = torch.as_tensor(own & (comp == kk), device=self.dev)
+                D = torch.zeros_like(self.D[:1])                    # its lowest reach: approach synapses off, avoid ones at their cap
+                D[:, :, cols & approach] = -self.w0[:, cols & approach]; D[:, :, cols & ~approach] = 2.0 * self.w0[:, cols & ~approach]
+                low, _ = self.predict(zero, u0, k, D=D * self.mask, s=sv)
+                cand.append((kk, -float((low[0] - base).median()), float(per[:, cols].sum(1).median()) / max(e_own, 1e-30), cols))
+            ok = [c_ for c_ in cand if c_[1] >= range_min]
+            kk, reach, share, cols = min(ok, key=lambda c_: (c_[2], c_[0])) if ok else max(cand, key=lambda c_: (c_[1], -c_[0]))
+            fill[s_] = cols; rest = self.learn[s_] & ~cols
+            e_rest = float(per[:, rest].sum(1).median()); rho = e_own / e_rest if e_rest > 0 else 1.0
+            self.alpha[:, rest] *= rho
+            out[s_] = {"compartment": int(kk), "lowers_by": reach, "energy_share": share, "outcome_rate_x": rho}
+        self.fill = fill
+        self.reset_columns(fill.any(0))
+        self.estimate_nu_fill(u0, k)
+        return out
+
+    def _nu_cols(self) -> torch.Tensor:
+        """[J] the ν each column's updates are scaled by: the fill pathways' own, ν elsewhere."""
+        out = torch.full((self.w0.shape[1],), float(self.nu), device=self.dev)
+        for s_ in range(self.fill.shape[0]):
+            out[self.fill[s_]] = self.nu_fill[s_]
+        return out
+
+    def _only(self, cols: torch.Tensor, D: torch.Tensor | None = None) -> torch.Tensor:
+        """``D`` with every column outside ``cols`` [J] at its bootstrap (zero change)."""
+        return (self.D if D is None else D) * cols.float()[None, None, :]
+
+    def pathway_scores(self, y_dn: torch.Tensor, u0: torch.Tensor, k: torch.Tensor, s=None) -> tuple[torch.Tensor, torch.Tensor]:
+        """(outcome-pathway score [C, B]: the score with every fill pathway at its bootstrap, fill-pathway change [C, B]:
+        what the fill pathways add) -- the two predictions each pathway's dopamine is measured against."""
+        fill_any = self.fill.any(0)
+        y_out, _ = self.predict(y_dn, u0, k, D=self._only(~fill_any), s=s)
+        y_fill, _ = self.predict(y_dn, u0, k, D=self._only(fill_any), s=s)
+        return y_out, y_fill - self.frozen(y_dn, u0, s=s)[None]
+
+    def update(self, tags: Tags, r: torch.Tensor, t: float, pathway: str = "outcome") -> dict:
+        """Capture ``tags`` with their target ``r`` [B] at event time ``t``; returns per-configuration statistics.
+        ``pathway`` "outcome": ``r`` is the realized net return and the outcome pathway learns its error (with no fill
+        pathways: every own column, as before); "fill": ``r`` is the live fill residual and the fill pathways learn it."""
         self.decay_to(t)
         if len(tags) == 0:
             return {"n": 0}
         r = r.to(self.dev).float().clamp(-RET_CLIP, RET_CLIP)
-        yhat, m = self.predict(tags.y_dn, tags.u0, tags.k, s=tags.s)
+        y_out, y_fill = self.pathway_scores(tags.y_dn, tags.u0, tags.k, s=tags.s)
+        _, m = self.predict(tags.y_dn, tags.u0, tags.k, s=tags.s)                   # a column's activity depends on its own D only
+        yhat = y_fill if pathway == "fill" else y_out
         delta = (r[None] - yhat).clamp(-DELTA_CLIP, DELTA_CLIP)                     # [C, B]
-        own = self.learn.float()[torch.as_tensor(tags.s, device=self.dev)] if self.learn.shape[0] > 1 else self.learn[0].float()[None]
-        g = self.grad_factor(m, tags.s) * own                                       # [C, B, J]: only the row's own channel learns
+        cols = self.fill if pathway == "fill" else self.learn & ~self.fill
+        own = cols.float()[torch.as_tensor(tags.s, device=self.dev)] if cols.shape[0] > 1 else cols[0].float()[None]
+        g = self.grad_factor(m, tags.s) * own                                       # [C, B, J]: only the row's own pathway learns
         dD = torch.einsum("bi,cbj->cij", tags.k, (tags.w * delta)[:, :, None] * g) * self.mask
         if self.beta_pot != 1.0:
             dD = torch.where(dD > 0, dD * self.beta_pot, dD)
-        dD = dD * (self.alpha / self.nu)[:, None, :]
+        dD = dD * (self.alpha / self._nu_cols()[None, :])[:, None, :]
         norms = torch.linalg.norm(dD.flatten(1), dim=1)
         cap = self.step_cap * self.w0_norm
         capped = norms > cap
@@ -241,20 +338,30 @@ class PlasticBank:
         return {"n": len(tags), "mean_delta": delta.mean(1).tolist(), "mean_abs_delta": delta.abs().mean(1).tolist(),
                 "step": torch.linalg.norm(dD.flatten(1), dim=1).tolist(), "capped": capped.tolist(), "drift": self.drift().tolist()}
 
-    def drift(self, s: int | None = None) -> torch.Tensor:
-        """‖D‖_F / ‖w0‖_F per configuration (``s``: over that strategy's own channel only)."""
+    def drift(self, s: int | None = None, pathway: str | None = None) -> torch.Tensor:
+        """‖D‖_F / ‖w0‖_F per configuration (``s``: over that strategy's own channel only; ``pathway`` "outcome" or
+        "fill": over that pathway's columns of it)."""
         if s is None:
             return torch.linalg.norm(self.D.flatten(1), dim=1) / max(self.w0_norm, 1e-30)
-        cols = self.learn[s]
+        cols = self.learn[s] if pathway is None else self.fill[s] if pathway == "fill" else self.learn[s] & ~self.fill[s]
+        if not bool(cols.any()):
+            return torch.zeros(self.C, device=self.dev)
         return torch.linalg.norm(self.D[:, :, cols].flatten(1), dim=1) / max(float(torch.linalg.norm(self.w0[:, cols])), 1e-30)
+
+    def reset_columns(self, cols: torch.Tensor) -> None:
+        """Columns ``cols`` [J] back to their bootstrap weights (D = 0 there)."""
+        self.D[:, :, cols] = 0.0
 
     # ---- state ----
     def state(self) -> dict:
         m = self.mask.bool()
         return {"D": self.D[:, m].cpu(), "t_last": self.t_last, "configs": self.configs, "nu": self.nu, "beta_pot": self.beta_pot, "step_cap": self.step_cap,
-                "alpha": self.alpha.cpu(), "half_life_s": self.half_life_s.cpu(), "learn": self.learn.cpu(), "read": self.read.cpu()}
+                "alpha": self.alpha.cpu(), "half_life_s": self.half_life_s.cpu(), "learn": self.learn.cpu(), "read": self.read.cpu(),
+                "fill": self.fill.cpu(), "nu_fill": self.nu_fill.cpu()}
 
     def load_state(self, s: dict) -> None:
+        """Restore a saved state, its fill pathways included (``choose_fill`` chose them once; a state from before them
+        has none and leaves this bank's)."""
         if [tuple(c) for c in s["configs"]] != self.configs:
             raise ValueError(f"plastic state for configurations {s['configs']} does not match {self.configs}")
         D = torch.zeros_like(self.D); D[:, self.mask.bool()] = s["D"].to(self.dev).float()
@@ -262,12 +369,19 @@ class PlasticBank:
         if "alpha" in s:
             self.alpha, self.half_life_s = s["alpha"].to(self.dev), s["half_life_s"].to(self.dev)
             self.learn, self.read = s["learn"].to(self.dev), s["read"].to(self.dev)
+        if "fill" in s and bool(s["fill"].any()):
+            self.fill, self.nu_fill = s["fill"].to(self.dev), s["nu_fill"].to(self.dev)
         self.beta_pot, self.step_cap = float(s.get("beta_pot", self.beta_pot)), float(s.get("step_cap", self.step_cap))
+
+    def drop_fill(self) -> None:
+        """No fill pathways: their columns back to the bootstrap (what they learned was fills) and to the outcome."""
+        self.reset_columns(self.fill.any(0)); self.fill = torch.zeros_like(self.fill)
 
     def select(self, i: int) -> "PlasticBank":
         """A single-configuration bank holding configuration ``i``'s current ``D`` (the replay's winner, going live)."""
-        b = PlasticBank(self.net, [self.configs[i]], self.scale, self.nu, self.beta_pot, self.step_cap, self.learn.cpu().numpy(), self.read.cpu().numpy())
-        b.D = self.D[i:i + 1].clone(); b.t_last = self.t_last
+        b = PlasticBank(self.net, [self.configs[i]], self.scale, self.nu, self.beta_pot, self.step_cap, self.learn.cpu().numpy(), self.read.cpu().numpy(),
+                        self.fill.cpu().numpy())
+        b.D = self.D[i:i + 1].clone(); b.t_last = self.t_last; b.nu_fill = self.nu_fill.clone()
         return b
 
     def select_per_strategy(self, best: list[int]) -> "PlasticBank":

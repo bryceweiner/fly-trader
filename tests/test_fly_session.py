@@ -60,3 +60,20 @@ def test_tags_subset_keeps_the_chosen_rows():
                                            w=torch.tensor([[1.0, 10.0, 1.0]]))
     s = t.subset(np.array([True, False, True]))
     assert s.keys == ["a", "c"] and list(s.ts) == [0.0, 2.0] and s.y_dn.tolist() == [1.0, 3.0] and torch.equal(s.k, k[[0, 2]]) and s.w.tolist() == [[1.0, 1.0]]
+
+
+def test_outcomes_join_both_books_by_the_rows_decision(db_conn):
+    """A scored row (minute start t, mint, strategy) finds its book's and the wallet's positions through the entry
+    decision stamped at the minute's end, with each position's status and, once closed, realized / cost."""
+    from types import SimpleNamespace
+
+    from fly_trader.agent.fly_session import FlyBook
+    t = datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc).timestamp(); mint = "OUTCOME_TEST"
+    d = db_conn.execute("INSERT INTO decisions (ts, mint, kind, detail) VALUES (%s, %s, 'fly_enter', %s) RETURNING id",
+                        (datetime.fromtimestamp(t + 60, timezone.utc), mint, '{"strategy": "capitulation", "book": "paper_fly"}')).fetchone()["id"]
+    for book, status, realized in (("paper_fly", "closed", 0.02), ("live", "open", None)):
+        db_conn.execute("INSERT INTO positions (book, mint, entry_decision_id, qty, cost_sol, realized_sol, status) VALUES (%s, %s, %s, 1, 0.1, %s, %s)",
+                        (book, mint, d, realized, status))
+    me = SimpleNamespace(BOOK="paper_fly", KIND="fly", market=SimpleNamespace(live_book="live"))
+    book, live = FlyBook._outcomes(me, db_conn, [(t, mint, "capitulation"), (t + 60, mint, "capitulation")])
+    assert book == {(t, mint, "capitulation"): ("closed", pytest.approx(0.2))} and live == {(t, mint, "capitulation"): ("open", None)}

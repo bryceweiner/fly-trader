@@ -136,6 +136,7 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
     ts_o = ds.ts[order]; n = len(order)
     live_from = int(np.searchsorted(ts_o, S_epoch, side="left"))                      # rows before it: history only (calibration seed)
     bank = plastic.PlasticBank(fly.net, configs, fly_selector.SCALE, learn=fly.net.learn.cpu().numpy(), read=fly.net.read.cpu().numpy())
+    comp, _ = plastic.net_compartments(fly.net) if config.FLY_FILL_PATHWAY else (None, [])
     brain_device.empty_cache(bank.dev); chunk = fly.net.batch_rows(ceiling=CHUNK)   # the bootstrap's workspace goes back; rows per batch from the device's memory
     log.info("fly replay on %s: %d rows per batch", brain_device.describe(bank.dev), chunk)
     C = bank.C
@@ -182,6 +183,8 @@ def run(days: int | None = None, start_day: int = START_DAY, configs: list | Non
         Y, u0, k = fly.parts_all(ds.X[order[a:b]]); trig = fly.triggers(ds.X[order[a:b]], ds.cols)
         if not nu_set:
             bank.estimate_nu(Y[:, 0], u0, k); nu_set = True
+            if config.FLY_FILL_PATHWAY:      # the same outcome pathways as live: each channel less its fill pathway (no fills to learn here)
+                bank.choose_fill(u0, k, comp, config.FLY_FILL_RANGE)
         for gi in range(g, g1):
             s0, s1 = starts[gi], ends[gi]; now = float(ts_o[s0]); lo, hi = s0 - a, s1 - a
             if s0 >= live_from:
