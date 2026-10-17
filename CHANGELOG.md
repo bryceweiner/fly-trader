@@ -3,7 +3,16 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
-## Unreleased
+## 2026-10-18, release 6: A restart never holds a sale back, and Kalshi orders go first
+
+Published to Hugging Face as signed release 6. Fly #157 and selector #154 are unchanged, and so are the definitions they
+were judged on: no model, seed or infrastructure file changes.
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 6`.
 
 ### Live money
 
