@@ -3,6 +3,94 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## 2026-10-17, release 5: Live orders go first, and live trades what paper trades
+
+Published to Hugging Face as signed release 5. Fly #157 and selector #154 are unchanged, and so are the definitions they
+were judged on: this release is code only.
+
+### Upgrading
+
+- **Nothing to do:** the updater applies it like any code release. New columns are added on start: `fee_v` on the
+  Robinhood Chain swap and minute tables, `hook_fee_v` on its pools, and `outcome`, `fill` and `fill_score` on `fly_scored`.
+- **Robinhood Chain installs:** TSLA-quoted coins were valued about 2,430× too high since 2026-09-05. TSLA's reference
+  path ended at USDG, so its USD price was read as ETH.
+  - The price scan now finds again any stored path that stops short of WETH, on its first pass, and prices these coins
+    in ETH from then on.
+  - Their minutes from before keep the USD scale. The engine treats the jump as a scale break and leaves each of these
+    coins out until it restarts more than a day after the change.
+- **New settings,** all with defaults: `MAX_ENTRY_CHASE` (0.03), `ENTRY_RETRY_MIN` (2), `ENTRY_MAX_LAG_S` (90),
+  `CIRCUIT_COOLDOWN_S` (900), `FLY_OUTCOME_FROM_BOOK` (on), `FLY_FILL_PATHWAY` (on), `FLY_FILL_ALPHA` (0.02),
+  `FLY_FILL_HALF_LIFE_DAYS` (14), `FLY_FILL_RANGE` (0.05), `RH_TX_FEE_MULTIHOP_ETH` and `RH_HOP_FEE`.
+
+### Live money
+
+- **Live orders go first, on both chains.**
+  - The wallet's scheduled sales go out the moment a minute ends, from a thread of their own, before the feed has
+    written the minute.
+  - Its buys go out as soon as the fly has scored the minute.
+  - Paper trades, the fly's learning, the selector's minute, the wealth mark and all other bookkeeping come after.
+  - Before this release, Solana orders left 9–27 s after their minute ended and Robinhood Chain orders 5–39 s (once 207 s).
+    A sale's booking also waited for the paper work to finish.
+  - The Solana feed now announces a written minute at once instead of on its 5-second status, and the engine looks for
+    it every 0.25 s.
+- **Live trades what paper trades, when paper trades it.** These fixes come from a live-against-paper audit on
+  2026-10-17:
+  - A live position's hold now runs from its decision's minute, not from its fill. Live had sold 74–90 s after paper on
+    every trade, once into a dump: +13 % on paper, −1.4 % live.
+  - A Solana sale that empties its token account closes it, and the ~0.0015 SOL of rent comes back onto the position.
+  - A buy is refused before signing when its quote is more than `MAX_ENTRY_CHASE` (3 %) above its paper fill.
+  - A buy that failed without moving anything is retried, re-sized, for `ENTRY_RETRY_MIN` (2) minutes while paper still
+    holds the token.
+  - The circuit breaker re-arms `CIRCUIT_COOLDOWN_S` (15 minutes) after its last failure. Robinhood Chain failures
+    count on its own circuit.
+  - No book buys on a minute traded more than `ENTRY_MAX_LAG_S` (90 s) after it ended.
+  - A sale or a mark in a quiet minute pays the coin's last known pool fee; Robinhood Chain coins quoted in another
+    asset pay their multi-hop route.
+  - Every paper entry the wallet did not take is recorded with the reason.
+  - Solana live positions show their strategy and hold.
+- **Robinhood Chain orders:**
+  - A swap whose receipt timed out is settled by recovery, never failed and sent again, so it cannot buy twice.
+  - Buys climb the slippage ladder like sales.
+- **The kill switch** now trips from the wealth mark taken after the minute's orders. With `KILL_SWITCH_LIQUIDATE`, its
+  sales start at the next minute boundary.
+- **Fixed:** a test run could still reach Jupiter's `/execute`, which broadcasts a signed swap itself. It now refuses
+  under a test run like every other send path. The test configuration also blanks the signer socket, and the database
+  guard applies from its first line.
+
+### The fly
+
+- **It learns from outcomes and fills as mushroom-body pathways.**
+  - Its outcome pathway learns what each traded row made in its own book; for a row it did not trade, it learns the
+    market label.
+  - A fill pathway per strategy learns what the wallet's real fills added (live minus paper) once the live position
+    closes.
+  - Learned bad fills can veto a teacher trade.
+  - A fill pathway whose predictions run against the fills over 7 days is reset.
+- **It scores a minute before it learns from it,** so what it learns in a minute applies from the next one.
+
+### Robinhood Chain
+
+- **Quote assets are priced in ETH again:** a reference path must reach WETH, and a route split across several hops is
+  followed to the end.
+- **Hook fees are stored as taken / gross:** the hook takes its fee out of the pool's gross output, so a 1 % fee had been
+  stored as 0.0099. Rows stored the old way are converted when read.
+
+### The console
+
+- **Trades by hour of day** on the Overview: a colourful 24-hour wheel per chain (Solana left, Robinhood Chain right),
+  Highcharts' variable-radius pie. Each hour is an equal slice and its radius is the trades entered in that hour, every
+  trade ever (the positions table plus every reset's archive), all books or live only, in UTC or local time.
+- **Bar sparklines stand on zero:** a losing day hangs below the line and a quiet day is a dash.
+
+### Platform
+
+- **AMD GPUs through ROCm:**
+  - `DEVICE=rocm[:N]` drives the GPU through a ROCm build of torch; `uv sync --extra rocm72` installs torch
+    2.14.1+rocm7.2.
+  - `docker-compose.rocm.yml` builds that torch into the image and gives the container `/dev/kfd` and `/dev/dri`.
+  - It has not yet run on AMD hardware.
+- **Fixed:** the replay assembler failed on a missing dependency. `pytz` is now declared.
+
 ## 2026-10-17: A new operator console
 
 The Streamlit console is replaced by a web dashboard served by the same single process.
@@ -42,10 +130,6 @@ The Streamlit console is replaced by a web dashboard served by the same single p
   chain. Tests never load the operator's signing keys or live switches.
 - **Fixed:** a SIGTERM killed the worker threads mid-step: uvicorn re-raises the signal once the server stops. The
   console now stops them in the app's shutdown and waits for them to flush.
-
-- **Trades by hour of day** on the Overview: a colourful 24-hour wheel per chain (Solana left, Robinhood Chain right),
-  Highcharts' variable-radius pie. Each hour is an equal slice and its radius is the trades entered in that hour, every
-  trade ever (the positions table plus every reset's archive), all books or live only, in UTC or local time.
 
 ### The console
 
