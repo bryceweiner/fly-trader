@@ -52,7 +52,7 @@ from ..execution.broker_paper import PaperBroker
 from ..ops.reset import activity_dir, fly_state_dir
 from ..train import fly_calibrate, fly_governance as gov, fly_selector, selector, strategies
 from ..train.decisions import X_COLS
-from . import handover, paper_trading
+from . import handover, live_first, paper_trading
 
 log = logging.getLogger(__name__)
 BOOK, KIND = "paper_fly", "fly"            # the Solana book's names (another chain's book takes its own from fly_trader/markets)
@@ -142,7 +142,7 @@ def no_teacher(n: int) -> dict:
 
 class FlyBook:
     def __init__(self, boot: dict, verdict: dict, live: bool = False, chain: str = "sol", brain: "FlyBook | None" = None):
-        self.live = live; self.done = False; self.mirror = None
+        self.live = live; self.done = False
         self._phase: dict | None = None; self._scored_rows: list = []; self._activity: tuple | None = None   # the live phase's, written after it
         self.verdict = verdict
         self.chain = chain; self.market = markets.for_chain(chain); self.brain = brain
@@ -486,15 +486,16 @@ class FlyBook:
     def trades_live(self, conn) -> bool:
         """Mirror this minute on the wallet: the runner may sign, and the fly holds the seat or LIVE_WITHOUT_HANDOVER says
         live money trades whoever holds it (the signing gates in ``_live`` still apply)."""
-        return bool(self.live) and (config.LIVE_WITHOUT_HANDOVER or handover.state(conn, self.chain) is not None)
+        return live_first.trades_live(conn, self.chain, self.live)
 
     def _signing(self) -> str | None:
         """Why the wallet may not sign now (None: it may)."""
-        if self.chain != "sol":
-            missing = config.rh_live_prerequisites_missing()
-            return ", ".join(missing) if missing else None
-        from ..chain.cluster_guard import signing_allowed
-        return None if signing_allowed() else "signing is not allowed (LIVE_ENABLED=1 and the live prerequisites)"
+        return live_first.signing_refused(self.chain)
+
+    @property
+    def mirror(self):
+        """The chain's live mirror, one per process and owned by the runner (agent/live_first.py); None until made."""
+        return live_first.mirror_of(self.chain)
 
     def _go_live(self, ctx, beat_id: int, entries: list) -> dict:
         """The wallet's orders of this minute, in their own savepoint: a wallet RPC timeout must not roll back the paper plan."""
@@ -512,51 +513,27 @@ class FlyBook:
         why = self._signing()
         if why:
             return {"stage": f"live gated: {why}"}
-        if self.mirror is None:
-            if self.chain != "sol":
-                from ..rh.live import RhLiveMirror
-                self.mirror = RhLiveMirror(self.H)
-                record_event("info", "rh_live", "the RH fly trades the ETH wallet", {"run_id": self.run_id})
-            else:
-                from .fly_live import LiveMirror
-                self.mirror = LiveMirror(self.H)
-                record_event("info", "fly_live", "the fly trades the bot wallet", {"run_id": self.run_id})
+        mirror = live_first.mirror(self.chain, self.H)          # the clock may have made it while this book was loading
         if self.chain != "sol":
-            return self.mirror.minute(ctx, run_id=self.run_id, beat_id=beat_id, entries=entries)
-        return self.mirror.minute(ctx, run_id=self.run_id, beat_id=beat_id, entries=entries, line=self.lines["plastic"][self.names[0]],
-                                  table=self.sizing["plastic"][self.names[0]])
+            return mirror.minute(ctx, run_id=self.run_id, beat_id=beat_id, entries=entries)
+        return mirror.minute(ctx, run_id=self.run_id, beat_id=beat_id, entries=entries, line=self.lines["plastic"][self.names[0]],
+                             table=self.sizing["plastic"][self.names[0]])
 
     def _live_after(self, ctx, beat_id: int) -> dict:
         """The live book's bookkeeping of the minute (dead-bags, the gap monitor), in its own savepoint."""
-        if self.mirror is None:
+        mirror = self.mirror
+        if mirror is None:
             return {}
         try:
             with ctx.conn.transaction():
-                return self.mirror.after(ctx.conn, ctx, run_id=self.run_id, beat_id=beat_id)
+                return mirror.after(ctx.conn, ctx, run_id=self.run_id, beat_id=beat_id)
         except Exception as e:
             log.exception("%s: live bookkeeping of minute %s failed", self.name, ctx.m1.isoformat())
             record_event("error", "fly_live", f"live bookkeeping failed: {type(e).__name__}: {str(e)[:160]}", {"chain": self.chain, "minute": ctx.m1.isoformat()})
             return {"bookkeeping": f"failed: {type(e).__name__}"}
 
-    def live_exits(self, m1_epoch: float) -> dict | None:
-        """The wallet's sales due at the minute boundary ``m1_epoch``, sent from the live clock's thread the moment it passes
-        (agent/live_first.py): before the stream has written the minute, whatever the engine is busy with."""
-        mirror = self.mirror
-        if mirror is None or self.done or self._signing():
-            return None
-        with transaction() as conn:
-            if not self.trades_live(conn):
-                return None
-            return mirror.exits(conn, m1=datetime.fromtimestamp(m1_epoch, timezone.utc), run_id=self.run_id)
-
-    def idle(self) -> None:
-        """Between minutes: the live book's bookkeeping that waits for an idle wallet (agent/live_first.py)."""
-        if self.mirror is not None and not self.done:
-            self.mirror.idle()
-
     def finish(self) -> None:
-        if self.mirror is not None:
-            self.mirror.stop()
+        """The book's state and run row; its chain's live mirror outlives it (the runner stops it, agent/live_first.py)."""
         try:
             self._write_state()
         except Exception:
