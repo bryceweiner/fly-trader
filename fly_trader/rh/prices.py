@@ -206,17 +206,17 @@ def run_once(max_ranges: int = 1, rpc=None) -> dict:
     for a in rows:
         c = curs.get(f"price:{a['asset']}")
         stored = (json.loads(a["ref_path"]) if isinstance(a["ref_path"], str) else a["ref_path"]) if a["ref_path"] else None
-        if stored and not path_reaches_weth(a["asset"], stored):  # fail closed: a mark in another unit is worse than none
-            log.error("rh prices %s: stored reference path does not end at WETH; not priced", a["asset"])
-            continue
+        if stored and not path_reaches_weth(a["asset"], stored):  # a mark in another unit is worse than none: found again below
+            # a path stored before 2026-10-17 can stop at a route's first split (TSLA's ended at USDG: USD read as ETH), and
+            # a running install keeps it (the seed never overwrites rh_assets)
+            log.warning("rh prices %s: stored reference path does not end at WETH; finding it again", a["asset"])
+            stored = None
         if stored and c is not None:                             # the usual case: path known, cursor exists
             assets.append({"asset": a["asset"], "hops": stored, "at": int(c["block"]), "rng": int(c["range_blocks"]), "state": (c["detail"] or {}).get("state", {})})
             continue
         try:
             with transaction() as conn:
-                hops = a["ref_path"] if a["ref_path"] else discover(conn, rpc, a["asset"], int(a["decimals"]))
-                if isinstance(hops, str):
-                    hops = json.loads(hops)
+                hops = stored or discover(conn, rpc, a["asset"], int(a["decimals"]))     # discover refuses a path short of WETH
                 # marks are needed from the first graduation quoted in the asset (a day of history before it for the carry-forward)
                 fg = conn.execute("SELECT min(grad_block) AS b FROM rh_tokens WHERE quote_asset = %s AND grad_block IS NOT NULL", (a["asset"],)).fetchone()["b"]
                 first = max(start, int(fg) - 800_000) if fg is not None else through
