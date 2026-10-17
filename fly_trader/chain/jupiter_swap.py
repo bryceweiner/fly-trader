@@ -203,6 +203,8 @@ class JupiterSwap:
     def execute(self, signed_transaction_b64: str, request_id: str, last_valid_block_height: int | None = None) -> dict:
         """``POST /execute``. Returns the parsed JSON plus ``_latency_ms``/``_http_status``; a body with
         ``status``/``code`` is returned even on HTTP errors so the broker can see the code."""
+        from ..netguard import refuse_broadcast
+        refuse_broadcast(self.base, "a Jupiter swap")                   # Jupiter broadcasts it: never from a test run (fly_trader/netguard.py)
         payload: dict = {"signedTransaction": signed_transaction_b64, "requestId": request_id}
         if last_valid_block_height is not None:
             payload["lastValidBlockHeight"] = str(int(last_valid_block_height))
