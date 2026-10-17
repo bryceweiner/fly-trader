@@ -118,3 +118,33 @@ def test_pending_tags_return_as_pushed_and_only_when_due(net):
     assert plastic.row_weights(torch.tensor([[0.1, 0.3]]), torch.tensor([0.2])).tolist() == [[0.0, 1.0]]   # below the line teaches nothing
     two = plastic.row_weights(torch.tensor([[0.1, 0.3], [0.1, 0.3]]), torch.tensor([0.2, 0.5]))
     assert two.tolist() == [[0.0, 1.0], [0.0, 0.0]]              # each configuration judges against its own line
+
+
+def test_fill_pathway_learns_its_own_signal_and_the_outcome_keeps_its_rate(net):
+    """The fill pathway is one compartment of the channel: choosing it moves no score; outcome updates touch only the
+    outcome columns and, their rate raised by the energy they gave up, move a prediction as far as the whole channel's
+    did; the fill pathway learns the live residual alone (a bad fill lowers the score); the state keeps it all."""
+    y_dn, u0, k = _parts(net, B=64)
+    whole = plastic.PlasticBank(net, [(1e-3, math.inf)], SCALE, step_cap=1e9); whole.estimate_nu(y_dn, u0, k)
+    bank = plastic.PlasticBank(net, [(1e-3, math.inf)], SCALE, step_cap=1e9); bank.estimate_nu(y_dn, u0, k)
+    before = bank.frozen(y_dn, u0)
+    info = bank.choose_fill(u0, k, None, range_min=0.0)
+    fill = bank.fill.any(0)
+    assert info and bool(fill.any()) and bool((bank.learn[0] & ~fill).any())
+    assert torch.allclose(bank.predict(y_dn, u0, k)[0][0], before, atol=1e-6)
+    tags = lambda: plastic.Tags(list(range(len(y_dn))), np.zeros(len(y_dn)), y_dn, u0, k, torch.ones(1, len(y_dn)))
+    r = torch.full((len(y_dn),), 0.02)
+    whole.update(tags(), r, 0.0); bank.update(tags(), r, 0.0, pathway="outcome")
+    assert float(bank.D[:, :, fill].abs().sum()) == 0.0
+    moved_whole = float((whole.predict(y_dn, u0, k)[0][0] - before).mean()); moved = float((bank.pathway_scores(y_dn, u0, k)[0][0] - before).mean())
+    assert moved == pytest.approx(moved_whole, rel=0.25)
+    out_cols = bank.D[:, :, ~fill].clone()
+    bank.update(tags(), torch.full((len(y_dn),), -0.05), 1.0, pathway="fill")
+    assert torch.equal(bank.D[:, :, ~fill], out_cols) and float(bank.D[:, :, fill].abs().sum()) > 0
+    assert float(bank.pathway_scores(y_dn, u0, k)[1].mean()) < 0
+    other = plastic.PlasticBank(net, [(1e-3, math.inf)], SCALE); other.load_state(bank.state())
+    assert torch.equal(other.fill, bank.fill) and torch.allclose(other.nu_fill, bank.nu_fill) and torch.allclose(other.alpha, bank.alpha)
+    other.drop_fill()
+    assert not bool(other.fill.any()) and float(other.D[:, :, fill].abs().sum()) == 0.0
+    plain = plastic.PlasticBank(net, [(1e-3, math.inf)], SCALE); plain.load_state(whole.state())     # a state without fill pathways
+    assert not bool(plain.fill.any()) and torch.allclose(plain.D, whole.D)

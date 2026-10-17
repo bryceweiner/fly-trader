@@ -12,9 +12,11 @@ Jupiter's execute status is recorded but never trusted alone: 'Failed' with move
 fill (verified_by='balance_delta_despite_failed'); 'Success' without movement is a fills row with
 verified_by='unverified' plus an events row after a getTransaction check. On execute code -1000
 (failed to land) or a slippage error with NO balance movement the order is retried with
-slippage + step_bps up to max_slippage_bps; each attempt is its own orders row.
+slippage + step_bps up to max_slippage_bps; each attempt is its own orders row. A buy given its decision's paper
+fill price (``ref_price``) is refused before signing when the /order quote's price (amount in / outAmount) is more
+than ``MAX_ENTRY_CHASE`` above it: slippage is measured against the fresh quote only, which may already have run.
 
-orders.status words: ordered | order_error | sign_error | executed | execute_error | confirmed |
+orders.status words: ordered | order_error | price_ran | sign_error | executed | execute_error | confirmed |
 failed_on_chain | expired | unsent.   fills.verified_by: balance_delta |
 balance_delta_despite_failed | unverified.   price_sol = |sol delta| / 1e9 / (|token delta| /
 10^decimals) — an all-in effective price (transaction fee, priority fee and any ATA rent are inside
@@ -151,8 +153,9 @@ class LiveBroker:
 
     # ---- public ----
     def swap(self, conn, *, decision_id: int | None, book: str, side: str, mint: str, amount_in: int,
-             slippage_bps: int, max_slippage_bps: int, step_bps: int) -> FillResult:
-        """Buy (lamports in -> ``mint``) or sell (raw token units in -> SOL) with balance verification."""
+             slippage_bps: int, max_slippage_bps: int, step_bps: int, ref_price: float | None = None, decimals: int | None = None) -> FillResult:
+        """Buy (lamports in -> ``mint``) or sell (raw token units in -> SOL) with balance verification. ``ref_price`` (a
+        buy: SOL per whole token, ``decimals`` the token's): the most its quote may exceed by ``MAX_ENTRY_CHASE``."""
         assert_signing_allowed()
         if side not in ("buy", "sell"):
             raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
@@ -170,7 +173,8 @@ class LiveBroker:
                 attempt += 1
                 result, retryable = self._attempt(
                     conn, decision_id=decision_id, book=book, side=side, mint=mint, input_mint=input_mint,
-                    output_mint=output_mint, amount_in=amount_in, slippage_bps=slip, attempt=attempt)
+                    output_mint=output_mint, amount_in=amount_in, slippage_bps=slip, attempt=attempt,
+                    ref_price=ref_price if side == "buy" else None, decimals=decimals)
                 result.attempts = attempt
                 if result.ok or not retryable or step_bps <= 0 or slip + step_bps > max_slippage_bps:
                     if retryable and not result.ok:
@@ -180,9 +184,43 @@ class LiveBroker:
                 log.warning("retrying %s %s after %s (code %s) with slippage %d bps",
                             side, mint, result.status, result.code, slip)
 
+    def close_token_account(self, mint: str) -> int | None:
+        """Close the bot's empty token account(s) of ``mint`` through the signer (it re-checks each is ours and empty): the
+        rent goes back to the wallet. Returns the lamports the wallet gained, net of the close's fee, measured from the
+        transaction (else the balance around it); None when nothing was sent (the wallet holds the token, or has no such
+        account) or the close never landed. Recorded as wallet_events(kind='ata_closed')."""
+        assert_signing_allowed()
+        owner = self.pubkey
+        accts = [a for a in self.rpc.get_token_accounts_by_owner(owner) if a["mint"] == mint and not a.get("is_native")]
+        if not accts or any(int(a["amount"]) > 0 for a in accts):
+            return None
+        with _INFLIGHT:                                 # no swap snapshots the wallet while the rent comes back
+            pre = int(self.rpc.get_balance(owner))
+            built = self.signer.call("close_atas", accounts=[a["address"] for a in accts])
+            if not built:
+                return None
+            sig = self.rpc.send_transaction(built[0]["tx"])
+            status, st = await_confirmation(self.rpc, sig, built[0]["last_valid_block_height"])
+            got = None
+            if status in ("confirmed", "failed_on_chain"):       # landed: the rent (or only the fee) moved
+                try:
+                    exact = tx_deltas(self.rpc.get_transaction(sig), str(owner), mint)
+                except Exception:
+                    exact = None
+                got = int(exact[0]) if exact is not None else int(self.rpc.get_balance(owner)) - pre
+        try:
+            with transaction() as conn:
+                conn.execute("INSERT INTO wallet_events (kind, pubkey, detail) VALUES ('ata_closed', %s, %s)",
+                             (owner, Jsonb({"accounts": [a["address"] for a in accts], "mint": mint, "signature": sig, "status": status, "lamports": got,
+                                            "slot": int((st or {}).get("slot") or 0), "after": "sale"})))
+        except Exception as e:
+            log.warning("wallet_events insert failed: %s", type(e).__name__)
+        log.info("closed the token account of %s after its sale: %s, %s lamports back", mint, status, got)
+        return got
+
     # ---- one attempt ----
     def _attempt(self, conn, *, decision_id, book, side, mint, input_mint, output_mint, amount_in,
-                 slippage_bps, attempt) -> tuple[FillResult, bool]:
+                 slippage_bps, attempt, ref_price=None, decimals=None) -> tuple[FillResult, bool]:
         taker = self.pubkey
         pre = snapshot_balances(self.rpc, taker)
         request = {"inputMint": input_mint, "outputMint": output_mint, "amount": str(amount_in), "taker": taker,
@@ -212,6 +250,12 @@ class LiveBroker:
         fee_payer = order.get("signatureFeePayer")
         if fee_payer and fee_payer != taker:
             return fail("order_error", f"signatureFeePayer {fee_payer} != taker", None, order)
+        if ref_price and decimals is not None:          # the quote against its decision's paper fill: nothing signed yet
+            out = _int_or_none(order.get("outAmount")) or 0
+            px = (amount_in / config.LAMPORTS_PER_SOL) / (out / 10 ** int(decimals)) if out > 0 else float("inf")
+            if px > ref_price * (1.0 + config.MAX_ENTRY_CHASE):
+                return fail("price_ran", f"price ran: quoted {px:.6g} SOL per token, {px / ref_price - 1:+.1%} over the decision's {ref_price:.6g} "
+                                         f"(at most +{config.MAX_ENTRY_CHASE:.0%})", None, order)
         lvbh = _int_or_none(order.get("lastValidBlockHeight"))
         program_ids = static_program_ids(tx_b64)
         unknown = [p for p in program_ids if p not in KNOWN_PROGRAM_IDS and p not in self.labels]

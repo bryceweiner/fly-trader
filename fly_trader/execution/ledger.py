@@ -19,10 +19,13 @@ log = logging.getLogger(__name__)
 
 
 def open_positions(conn, book: str) -> list[dict]:
+    """Open positions of ``book`` with what trading them needs; ``decision_ts`` is the entry decision's minute (its ``ts``,
+    the minute end a paper position opens at): a live position's hold runs from it, not from its fill 10–20 s later."""
     rows = conn.execute(
         """SELECT p.*, COALESCE(t.decimals, CASE WHEN p.chain = 'rh' THEN 18 END) AS decimals, t.graduated_at,
                   COALESCE(wp.program_label, CASE WHEN p.chain = 'rh' THEN 'Pons v4' END) AS program_label,
-                  COALESCE(p.hold_s, (d.detail->>'hold_s')::float) AS hold_s, COALESCE(p.strategy, d.detail->>'strategy') AS strategy
+                  COALESCE(p.hold_s, (d.detail->>'hold_s')::float) AS hold_s, COALESCE(p.strategy, d.detail->>'strategy') AS strategy,
+                  d.ts AS decision_ts
            FROM positions p LEFT JOIN tokens t ON t.mint = p.mint
            LEFT JOIN watch_pools wp ON wp.pool = p.pool
            LEFT JOIN decisions d ON d.id = p.entry_decision_id
@@ -112,6 +115,19 @@ def close_position(conn, *, position_id: int, exit_price: float, proceeds_sol: f
         log.warning("close_position: position %s is not open; nothing booked", position_id)
         return None
     return float(r["realized"])
+
+
+def credit(conn, position_id: int, sol: float) -> None:
+    """Book ``sol`` that reached the wallet after a position closed (its token account's rent refunded, a dead-bag's tokens
+    swept) onto that position's realized P&L."""
+    conn.execute("UPDATE positions SET realized_sol = COALESCE(realized_sol, 0) + %s WHERE id = %s", (sol, position_id))
+
+
+def last_dead_bag(conn, book: str, mint: str) -> int | None:
+    """The most recent position of ``mint`` written off as a dead-bag in ``book`` (its later sweeps' proceeds are its)."""
+    r = conn.execute("SELECT id FROM positions WHERE book = %s AND mint = %s AND forced_exit_kind = 'dead_bag' ORDER BY closed_at DESC NULLS LAST, id DESC LIMIT 1",
+                     (book, mint)).fetchone()
+    return int(r["id"]) if r else None
 
 
 def mark_positions(conn, book: str, prices: dict[str, float], last_swaps: dict[str, float], ts: datetime,

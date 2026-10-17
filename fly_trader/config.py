@@ -88,6 +88,14 @@ MIN_POSITION_SOL = env_float("MIN_POSITION_SOL", 0.02)             # smaller siz
 KILL_SWITCH_DRAWDOWN = env_float("KILL_SWITCH_DRAWDOWN", 0.30)
 KILL_SWITCH_LIQUIDATE = env_bool("KILL_SWITCH_LIQUIDATE", False)   # a tripped kill switch also sells every open live position (agent/fly_live.py)
 CIRCUIT_THRESHOLD = env_int("CIRCUIT_THRESHOLD", 3)
+# a tripped memecoin breaker (circuits 1 and 3, agent/rails.py) blocks live entries this long after its last failure; then
+# entries may try again: a success re-arms it, a failure re-trips it (paper never stops, so a hand reset left the books apart)
+CIRCUIT_COOLDOWN_S = env_float("CIRCUIT_COOLDOWN_S", 900.0)
+# a live buy executes 10–20 s after its decision at a fresh quote: refused when that quote's all-in price is more than this
+# above the decision's paper fill price (2026-10: one RH buy paid +7.3 % over it, its slippage measured on the fresh quote only)
+MAX_ENTRY_CHASE = env_float("MAX_ENTRY_CHASE", 0.03)
+ENTRY_RETRY_MIN = env_float("ENTRY_RETRY_MIN", 2.0)               # a failed live entry is retried this many minutes after its decision while paper holds it
+ENTRY_MAX_LAG_S = env_float("ENTRY_MAX_LAG_S", 90.0)              # no entries (paper and live) on a minute that ended longer ago: the price moved on
 EXECUTABILITY_MAX_IMPACT = env_float("EXECUTABILITY_MAX_IMPACT", 0.30)
 SLIPPAGE_ENTRY_BPS = env_int("SLIPPAGE_ENTRY_BPS", 150)
 SLIPPAGE_EXIT_BPS = env_int("SLIPPAGE_EXIT_BPS", 300)
@@ -127,6 +135,18 @@ FLY_LEARNED_VETO = env_float("FLY_LEARNED_VETO", 0.02)
 # selector. own: its distilled copy of the selector (until 2026-10-11): that copy ranked the selector's top 1 % of
 # candidates only ~0.6-correlated, so its own judgement at the line was half noise (fly #157 and #251 alike).
 FLY_SCORE = env_str("FLY_SCORE", "teacher")
+# What the fly's mushroom body learns from (brain/plastic.py, agent/fly_session._learn). Its outcome pathway learns the
+# book's realized return of every row it traded (the market label only for a row it did not); its fill pathway learns
+# what the wallet's real fills added to that (live realized − outcome) at FLY_FILL_ALPHA (the share of a fill error one
+# update corrects), forgetting with FLY_FILL_HALF_LIFE_DAYS. The fill pathway is one compartment of each strategy's
+# channel, chosen once on the first scored minute: the one taking the least of the channel's learning that can still
+# lower a score by FLY_FILL_RANGE (on fly #157 the lightest ones reach only 0.2–2 %, the learned veto's own size).
+# FLY_FILL_PATHWAY=0: every own compartment learns the outcome alone.
+FLY_OUTCOME_FROM_BOOK = env_bool("FLY_OUTCOME_FROM_BOOK", True)
+FLY_FILL_PATHWAY = env_bool("FLY_FILL_PATHWAY", True)
+FLY_FILL_ALPHA = env_float("FLY_FILL_ALPHA", 0.02)
+FLY_FILL_HALF_LIFE_DAYS = env_float("FLY_FILL_HALF_LIFE_DAYS", 14.0)
+FLY_FILL_RANGE = env_float("FLY_FILL_RANGE", 0.05)
 DEVICE = env_str("DEVICE", "auto")          # auto (CUDA/ROCm, else MPS, else CPU) | cpu | cuda[:N] | rocm[:N] | mps  — brain/device.py
 NT_SIGN_MODE = env_str("NT_SIGN_MODE", "shiu")  # shiu | flybrain
 CELL_TYPES_SOURCE = env_str("CELL_TYPES_SOURCE", "annotations")  # annotations | flybrain
@@ -289,7 +309,17 @@ RH_MIN_POSITION_ETH = env_float("RH_MIN_POSITION_ETH", 0.000891166)         # 0.
 RH_GAS_RESERVE_ETH = env_float("RH_GAS_RESERVE_ETH", 0.0029)        # 200 round trips at 2x the gas rh-probe measured (356k gas, 0.02 gwei, 2026-09-28)
 RH_MAX_FEE_GWEI = env_float("RH_MAX_FEE_GWEI", 5.0)                  # a transaction never offers more per gas
 RH_TX_FEE_ETH = env_float("RH_TX_FEE_ETH", 7.2e-6)                 # one swap's gas in ETH (rh-probe 2026-09-28: 356k gas × 0.02 gwei); fixed like the SOL fee
-RH_HOOK_FEE = env_float("RH_HOOK_FEE", 0.0099)                      # Pons hook fee + creator tax per side when a minute has none: the median of 52k indexed swaps (1 % of the net = 0.99 % of gross; high-tax launches reach 5.7 %)
+# Pons hook fee + creator tax per side when no fee is known for the coin: the median of 52k indexed swaps. The hook takes it
+# from the pool's gross output (live fills receive exactly 1 − r of it), so a 1 % fee is 0.01; 0.0099 is what the indexer's
+# old formula (taken / (net + taken), until 2026-10-17) made of it. It stays 0.0099 for now: it is part of every model's
+# validity key (train/selector.DATA_VERSION "rh_costs"), so changing it retires every selector and fly and stops all
+# trading — change it together with the next deliberate retrain. High-tax launches reach 5.7 %.
+RH_HOOK_FEE = env_float("RH_HOOK_FEE", 0.0099)
+# a coin quoted in USDG or a stock token is swapped through its base (ETH→base→coin): more gas and one more pool's fee per
+# side than the one Pons swap the cost model assumes (2026-10: a 3-hop buy paid 1.87e-5 ETH gas, ~0.07 % in hop costs).
+# The paper books' cost only (market/exit_cost.fee_fraction): the training labels keep the one-swap model.
+RH_TX_FEE_MULTIHOP_ETH = env_float("RH_TX_FEE_MULTIHOP_ETH", 1.9e-5)
+RH_HOP_FEE = env_float("RH_HOP_FEE", 0.0007)
 RH_KILL_SWITCH_DRAWDOWN = env_float("RH_KILL_SWITCH_DRAWDOWN", 0.30)
 RH_MIN_SWEEP_ETH = env_float("RH_MIN_SWEEP_ETH", 0.0002)           # base-asset or dead-bag balances worth less are dust
 RH_STREAM_POLL_S = env_float("RH_STREAM_POLL_S", 2.0)

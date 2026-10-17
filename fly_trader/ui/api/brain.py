@@ -107,7 +107,7 @@ def _pathways(mode: str, boot_id: int, boot_path: str, connectome_file: str, sta
         else:
             out["note"] = "no snapshot a day old yet: showing the change since bootstrap"
     out["changed"] = int(((D - (D_ref if D_ref is not None else 0)) != 0).sum())
-    out["items"] = pw.top_pathways(D, w0, kc, mbon, learn, strategies, n_app, n_av, D_ref=D_ref, mbon_offset=mbon_offset)
+    out["items"] = pw.top_pathways(D, w0, kc, mbon, learn, strategies, n_app, n_av, D_ref=D_ref, mbon_offset=mbon_offset, fill=pw.bank_fill(state))
     return out
 
 

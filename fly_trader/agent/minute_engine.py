@@ -12,10 +12,21 @@ mint's state began) goes to every book; each picks its model's columns by name.
 Books — ``SelectorBook`` (agent/selector_session.py) and ``FlyBook`` (agent/fly_session.py) — implement ``name``,
 ``on_bars(t_start, bars)`` (every processed minute, warm-up included: open, close and exit cost of every traded mint),
 ``on_minute(ctx)``, ``open_mints(conn)``, ``maybe_reload()``, ``done`` and ``finish()``. Each book trades inside its own
-savepoint, so one book's failure never undoes the other's minute. Books join when they qualify (checked every
-``MODEL_CHECK_S``): the selector while it has a deployable model and has not handed its seat to a fly that is trading;
+savepoint, so one book's failure never undoes the other's minute.
+
+Live money first and fast over paper, always (CLAUDE.md, agent/live_first.py). A book that trades live money (``LIVE``:
+the fly) runs its minute in two parts: ``on_minute`` in the minute's live phase (``live_phase``: the features, then the
+fly scores, plans and sends the wallet's orders; committed at once), ``after_minute`` in its paper phase
+(``paper_phase``: its paper trades, learning and bookkeeping, then every other book's minute). The loop runs every
+chain's newest minute's live phase before any chain's paper phase, and calls ``idle`` on the books between minutes. The
+wallet's scheduled sales go out at the minute boundary from the live clock's own thread (``live_exits``).
+
+Books join when they qualify (checked every ``MODEL_CHECK_S``, mid-minute): the selector while it has a deployable
+model and has not handed its seat to a fly that is trading;
 the fly once its design passed the replay and a deployable bootstrap exists. No entries or exits while the stream is
-stale; missed minutes are replayed through the features without trading.
+stale; missed minutes are replayed through the features without trading; a minute traded more than ``ENTRY_MAX_LAG_S``
+after its end (``Minute.lag_s``) takes no entries (agent/paper_trading.py), only exits. A minute runs as soon as its
+stream has written it (polled every ``POLL_S``).
 """
 from __future__ import annotations
 
@@ -25,7 +36,7 @@ import math
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 import numpy as np
@@ -34,13 +45,14 @@ from .. import config, markets
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..market.exit_cost import PUMP_SUPPLY
-from ..market.exit_cost import cost_at_size
+from ..market.exit_cost import cost_at_size, cost_label
 from ..market.features import FEATURES, FIDX, TokenMeta, TokenState
 from ..train.corpus_meta import FEATURE_COLS as META_COLS
 from ..train.decisions import MIN_RESQ_SOL, MIN_VOL_15M_SOL, X_COLS
 from ..train.flow import FlowWindow, MarketWindow
 from ..train.mature import MASKED
 from ..train.selector import in_universe
+from . import live_first
 
 log = logging.getLogger(__name__)
 WARMUP_MIN = 1440            # training warms each day on the previous day's candles
@@ -48,10 +60,11 @@ IDLE_EVICT_S = 86400         # training has no history for a mint idle since bef
 STREAM_STALE_S = 180         # no entries or exits when the stream's newest complete minute is older than this
 META_TTL_S = 600
 MODEL_CHECK_S = 600          # how often books reload newer models and new books are admitted
+POLL_S = 0.25                # how often the loop looks for a minute its stream has written
 
 
 class MintState:
-    __slots__ = ("st", "meta", "hist", "decimals", "pool", "program_label", "graduated_at", "meta_row", "prev_close", "broken", "flow")
+    __slots__ = ("st", "meta", "hist", "decimals", "pool", "program_label", "graduated_at", "meta_row", "prev_close", "broken", "flow", "fee")
 
     def __init__(self, mint: str, decimals: int, pool: str | None, program_label: str | None, graduated_at: float | None, meta_row: dict | None):
         self.st = TokenState(mint); self.meta = TokenMeta(mint=mint, program_label=program_label or "Pump.fun Amm", graduated_at=graduated_at)
@@ -59,6 +72,7 @@ class MintState:
         self.decimals, self.pool, self.program_label, self.graduated_at, self.meta_row = decimals, pool, program_label, graduated_at, meta_row
         self.prev_close: float | None = None; self.broken = False
         self.flow = FlowWindow()                    # wallet flow inputs (train/flow.py, as mature.build_day)
+        self.fee: float | None = None               # the last pool fee a minute of this mint reported (Minute.fee)
 
 
 @dataclass
@@ -80,6 +94,7 @@ class Minute:
     trade: bool
     engine: "MinuteEngine"
     market: object = None     # fly_trader/markets.MarketSpec of these rows (None: Solana)
+    lag_s: float = 0.0        # how long after its end the minute is traded (a lagging stream): past ENTRY_MAX_LAG_S, no entries
 
     @property
     def t_start(self) -> float:
@@ -90,6 +105,18 @@ class Minute:
 
     def mcap(self, mint: str, price: float | None) -> float | None:
         return self.engine._mcap(mint, price)
+
+    def fee(self, mint: str) -> float | None:
+        """The pool fee a swap of ``mint`` pays now: this minute's, else the last one known for the mint. A held position's
+        quiet minute reports none, and the cost model's generic fallback under-charged Pons coins (RH_HOOK_FEE ~1 % where
+        their hooks charge 2.8–5 %) on 63 % of the paper RH exits."""
+        f = self.fees.get(mint)
+        return f if f is not None else self.engine._last_fee(self.conn, mint)
+
+    def cost_label(self, mint: str, label: str | None) -> str | None:
+        """The label a swap of ``mint`` is priced under (market/exit_cost.cost_label): an RH coin quoted in USDG or a stock
+        token swaps through its base."""
+        return cost_label(label, (self.engine._meta(self.conn, mint) or {}).get("quote_class")) if self.engine.rh else label
 
 
 class MinuteEngine:
@@ -156,6 +183,22 @@ class MinuteEngine:
             r = conn.execute("SELECT resq_sol AS q FROM pump_minutes WHERE mint = %s AND resq_sol IS NOT NULL ORDER BY ts DESC LIMIT 1", (mint,)).fetchone()
         return float(r["q"]) if r else None
 
+    def _last_fee(self, conn, mint: str) -> float | None:
+        """The last pool fee reported for ``mint``: this engine's own minutes, else the newest stream row with one (RH: else
+        the pool's measured hook fee, rh/index.py). None: none known (the cost model's fallback applies)."""
+        s = self.states.get(mint)
+        if s is not None and s.fee is not None:
+            return s.fee
+        if self.rh:
+            r = conn.execute("SELECT COALESCE((SELECT fee_rate FROM rh_minutes WHERE mint = %s AND fee_rate IS NOT NULL ORDER BY ts DESC LIMIT 1), "
+                             "(SELECT hook_fee FROM rh_pools WHERE token = %s AND hook_fee IS NOT NULL LIMIT 1)) AS f", (mint, mint)).fetchone()
+        else:
+            r = conn.execute("SELECT fee_rate AS f FROM pump_minutes WHERE mint = %s AND fee_rate IS NOT NULL ORDER BY ts DESC LIMIT 1", (mint,)).fetchone()
+        f = float(r["f"]) if r and r["f"] is not None else None
+        if s is not None and f is not None:
+            s.fee = f
+        return f
+
     def _mcap(self, mint: str, price: float | None) -> float | None:
         """Market cap in SOL (price × supply), which sets the pool fee tier; None without a price."""
         s = self.states.get(mint)
@@ -187,6 +230,8 @@ class MinuteEngine:
         st, price, resq = s.st, float(a["close"]), a["resq"]
         if self.rh:
             s.meta.pool_fee = a.get("fee_rate")          # the Pons hook fee this minute charged (the cost model's fee)
+        if a.get("fee_rate") is not None:
+            s.fee = float(a["fee_rate"])
         if (s.prev_close and not (1 / 50 <= price / s.prev_close <= 50)) or (resq is not None and resq > 1e5 * self.spec.k()):
             s.broken = True                          # train/decisions.py: a scale break makes the mint ineligible from that minute on
         s.prev_close = price
@@ -281,7 +326,10 @@ class MinuteEngine:
         if idle:
             log.info("evicted %d mint states idle for more than %d h", len(idle), IDLE_EVICT_S // 3600)
 
-    def run_minute(self, m1_epoch: float, trade: bool = True) -> dict:
+    def live_phase(self, m1_epoch: float, trade: bool = True) -> tuple[Minute, dict]:
+        """The minute's features, then the minute of every book that trades live money (``LIVE``: the fly scores, its
+        paper book plans, the wallet's orders go out), committed at once: no other book's work and, through ``main``, no
+        other chain's paper work runs before these orders (live money first, CLAUDE.md)."""
         m1 = datetime.fromtimestamp(m1_epoch, timezone.utc); m0 = datetime.fromtimestamp(m1_epoch - 60, timezone.utc)
         out: dict = {"minute": m1.isoformat()}
         with transaction() as conn:
@@ -290,21 +338,45 @@ class MinuteEngine:
             ctx = Minute(conn=conn, m0=m0, m1=m1, m1_epoch=m1_epoch, agg=agg, X=X, infos=infos, mints=mints, bars=bars,
                          prices={m: float(a["close"]) for m, a in agg.items()}, resqs={m: a["resq"] for m, a in agg.items()},
                          fees={m: a.get("fee_rate") for m, a in agg.items()}, fresh=trade and self.stream_fresh(m1_epoch - 60), trade=trade, engine=self,
-                         market=self.spec)
-            out.update(mints_traded=len(agg), eligible=len(mints)); held: set[str] = set()
-            for b in list(self.my_books()):
+                         market=self.spec, lag_s=time.time() - m1_epoch)
+            out.update(mints_traded=len(agg), eligible=len(mints))
+            for b in [b for b in self.my_books() if getattr(b, "LIVE", False)]:
                 try:
                     with conn.transaction():                            # a savepoint per book
                         b.on_bars(m1_epoch - 60.0, bars)
                         out[b.name] = b.on_minute(ctx)
+                except Exception:
+                    log.exception("%s: live minute %s failed", b.name, m1.isoformat())
+                    record_event("error", b.name, f"live minute failed: {m1.isoformat()}")
+        return ctx, out
+
+    def paper_phase(self, ctx: Minute, out: dict) -> dict:
+        """The rest of the minute, once every chain's live orders are out: the live books' paper trades, learning and
+        bookkeeping (``after_minute``), then every other book's minute, each in its own savepoint."""
+        held: set[str] = set()
+        with transaction() as conn:
+            ctx = replace(ctx, conn=conn)
+            for b in list(self.my_books()):
+                try:
+                    with conn.transaction():                            # a savepoint per book
+                        if getattr(b, "LIVE", False):
+                            out[b.name] = b.after_minute(ctx)
+                        else:
+                            b.on_bars(ctx.m1_epoch - 60.0, ctx.bars)
+                            out[b.name] = b.on_minute(ctx)
                         held |= set(b.open_mints(conn))
                 except Exception:
-                    log.exception("%s: minute %s failed", b.name, m1.isoformat())
-                    record_event("error", b.name, f"minute failed: {m1.isoformat()}")
-            self._sweep(m1_epoch, held)
+                    out.pop(b.name, None)
+                    log.exception("%s: minute %s failed", b.name, ctx.m1.isoformat())
+                    record_event("error", b.name, f"minute failed: {ctx.m1.isoformat()}")
+            self._sweep(ctx.m1_epoch, held)
         for b in [b for b in self.my_books() if b.done]:
             b.finish(); self.books.remove(b)
         return out
+
+    def run_minute(self, m1_epoch: float, trade: bool = True) -> dict:
+        """One minute whole: its live phase, then its paper phase (minutes the engine catches up on, and tests)."""
+        return self.paper_phase(*self.live_phase(m1_epoch, trade))
 
 
 
@@ -351,6 +423,41 @@ def admit_books(engine: MinuteEngine, live: bool) -> list:
     return new
 
 
+def run_ready(engines: list, m1: float) -> list:
+    """Every chain's minutes its stream has written up to wall-clock minute ``m1``: older ones whole (catching up: features
+    and the fly's learning only), then each chain's newest -- live money first: every chain's live phase before any
+    chain's paper phase. [(engine, minute, its minute's output or None when it failed)] of the newest minutes."""
+    staged = []
+    for engine in engines:
+        if not engine.my_books() or m1 <= engine.last_minute:
+            continue
+        if (upto := engine.ready_through(m1)) <= engine.last_minute:        # only minutes this chain's stream has written
+            continue
+        for minute in range(int(engine.last_minute) + 60, int(upto), 60):
+            try:
+                engine.run_minute(float(minute), trade=engine.tradeable(minute, m1))
+            except Exception:
+                log.exception("%s minute %s failed", engine.spec.chain, minute); record_event("error", "engine", f"{engine.spec.chain} minute failed: {minute}")
+        staged.append((engine, int(upto)))
+    live = {}
+    for engine, minute in staged:
+        try:
+            live[id(engine)] = engine.live_phase(float(minute), trade=engine.tradeable(minute, m1))
+        except Exception:
+            log.exception("%s live minute %s failed", engine.spec.chain, minute); record_event("error", "engine", f"{engine.spec.chain} live minute failed: {minute}")
+    ran = []
+    for engine, minute in staged:
+        st = None
+        if id(engine) in live:
+            try:
+                st = engine.paper_phase(*live[id(engine)])
+            except Exception:
+                log.exception("%s minute %s failed", engine.spec.chain, minute); record_event("error", "engine", f"{engine.spec.chain} minute failed: {minute}")
+        engine.last_minute = minute
+        ran.append((engine, minute, st))
+    return ran
+
+
 def main(stop_event: threading.Event | None = None, live: bool = False) -> None:
     """One engine per enabled chain (markets.enabled()), all sharing one list of books: each engine feeds its minutes, as
     its own stream writes them, to its chain's books only — a lagging chain never holds another chain's minutes back."""
@@ -369,6 +476,7 @@ def main(stop_event: threading.Event | None = None, live: bool = False) -> None:
     m_start = math.floor(time.time() / 60) * 60
     for e in engines:
         e.warm_up(m_start); e.last_minute = m_start - 60
+    clock = live_first.LiveClock(books, stop_event).start()     # the wallet's scheduled sales at each boundary, from their own thread
     last_check = time.time(); n_min = 0
     last_release, last_stamp_check = release_stamp(), 0.0
     try:
@@ -378,7 +486,7 @@ def main(stop_event: threading.Event | None = None, live: bool = False) -> None:
                 last_stamp_check, stamp = now, release_stamp()
                 if stamp != last_release:              # a release was applied (ops/release.py): reload at once
                     last_release, last_check = stamp, 0.0
-            if now - last_check >= MODEL_CHECK_S:
+            if now - last_check >= MODEL_CHECK_S and live_first.mid_minute(now):   # a reload takes seconds: never in front of a minute's orders
                 last_check = now
                 for b in books:
                     try:
@@ -389,24 +497,22 @@ def main(stop_event: threading.Event | None = None, live: bool = False) -> None:
                     books += admit_books(lead, live)
                 except Exception:
                     log.exception("book admission failed")
-            for engine in engines:
-                if not engine.my_books() or m1 <= engine.last_minute or now - m1 < 4.0:
-                    continue
-                if (upto := engine.ready_through(m1)) <= engine.last_minute:        # only minutes this chain's stream has written
-                    continue
-                for minute in range(int(engine.last_minute) + 60, int(upto) + 1, 60):
+            ran = run_ready(engines, m1)
+            for engine, minute, st in ran:
+                n_min += 1
+                if st is not None and engine.tradeable(minute, m1) and n_min % 10 == 0:
+                    log.info("%s minute %s: traded %d eligible %d | %s", engine.spec.chain, st["minute"], st.get("mints_traded", 0), st.get("eligible", 0),
+                             " | ".join(f"{b.name}: picks {(st.get(b.name) or {}).get('picks')} open {(st.get(b.name) or {}).get('open')} wealth {(st.get(b.name) or {}).get('wealth')}"
+                                        for b in engine.my_books()))
+            if not ran:                                  # between minutes: bookkeeping that waits for an idle wallet
+                for b in list(books):
                     try:
-                        st = engine.run_minute(float(minute), trade=engine.tradeable(minute, m1))   # older minutes update features (and the fly's learning) only
-                        n_min += 1
-                        if engine.tradeable(minute, m1) and n_min % 10 == 0:
-                            log.info("%s minute %s: traded %d eligible %d | %s", engine.spec.chain, st["minute"], st.get("mints_traded", 0), st.get("eligible", 0),
-                                     " | ".join(f"{b.name}: picks {(st.get(b.name) or {}).get('picks')} open {(st.get(b.name) or {}).get('open')} wealth {(st.get(b.name) or {}).get('wealth')}"
-                                                for b in engine.my_books()))
+                        getattr(b, "idle", lambda: None)()
                     except Exception:
-                        log.exception("%s minute %s failed", engine.spec.chain, minute); record_event("error", "engine", f"{engine.spec.chain} minute failed: {minute}")
-                engine.last_minute = upto
-            time.sleep(0.5)
+                        log.exception("%s: idle bookkeeping failed", b.name)
+            time.sleep(POLL_S)
     finally:
+        clock.close()
         for b in books:
             try:
                 b.finish()

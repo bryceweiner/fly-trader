@@ -2,6 +2,7 @@
 balances moved, gas included; a sale climbs the slippage ladder over on-chain reverts; two-leg routes keep their base in
 lots; a crash after broadcast is booked exactly once on recovery; a dropped transaction is cancelled at its nonce; the
 reconciler trips circuit 3 on ETH leaving unexplained; the mirror sizes RH entries from the wallet and respects circuit 3."""
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction as F
@@ -10,10 +11,12 @@ from types import SimpleNamespace
 import pytest
 
 from fly_trader import config
+from fly_trader.agent import rails
 from fly_trader.db.connection import transaction
+from fly_trader.execution import ledger
 from fly_trader.markets import RH_CIRCUIT
 from fly_trader.rh import abi, accounting as A, kyber as K, router
-from fly_trader.rh.exec import RhExecutor, RhRequest
+from fly_trader.rh.exec import DUPLICATE, RhExecutor, RhRequest, RhResult
 from fly_trader.rh.tx import address_of, decode_raw
 from fly_trader.rh.wallet import RhWallet
 from fly_trader.vault.evm import EvmRpcError
@@ -275,7 +278,8 @@ def test_mirror_sizes_rh_entries_and_respects_circuit_3(chain, monkeypatch):
         beat = conn.execute("INSERT INTO beats (run_id, beat_no) VALUES (%s, 1) RETURNING id", (run,)).fetchone()["id"]
         did = conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, kind, size_sol) VALUES (%s, %s, %s, %s, 'enter', 0.01) RETURNING id",
                            (beat, run, now, TOKEN)).fetchone()["id"]
-        ctx = SimpleNamespace(conn=conn, m1=now, m1_epoch=now.timestamp(), prices={TOKEN: 1e-6}, resqs={TOKEN: 10.0}, fees={}, last_resq=lambda x: 10.0)
+        ctx = SimpleNamespace(conn=conn, m1=now, m1_epoch=now.timestamp(), prices={TOKEN: 1e-6}, resqs={TOKEN: 10.0}, fees={}, last_resq=lambda x: 10.0,
+                              fee=lambda x: None, lag_s=0.0)
         e = {"mint": TOKEN, "decision_id": did, "score": 0.1, "threshold": 0.0, "table": None, "hold_s": 600.0, "strategy": "ev",
              "info": {"pool": None, "resq": 10.0, "decimals": 18}}
         out = m.minute(ctx, run_id=run, beat_id=beat, entries=[e])
@@ -290,3 +294,151 @@ def test_mirror_sizes_rh_entries_and_respects_circuit_3(chain, monkeypatch):
         conn.execute("DELETE FROM decisions WHERE run_id = %s", (run,)); conn.execute("DELETE FROM beats WHERE run_id = %s", (run,))
         conn.execute("DELETE FROM runs WHERE run_id = %s", (run,))
     assert out["entered"] == 0 and out["blocked"] == "kill switch"
+
+
+def test_a_buy_climbs_the_slippage_ladder_to_the_entry_maximum(chain, monkeypatch):
+    """A buy reverted at the entry slippage is not given up: it climbs the ladder to its maximum, as on Solana."""
+    monkeypatch.setattr(config, "SLIPPAGE_STEP_BPS", 100)
+    chain.c.revert_onchain[(K.NATIVE, TOKEN)] = 1                                   # mined and reverted at 150 bps, filled at 250
+    ex = chain.ex(); amt = WEI // 100
+    b = ex.execute(RhRequest(kind="buy", token=TOKEN, amount_in=amt, slippage_bps=150, max_slippage_bps=300))
+    with transaction() as conn:
+        st = [r["status"] for r in conn.execute("SELECT status FROM rh_txs WHERE from_addr = %s AND kind = 'swap' ORDER BY id", (ADDR,)).fetchall()]
+    assert b.ok and st == ["reverted", "mined_ok"] and _pos(b.position_id)["cost_sol"] == pytest.approx((amt + 2 * FEE) / WEI)   # both attempts' gas
+
+
+def test_a_buy_whose_quote_ran_past_its_paper_fill_is_refused_unsigned(chain):
+    """The planner quotes 1e-6 ETH per token: a decision filled at 0.9e-6 would chase it +11 % — refused before anything
+    is signed, no circuit failure, sent again later; one filled at 0.98e-6 (+2 %) is bought."""
+    ex = chain.ex(); amt = WEI // 100
+    r = ex.execute(RhRequest(kind="buy", token=TOKEN, amount_in=amt, ref_price=0.9e-6))
+    with transaction() as conn:
+        n = conn.execute("SELECT count(*) AS n FROM rh_txs WHERE from_addr = %s", (ADDR,)).fetchone()["n"]
+        it = conn.execute("SELECT state, error FROM rh_intents WHERE kind = 'buy'").fetchone()
+        fails = rails.load_circuit(conn, RH_CIRCUIT).fail_count
+    assert not r.ok and r.retryable and r.error.startswith("price ran") and n == 0 and chain.c.nonce == 0
+    assert it["state"] == "failed" and it["error"].startswith("price ran") and fails == 0
+    assert ex.execute(RhRequest(kind="buy", token=TOKEN, amount_in=amt, ref_price=0.98e-6)).ok
+
+
+def test_every_intent_counts_on_circuit_3(chain, monkeypatch):
+    monkeypatch.setattr(config, "CIRCUIT_THRESHOLD", 2)
+    chain.c.revert_onchain[(K.NATIVE, TOKEN)] = 2
+    ex = chain.ex()
+    one = lambda: ex.execute(RhRequest(kind="buy", token=TOKEN, amount_in=WEI // 100, slippage_bps=150, max_slippage_bps=150))   # noqa: E731
+    assert not one().ok and not one().ok
+    with transaction() as conn:
+        c = rails.load_circuit(conn, RH_CIRCUIT)
+    assert c.tripped and c.fail_count == 2
+    assert one().ok
+    with transaction() as conn:
+        c = rails.load_circuit(conn, RH_CIRCUIT)
+    assert not c.tripped and c.fail_count == 0                                       # a success re-arms circuit 3
+
+
+def test_a_failed_entry_is_sent_again_under_its_decision(chain):
+    """A retry's intent leaves the decision's unique slot to the first one and books under the decision; it runs only
+    while no intent of the decision bought anything."""
+    ex = chain.ex(); amt = WEI // 100
+    with transaction() as conn:
+        did = conn.execute("INSERT INTO decisions (kind, mint) VALUES ('fly_rh_enter', %s) RETURNING id", (TOKEN,)).fetchone()["id"]
+    try:
+        chain.c.revert_onchain[(K.NATIVE, TOKEN)] = 1
+        first = ex.execute(RhRequest(kind="buy", token=TOKEN, amount_in=amt, decision_id=did, slippage_bps=150, max_slippage_bps=150))
+        assert not first.ok and first.retryable
+        assert ex.execute(RhRequest(kind="buy", token=TOKEN, amount_in=amt, decision_id=did)).error == DUPLICATE
+        again = ex.execute(RhRequest(kind="buy", token=TOKEN, amount_in=amt, decision_id=did, retry=1))
+        assert again.ok and _pos(again.position_id)["entry_decision_id"] == did
+        with transaction() as conn:
+            assert [r["decision_id"] for r in conn.execute("SELECT decision_id FROM rh_intents WHERE kind = 'buy' ORDER BY id").fetchall()] == [did, None]
+            conn.execute("UPDATE positions SET status = 'closed' WHERE id = %s", (again.position_id,))
+        assert ex.execute(RhRequest(kind="buy", token=TOKEN, amount_in=amt, decision_id=did, retry=2)).error == DUPLICATE   # it bought: never twice
+    finally:
+        with transaction() as conn:
+            conn.execute("DELETE FROM decisions WHERE id = %s", (did,))
+
+
+def test_a_dead_bag_sweep_is_booked_onto_the_written_off_position(chain):
+    ex = chain.ex(); amt = WEI // 100
+    b = ex.execute(RhRequest(kind="buy", token=TOKEN, amount_in=amt)); p = _pos(b.position_id)
+    with transaction() as conn:
+        ledger.close_position(conn, position_id=b.position_id, exit_price=0.0, proceeds_sol=0.0, fees_sol=0.0, decision_id=None, forced_kind="dead_bag")
+    s = ex.execute(RhRequest(kind="sweep", token=TOKEN, amount_in=int(p["qty"]), slippage_bps=500, max_slippage_bps=500, forced_kind="dead_bag_sweep"))
+    after = _pos(b.position_id); eth_in = int(int(p["qty"]) * F("1.1e-6"))
+    assert s.ok and s.position_id == b.position_id
+    assert after["realized_sol"] == pytest.approx(-p["cost_sol"] + (eth_in - 2 * FEE) / WEI, abs=1e-15)    # net of its approval and swap
+    with transaction() as conn:
+        assert A.reconcile(conn, ex.wallet)["ok"]
+
+
+def test_a_buy_queues_behind_the_sale_of_its_token_and_a_stop_drops_what_never_started(chain):
+    ex = chain.ex()
+    assert ex.submit(RhRequest(kind="sell", token=TOKEN, amount_in=1, position_id=1)) and ex.selling() == {TOKEN}
+    assert ex.submit(RhRequest(kind="buy", token=TOKEN, amount_in=5))
+    assert not ex.submit(RhRequest(kind="buy", token=TOKEN, amount_in=7)) and not ex.submit(RhRequest(kind="sell", token=TOKEN, amount_in=1))
+    assert ex.selling() == set() and ex.pending() == {TOKEN} and ex.committed_wei() == 5
+    ex.stop()
+    assert ex.pending() == set() and ex.q.empty() and not ex.submit(RhRequest(kind="sell", token=TOKEN, amount_in=1))
+
+
+def _minute_rows(conn, now):
+    run = str(uuid.uuid4()); conn.execute("INSERT INTO runs (run_id, kind, status) VALUES (%s, 'fly_rh', 'running')", (run,))
+    beat = conn.execute("INSERT INTO beats (run_id, beat_no) VALUES (%s, 1) RETURNING id", (run,)).fetchone()["id"]
+    ctx = SimpleNamespace(conn=conn, m1=now, m1_epoch=now.timestamp(), prices={TOKEN: 1e-6}, resqs={TOKEN: 10.0}, fees={}, last_resq=lambda x: 10.0,
+                          fee=lambda x: None, lag_s=0.0)
+    return run, beat, ctx
+
+
+def _drop_minute_rows(conn, run):
+    conn.execute("DELETE FROM decisions WHERE run_id = %s", (run,)); conn.execute("DELETE FROM beats WHERE run_id = %s", (run,))
+    conn.execute("DELETE FROM runs WHERE run_id = %s", (run,)); conn.execute("DELETE FROM positions WHERE book = 'paper_rh_fly' AND mint = %s", (TOKEN,))
+
+
+def test_the_rh_mirror_retries_a_failed_entry_and_records_what_it_did_not_take(chain, monkeypatch):
+    from fly_trader.rh.live import RhLiveMirror
+    monkeypatch.setattr(config, "FLY_SIZING", "flat"); monkeypatch.setattr(config, "ENTRY_RETRY_MIN", 2.0)
+    ex = chain.ex(); m = RhLiveMirror(600.0, executor=ex)
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    with transaction() as conn:
+        run, beat, ctx = _minute_rows(conn, now)
+        did = conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, kind, size_sol) VALUES (%s, %s, %s, %s, 'fly_rh_enter', 0.01) RETURNING id",
+                           (beat, run, now, TOKEN)).fetchone()["id"]
+        conn.execute("INSERT INTO positions (book, mint, opened_at, entry_decision_id, qty, cost_sol, entry_price, status, chain) "
+                     "VALUES ('paper_rh_fly', %s, %s, %s, 1, 0.01, 1e-6, 'open', 'rh')", (TOKEN, now, did))
+        e = {"mint": TOKEN, "decision_id": did, "score": 0.1, "threshold": 0.0, "table": None, "hold_s": 600.0, "strategy": "ev", "ref_price": 1.0e-6,
+             "info": {"pool": None, "resq": 10.0, "decimals": 18}}
+        assert m.minute(ctx, run_id=run, beat_id=beat, entries=[e])["entered"] == 1
+        req = ex.q.get_nowait(); ex._pending.clear()
+        ex.results.append(RhResult(req, False, "price ran: quoted 1.1e-06 ETH per token", retryable=True))
+        ctx.m1 = now + timedelta(minutes=1); ctx.m1_epoch += 60
+        out = m.minute(ctx, run_id=run, beat_id=beat + 1000001, entries=[])
+        again = ex.q.get_nowait()
+        rows = conn.execute("SELECT rail, detail FROM decisions WHERE run_id = %s AND kind = 'blocked'", (run,)).fetchall()
+        _drop_minute_rows(conn, run)
+    assert out["retried"] == 1 and again is not req and (again.decision_id, again.retry, again.ref_price) == (did, 1, 1.0e-6)
+    assert [(r["rail"], r["detail"]["book"], r["detail"]["of_decision"]) for r in rows] == [("price ran", "live_rh", did)]
+
+
+def test_the_rh_mark_waits_for_no_intent_between_its_snapshot_and_its_booking(chain, monkeypatch):
+    """The mark is bookkeeping, taken after the minute's intents (``mark_due``). The executor holds the wallet lock from an
+    intent's snapshot to its booking: a mark read beside it would count that trade twice or not at all, so the minute goes
+    unmarked."""
+    from fly_trader.rh import live as rh_live
+    monkeypatch.setattr(rh_live, "MARK_WAIT_S", 0.05)
+    ex = chain.ex(); m = rh_live.RhLiveMirror(600.0, executor=ex); held, go = threading.Event(), threading.Event()
+
+    def intent():
+        with ex.wallet.lock:
+            held.set(); go.wait(10)
+    t = threading.Thread(target=intent); t.start(); assert held.wait(10)
+    try:
+        with transaction() as conn:
+            run, beat, ctx = _minute_rows(conn, datetime.now(timezone.utc).replace(second=0, microsecond=0))
+            out = m.minute(ctx, run_id=run, beat_id=beat, entries=[])
+            due = m.due_mark is not None
+            mark = m.mark_due(conn)
+            n = conn.execute("SELECT count(*) AS n FROM wealth_marks WHERE book = 'live_rh' AND beat_id = %s", (beat,)).fetchone()["n"]
+            _drop_minute_rows(conn, run)
+    finally:
+        go.set(); t.join(10)
+    assert "wealth" not in out and due and mark is None and m.due_mark is None and n == 0

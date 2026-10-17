@@ -13,7 +13,7 @@ from fly_trader.agent import handover, minute_engine as me, rails
 from fly_trader.db.connection import transaction
 from fly_trader.execution import ledger
 from fly_trader.execution.broker_paper import PaperBroker
-from fly_trader.market.exit_cost import PONS_LABEL, exit_cost_fraction, fee_fraction, impact_fraction
+from fly_trader.market.exit_cost import PONS_LABEL, PONS_MULTIHOP_LABEL, exit_cost_fraction, fee_fraction, impact_fraction
 from fly_trader.train.decisions import X_COLS
 
 M0 = datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc)
@@ -48,6 +48,19 @@ def test_rh_minute_features_in_eth_with_chain_inputs(db_conn, rh_rows):
     # the same pool in SOL would pass the Solana gate: in ETH it passes the K-scaled one (and a Solana engine's gate would refuse it)
     info = {**info, "logvol_15m": math.log1p(20.0 * k)}
     assert e.eligible(info) and not me.MinuteEngine().eligible(info)
+
+
+def test_a_coin_quoted_in_a_stock_token_is_priced_through_its_base(db_conn, rh_rows):
+    """The paper books price a Pons coin quoted in another asset than ETH at its route through the base (more gas, one more
+    pool's fee: market/exit_cost.PONS_MULTIHOP_LABEL); its features keep the one-swap cost model."""
+    import numpy as np
+    e = me.MinuteEngine(market=markets.RH)
+    ctx = me.Minute(conn=db_conn, m0=M0, m1=M0, m1_epoch=M0.timestamp(), agg={}, X=np.zeros((0, len(X_COLS)), np.float32), infos=[], mints=[], bars={},
+                    prices={}, resqs={}, fees={}, fresh=True, trade=True, engine=e, market=markets.RH)
+    assert ctx.cost_label(MINT, PONS_LABEL) == PONS_MULTIHOP_LABEL and ctx.cost_label("0x" + "e2" * 20, PONS_LABEL) == PONS_LABEL   # unknown quote: one swap
+    agg = e._aggregate(db_conn, M0, M0 + timedelta(minutes=1))
+    _x, info = e._features(db_conn, MINT, agg[MINT], M0.timestamp() + 60)
+    assert info["quote_class"] == "stock" and e.states[MINT].meta.program_label == PONS_LABEL
 
 
 def test_solana_rows_keep_the_chain_inputs_off(db_conn):

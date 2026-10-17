@@ -126,6 +126,11 @@ RH_DDL: list[str] = [
     # a pool's hook fee + tax is fixed at launch (measured: 1,665 of 1,732 pools vary < 0.05 points): read from its first
     # FEE_OBS swaps' HookFeeCollected logs, then applied to its later swaps without fetching their fee logs (rh/index.py)
     "ALTER TABLE rh_pools ADD COLUMN IF NOT EXISTS hook_fee double precision",
+    # the fee fractions' formula: 2 = taken / gross (2026-10-17); NULL = taken / (gross + taken), which read the hook's 1 %
+    # as 0.0099. Readers convert those (f / (1 − f)): rh_swaps stays as written, rh_pools and rh_minutes are converted once
+    "ALTER TABLE rh_swaps ADD COLUMN IF NOT EXISTS fee_v smallint",
+    "ALTER TABLE rh_pools ADD COLUMN IF NOT EXISTS hook_fee_v smallint",
+    "ALTER TABLE rh_minutes ADD COLUMN IF NOT EXISTS fee_v smallint",
     "ALTER TABLE rh_pools ADD COLUMN IF NOT EXISTS fee_obs int NOT NULL DEFAULT 0",
     "ALTER TABLE rh_tokens ADD COLUMN IF NOT EXISTS curve_indexed boolean NOT NULL DEFAULT false",
     "ALTER TABLE rh_assets ADD COLUMN IF NOT EXISTS ref_path jsonb",

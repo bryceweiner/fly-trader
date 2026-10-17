@@ -3,7 +3,7 @@ the number of books, the training eligibility rules, and each book trading in it
 import json
 import math
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
@@ -81,7 +81,7 @@ class _Book:
 
     def on_minute(self, ctx):
         ctx.conn.execute("INSERT INTO events (level, source, message) VALUES ('info', 'engine_test', %s)", (self.name,))
-        self.seen = (ctx.X.shape, list(ctx.mints))
+        self.seen = (ctx.X.shape, list(ctx.mints)); self.lag = ctx.lag_s
         if self.fail:
             raise RuntimeError("boom")
         return {"ok": True}
@@ -91,6 +91,66 @@ class _Book:
 
     def finish(self):
         pass
+
+
+class _LiveBook(_Book):
+    """A book that trades live money: its order goes out, committed, in the live phase."""
+    LIVE = True
+
+    def __init__(self, name, calls):
+        super().__init__(name); self.calls = calls
+
+    def on_minute(self, ctx):
+        self.calls.append(("live", self.name))
+        ctx.conn.execute("INSERT INTO events (level, source, message) VALUES ('info', 'engine_test', 'live order')")
+        return {"live": True}
+
+    def after_minute(self, ctx):
+        self.calls.append(("after", self.name))
+        return {"ok": True}
+
+
+class _PaperBook(_Book):
+    def __init__(self, name, calls):
+        super().__init__(name); self.calls = calls
+
+    def on_minute(self, ctx):
+        self.calls.append(("paper", self.name))
+        with transaction() as other:                     # another connection: the live phase is committed already
+            self.saw = other.execute("SELECT count(*) AS n FROM events WHERE source = 'engine_test' AND message = 'live order'").fetchone()["n"]
+        return {"ok": True}
+
+
+def test_live_books_trade_and_commit_before_any_paper_book(db_conn, monkeypatch):
+    """Live money first: the live book's minute runs and commits before any other book's, whatever the books' order;
+    its paper trades, learning and bookkeeping (after_minute) come after the paper books."""
+    m0 = datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc); calls = []
+    with transaction() as conn:
+        conn.execute("DELETE FROM events WHERE source = 'engine_test'")
+    paper, live = _PaperBook("selector", calls), _LiveBook("fly", calls)
+    e = _engine([paper, live]); monkeypatch.setattr(e, "stream_fresh", lambda m0_epoch: True)
+    out = e.run_minute(m0.timestamp() + 60)
+    with transaction() as conn:
+        conn.execute("DELETE FROM events WHERE source = 'engine_test'")
+    assert calls == [("live", "fly"), ("paper", "selector"), ("after", "fly")] and paper.saw == 1
+    assert out["fly"] == {"ok": True} and out["selector"] == {"ok": True}
+
+
+def test_every_chains_live_phase_runs_before_any_chains_paper_phase(monkeypatch):
+    """Live money first across chains: older minutes are caught up whole, then every chain's newest minute's live phase,
+    and only then any chain's paper phase."""
+    calls, engines = [], []
+    for name in ("sol", "rh"):
+        e = _engine([_Book(f"book_{name}")]); e.last_minute = 600.0
+        monkeypatch.setattr(e, "ready_through", lambda m1: 720.0)
+        monkeypatch.setattr(e, "run_minute", lambda m, trade=True, n=name: calls.append((n, "whole", m)) or {})
+        monkeypatch.setattr(e, "live_phase", lambda m, trade=True, n=name: calls.append((n, "live", m)) or (None, {"minute": m}))
+        monkeypatch.setattr(e, "paper_phase", lambda ctx, out, n=name: calls.append((n, "paper")) or out)
+        engines.append(e)
+    ran = me.run_ready(engines, 720.0)
+    assert calls == [("sol", "whole", 660.0), ("rh", "whole", 660.0), ("sol", "live", 720.0), ("rh", "live", 720.0), ("sol", "paper"), ("rh", "paper")]
+    assert [(m, st) for _, m, st in ran] == [(720, {"minute": 720.0})] * 2 and all(e.last_minute == 720 for e in engines)
+    assert me.run_ready(engines, 720.0) == []                                       # nothing new: the loop goes idle
 
 
 def test_books_share_one_feature_pass_and_trade_in_their_own_savepoints(db_conn, monkeypatch):
@@ -107,9 +167,41 @@ def test_books_share_one_feature_pass_and_trade_in_their_own_savepoints(db_conn,
     monkeypatch.setattr(e, "stream_fresh", lambda m0_epoch: True)
     out = e.run_minute(m0.timestamp() + 60)
     assert calls == ["Wpump"]                                                      # one feature pass per mint, two books
+    assert good.lag > 86400                                                         # how long after its end the minute was traded (a replayed past one)
     assert good.seen == ((1, len(X_COLS)), ["Wpump"]) and good.bars["Wpump"][0] == m0.timestamp()
     assert "good" in out and "bad" not in out
     with transaction() as conn:
         left = [r["message"] for r in conn.execute("SELECT message FROM events WHERE source = 'engine_test'").fetchall()]
         conn.execute("DELETE FROM events WHERE source = 'engine_test'"); conn.execute("DELETE FROM pump_minutes WHERE mint = 'Wpump'")
     assert left == ["good"]                                                        # the failing book's writes were rolled back alone
+
+
+def test_a_quiet_minute_is_charged_the_mints_last_known_fee(db_conn):
+    """A held coin that did not trade this minute reports no fee: its sale and its mark pay the last one known (the
+    engine's own minutes, else the stream's newest row with one; RH: else the pool's measured hook fee), not the cost
+    model's generic fallback (on RH ~1 % against hook fees of 2.8-5 %)."""
+    from fly_trader import markets
+    m0 = datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc); s = _engine(); rh = me.MinuteEngine(market=markets.RH)
+    tok, pool = "0x" + "f1" * 20, "0x" + "f2" * 32
+
+    def ctx(engine, fees):
+        return me.Minute(conn=db_conn, m0=m0, m1=m0, m1_epoch=m0.timestamp(), agg={}, X=np.zeros((0, len(X_COLS)), np.float32), infos=[], mints=[], bars={},
+                         prices={}, resqs={}, fees=fees, fresh=True, trade=True, engine=engine)
+    with db_conn.cursor() as cur:
+        cur.execute("DELETE FROM pump_minutes WHERE mint IN ('Fpump', 'Npump')"); cur.execute("DELETE FROM rh_pools WHERE pool_id = %s", (pool,))
+        cur.execute("INSERT INTO pump_minutes (mint, ts, pool_id, close, resq_sol, fee_rate) VALUES ('Fpump', %s, 'P', 1.0, 50.0, 0.0115), ('Fpump', %s, 'P', 1.0, 50.0, NULL)",
+                    (m0, m0 + timedelta(minutes=1)))
+        cur.execute("INSERT INTO rh_pools (pool_id, token, currency0, currency1, is_pons, hook_fee) VALUES (%s, %s, %s, %s, true, 0.029)", (pool, tok, "0x" + "00" * 20, tok))
+    db_conn.commit()
+    try:
+        c = ctx(s, {"Gpump": 0.01, "Fpump": None})
+        assert c.fee("Gpump") == 0.01 and c.fee("Fpump") == 0.0115 and c.fee("Npump") is None
+        a = {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "buy": 1.0, "sell": 0.0, "nb": 1, "ns": 0, "n_traders": 1, "resq": 50.0, "pool": "P",
+             "program_label": "Pump.fun Amm", "fee_rate": 0.0095}
+        s._features(db_conn, "Fpump", a, m0.timestamp() + 180)
+        assert c.fee("Fpump") == 0.0095                                                # the engine's own newer minute
+        assert ctx(rh, {}).fee(tok) == 0.029 and c.cost_label("Fpump", "Pump.fun Amm") == "Pump.fun Amm"
+    finally:
+        with db_conn.cursor() as cur:
+            cur.execute("DELETE FROM pump_minutes WHERE mint IN ('Fpump', 'Npump')"); cur.execute("DELETE FROM rh_pools WHERE pool_id = %s", (pool,))
+        db_conn.commit()

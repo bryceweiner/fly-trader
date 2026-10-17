@@ -35,3 +35,20 @@ def test_exit_cost():
     # fees = pool fee + Jupiter 10 bps + 5,000-lamport network fee; a stream-reported pool fee overrides the schedule
     assert fee_fraction(0.1, 2e5) == pytest.approx(0.003 + 0.001 + 5e-6 / 0.1)
     assert fee_fraction(0.1, 2e5, pool_fee=0.0095) == pytest.approx(0.0095 + 0.001 + 5e-6 / 0.1)
+
+
+def test_paper_costs_beyond_the_label_model():
+    """A stream fee below the lowest tier (PumpSwap minutes reporting 0.0005) is no rate a swap of ours pays: the tier is
+    charged. A Pons coin quoted in another asset than ETH pays its route through the base (one more pool's fee, a
+    multi-hop route's gas) under its own label; features and labels never use that label, and its impact is the pool's."""
+    from fly_trader import config
+    from fly_trader.market.exit_cost import PONS_LABEL, PONS_MULTIHOP_LABEL, cost_label
+    assert fee_fraction(0.1, 1300.0, pool_fee=0.0005) == pytest.approx(fee_fraction(0.1, 1300.0)) == pytest.approx(0.012 + 0.001 + 5e-6 / 0.1)
+    assert fee_fraction(0.1, 2e5, pool_fee=0.003) == pytest.approx(0.003 + 0.001 + 5e-6 / 0.1)          # the floor tier itself stands
+    assert cost_label(PONS_LABEL, "stock") == cost_label(PONS_LABEL, "stable") == PONS_MULTIHOP_LABEL
+    assert cost_label(PONS_LABEL, "eth") == cost_label(PONS_LABEL, None) == PONS_LABEL and cost_label("Pump.fun Amm", "stock") == "Pump.fun Amm"
+    v = 0.01
+    assert fee_fraction(v, None, 0.03, PONS_MULTIHOP_LABEL) == pytest.approx(0.03 + config.RH_HOP_FEE + config.RH_TX_FEE_MULTIHOP_ETH / v)
+    assert fee_fraction(v, None, 0.03, PONS_LABEL) == pytest.approx(0.03 + config.RH_TX_FEE_ETH / v)
+    assert fee_fraction(v, None, None, PONS_MULTIHOP_LABEL) == pytest.approx(config.RH_HOOK_FEE + config.RH_HOP_FEE + config.RH_TX_FEE_MULTIHOP_ETH / v)
+    assert impact_fraction(v, 5.0, PONS_MULTIHOP_LABEL) == impact_fraction(v, 5.0, PONS_LABEL)

@@ -5,11 +5,12 @@ import { BrainPanel } from '../brain'
 import { PageHead } from '../components/ChainPicker'
 import { LineChart, RadialGauge, type Series } from '../components/Charts'
 import { DataTable, type Col } from '../components/DataTable'
-import { Callout, Caption, Card, Loaded, Md, Metric, Metrics, ProgressList, RowGroup, Widget, WidgetGrid } from '../components/ui'
+import { HourWheel, hourColor, type HourBucket } from '../components/HourWheel'
+import { Callout, Caption, Card, Loaded, Md, Metric, Metrics, ProgressList, RowGroup, Segmented, Widget, WidgetGrid } from '../components/ui'
 import { useApp, type Market } from '../context'
 import { TickerCard } from '../fly/Ticker'
 import { ago, amount, int, num, pct, pctPts, tone } from '../lib/format'
-import { useNow, useTopic } from '../lib/hooks'
+import { useNow, useStored, useTopic } from '../lib/hooks'
 
 type Summary = {
   market: Market
@@ -217,6 +218,64 @@ function BookPanel() {
   )
 }
 
+type HourChain = { chain: string; name: string; unit: string; all: HourBucket[]; live: HourBucket[] }
+type Hours = { tz: string; archives: number; chains: HourChain[] }
+const LOCAL_SHIFT = Math.round(-new Date().getTimezoneOffset() / 60)
+const pad2 = (h: number) => String(h).padStart(2, '0')
+
+/** Every trade ever entered, by hour of day: one wheel per chain, Solana on the left, Robinhood Chain on the right. */
+function HoursPanel() {
+  const h = useTopic<Hours>('overview.hours')
+  const [scope, setScope] = useStored<'all' | 'live'>('hours_scope', 'all')
+  const [tz, setTz] = useStored<'UTC' | 'local'>('hours_tz', 'UTC')
+  const shift = tz === 'local' ? LOCAL_SHIFT : 0
+  const localLabel = `Local (UTC${LOCAL_SHIFT >= 0 ? '+' : ''}${LOCAL_SHIFT})`
+  return (
+    <Card title="Trades by hour of day" icon="bx-time-five"
+      sub={`every trade ever entered, by the hour it opened (${tz === 'UTC' ? 'UTC' : localLabel.toLowerCase()}) · the larger the slice, the busier the hour`}
+      actions={<>
+        <Segmented options={['all', 'live'] as const} value={scope} onChange={setScope} labels={{ all: 'All books', live: 'Live' }} />
+        <Segmented options={['UTC', 'local'] as const} value={tz} onChange={setTz} labels={{ UTC: 'UTC', local: localLabel }} />
+      </>}>
+      <Loaded state={h} height={420}>
+        {(d) => (
+          <div className="row g-4">
+            {d.chains.map((c) => {
+              const b = c[scope]
+              const total = b.reduce((s, x) => s + x.trades, 0)
+              const shown = Array.from({ length: 24 }, (_, i) => ({ ...(b[(((i - shift) % 24) + 24) % 24] ?? { trades: 0, closed: 0, wins: 0, pnl: 0 }), hour: i }))   // the hour shown
+              const ranked = [...shown].sort((x, y) => y.trades - x.trades)
+              const quiet = [...shown].sort((x, y) => x.trades - y.trades)[0]
+              return (
+                <div key={c.chain} className={`col-12 ${d.chains.length > 1 ? 'col-xl-6' : ''}`}>
+                  <div className="d-flex align-items-baseline gap-2 mb-1">
+                    <h6 className="m-0" style={{ color: '#fff' }}>{c.name}</h6>
+                    <span className="caption m-0">{int(total)} trades{scope === 'live' ? ' with real money' : ''}</span>
+                  </div>
+                  {total ? (
+                    <>
+                      <HourWheel buckets={b} unit={c.unit} shift={shift} />
+                      <div className="d-flex flex-wrap gap-2 justify-content-center mt-1">
+                        {ranked.slice(0, 3).map((x, i) => (
+                          <span key={x.hour} className="fbadge" style={{ background: hourColor(x.hour), color: '#120a18' }}>
+                            #{i + 1} {pad2(x.hour)}:00 · {int(x.trades)} ({((x.trades / total) * 100).toFixed(1)}%)
+                          </span>
+                        ))}
+                        <span className="fbadge gray">quietest {pad2(quiet.hour)}:00 · {int(quiet.trades)}</span>
+                      </div>
+                    </>
+                  ) : <Caption>{scope === 'live' ? 'No live trades on this chain yet.' : 'No trades on this chain yet.'}</Caption>}
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </Loaded>
+      <Caption>Counts every memecoin position ever opened, paper and live: the positions table plus every reset's archive (data/pg_archive). Hover a slice for its trades, win rate and realized P&L.</Caption>
+    </Card>
+  )
+}
+
 export default function Overview() {
   return (
     <>
@@ -225,6 +284,7 @@ export default function Overview() {
       <BrainPanel variant="memecoin" />
       <ThisMinute />
       <RacePanel />
+      <HoursPanel />
       <TickerCard />
       <BookPanel />
     </>

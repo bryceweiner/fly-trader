@@ -42,14 +42,18 @@ class _Row:
         self.resq_eth = self.resq_q = None; self.fee_w = 0.0; self.fee_v = 0.0
 
 
-def aggregate(conn, t0: int, t1: int, skill: dict | None = None) -> list[tuple]:
-    """rh_minutes rows for every minute in [t0, t1) (epoch s, minute-aligned)."""
+def aggregate(conn, t0: int, t1: int, skill: dict | None = None, quote_asset: str | None = None) -> list[tuple]:
+    """rh_minutes rows for every minute in [t0, t1) (epoch s, minute-aligned). ``quote_asset``: only the pools quoted in
+    it (a repair after that asset's ETH marks changed)."""
     k = config.RH_ETH_PER_SOL; lo_band, hi_band = RESQ_BAND_SOL[0] * k, RESQ_BAND_SOL[1] * k
     day0 = (t0 // 86400) * 86400
     swaps = conn.execute(
-        "SELECT s.ts, s.token, s.pool_id, s.trader, s.side, s.quote_raw, s.price_q, s.resq_q, s.fee_frac, p.quote_asset, a.decimals AS qdec, a.class AS cls "
+        "SELECT s.ts, s.token, s.pool_id, s.trader, s.side, s.quote_raw, s.price_q, s.resq_q, "
+        "CASE WHEN s.fee_v = 2 OR s.fee_frac IS NULL OR s.fee_frac >= 1 THEN s.fee_frac ELSE s.fee_frac / (1 - s.fee_frac) END AS fee_frac, "   # rh/index.FEE_FRAC
+        "p.quote_asset, a.decimals AS qdec, a.class AS cls "
         "FROM rh_swaps s JOIN rh_pools p ON p.pool_id = s.pool_id JOIN rh_assets a ON a.asset = p.quote_asset "
-        "WHERE s.ts >= to_timestamp(%s) AND s.ts < to_timestamp(%s) ORDER BY s.ts, s.block, s.log_index", (day0, t1)).fetchall()
+        "WHERE s.ts >= to_timestamp(%s) AND s.ts < to_timestamp(%s) AND (%s::text IS NULL OR p.quote_asset = %s) ORDER BY s.ts, s.block, s.log_index",
+        (day0, t1, quote_asset, quote_asset)).fetchall()
     insiders: dict[str, frozenset] = {}
     base_cache: dict[tuple, tuple] = {}
     ref: dict[str, deque] = {}; ref_day = None
@@ -106,8 +110,8 @@ def write(conn, rows: list[tuple]) -> int:
     if rows:
         conn.cursor().executemany(
             "INSERT INTO rh_minutes (mint, ts, pool_id, quote_asset, quote_class, open, high, low, close, close_q, base_eth, buy_eth, sell_eth, n_buys, n_sells, "
-            "n_traders, resq_eth, resq_q, fee_rate, n_buyers, wash_eth, wash_buy_eth, top_sell_eth, insider_sell_eth, skill_buy) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (mint, ts) DO UPDATE SET "
+            "n_traders, resq_eth, resq_q, fee_rate, n_buyers, wash_eth, wash_buy_eth, top_sell_eth, insider_sell_eth, skill_buy, fee_v) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,2) ON CONFLICT (mint, ts) DO UPDATE SET fee_v = 2, "
             "pool_id = EXCLUDED.pool_id, open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low, close = EXCLUDED.close, close_q = EXCLUDED.close_q, "
             "base_eth = EXCLUDED.base_eth, buy_eth = EXCLUDED.buy_eth, sell_eth = EXCLUDED.sell_eth, n_buys = EXCLUDED.n_buys, n_sells = EXCLUDED.n_sells, "
             "n_traders = EXCLUDED.n_traders, resq_eth = EXCLUDED.resq_eth, resq_q = EXCLUDED.resq_q, fee_rate = EXCLUDED.fee_rate, n_buyers = EXCLUDED.n_buyers, "

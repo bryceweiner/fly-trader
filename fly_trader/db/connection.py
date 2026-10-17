@@ -30,7 +30,8 @@ def database_name(url: str | None = None) -> str:
 
 
 def _refuse_production_under_pytest(url: str) -> None:
-    if "PYTEST_CURRENT_TEST" in os.environ and "test" not in database_name(url):
+    from ..netguard import under_test                  # pytest's per-test variable, or FLY_TRADER_TESTING from conftest's first line
+    if under_test() and "test" not in database_name(url):
         raise ProductionDatabaseUnderPytest(
             f"refusing to open non-test database {database_name(url)!r} under pytest"
         )

@@ -11,7 +11,7 @@ than 50× away from the median of the mint's previous 200 legs that UTC day is d
 pool with the most legs. Minutes are written to ``pump_minutes`` once complete: an event stamped ≥ 2 s after the
 minute's end has arrived (event-time watermark) or, once no trade has arrived for 15 s, by wall clock; a leg for a minute
 already written is dropped (never merged into it). ``pumpstream_status.flushed_through``
-publishes the newest complete minute for the selector.
+publishes the newest complete minute for the engine the moment it is written (the fly's live orders wait on it).
 
 Lifecycle: ``create`` events go to ``pump_events`` as they arrive; at ``migrate`` a ``corpus_meta`` row is written
 with the creation facts and the creator's point-in-time history (``train/corpus_meta.creator_history``, the training
@@ -51,6 +51,7 @@ RESQ_BAND = (0.001, 100000.0)     # train/mature.py: quote_in_pool BETWEEN 0.001
 PRICE_BAND = 50.0                  # train/mature.py: within 50x of the trailing median of the mint's previous 200 legs
 REF_LEGS = 200
 FLUSH_GRACE_S = 2.0
+FLUSH_CHECK_S = 0.25         # how often complete minutes are looked for: a written minute is published at once (live money first)
 FLUSH_FALLBACK_S = 15.0
 MAX_PENDING_CREATES = 200_000
 
@@ -436,12 +437,15 @@ async def _run(stop: threading.Event | None, agg: Aggregator) -> None:
                     if isinstance(e, dict):
                         agg.ingest(e)
                     now = time.time()
-                    if now - last_flush >= 1.0:
+                    if now - last_flush >= FLUSH_CHECK_S:
+                        before = agg.flushed_through
                         try:
                             agg.flush(agg.flush_bound(now))
                         except Exception:
                             log.exception("minute flush failed; rows kept for the next attempt")
                         last_flush = now
+                        if agg.flushed_through != before:
+                            last_status = 0.0      # a minute was written: the engine hears of it now, not at the next 5 s status
                     if now - last_pools >= 300:
                         _load_blocked(agg); last_pools = now
                         try:

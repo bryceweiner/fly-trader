@@ -18,6 +18,7 @@ from solders.transaction import VersionedTransaction
 from fly_trader import config
 from fly_trader.chain.cluster_guard import SigningRefused
 from fly_trader.chain.rpc import TOKEN_PROGRAM_ID
+from fly_trader.db.connection import transaction
 from fly_trader.execution import broker_live
 from fly_trader.execution.broker_live import LiveBroker
 
@@ -291,3 +292,52 @@ def test_signing_gate_is_checked_first(db_conn, monkeypatch):
     with pytest.raises(SigningRefused):
         _swap(broker, db_conn, random.randrange(1 << 40))
     assert jup.orders == []
+
+
+def test_a_buy_quoted_past_its_paper_fill_is_refused_before_signing(db_conn, gate_open):
+    """The fake /order quotes 1 token (6 decimals) for 0.01 SOL. A decision whose paper fill was 0.0095 SOL per token
+    would chase it +5.3 % (over MAX_ENTRY_CHASE): refused with nothing signed or sent; at 0.0098 (+2 %) it is bought."""
+    broker, rpc, jup = _broker(["success_buy"])
+    did = random.randrange(1 << 40)
+    res = broker.swap(db_conn, decision_id=did, book="live", side="buy", mint=MINT, amount_in=BUY_LAMPORTS, slippage_bps=150, max_slippage_bps=300,
+                      step_bps=100, ref_price=0.0095, decimals=6)
+    assert not res.ok and res.status == "price_ran" and res.error.startswith("price ran") and res.attempts == 1 and res.fill_id is None
+    assert jup.executes == [] and len(jup.orders) == 1
+    o = _orders(db_conn, did)
+    assert len(o) == 1 and o[0]["status"] == "price_ran" and o[0]["order_response"]["outAmount"] == str(BUY_TOKENS)
+    res = broker.swap(db_conn, decision_id=did, book="live", side="buy", mint=MINT, amount_in=BUY_LAMPORTS, slippage_bps=150, max_slippage_bps=300,
+                      step_bps=100, ref_price=0.0098, decimals=6)
+    assert res.ok and res.token_delta == BUY_TOKENS
+
+
+def test_closing_an_emptied_token_account_measures_the_rent_it_returns(db_conn, gate_open):
+    kp = Keypair(); owner = str(kp.pubkey()); rent, fee = 2_039_280, 5_000
+
+    class Rpc(FakeRpc):
+        def send_transaction(self, tx_b64, skip_preflight=False, max_retries=3):
+            self.lamports += rent - fee; self.landed.add("closesig"); return "closesig"
+
+        def get_transaction(self, sig, encoding="jsonParsed"):
+            return {"slot": 9, "transaction": {"message": {"accountKeys": [{"pubkey": owner}]}},
+                    "meta": {"err": None, "fee": fee, "preBalances": [10 ** 9], "postBalances": [10 ** 9 + rent - fee], "preTokenBalances": [], "postTokenBalances": []}}
+
+    class Signer(RawSigner):
+        closed: list = []
+
+        def call(self, method, **p):
+            if method == "close_atas":
+                self.closed = list(p["accounts"])
+                return [{"tx": "unsigned-in-tests", "signature": "closesig", "last_valid_block_height": rpc.height + 150}]
+            return super().call(method, **p)
+
+    rpc = Rpc(10 ** 9, {MINT: 0}, {MINT: 6}); signer = Signer(kp)
+    broker = LiveBroker(rpc=rpc, jup=None, signer=signer)
+    try:
+        assert broker.close_token_account(MINT) == rent - fee and signer.closed == [f"ata-{MINT[:6]}"]
+        ev = db_conn.execute("SELECT detail FROM wallet_events WHERE kind = 'ata_closed' AND pubkey = %s", (owner,)).fetchone()["detail"]
+        assert ev["mint"] == MINT and ev["lamports"] == rent - fee and ev["status"] == "confirmed"
+        rpc.tokens[MINT] = 5; signer.closed = []                                    # the wallet still holds some: nothing is closed
+        assert broker.close_token_account(MINT) is None and signer.closed == []
+    finally:
+        with transaction() as conn:
+            conn.execute("DELETE FROM wallet_events WHERE pubkey = %s", (owner,))

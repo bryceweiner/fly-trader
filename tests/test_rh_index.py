@@ -103,9 +103,9 @@ def minute_db():
             conn.execute(f"DELETE FROM {t}")
 
 
-def _swap(conn, i, t, tok, pool, trader, side, quote_raw, price_q, resq_q, fee=0.029):
-    conn.execute("INSERT INTO rh_swaps (block, log_index, tx_hash, ts, pool_id, token, trader, side, token_raw, quote_raw, price_q, resq_q, fee_frac) "
-                 "VALUES (%s, 0, %s, to_timestamp(%s), %s, %s, %s, %s, 1, %s, %s, %s, %s)", (i, f"0x{i}", t, pool, tok, trader, side, quote_raw, price_q, resq_q, fee))
+def _swap(conn, i, t, tok, pool, trader, side, quote_raw, price_q, resq_q, fee=0.029, fee_v=2):
+    conn.execute("INSERT INTO rh_swaps (block, log_index, tx_hash, ts, pool_id, token, trader, side, token_raw, quote_raw, price_q, resq_q, fee_frac, fee_v) "
+                 "VALUES (%s, 0, %s, to_timestamp(%s), %s, %s, %s, %s, 1, %s, %s, %s, %s, %s)", (i, f"0x{i}", t, pool, tok, trader, side, quote_raw, price_q, resq_q, fee, fee_v))
 
 
 def test_minutes_in_eth_with_bands_fees_and_wallets(minute_db, monkeypatch):
@@ -130,6 +130,20 @@ def test_minutes_in_eth_with_bands_fees_and_wallets(minute_db, monkeypatch):
         minutes.write(conn, minutes.aggregate(conn, t0, t0 + 120))
         again = [dict(x) for x in conn.execute("SELECT * FROM rh_minutes ORDER BY mint, ts").fetchall()]
         assert n1 == 2 and first == again and not any(r["revised"] for r in again)                                     # a recompute is identical
+
+
+def test_minutes_read_a_fee_stored_the_old_way_as_taken_over_gross(minute_db, monkeypatch):
+    """A swap indexed before 2026-10-17 (fee_v NULL) holds taken / (gross + taken): the hook's 1 % as 0.0099. The minute
+    reads it as taken / gross, as the indexer now writes it, and the written minute says so (fee_v 2)."""
+    monkeypatch.setattr(config, "RH_ETH_PER_SOL", 0.05)
+    t0 = 1_790_002_000 - (1_790_002_000 % 60)
+    with transaction() as conn:
+        _swap(conn, 21, t0 + 5, MEME1, "p1", "alice", 1, 10 ** 17, 1e-8, 4.0, fee=0.01 / 1.01, fee_v=None)
+        _swap(conn, 22, t0 + 9, MEME1, "p1", "bob", 1, 10 ** 17, 1e-8, 4.0, fee=0.01)
+        rows = minutes.aggregate(conn, t0, t0 + 60)
+        assert len(rows) == 1 and rows[0][18] == pytest.approx(0.01)
+        minutes.write(conn, rows)
+        assert conn.execute("SELECT fee_v FROM rh_minutes WHERE mint = %s", (MEME1,)).fetchone()["fee_v"] == 2
 
 
 def test_a_non_eth_minute_without_a_mark_is_not_written(minute_db, monkeypatch):
@@ -161,3 +175,18 @@ def test_rh_skill_tables_are_written_before_their_day_and_today_falls_back(tmp_p
     rws._TODAY.update(key=None, table=None)
     t = rws.load_today()                                                   # today (real clock) has no table here: the newest on disk
     assert t == {"0xw1": t["0xw1"], "0xw2": t["0xw2"]} and set(t) == {"0xw1", "0xw2"}
+
+
+def test_the_hook_fee_is_a_share_of_the_pools_gross_output(minute_db, monkeypatch):
+    """The Pons hook takes fee + tax out of the pool's gross output (the Swap event's amount of that currency), and live
+    fills receive exactly 1 − r of it: r = taken / gross (the old taken / (gross + taken) read a 1 % fee as 0.99 %)."""
+    from types import SimpleNamespace
+    ev = {"event": "Swap", "pool_id": "p1", "block": 7, "log_index": 0, "tx_hash": "0xfee", "block_hash": "0xbb", "ts": 1_800_000_000,
+          "amount0": -10 ** 16, "amount1": 10 ** 21, "sqrt_price_x96": v4.Q96, "liquidity": 10 ** 20, "tick": 0}          # p1: the coin is currency1, bought
+    monkeypatch.setattr(index.v4, "decode", lambda log: log["_ev"])
+    monkeypatch.setattr(index, "_get_logs", lambda *a, **k: [])
+    fee = {"event": "HookFeeCollected", "tx_hash": "0xfee", "pool_id": "p1", "currency": MEME1, "fee_raw": 10 ** 19, "tax_raw": 0}
+    with transaction() as conn:
+        index.apply_v4(conn, SimpleNamespace(), [{"blockNumber": "0x7", "logIndex": "0x0", "_ev": ev}], [fee])
+        r = conn.execute("SELECT fee_frac, hook_fee_raw FROM rh_swaps WHERE tx_hash = '0xfee'").fetchone()
+    assert r["fee_frac"] == pytest.approx(0.01) and int(r["hook_fee_raw"]) == 10 ** 19
