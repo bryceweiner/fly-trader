@@ -32,6 +32,8 @@ CURSOR = "rh"
 IDS_PER_REQUEST = 200
 TOKENS_PER_REQUEST = 200
 FEE_OBS = 20                           # hook-fee logs read per pool before its fee is taken as known
+# a stored swap's fee as taken / gross: rows written before 2026-10-17 (fee_v NULL) hold taken / (gross + taken)
+FEE_FRAC = "CASE WHEN fee_v = 2 OR fee_frac IS NULL OR fee_frac >= 1 THEN fee_frac ELSE fee_frac / (1 - fee_frac) END"
 TOKENS_PER_REQUEST_BULK = 5000         # HyperSync: bounded by its 2 MB request body, not a log cap
 IDS_PER_REQUEST_BULK = 5000            # 66-char pool ids: ~0.35 MB of filter per request
 LIVE_SPAN_BULK = 20_000                # an index range this small is live: PoolManager events unfiltered (one query)
@@ -197,7 +199,8 @@ def apply_pons(conn, rpc, events: list[dict]) -> dict:
 def apply_v4(conn, rpc, logs: list[dict], fees: list[dict]) -> dict:
     """v4 logs of Pons pools (+ their hook fees) → rh_swaps / rh_liquidity / rh_pools state."""
     pools = {r["pool_id"]: dict(r) for r in conn.execute(
-        "SELECT p.pool_id, p.token, p.token_is_0, p.quote_asset, p.hook_fee, a.decimals AS qdec FROM rh_pools p JOIN rh_assets a ON a.asset = p.quote_asset WHERE p.is_pons").fetchall()}
+        "SELECT p.pool_id, p.token, p.token_is_0, p.quote_asset, p.hook_fee, p.hook_fee_v, a.decimals AS qdec FROM rh_pools p JOIN rh_assets a ON a.asset = p.quote_asset "
+        "WHERE p.is_pons").fetchall()}
     fee_q: dict[tuple, list] = {}; observed: dict[str, int] = {}
     for f in fees:
         fee_q.setdefault((f["tx_hash"], f["pool_id"]), []).append(f)
@@ -239,24 +242,30 @@ def apply_v4(conn, rpc, logs: list[dict], fees: list[dict]) -> dict:
             price_q = v4.token_price_in_quote(e["sqrt_price_x96"], ti0, PONS_DECIMALS, qdec)
             fee_frac = None
             if fee:
-                net = abs(tok_amt) if fee["currency"] == p["token"] else abs(q_amt)          # the fee is taken from the incoming currency
+                # the hook takes fee + tax out of the pool's gross output, which is the Swap event's amount of that currency:
+                # the swapper receives (1 − r) of it (live fills receive exactly that), so r = taken / gross. Until 2026-10-17
+                # this stored taken / (gross + taken), 0.0099 for a 1 % fee: those rows have fee_v NULL and readers convert them.
+                gross = abs(tok_amt) if fee["currency"] == p["token"] else abs(q_amt)
                 taken = fee["fee_raw"] + fee["tax_raw"]
-                fee_frac = taken / (net + taken) if net + taken > 0 else None
+                fee_frac = taken / gross if gross > 0 else None; fee_v = 2
                 observed[e["pool_id"]] = observed.get(e["pool_id"], 0) + 1
             elif p.get("hook_fee") is not None:
-                fee_frac = float(p["hook_fee"])                                  # the pool's measured, fixed fee
+                fee_frac = float(p["hook_fee"]); fee_v = p.get("hook_fee_v")       # the pool's measured, fixed fee (in its own formula)
+            else:
+                fee_v = None
             resq_q = v4.quote_reserve(e["sqrt_price_x96"], e["liquidity"], ti0, qdec)
             conn.execute(
                 "INSERT INTO rh_swaps (block, log_index, tx_hash, block_hash, ts, pool_id, token, trader, side, token_raw, quote_raw, hook_fee_raw, hook_tax_raw, "
-                "sqrt_price_x96, liquidity, tick, price_q, resq_q, fee_frac) VALUES (%s,%s,%s,%s,to_timestamp(%s),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                "sqrt_price_x96, liquidity, tick, price_q, resq_q, fee_frac, fee_v) VALUES (%s,%s,%s,%s,to_timestamp(%s),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT DO NOTHING",
                 (e["block"], e["log_index"], e["tx_hash"], e["block_hash"], e["ts"], e["pool_id"], p["token"], senders.get((e["tx_hash"], e["pool_id"])), side, abs(tok_amt),
-                 abs(q_amt), fee["fee_raw"] if fee else None, fee["tax_raw"] if fee else None, e["sqrt_price_x96"], e["liquidity"], e["tick"], price_q, resq_q, fee_frac))
+                 abs(q_amt), fee["fee_raw"] if fee else None, fee["tax_raw"] if fee else None, e["sqrt_price_x96"], e["liquidity"], e["tick"], price_q, resq_q, fee_frac, fee_v))
             last_state[e["pool_id"]] = e; n["swaps"] += 1
     for pid, k in observed.items():                                          # a pool's fee is known once FEE_OBS swaps showed it
         r = conn.execute("UPDATE rh_pools SET fee_obs = fee_obs + %s WHERE pool_id = %s RETURNING fee_obs, hook_fee", (k, pid)).fetchone()
         if r and r["fee_obs"] >= FEE_OBS and r["hook_fee"] is None:
-            conn.execute("UPDATE rh_pools SET hook_fee = (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY fee_frac) FROM rh_swaps "
-                         "WHERE pool_id = %s AND hook_fee_raw IS NOT NULL AND fee_frac IS NOT NULL) WHERE pool_id = %s", (pid, pid))
+            conn.execute(f"UPDATE rh_pools SET hook_fee = (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY {FEE_FRAC}) FROM rh_swaps "
+                         "WHERE pool_id = %s AND hook_fee_raw IS NOT NULL AND fee_frac IS NOT NULL), hook_fee_v = 2 WHERE pool_id = %s", (pid, pid))
     for pid, e in last_state.items():
         conn.execute("UPDATE rh_pools SET sqrt_price_x96 = %s, liquidity = %s, tick = %s, updated_block = %s WHERE pool_id = %s",
                      (e["sqrt_price_x96"], e["liquidity"], e["tick"], e["block"], pid))
