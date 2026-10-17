@@ -420,8 +420,9 @@ def test_the_rh_mirror_retries_a_failed_entry_and_records_what_it_did_not_take(c
 
 
 def test_the_rh_mark_waits_for_no_intent_between_its_snapshot_and_its_booking(chain, monkeypatch):
-    """The executor holds the wallet lock from an intent's snapshot to its booking: a mark read beside it would count that
-    trade twice or not at all, so the minute goes unmarked."""
+    """The mark is bookkeeping, taken after the minute's intents (``mark_due``). The executor holds the wallet lock from an
+    intent's snapshot to its booking: a mark read beside it would count that trade twice or not at all, so the minute goes
+    unmarked."""
     from fly_trader.rh import live as rh_live
     monkeypatch.setattr(rh_live, "MARK_WAIT_S", 0.05)
     ex = chain.ex(); m = rh_live.RhLiveMirror(600.0, executor=ex); held, go = threading.Event(), threading.Event()
@@ -434,8 +435,10 @@ def test_the_rh_mark_waits_for_no_intent_between_its_snapshot_and_its_booking(ch
         with transaction() as conn:
             run, beat, ctx = _minute_rows(conn, datetime.now(timezone.utc).replace(second=0, microsecond=0))
             out = m.minute(ctx, run_id=run, beat_id=beat, entries=[])
+            due = m.due_mark is not None
+            mark = m.mark_due(conn)
             n = conn.execute("SELECT count(*) AS n FROM wealth_marks WHERE book = 'live_rh' AND beat_id = %s", (beat,)).fetchone()["n"]
             _drop_minute_rows(conn, run)
     finally:
         go.set(); t.join(10)
-    assert out["wealth"] is None and out["mark"].startswith("skipped") and n == 0
+    assert "wealth" not in out and due and mark is None and m.due_mark is None and n == 0

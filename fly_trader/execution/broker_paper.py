@@ -37,12 +37,11 @@ class PaperBroker:
         assert book in paper or book.startswith("replay_"), book   # the race books of every market; replay_* for tests
         self.book = book
 
-    def buy(self, conn, *, decision_id: int | None, mint: str, pool: str | None, size_sol: float, price: float | None,
-            res_quote_sol: float | None, mcap_sol: float | None, decimals: int, program_label: str | None, pool_fee: float | None = None,
-            ts: datetime | None = None, hold_s: float | None = None, strategy: str | None = None) -> PaperFill:
-        """Fill at ``price`` pushed up by the constant-product impact, paying the real fees (market/exit_cost.py): the pool
-        fee the stream reports (``pool_fee``) or the schedule's rate for ``mcap_sol``, Jupiter's platform fee, the network fee."""
-        ts = ts or datetime.now(timezone.utc)
+    @staticmethod
+    def quote_buy(*, size_sol: float, price: float | None, res_quote_sol: float | None, mcap_sol: float | None, decimals: int,
+                  program_label: str | None, pool_fee: float | None = None) -> PaperFill:
+        """What ``buy`` would fill, written nowhere (``position_id`` None): the book plans its entries with it before live
+        money goes out, then books them (live money first, CLAUDE.md)."""
         if not price or price <= 0:
             return PaperFill(False, None, None, 0.0, 0.0, 0, 0.0, "no price")
         if res_quote_sol is None or res_quote_sol <= 0:
@@ -57,13 +56,33 @@ class PaperBroker:
         qty_raw = int(tokens * (10 ** decimals))
         if qty_raw <= 0:
             return PaperFill(False, None, None, price, 0.0, 0, 0.0, "zero quantity")
-        fee_sol = size_sol * fee_frac
+        return PaperFill(True, None, None, eff_price, -size_sol, qty_raw, size_sol * fee_frac)
+
+    def buy(self, conn, *, decision_id: int | None, mint: str, pool: str | None, size_sol: float, price: float | None,
+            res_quote_sol: float | None, mcap_sol: float | None, decimals: int, program_label: str | None, pool_fee: float | None = None,
+            ts: datetime | None = None, hold_s: float | None = None, strategy: str | None = None) -> PaperFill:
+        """Fill at ``price`` pushed up by the constant-product impact, paying the real fees (market/exit_cost.py): the pool
+        fee the stream reports (``pool_fee``) or the schedule's rate for ``mcap_sol``, Jupiter's platform fee, the network fee."""
+        ts = ts or datetime.now(timezone.utc)
+        q = self.quote_buy(size_sol=size_sol, price=price, res_quote_sol=res_quote_sol, mcap_sol=mcap_sol, decimals=decimals,
+                           program_label=program_label, pool_fee=pool_fee)
+        if not q.ok:
+            return q
+        eff_price, qty_raw, fee_sol = q.price, q.token_delta, q.fee_sol
         pid = ledger.open_position(conn, book=self.book, mint=mint, pool=pool, qty_raw=qty_raw, cost_sol=size_sol,
                                    entry_price=eff_price, decision_id=decision_id, fees_sol=fee_sol, ts=ts, hold_s=hold_s, strategy=strategy)
         fid = ledger.record_fill(conn, order_id=None, book=self.book, mint=mint, side="buy", token_delta=qty_raw,
                                  sol_delta_lamports=-int(size_sol * config.LAMPORTS_PER_SOL), price_sol=eff_price,
                                  fee_lamports=int(fee_sol * config.LAMPORTS_PER_SOL), verified_by="model", ts=ts)
         return PaperFill(True, pid, fid, eff_price, -size_sol, qty_raw, fee_sol)
+
+    @staticmethod
+    def quote_sell(*, position: dict, price: float | None, res_quote_sol: float | None, mcap_sol: float | None, program_label: str | None,
+                   pool_fee: float | None = None) -> float:
+        """What a full ``sell`` of ``position`` would bring, written nowhere: the book plans with it before live money goes out."""
+        price = price or float(position.get("last_mark_price") or position.get("entry_price") or 0.0)
+        gross = int(position["qty"]) / (10 ** int(position.get("decimals") or 6)) * price
+        return gross * (1.0 - exit_cost_fraction(gross, res_quote_sol, mcap_sol, program_label, pool_fee))
 
     def sell(self, conn, *, position: dict, decision_id: int | None, price: float | None, res_quote_sol: float | None,
              mcap_sol: float | None, program_label: str | None, forced_kind: str | None, pool_fee: float | None = None,

@@ -93,6 +93,66 @@ class _Book:
         pass
 
 
+class _LiveBook(_Book):
+    """A book that trades live money: its order goes out, committed, in the live phase."""
+    LIVE = True
+
+    def __init__(self, name, calls):
+        super().__init__(name); self.calls = calls
+
+    def on_minute(self, ctx):
+        self.calls.append(("live", self.name))
+        ctx.conn.execute("INSERT INTO events (level, source, message) VALUES ('info', 'engine_test', 'live order')")
+        return {"live": True}
+
+    def after_minute(self, ctx):
+        self.calls.append(("after", self.name))
+        return {"ok": True}
+
+
+class _PaperBook(_Book):
+    def __init__(self, name, calls):
+        super().__init__(name); self.calls = calls
+
+    def on_minute(self, ctx):
+        self.calls.append(("paper", self.name))
+        with transaction() as other:                     # another connection: the live phase is committed already
+            self.saw = other.execute("SELECT count(*) AS n FROM events WHERE source = 'engine_test' AND message = 'live order'").fetchone()["n"]
+        return {"ok": True}
+
+
+def test_live_books_trade_and_commit_before_any_paper_book(db_conn, monkeypatch):
+    """Live money first: the live book's minute runs and commits before any other book's, whatever the books' order;
+    its paper trades, learning and bookkeeping (after_minute) come after the paper books."""
+    m0 = datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc); calls = []
+    with transaction() as conn:
+        conn.execute("DELETE FROM events WHERE source = 'engine_test'")
+    paper, live = _PaperBook("selector", calls), _LiveBook("fly", calls)
+    e = _engine([paper, live]); monkeypatch.setattr(e, "stream_fresh", lambda m0_epoch: True)
+    out = e.run_minute(m0.timestamp() + 60)
+    with transaction() as conn:
+        conn.execute("DELETE FROM events WHERE source = 'engine_test'")
+    assert calls == [("live", "fly"), ("paper", "selector"), ("after", "fly")] and paper.saw == 1
+    assert out["fly"] == {"ok": True} and out["selector"] == {"ok": True}
+
+
+def test_every_chains_live_phase_runs_before_any_chains_paper_phase(monkeypatch):
+    """Live money first across chains: older minutes are caught up whole, then every chain's newest minute's live phase,
+    and only then any chain's paper phase."""
+    calls, engines = [], []
+    for name in ("sol", "rh"):
+        e = _engine([_Book(f"book_{name}")]); e.last_minute = 600.0
+        monkeypatch.setattr(e, "ready_through", lambda m1: 720.0)
+        monkeypatch.setattr(e, "run_minute", lambda m, trade=True, n=name: calls.append((n, "whole", m)) or {})
+        monkeypatch.setattr(e, "live_phase", lambda m, trade=True, n=name: calls.append((n, "live", m)) or (None, {"minute": m}))
+        monkeypatch.setattr(e, "paper_phase", lambda ctx, out, n=name: calls.append((n, "paper")) or out)
+        engines.append(e)
+    ran = me.run_ready(engines, 720.0)
+    assert calls == [("sol", "whole", 660.0), ("rh", "whole", 660.0), ("sol", "live", 720.0), ("rh", "live", 720.0), ("sol", "paper"), ("rh", "paper")]
+    assert [(m, st) for _, m, st in ran] == [(720, {"minute": 720.0})] * 2 and all(e.last_minute == 720 for e in engines)
+    assert me.run_ready(engines, 720.0) == []                                       # nothing new: the loop goes idle
+
+
 def test_books_share_one_feature_pass_and_trade_in_their_own_savepoints(db_conn, monkeypatch):
     m0 = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
     with db_conn.cursor() as cur:

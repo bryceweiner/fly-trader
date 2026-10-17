@@ -2,19 +2,23 @@
 
 It starts once the fly design passed its replay (``train/fly_replay.verdict``, current definitions) and a deployable
 bootstrap exists (``train/fly_selector.latest_deployable``); the replay's chosen configuration (α, half-life) is the
-learning rate and forgetting of its mushroom body (``brain/plastic.py``). Each minute (agent/minute_engine.py):
+learning rate and forgetting of its mushroom body (``brain/plastic.py``). Each minute (agent/minute_engine.py), live money
+first (CLAUDE.md): ``on_minute`` runs before any other book's minute, ``after_minute`` once every chain's live orders are out.
 
 1. bars: minute start, open, close and exit cost of every traded mint with a pending tag feed the label resolver;
-2. outcomes: tags whose exit minute has now been seen teach the mushroom body's outcome pathway what the row made --
-   the book's realized return when it traded the row, else its label (``resolve_label``, exactly as
-   ``train/decisions.build`` labels a row); a row the wallet bought too then teaches the fill pathway what the real fills
-   added (live realized − outcome) once its live position has closed (``fly_scored`` state 'awaiting_fill' until then);
-   a row with neither outcome nor label is dropped;
-3. calibration: at the first minute of each UTC day, the line and sizing of the plastic fly and of its frozen shadow
-   (the bootstrap, D = 0) from their scores of the minutes resolved in the last seven days (``train/fly_calibrate.py``);
-4. scoring: eligible minutes are scored by the plastic fly and its shadow, stored (``fly_scored``: pending rows keep the
-   feature vector, so tags survive restarts) and tagged; only minutes at or above the line teach it (brain/plastic.py);
-5. trading (fresh stream, trade minutes): the race rules (``agent/paper_trading.py``) at the plastic line and sizing.
+2. scoring (``on_minute``): eligible minutes are scored by the plastic fly and its shadow and tagged; only minutes at or
+   above the line teach it (brain/plastic.py);
+3. trading (``on_minute``; fresh stream, trade minutes): the race rules (``agent/paper_trading.py``) at the plastic line
+   and sizing plan the paper book's minute, and once the fly holds the seat the wallet's orders on its entries go out
+   (agent/fly_live.py, rh/live.py; the wallet's scheduled sales left at the minute boundary, agent/live_first.py);
+4. after the live orders (``after_minute``): the scored rows stored (``fly_scored``: pending rows keep the feature
+   vector, so tags survive restarts), the paper trades booked, then outcomes: tags whose exit minute has now been seen
+   teach the mushroom body's outcome pathway what the row made -- the book's realized return when it traded the row,
+   else its label (``resolve_label``, exactly as ``train/decisions.build`` labels a row); a row the wallet bought too
+   then teaches the fill pathway what the real fills added (live realized − outcome) once its live position has closed
+   (``fly_scored`` state 'awaiting_fill' until then); a row with neither outcome nor label is dropped;
+5. calibration: at the first minute of each UTC day, the line and sizing of the plastic fly and of its frozen shadow
+   (the bootstrap, D = 0) from their scores of the minutes resolved in the last seven days (``train/fly_calibrate.py``).
 
 Hourly: learning statistics (``fly_updates``), a snapshot of the plastic state (kind 'fly_plastic'; hourly for 7 days,
 then one per day), the rollback checks (``train/fly_governance.py``; a rollback restores the newest good snapshot at
@@ -55,7 +59,7 @@ BOOK, KIND = "paper_fly", "fly"            # the Solana book's names (another ch
 BAR_KEEP = 270               # minutes of bars kept per watched mint (the longest strategy hold, 240, + next-open window + margin)
 NEXT_OPEN_S = 120.0          # entry at the next traded minute's open when it comes within two minutes (decisions.build)
 JUMP = 50.0
-LABEL_LAG_S = 120.0          # a row teaches a minute after its exit minute: the book sells it in that minute, after the fly learns
+LABEL_LAG_S = 120.0          # a row teaches a minute after its exit minute, when the book has sold it
 OUTCOME_WAIT_S = 600.0       # a traded row whose book position is still open waits up to this long past its hold, else its label
 FILL_RETRY_S = 60.0          # a row whose live position is still open is looked at again a minute later
 FILL_WAIT_S = 4 * 3600.0     # ... until this long after its hold (a live position unsold 3 h past its hold is a dead-bag)
@@ -139,6 +143,7 @@ def no_teacher(n: int) -> dict:
 class FlyBook:
     def __init__(self, boot: dict, verdict: dict, live: bool = False, chain: str = "sol", brain: "FlyBook | None" = None):
         self.live = live; self.done = False; self.mirror = None
+        self._phase: dict | None = None; self._scored_rows: list = []; self._activity: tuple | None = None   # the live phase's, written after it
         self.verdict = verdict
         self.chain = chain; self.market = markets.for_chain(chain); self.brain = brain
         self.name = "fly" if chain == "sol" else f"fly_{chain}"
@@ -404,40 +409,56 @@ class FlyBook:
     def open_mints(self, conn) -> set[str]:
         return {p["mint"] for p in ledger.open_positions(conn, self.BOOK)}
 
+    LIVE = True                  # the engine runs this book's minute before any other book's (agent/minute_engine.py)
+
     def on_minute(self, ctx) -> dict:
-        conn, t_now = ctx.conn, ctx.t_start
+        """The minute's live part (live money first, CLAUDE.md): operator commands, the fly's scores, its paper book's plan
+        (agent/paper_trading.plan_minute) and the wallet's orders on it (``_go_live``). Nothing else of the minute runs
+        before them: ``after_minute`` books the paper trades, learns and writes the rest once every chain's live orders
+        are out."""
+        conn = ctx.conn; self._phase = None
         self._commands(conn, ctx.m1_epoch)
-        learned = self._learn(conn, ctx.m1_epoch)
-        day = int(t_now // 86400)
-        if self.last_day is None:
-            self.last_day = day
-        elif day > self.last_day:
-            self.last_day = day; self._calibrate(conn, ctx.m1_epoch)
         scored = self._score(conn, ctx)
-        drift = {k: float(self.bank.drift(j)[0]) if self.bank.learn.shape[0] > 1 else float(self.bank.drift()[0]) for j, k in enumerate(self.names)}
-        out = {"minute": ctx.m1.isoformat(), "eligible": len(ctx.mints), "picks": scored["picks"], "lines": self.lines["plastic"], "frozen_lines": self.lines["frozen"],
-               "line": self.lines["plastic"][self.names[0]], "frozen_line": self.lines["frozen"][self.names[0]],
-               "drift": max(drift.values()) if drift else 0.0, "drift_by_strategy": drift, "pending": len(self.pending), "learned": learned,
-               "learning_frozen": self.learning_frozen, "channels": self.cfg, "holds_min": {k: v / 60.0 for k, v in self.holds.items()}, "bootstrap": self.boot_id,
-               "device": str(self.fly.net.dev)}
+        plan = live = None
         if ctx.trade and ctx.fresh:
             if self.race_started_at is None:
                 self.race_started_at = ctx.m1_epoch
             self.beat_no += 1
             d = scored["decision"]
-            st = paper_trading.trade_minute(ctx, book=self.BOOK, run_id=self.run_id, beat_no=self.beat_no, broker=self.broker, kind=self.KIND, mints=ctx.mints, infos=ctx.infos,
-                                            scores=d["score"], threshold=d["threshold"], table=None, horizon_s=self.holds[self.names[0]], holds=d["hold_s"],
-                                            strategies=d["strategy"], tables=d["tables"], flat=config.FLY_SIZING == "flat",
-                                            allow=d.get("allow"), reasons=d.get("reason"))
-            out.update({k: v for k, v in st.items() if k != "entries"}); out["stage"] = "trading"
+            plan = paper_trading.plan_minute(ctx, book=self.BOOK, run_id=self.run_id, beat_no=self.beat_no, broker=self.broker, kind=self.KIND, mints=ctx.mints,
+                                             infos=ctx.infos, scores=d["score"], threshold=d["threshold"], table=None, horizon_s=self.holds[self.names[0]],
+                                             holds=d["hold_s"], strategies=d["strategy"], tables=d["tables"], flat=config.FLY_SIZING == "flat",
+                                             allow=d.get("allow"), reasons=d.get("reason"))
             if self.trades_live(conn):
-                try:                     # its own savepoint: a wallet RPC timeout must not roll back the paper book's minute
-                    with conn.transaction():
-                        out["live"] = self._live(ctx, st)
-                except Exception as e:
-                    log.exception("%s: live minute %s failed; the paper minute stands", self.name, ctx.m1.isoformat())
-                    record_event("error", "fly_live", f"live minute failed: {type(e).__name__}: {str(e)[:160]}", {"chain": self.chain, "minute": ctx.m1.isoformat()})
-                    out["live"] = {"stage": f"live minute failed: {type(e).__name__}"}
+                live = self._go_live(ctx, plan["beat_id"], plan["entries"])
+        self._phase = {"m1": ctx.m1, "picks": scored["picks"], "plan": plan, "live": live}
+        return {"minute": ctx.m1.isoformat(), "picks": scored["picks"], "live": live}
+
+    def after_minute(self, ctx) -> dict:
+        """The rest of the minute, once every chain's live orders are out (agent/minute_engine.py): the scored rows stored,
+        the paper trades booked (agent/paper_trading.book_minute), outcomes learned, the daily calibration, the live book's
+        bookkeeping, the hourly checks, the state and the status."""
+        conn = ctx.conn
+        ph = self._phase if self._phase is not None and self._phase["m1"] == ctx.m1 else {"picks": 0, "plan": None, "live": None}
+        self._phase = None
+        self._store_scored(conn)
+        st = paper_trading.book_minute(ctx, ph["plan"]) if ph["plan"] is not None else None
+        learned = self._learn(conn, ctx.m1_epoch)
+        day = int(ctx.t_start // 86400)
+        if self.last_day is None:
+            self.last_day = day
+        elif day > self.last_day:
+            self.last_day = day; self._calibrate(conn, ctx.m1_epoch)
+        drift = {k: float(self.bank.drift(j)[0]) if self.bank.learn.shape[0] > 1 else float(self.bank.drift()[0]) for j, k in enumerate(self.names)}
+        out = {"minute": ctx.m1.isoformat(), "eligible": len(ctx.mints), "picks": ph["picks"], "lines": self.lines["plastic"], "frozen_lines": self.lines["frozen"],
+               "line": self.lines["plastic"][self.names[0]], "frozen_line": self.lines["frozen"][self.names[0]],
+               "drift": max(drift.values()) if drift else 0.0, "drift_by_strategy": drift, "pending": len(self.pending), "learned": learned,
+               "learning_frozen": self.learning_frozen, "channels": self.cfg, "holds_min": {k: v / 60.0 for k, v in self.holds.items()}, "bootstrap": self.boot_id,
+               "device": str(self.fly.net.dev)}
+        if st is not None:
+            out.update({k: v for k, v in st.items() if k != "entries"}); out["stage"] = "trading"
+            if ph["live"] is not None:
+                out["live"] = {**ph["live"], **self._live_after(ctx, st["beat_id"])}
         else:
             out["stage"] = "learning (not trading this minute)" if ctx.trade else "catching up"
         hour = int(ctx.m1_epoch // 3600)
@@ -445,6 +466,7 @@ class FlyBook:
             self.last_hour = hour
         elif hour > self.last_hour:
             self.last_hour = hour; self._hourly(conn, ctx.m1_epoch)
+        self._write_capture()
         self._write_state()
         if learned.get("keys"):          # a row still waiting for its live fill keeps its features (tags survive restarts)
             with conn.cursor() as cur:
@@ -466,20 +488,71 @@ class FlyBook:
         live money trades whoever holds it (the signing gates in ``_live`` still apply)."""
         return bool(self.live) and (config.LIVE_WITHOUT_HANDOVER or handover.state(conn, self.chain) is not None)
 
-    def _live(self, ctx, st: dict) -> dict:
-        """Mirror this minute on the bot wallet (agent/fly_live.py, rh/live.py) while signing is allowed."""
+    def _signing(self) -> str | None:
+        """Why the wallet may not sign now (None: it may)."""
         if self.chain != "sol":
-            from ..rh import live as rh_live                     # Robinhood Chain: the ETH wallet (rh/live.py)
-            return rh_live.minute(self, ctx, st)
+            missing = config.rh_live_prerequisites_missing()
+            return ", ".join(missing) if missing else None
         from ..chain.cluster_guard import signing_allowed
-        if not signing_allowed():
-            return {"stage": "live gated: signing is not allowed (LIVE_ENABLED=1 and the live prerequisites)"}
+        return None if signing_allowed() else "signing is not allowed (LIVE_ENABLED=1 and the live prerequisites)"
+
+    def _go_live(self, ctx, beat_id: int, entries: list) -> dict:
+        """The wallet's orders of this minute, in their own savepoint: a wallet RPC timeout must not roll back the paper plan."""
+        try:
+            with ctx.conn.transaction():
+                return self._live(ctx, beat_id, entries)
+        except Exception as e:
+            log.exception("%s: live minute %s failed; the paper minute stands", self.name, ctx.m1.isoformat())
+            record_event("error", "fly_live", f"live minute failed: {type(e).__name__}: {str(e)[:160]}", {"chain": self.chain, "minute": ctx.m1.isoformat()})
+            return {"stage": f"live minute failed: {type(e).__name__}"}
+
+    def _live(self, ctx, beat_id: int, entries: list) -> dict:
+        """Mirror this minute's entries on the bot wallet (agent/fly_live.py; Robinhood Chain: the ETH wallet, rh/live.py)
+        while signing is allowed."""
+        why = self._signing()
+        if why:
+            return {"stage": f"live gated: {why}"}
         if self.mirror is None:
-            from .fly_live import LiveMirror
-            self.mirror = LiveMirror(self.H)
-            record_event("info", "fly_live", "the fly trades the bot wallet", {"run_id": self.run_id})
-        return self.mirror.minute(ctx, run_id=self.run_id, beat_id=st["beat_id"], entries=st["entries"], line=self.lines["plastic"][self.names[0]],
+            if self.chain != "sol":
+                from ..rh.live import RhLiveMirror
+                self.mirror = RhLiveMirror(self.H)
+                record_event("info", "rh_live", "the RH fly trades the ETH wallet", {"run_id": self.run_id})
+            else:
+                from .fly_live import LiveMirror
+                self.mirror = LiveMirror(self.H)
+                record_event("info", "fly_live", "the fly trades the bot wallet", {"run_id": self.run_id})
+        if self.chain != "sol":
+            return self.mirror.minute(ctx, run_id=self.run_id, beat_id=beat_id, entries=entries)
+        return self.mirror.minute(ctx, run_id=self.run_id, beat_id=beat_id, entries=entries, line=self.lines["plastic"][self.names[0]],
                                   table=self.sizing["plastic"][self.names[0]])
+
+    def _live_after(self, ctx, beat_id: int) -> dict:
+        """The live book's bookkeeping of the minute (dead-bags, the gap monitor), in its own savepoint."""
+        if self.mirror is None:
+            return {}
+        try:
+            with ctx.conn.transaction():
+                return self.mirror.after(ctx.conn, ctx, run_id=self.run_id, beat_id=beat_id)
+        except Exception as e:
+            log.exception("%s: live bookkeeping of minute %s failed", self.name, ctx.m1.isoformat())
+            record_event("error", "fly_live", f"live bookkeeping failed: {type(e).__name__}: {str(e)[:160]}", {"chain": self.chain, "minute": ctx.m1.isoformat()})
+            return {"bookkeeping": f"failed: {type(e).__name__}"}
+
+    def live_exits(self, m1_epoch: float) -> dict | None:
+        """The wallet's sales due at the minute boundary ``m1_epoch``, sent from the live clock's thread the moment it passes
+        (agent/live_first.py): before the stream has written the minute, whatever the engine is busy with."""
+        mirror = self.mirror
+        if mirror is None or self.done or self._signing():
+            return None
+        with transaction() as conn:
+            if not self.trades_live(conn):
+                return None
+            return mirror.exits(conn, m1=datetime.fromtimestamp(m1_epoch, timezone.utc), run_id=self.run_id)
+
+    def idle(self) -> None:
+        """Between minutes: the live book's bookkeeping that waits for an idle wallet (agent/live_first.py)."""
+        if self.mirror is not None and not self.done:
+            self.mirror.idle()
 
     def finish(self) -> None:
         if self.mirror is not None:
@@ -645,10 +718,7 @@ class FlyBook:
                 q_ = self.bars.setdefault(m, deque(maxlen=BAR_KEEP)); b = ctx.bars.get(m)
                 if b is not None and (not q_ or q_[-1][0] < b[0]):
                     q_.append(b)
-        if rows:
-            with conn.cursor() as cur:
-                cur.executemany("INSERT INTO fly_scored (ts, mint, strategy, hold_min, x, score, frozen_score, line, frozen_line, bootstrap_id, teacher_allow, fill_score, chain) "
-                                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ts, mint, strategy) DO NOTHING", [r + (self.chain,) for r in rows])
+        self._scored_rows = [r + (self.chain,) for r in rows]   # stored by after_minute (_store_scored): no row write before the live orders
         if self.chain == "sol":
             self.fly.lines = dict(self.lines["plastic"]); self.fly.sizings = {k: list(v) for k, v in self.sizing["plastic"].items()}
         else:                                                    # the shared model decides this chain's rows on this chain's lines
@@ -707,16 +777,36 @@ class FlyBook:
 
     def _capture(self, H: torch.Tensor, trig: np.ndarray, t: float) -> None:
         """The console's brain view: this minute's mean activity over the rows some strategy's trigger fired on (every
-        row when none did), one file per minute (brain/activity.py). Never allowed to interrupt scoring."""
+        row when none did), kept for ``_write_capture`` (one file per minute, brain/activity.py) after the live orders.
+        Never allowed to interrupt scoring."""
+        self._activity = None
         if not self.capture_ok:
             return
         try:
             sel = np.flatnonzero(trig.any(1)); n_c = int(len(sel))
             m = (H.index_select(0, torch.as_tensor(sel, device=H.device)) if n_c else H).mean(0)
-            activity.write(activity_dir(), t, activity.quantise(m), n_rows=int(len(trig)), n_cand=n_c, connectome=self.connectome_name)
+            self._activity = (t, activity.quantise(m), int(len(trig)), n_c)
         except Exception:
             self.capture_ok = False
             log.exception("brain activity capture disabled for this session")
+
+    def _write_capture(self) -> None:
+        a, self._activity = self._activity, None
+        if a is None or not self.capture_ok:
+            return
+        try:
+            activity.write(activity_dir(), a[0], a[1], n_rows=a[2], n_cand=a[3], connectome=self.connectome_name)
+        except Exception:
+            self.capture_ok = False
+            log.exception("brain activity capture disabled for this session")
+
+    def _store_scored(self, conn) -> None:
+        """The live phase's scored rows (``fly_scored``: pending rows keep the feature vector, so tags survive restarts)."""
+        rows, self._scored_rows = self._scored_rows, []
+        if rows:
+            with conn.cursor() as cur:
+                cur.executemany("INSERT INTO fly_scored (ts, mint, strategy, hold_min, x, score, frozen_score, line, frozen_line, bootstrap_id, teacher_allow, fill_score, chain) "
+                                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ts, mint, strategy) DO NOTHING", rows)
 
     # ---- daily and hourly ----
     def _resolved(self, conn, since_resolved: float, cols: str, name: str) -> list[dict]:
