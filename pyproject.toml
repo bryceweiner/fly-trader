@@ -9,6 +9,7 @@ dependencies = [
   "pandas",
   "pyarrow>=15",
   "duckdb",
+  "pytz",                    # duckdb returns TIMESTAMPTZ values through it, declares nothing; pandas 3 brings tzdata instead
   "psycopg[binary]>=3.2",
   "scikit-learn>=1.5",
   "scipy",
