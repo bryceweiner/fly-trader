@@ -174,10 +174,17 @@ export function Sparkline({ data, height = 52, type = 'area', color = '#fff' }: 
   const lo = Math.min(...vals), hi = Math.max(...vals), span = hi - lo || 1
   const y = (v: number) => height - pad - ((v - lo) / span) * (height - 2 * pad)
   if (type === 'bar') {
-    const bw = w / data.length
+    // bars stand on zero: a loss hangs below it, a quiet day is a dash on it (standing on the lowest value, every zero
+    // day beside one losing day was drawn full height and the loss as a sliver)
+    const blo = Math.min(lo, 0), bspan = Math.max(hi, 0) - blo || 1, dash = 2
+    const by = (v: number) => height - pad - ((v - blo) / bspan) * (height - 2 * pad), base = by(0), bw = w / data.length
     return (
       <svg className="w-spark" viewBox={`0 0 ${w} ${height}`} preserveAspectRatio="none" width="100%" height={height}>
-        {data.map((v, i) => <rect key={i} x={i * bw + bw * 0.22} width={bw * 0.56} y={y(v)} height={height - y(v)} rx={Math.min(3, bw * 0.2)} fill={color} opacity={0.9} />)}
+        {data.map((v, i) => {
+          const h = Number.isFinite(v) ? Math.abs(by(v) - base) : 0
+          return <rect key={i} x={i * bw + bw * 0.22} width={bw * 0.56} y={h < dash ? base - dash / 2 : Math.min(by(v), base)} height={Math.max(h, dash)}
+                       rx={Math.min(3, bw * 0.2)} fill={color} opacity={v < 0 ? 0.6 : 0.9} />
+        })}
       </svg>
     )
   }
