@@ -9,6 +9,11 @@ as a corpus row exists only for minutes with a candle — when it lies inside th
 go to every book as ``K_COLS`` vectors. Books implement ``name``, ``on_minute(ctx)``, ``tickers_watched()``,
 ``maybe_reload()``, ``done`` and ``finish()``; each trades in its own savepoint. Warm-up feeds the last ``WARMUP_MIN``
 minutes without trading; no entries while the stream is stale; missed minutes are replayed through the features only.
+
+Live money first (CLAUDE.md): a book that trades live money (``LIVE``: the Kalshi fly) runs ``on_minute`` in the
+minute's live phase (``live_phase``: the features, the fly's scores and plan and the live orders, committed at once) and
+``after_minute`` in its paper phase (``paper_phase``: the paper trades, learning and bookkeeping). A minute runs as soon
+as the stream has written it (polled every ``POLL_S``).
 """
 from __future__ import annotations
 
@@ -17,12 +22,13 @@ import logging
 import math
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
 import numpy as np
 
 from .. import config
+from ..agent import live_first
 from ..db.apilog import record_event
 from ..db.connection import connect, transaction
 from ..logging_setup import setup
@@ -37,6 +43,7 @@ WARMUP_MIN = 1440
 STREAM_STALE_S = 180
 META_TTL_S = 3600
 MODEL_CHECK_S = 600
+POLL_S = 0.25                # how often the loop looks for a minute the stream has written
 IDLE_EVICT_S = 7 * 86400
 KALSHI_LOCK_KEY = 0x6B616C5F72756E     # "kal_run": one Kalshi runner per database
 
@@ -184,7 +191,8 @@ class KalshiMinuteEngine:
         if idle:
             log.info("evicted %d market states idle for more than %d days", len(idle), IDLE_EVICT_S // 86400)
 
-    def run_minute(self, m1_epoch: float, trade: bool = True) -> dict:
+    def live_phase(self, m1_epoch: float, trade: bool = True) -> tuple[KMinute, dict]:
+        """The minute's features, then the minute of every book that trades live money (``LIVE``), committed at once."""
         m1 = datetime.fromtimestamp(m1_epoch, timezone.utc); m0 = datetime.fromtimestamp(m1_epoch - 60, timezone.utc)
         out: dict = {"minute": m1.isoformat()}
         with transaction() as conn:
@@ -194,19 +202,38 @@ class KalshiMinuteEngine:
             extremes = {r["ticker"]: (r["yes_ask_low"], r["yes_bid_high"], r["yes_sold_low"], r["yes_bought_high"]) for r in rows}
             ctx = KMinute(conn=conn, m0=m0, m1=m1, m1_epoch=m1_epoch, X=X, keys=keys, hold_s=holds, metas=self.metas, quotes=self.quotes, extremes=extremes,
                           n_rows=n_rows, fresh=trade and self.stream_fresh(m1_epoch - 60), trade=trade, engine=self)
-            out.update(markets_active=len(rows), in_window=n_rows // 2, eligible=len(keys)); held: set[str] = set()
-            for b in list(self.books):
+            out.update(markets_active=len(rows), in_window=n_rows // 2, eligible=len(keys))
+            for b in [b for b in self.books if getattr(b, "LIVE", False)]:
                 try:
                     with conn.transaction():
                         out[b.name] = b.on_minute(ctx)
+                except Exception:
+                    log.exception("%s: live minute %s failed", b.name, m1.isoformat())
+                    record_event("error", b.name, f"live minute failed: {m1.isoformat()}")
+        return ctx, out
+
+    def paper_phase(self, ctx: KMinute, out: dict) -> dict:
+        """The rest of the minute, once the live orders are out: the live books' ``after_minute``, every other book's minute."""
+        held: set[str] = set()
+        with transaction() as conn:
+            ctx = replace(ctx, conn=conn)
+            for b in list(self.books):
+                try:
+                    with conn.transaction():
+                        out[b.name] = b.after_minute(ctx) if getattr(b, "LIVE", False) else b.on_minute(ctx)
                         held |= set(b.tickers_watched())
                 except Exception:
-                    log.exception("%s: minute %s failed", b.name, m1.isoformat())
-                    record_event("error", b.name, f"minute failed: {m1.isoformat()}")
-            self._sweep(m1_epoch, held)
+                    out.pop(b.name, None)
+                    log.exception("%s: minute %s failed", b.name, ctx.m1.isoformat())
+                    record_event("error", b.name, f"minute failed: {ctx.m1.isoformat()}")
+            self._sweep(ctx.m1_epoch, held)
         for b in [b for b in self.books if b.done]:
             b.finish(); self.books.remove(b)
         return out
+
+    def run_minute(self, m1_epoch: float, trade: bool = True) -> dict:
+        """One minute: its live phase, then its paper phase."""
+        return self.paper_phase(*self.live_phase(m1_epoch, trade))
 
 
 def _status(key: str, value: dict) -> None:
@@ -270,7 +297,7 @@ def _main(stop_event: threading.Event | None) -> None:
     try:
         while not (stop_event is not None and stop_event.is_set()):
             now = time.time(); m1 = math.floor(now / 60) * 60
-            if now - last_check >= MODEL_CHECK_S:
+            if now - last_check >= MODEL_CHECK_S and live_first.mid_minute(now):   # a reload takes seconds: never in front of a minute's orders
                 last_check = now
                 for b in engine.books:
                     try:
@@ -281,7 +308,7 @@ def _main(stop_event: threading.Event | None) -> None:
                     engine.books += admit_books(engine)
                 except Exception:
                     log.exception("book admission failed")
-            if engine.books and m1 > engine.last_minute and now - m1 >= 4.0 and (upto := engine.ready_through(m1)) > engine.last_minute:
+            if engine.books and m1 > engine.last_minute and (upto := engine.ready_through(m1)) > engine.last_minute:
                 for minute in range(int(engine.last_minute) + 60, int(upto) + 1, 60):
                     try:
                         st = engine.run_minute(float(minute), trade=(minute == int(m1))); n_min += 1
@@ -291,7 +318,7 @@ def _main(stop_event: threading.Event | None) -> None:
                     except Exception:
                         log.exception("kalshi minute %s failed", minute); record_event("error", "kalshi_runner", f"minute failed: {minute}")
                 engine.last_minute = upto
-            time.sleep(0.5)
+            time.sleep(POLL_S)
     finally:
         for b in engine.books:
             try:

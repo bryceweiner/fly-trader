@@ -106,6 +106,51 @@ def _ctx(conn, m1: datetime, X, keys, hold, metas, quotes, extremes):
                       n_rows=len(keys), fresh=True, trade=True, engine=None)
 
 
+def _minute(book, ctx):
+    """The fly's minute whole: its live part, then the rest (kalshi/engine.py runs them as two phases)."""
+    book.on_minute(ctx)
+    return book.after_minute(ctx)
+
+
+def test_the_live_book_trades_and_commits_before_any_paper_work(db_conn, monkeypatch):
+    """Live money first: the live book's part of the minute runs and commits before any other book's minute; its own
+    paper work and learning (after_minute) come last."""
+    calls = []
+
+    class Live:
+        name, LIVE, done = "kalshi_fly", True, False
+
+        def on_minute(self, ctx):
+            calls.append("live"); ctx.conn.execute("INSERT INTO events (level, source, message) VALUES ('info', 'kalshi_engine_test', 'live order')")
+            return {"live": True}
+
+        def after_minute(self, ctx):
+            calls.append("after"); return {"ok": True}
+
+        def tickers_watched(self):
+            return set()
+
+    class Paper:
+        name, done = "kalshi_paper", False
+
+        def on_minute(self, ctx):
+            calls.append("paper")
+            with transaction() as other:                     # another connection: the live part is committed already
+                self.saw = other.execute("SELECT count(*) AS n FROM events WHERE source = 'kalshi_engine_test'").fetchone()["n"]
+            return {"ok": True}
+
+        def tickers_watched(self):
+            return set()
+    with transaction() as c:
+        c.execute("DELETE FROM events WHERE source = 'kalshi_engine_test'")
+    paper, live = Paper(), Live()
+    eng = KE.KalshiMinuteEngine([paper, live]); monkeypatch.setattr(eng, "stream_fresh", lambda t: True)
+    out = eng.run_minute(T0.timestamp(), trade=True)
+    with transaction() as c:
+        c.execute("DELETE FROM events WHERE source = 'kalshi_engine_test'")
+    assert calls == ["live", "paper", "after"] and paper.saw == 1 and out["kalshi_fly"] == {"ok": True}
+
+
 def test_fly_session_scores_trades_both_arms_and_learns_from_a_settlement(monkeypatch, tmp_path, db_conn):
     monkeypatch.setattr(fly_selector.prog, "update", lambda *a, **k: None); monkeypatch.setattr(KF.prog, "update", lambda *a, **k: None)
     monkeypatch.setattr(fly_selector, "EPOCHS", 2); monkeypatch.setattr(config, "BRAIN_DIR", tmp_path); monkeypatch.setattr(config, "KALSHI_LIVE_ENABLED", False)
@@ -136,7 +181,7 @@ def test_fly_session_scores_trades_both_arms_and_learns_from_a_settlement(monkey
         X[i, KIDX["side_ask"]] = ask; X[i, KIDX["side_bid"]] = ask - 2; X[i, KIDX["eff_price"]] = ask + 1.0
     quotes = {"TSTS-1": (73.0, 75.0, 50.0, 50.0), "TSTS-2": (73.0, 75.0, 50.0, 50.0)}
     hold = np.full(4, close.timestamp() - (m1.timestamp() - 60.0))
-    out = book.on_minute(_ctx(db_conn, m1, X, keys, hold, metas, quotes, {}))
+    out = _minute(book, _ctx(db_conn, m1, X, keys, hold, metas, quotes, {}))
     assert out["stage"] == "trading" and out["picks"] > 0 and out["pending"] > 0
     n_scored = db_conn.execute("SELECT count(*) AS n FROM kalshi_fly_scored WHERE ticker LIKE 'TSTS-%' AND state = 'pending'").fetchone()["n"]
     assert n_scored > 0 and (out["books"]["taker"]["entered"] + out["books"]["maker"]["posted"]) > 0
@@ -148,7 +193,7 @@ def test_fly_session_scores_trades_both_arms_and_learns_from_a_settlement(monkey
     db_conn.execute("INSERT INTO kalshi_markets (ticker, status, result, source) VALUES ('TSTS-1', 'settled', 'yes', 'test'), ('TSTS-2', 'settled', 'no', 'test')")
     d0 = float(book.bank.drift()[0])
     m2 = close + timedelta(minutes=2)
-    out2 = book.on_minute(_ctx(db_conn, m2, np.zeros((0, len(K_COLS)), np.float32), [], np.zeros(0), metas, quotes, {}))
+    out2 = _minute(book, _ctx(db_conn, m2, np.zeros((0, len(K_COLS)), np.float32), [], np.zeros(0), metas, quotes, {}))
     assert out2["learned"]["n"] > 0 and float(book.bank.drift()[0]) > d0 and out2["pending"] == 0
     resolved = db_conn.execute("SELECT state, label, strategy FROM kalshi_fly_scored WHERE ticker LIKE 'TSTS-%' AND state <> 'pending'").fetchall()
     assert resolved and all(r["state"] in ("resolved", "unfilled") for r in resolved)
