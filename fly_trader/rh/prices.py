@@ -30,21 +30,46 @@ def _is_id(pool: str) -> bool:
     return len(pool) == 66
 
 
+def chain_route(asset: str, route: list) -> list[dict]:
+    """Kyber's route hops chained token to token from ``asset`` to WETH, across every split: one split can carry only
+    part of the path (2026-10-17: TSLA's first split was TSLA → USDG alone, so every TSLA-quoted coin was priced in
+    USD — 2,430× too high in ETH). [] when the hops never reach WETH."""
+    weth = config.RH_WETH.lower(); hops = [h for split in route or [] for h in split or []]
+    out: list[dict] = []; cur = asset.lower(); used: set[int] = set()
+    while cur != weth:
+        i = next((i for i, h in enumerate(hops) if i not in used and h["tokenIn"].lower() == cur), None)
+        if i is None:
+            return []
+        used.add(i); out.append(hops[i]); cur = hops[i]["tokenOut"].lower()
+    return out
+
+
+def path_reaches_weth(asset: str, hops: list[dict]) -> bool:
+    """Whether stored hops lead from ``asset`` to WETH, each hop taking the token the previous one gave."""
+    cur = asset.lower()
+    for h in hops or []:
+        if h["token_in"].lower() != cur:
+            return False
+        cur = h["token1"].lower() if h["token_in"].lower() == h["token0"].lower() else h["token0"].lower()
+    return bool(hops) and cur == config.RH_WETH.lower()
+
+
 def discover(conn, rpc, asset: str, decimals: int, kyber: K.Kyber | None = None) -> list[dict]:
     """The hops from ``asset`` to WETH (``[{pool, emitter, token0, token1, dec0, dec1, token_in}]``), stored on rh_assets."""
     ky = kyber or K.Kyber()
-    paths = []
+    path: list[dict] = []
     for sources in REF_SOURCES:                                   # AMM venues only: an order book leaves no price in the logs
         try:
-            paths = ky.get_route(asset, config.RH_WETH, 10 ** decimals, included_sources=sources)["routeSummary"].get("route") or []
+            route = ky.get_route(asset, config.RH_WETH, 10 ** decimals, included_sources=sources)["routeSummary"].get("route") or []
         except K.KyberError:
-            paths = []
-        if paths and paths[0]:
+            route = []
+        path = chain_route(asset, route)
+        if path:
             break
-    if not paths or not paths[0]:
-        raise K.KyberError(f"no AMM route for {asset}")
+    if not path:
+        raise K.KyberError(f"no AMM route from {asset} to WETH")
     hops = []
-    for h in paths[0]:                                             # the first split carries the path; splits share hops
+    for h in path:
         tin, tout, pool = h["tokenIn"].lower(), h["tokenOut"].lower(), h["pool"].lower()
         t0, t1 = sorted([tin, tout], key=lambda a: int(a, 16))
         if _is_id(pool):                                           # a singleton manager's pool id: find the manager from its logs
@@ -60,8 +85,10 @@ def discover(conn, rpc, asset: str, decimals: int, kyber: K.Kyber | None = None)
         for t in (t0, t1):
             dec[t] = 18 if int(t, 16) == 0 else abi.decode(["uint8"], bytes.fromhex(rpc.eth_call(t, "0x" + abi.selector("decimals()").hex())[2:]))[0]
         hops.append({"pool": pool, "emitter": emitter, "token0": t0, "token1": t1, "dec0": dec[t0], "dec1": dec[t1], "token_in": tin})
+    if not path_reaches_weth(asset, hops):
+        raise K.KyberError(f"route for {asset} does not end at WETH")
     conn.execute("UPDATE rh_assets SET ref_path = %s, ref_pool = %s, ref_kind = %s, updated_at = now() WHERE asset = %s",
-                 (json.dumps(hops), hops[0]["pool"], paths[0][0].get("poolType"), asset.lower()))
+                 (json.dumps(hops), hops[0]["pool"], path[0].get("poolType"), asset.lower()))
     return hops
 
 
@@ -178,9 +205,12 @@ def run_once(max_ranges: int = 1, rpc=None) -> dict:
     assets = []
     for a in rows:
         c = curs.get(f"price:{a['asset']}")
-        if a["ref_path"] and c is not None:                      # the usual case: path known, cursor exists
-            hops = json.loads(a["ref_path"]) if isinstance(a["ref_path"], str) else a["ref_path"]
-            assets.append({"asset": a["asset"], "hops": hops, "at": int(c["block"]), "rng": int(c["range_blocks"]), "state": (c["detail"] or {}).get("state", {})})
+        stored = (json.loads(a["ref_path"]) if isinstance(a["ref_path"], str) else a["ref_path"]) if a["ref_path"] else None
+        if stored and not path_reaches_weth(a["asset"], stored):  # fail closed: a mark in another unit is worse than none
+            log.error("rh prices %s: stored reference path does not end at WETH; not priced", a["asset"])
+            continue
+        if stored and c is not None:                             # the usual case: path known, cursor exists
+            assets.append({"asset": a["asset"], "hops": stored, "at": int(c["block"]), "rng": int(c["range_blocks"]), "state": (c["detail"] or {}).get("state", {})})
             continue
         try:
             with transaction() as conn:

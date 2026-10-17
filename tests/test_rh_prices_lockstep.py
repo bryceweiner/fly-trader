@@ -2,6 +2,7 @@
 assets share once), each asset only writes minutes past its own cursor, and the laggard sets the range."""
 import json
 
+from fly_trader import config
 from fly_trader.db.connection import transaction
 from fly_trader.rh import prices
 
@@ -16,6 +17,7 @@ def _hop(pool, tin, tout):
 
 
 def test_shared_pool_fetched_once_and_cursors_move_together(db_conn, monkeypatch):
+    monkeypatch.setattr(config, "RH_WETH", WETH)                                       # its paths end at this chain's WETH: priced
     paths = {SPY: [_hop(P_SPY, SPY, USDG), _hop(P_US, USDG, WETH)], NVDA: [_hop(P_NV, NVDA, USDG), _hop(P_US, USDG, WETH)]}
     with transaction() as conn:
         for t in ("rh_base_prices", "rh_pools", "rh_assets", "rh_scan"):
@@ -47,3 +49,15 @@ def test_shared_pool_fetched_once_and_cursors_move_together(db_conn, monkeypatch
         first_spy = conn.execute("SELECT min(ts) AS t FROM rh_base_prices WHERE asset = %s", (SPY,)).fetchone()["t"]
     assert cur == {f"price:{SPY}": 5000, f"price:{NVDA}": 5000}
     assert int(first_spy.timestamp()) >= (1_790_000_000 + 3000) // 60 * 60            # SPY wrote nothing before its own cursor
+
+
+def test_a_path_must_lead_to_weth_and_a_split_route_is_chained(monkeypatch):
+    """2026-10-17: Kyber's first split of TSLA's route was TSLA → USDG alone, which priced every TSLA-quoted coin in USD.
+    A stored path that does not reach WETH is refused; a route's hops are chained across its splits."""
+    monkeypatch.setattr(config, "RH_WETH", WETH)
+    assert prices.path_reaches_weth(SPY, [_hop(P_SPY, SPY, USDG), _hop(P_US, USDG, WETH)])
+    assert not prices.path_reaches_weth(SPY, [_hop(P_SPY, SPY, USDG)])                         # ends at USDG
+    assert not prices.path_reaches_weth(SPY, [_hop(P_US, USDG, WETH)])                         # does not start at the asset
+    route = [[{"tokenIn": SPY, "tokenOut": USDG, "pool": P_SPY}], [{"tokenIn": USDG, "tokenOut": WETH, "pool": P_US}]]
+    assert [h["pool"] for h in prices.chain_route(SPY, route)] == [P_SPY, P_US]
+    assert prices.chain_route(SPY, route[:1]) == []
