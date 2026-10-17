@@ -3,14 +3,21 @@
 The paper book ``paper_fly`` keeps running as the mirror. Each trade minute — only after the handover and only while
 signing is allowed (LIVE_ENABLED=1 and the live prerequisites, chain/cluster_guard.py) — ``LiveMirror.minute``:
 - drains the execution worker (execution/worker.py books live positions from balance-verified fills);
-- exits: live positions held the hold are sold (exit slippage, the forced ladder once ``OVERDUE_S`` late), retried every
-  minute; ``DEAD_BAG_S`` past the hold a position that could not be sold is written off (dead-bag: closed at 0, so it
-  leaves wealth) and its tokens are swept every ``SWEEP_S``;
+- exits: live positions held the hold — counted from their entry decision's minute, as paper counts it, not from the
+  fill 10–20 s later — are sold (exit slippage, the forced ladder once ``OVERDUE_S`` late), retried every minute;
+  ``DEAD_BAG_S`` past the hold a position that could not be sold is written off (dead-bag: closed at 0, so it leaves
+  wealth) and its tokens are swept every ``SWEEP_S`` (what they fetch is booked onto it);
 - entries: every paper entry of this minute is mirrored with the same score, line and certainty bands, sized from the
   wallet (SOL balance + open live positions at cost as the bankroll, the SOL balance as cash; the gas reserve is never
-  spent — agent/sizing.py), one position per token, unless the kill switch, the circuit breaker or paused entries block;
-- wealth: wallet SOL + open positions net of exit cost → ``wealth_marks`` (book 'live'); the kill switch on its own peak,
-  and with ``KILL_SWITCH_LIQUIDATE`` every open position is sold at the forced slippage while it stays on;
+  spent — agent/sizing.py), one position per token (a buy may queue behind the sale of the same token: paper sold and
+  bought it again this minute), never more than ``MAX_ENTRY_CHASE`` above its paper fill price, unless the kill switch,
+  the circuit breaker (until ``CIRCUIT_COOLDOWN_S`` after its last failure) or paused entries block. A buy that failed
+  without moving anything is sent again, re-sized, on the next minutes while its paper position is open, up to
+  ``ENTRY_RETRY_MIN`` after its decision. Every paper entry the wallet did not take is a decisions row of this book
+  (kind 'blocked', the reason as its rail, ``of_decision`` the paper entry);
+- wealth: wallet SOL + open positions net of exit cost → ``wealth_marks`` (book 'live'), read while no swap is between
+  its fill and its booking (else the minute is not marked); the kill switch on its own peak, and with
+  ``KILL_SWITCH_LIQUIDATE`` every open position is sold at the forced slippage while it stays on;
 - gap: over the last ``GAP_TRADES`` closed live trades, the mean return per trade trailing the paper mirror's same
   decisions by more than ``GAP_MAX`` pauses entries and raises an alert. Learning is unaffected: it learns from market
   labels, not fills.
@@ -35,6 +42,7 @@ log = logging.getLogger(__name__)
 BOOK, MIRROR = "live", "paper_fly"
 DEAD_BAG_S, OVERDUE_S, SWEEP_S = 3 * 3600.0, 600.0, 3600.0
 GAP_TRADES, GAP_MAX = 50, 0.02
+MARK_WAIT_S = 2.0             # how long the wealth mark waits for a swap between its fill and its booking
 
 
 class LiveMirror:
@@ -47,10 +55,43 @@ class LiveMirror:
             worker = ExecutionWorker(broker)
         self.broker, self.worker, self.H = broker, worker, float(horizon_s)
         self.last_sweep = 0.0
+        self.sent: dict[int, dict] = {}       # decision id -> {"e": its paper entry, "ts": its minute, "tries": n}: a buy queued or in flight
+        self.failed: dict[int, dict] = {}     # the same for a buy that failed without moving anything: sent again while it may be
 
     def _decision(self, conn, ctx, run_id, beat_id, p, reason: str, forced: bool) -> int:
         return int(conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, size_sol, forced, reason, detail) VALUES (%s,%s,%s,%s,%s,'fly_exit',%s,%s,%s,%s) RETURNING id",
                                 (beat_id, run_id, ctx.m1, p["mint"], p["pool"], float(p["cost_sol"]), forced, reason, json.dumps({"book": BOOK}))).fetchone()["id"])
+
+    def _blocked(self, conn, ctx, run_id, beat_id, e: dict, rail: str, reason: str, size: float = 0.0, **detail) -> None:
+        """A paper entry the wallet did not take (or not yet): a decisions row of this book, so live and paper can be told apart."""
+        conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, m_hat, size_sol, forced, rail, reason, detail) VALUES (%s,%s,%s,%s,%s,'blocked',%s,%s,false,%s,%s,%s)",
+                     (beat_id, run_id, ctx.m1, e["mint"], e["info"].get("pool"), float(e["score"]), float(size), rail, reason,
+                      json.dumps({"book": BOOK, "of_decision": e["decision_id"], **detail}, default=str)))
+
+    def _settled(self, conn, ctx, run_id, beat_id, r) -> None:
+        """A drained buy this mirror sent: done when it filled; else recorded, and kept for another try when it moved
+        nothing (no fill, no unknown outcome)."""
+        did = r.request.decision_id
+        f = self.sent.pop(did, None) if r.request.side == "buy" and did is not None else None
+        if f is None or r.ok:
+            return
+        rail = "price ran" if (r.error or "").startswith("price ran") else "entry failed"
+        self._blocked(conn, ctx, run_id, beat_id, f["e"], rail, (r.error or "failed")[:300], r.request.size_sol, attempt=f["tries"], retry=bool(r.retryable))
+        if r.retryable:
+            self.failed[did] = {**f, "error": r.error}
+
+    def _retry_over(self, conn, ctx, did: int, f: dict) -> str | None:
+        """Why a failed entry is not tried again (None: it may be)."""
+        if (ctx.m1 - f["ts"]).total_seconds() > config.ENTRY_RETRY_MIN * 60.0:
+            return f"not filled within {config.ENTRY_RETRY_MIN:g} min of its decision"
+        if not conn.execute("SELECT 1 FROM positions WHERE book = %s AND entry_decision_id = %s AND status = 'open'", (MIRROR, did)).fetchone():
+            return "its paper position is closed"
+        return None
+
+    def _buy(self, e: dict, size: float, retry: int = 0) -> bool:
+        return self.worker.submit(ExecRequest(decision_id=e["decision_id"], mint=e["mint"], pool=e["info"]["pool"], side="buy", amount_in=int(size * config.LAMPORTS_PER_SOL),
+                                              slippage_bps=config.SLIPPAGE_ENTRY_BPS, max_slippage_bps=config.MAX_SLIPPAGE_ENTRY_BPS, decimals=int(e["info"]["decimals"] or 6),
+                                              size_sol=size, hold_s=e.get("hold_s"), strategy=e.get("strategy"), ref_price=e.get("ref_price"), retry=retry))
 
     def minute(self, ctx, *, run_id: str, beat_id: int, entries: list, line: float, table: list | None) -> dict:
         conn, m1 = ctx.conn, ctx.m1
@@ -58,11 +99,35 @@ class LiveMirror:
         for r in drained:
             if not r.ok:
                 log.warning("live %s %s failed: %s", r.request.side, r.request.mint, r.error)
+            self._settled(conn, ctx, run_id, beat_id, r)
+        # the mark first, before this minute's orders, while no swap is between its fill and its booking (last minute's are
+        # done): marked after them, it found the worker busy on most trade minutes; and a kill switch it trips now blocks
+        # this minute's entries
+        ledger.mark_positions(conn, BOOK, ctx.prices, {}, m1)
+        rebase = rails.kill_rebase_at(conn); mark = self._mark(conn, ctx)
+        wealth = None; killed = rails.load_circuit(conn).kill_switch
+        if mark is not None:
+            lamports, gross_v, exit_cost, exposure, n_open = mark
+            sol_now = lamports / config.LAMPORTS_PER_SOL; wealth = sol_now + gross_v - exit_cost
+            pk = conn.execute("SELECT max(wealth) AS pk FROM wealth_marks WHERE book = %s AND (%s::timestamptz IS NULL OR ts > %s)",
+                              (BOOK, rebase, rebase)).fetchone(); peak = max(float(pk["pk"] or 0.0), wealth)
+            conn.execute("INSERT INTO wealth_marks (beat_id, book, ts, sol_free, positions_value, exit_cost, wealth, peak, drawdown, exposure, n_open) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                         "ON CONFLICT (beat_id, book) DO NOTHING",
+                         (beat_id, BOOK, m1, sol_now, gross_v - exit_cost, exit_cost, wealth, peak, (1.0 - wealth / peak) if peak > 0 else 0.0, exposure, n_open))
+            if config.VAULT_ENABLED:                 # deposits, withdrawals and payouts are not performance
+                from ..vault import nav as vault_nav, payout as vault_payout     # trading wallet + treasury are one book: a top-up or sweep is no loss
+                vault_nav.mark(conn, m1, lamports + vault_payout.cached_balance(), int(round(gross_v * config.LAMPORTS_PER_SOL)),
+                               int(round(exit_cost * config.LAMPORTS_PER_SOL)))
+                ix = vault_nav.status(conn, since=rebase)
+                killed = rails.check_drawdown(conn, ix["value"], ix["peak"], unit="index")
+            else:
+                killed = rails.check_drawdown(conn, wealth, peak)
         inflight = self.worker.pending()
         snap = snapshot_balances(self.broker.rpc, self.broker.pubkey); sol_free = snap.lamports / config.LAMPORTS_PER_SOL
         n_exit = n_dead = 0
         for p in ledger.open_positions(conn, BOOK):
-            held = (m1 - p["opened_at"]).total_seconds(); H = float(p.get("hold_s") or self.H)          # each position's own hold
+            # each position's own hold, from its entry decision's minute (paper's clock), not from its fill
+            held = (m1 - (p.get("decision_ts") or p["opened_at"])).total_seconds(); H = float(p.get("hold_s") or self.H)
             if held < H or p["mint"] in inflight:
                 continue
             if held >= H + DEAD_BAG_S:
@@ -76,49 +141,44 @@ class LiveMirror:
             n_exit += bool(self.worker.submit(ExecRequest(decision_id=did, mint=p["mint"], pool=p["pool"], side="sell", amount_in=int(p["qty"]),
                                                           slippage_bps=config.SLIPPAGE_FORCED_BPS if overdue else config.SLIPPAGE_EXIT_BPS,
                                                           max_slippage_bps=config.SLIPPAGE_FORCED_BPS, decimals=int(p.get("decimals") or 6), position_id=int(p["id"]))))
-        opens = ledger.open_positions(conn, BOOK); held_mints = {p["mint"] for p in opens} | set(inflight)
+        # a token whose only order is its sale is not held: a buy queues behind the sale (paper sold and bought it again)
+        opens = ledger.open_positions(conn, BOOK); inflight = self.worker.pending(); selling = self.worker.selling()
+        held_mints = {p["mint"] for p in opens if p["mint"] not in selling} | (inflight - selling)
         c = rails.load_circuit(conn)
-        blocked = "kill switch" if c.kill_switch else "circuit tripped" if c.tripped else "paused" if c.entries_paused else None
+        blocked = "kill switch" if c.kill_switch else "circuit tripped" if rails.breaker_blocks(c) else "paused" if c.entries_paused else None
         reserved = treasury = 0.0
         if config.VAULT_ENABLED:                     # SOL owed to vault lockers is never traded; the treasury's idle SOL is bankroll
             from ..vault import nav as vault_nav
             reserved = vault_nav.reserved_in_trading(conn) / config.LAMPORTS_PER_SOL
             treasury = vault_nav.treasury_free(conn) / config.LAMPORTS_PER_SOL
         # sized on the whole book, spent only from the trading wallet's own float (cash)
-        bankroll = sol_free + sum(float(p["cost_sol"]) for p in opens) - reserved + treasury; cash = sol_free - reserved; n_enter = 0; skipped = []
+        bankroll = sol_free + sum(float(p["cost_sol"]) for p in opens) - reserved + treasury; cash = sol_free - reserved; n_enter = n_retry = 0; skipped = []
+        stale = ctx.lag_s > config.ENTRY_MAX_LAG_S
+        for did, f in list(self.failed.items()):     # failed entries first (older decisions), each against every rail again
+            e = f["e"]; over = self._retry_over(conn, ctx, did, f)
+            if over:
+                self.failed.pop(did); skipped.append((e["mint"], "retries exhausted"))
+                self._blocked(conn, ctx, run_id, beat_id, e, "retries exhausted", f"{over}; last error: {(f.get('error') or '')[:200]}", tries=f["tries"]); continue
+            rail = blocked or ("stale minute" if stale else None) or ("held" if e["mint"] in held_mints else None)
+            size, why = (0.0, "") if rail else sizing.size_position(e["score"], e.get("threshold", line), e.get("table") or table or [], bankroll, cash,
+                                                                    ctx.resqs.get(e["mint"]) or e["info"]["resq"], flat=config.FLY_SIZING == "flat")
+            if rail or size <= 0:
+                skipped.append((e["mint"], rail or why)); self._blocked(conn, ctx, run_id, beat_id, e, rail or "sizing", f"retry not sent: {rail or why}", size, retry=True); continue
+            if self._buy(e, size, retry=f["tries"]):
+                self.failed.pop(did); self.sent[did] = {**f, "tries": f["tries"] + 1}
+                n_enter += 1; n_retry += 1; cash -= size; held_mints.add(e["mint"])
         for e in entries:
             if e["mint"] in held_mints:
-                skipped.append((e["mint"], "held")); continue
+                skipped.append((e["mint"], "held")); self._blocked(conn, ctx, run_id, beat_id, e, "held", "the wallet holds this token or has an order of it queued"); continue
             size, why = sizing.size_position(e["score"], e.get("threshold", line), e.get("table") or table or [], bankroll, cash, e["info"]["resq"],
                                              flat=config.FLY_SIZING == "flat")
             if blocked or size <= 0:
-                skipped.append((e["mint"], blocked or why)); continue
-            if self.worker.submit(ExecRequest(decision_id=e["decision_id"], mint=e["mint"], pool=e["info"]["pool"], side="buy", amount_in=int(size * config.LAMPORTS_PER_SOL),
-                                              slippage_bps=config.SLIPPAGE_ENTRY_BPS, max_slippage_bps=config.MAX_SLIPPAGE_ENTRY_BPS, decimals=int(e["info"]["decimals"] or 6), size_sol=size)):
-                n_enter += 1; cash -= size; held_mints.add(e["mint"])
+                skipped.append((e["mint"], blocked or why)); self._blocked(conn, ctx, run_id, beat_id, e, blocked or "sizing", why, size); continue
+            if self._buy(e, size):
+                n_enter += 1; cash -= size; held_mints.add(e["mint"]); self.sent[e["decision_id"]] = {"e": e, "ts": m1, "tries": 1}
                 conn.execute("UPDATE decisions SET book_targets = array_append(COALESCE(book_targets, '{}'), 'live') WHERE id = %s", (e["decision_id"],))
-        ledger.mark_positions(conn, BOOK, ctx.prices, {}, m1)
-        gross_v = exit_cost = exposure = 0.0
-        for p in ledger.open_positions(conn, BOOK):
-            px = float(p.get("last_mark_price") or p["entry_price"] or 0.0)
-            gross = int(p["qty"]) / 10 ** int(p.get("decimals") or 6) * px
-            gross_v += gross; exposure += float(p["cost_sol"])
-            exit_cost += gross * exit_cost_fraction(gross, ctx.resqs.get(p["mint"]) or ctx.last_resq(p["mint"]), ctx.mcap(p["mint"], px), p.get("program_label"), ctx.fees.get(p["mint"]))
-        wealth = sol_free + gross_v - exit_cost
-        rebase = rails.kill_rebase_at(conn)
-        pk = conn.execute("SELECT max(wealth) AS pk FROM wealth_marks WHERE book = %s AND (%s::timestamptz IS NULL OR ts > %s)",
-                          (BOOK, rebase, rebase)).fetchone(); peak = max(float(pk["pk"] or 0.0), wealth)
-        conn.execute("INSERT INTO wealth_marks (beat_id, book, ts, sol_free, positions_value, exit_cost, wealth, peak, drawdown, exposure, n_open) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                     "ON CONFLICT (beat_id, book) DO NOTHING",
-                     (beat_id, BOOK, m1, sol_free, gross_v - exit_cost, exit_cost, wealth, peak, (1.0 - wealth / peak) if peak > 0 else 0.0, exposure, len(opens)))
-        if config.VAULT_ENABLED:                     # deposits, withdrawals and payouts are not performance
-            from ..vault import payout as vault_payout      # trading wallet + treasury are one book: a top-up or sweep is no loss
-            vault_nav.mark(conn, m1, snap.lamports + vault_payout.cached_balance(), int(round(gross_v * config.LAMPORTS_PER_SOL)),
-                           int(round(exit_cost * config.LAMPORTS_PER_SOL)))
-            ix = vault_nav.status(conn, since=rebase)
-            killed = rails.check_drawdown(conn, ix["value"], ix["peak"], unit="index")
-        else:
-            killed = rails.check_drawdown(conn, wealth, peak)
+            else:
+                skipped.append((e["mint"], "held")); self._blocked(conn, ctx, run_id, beat_id, e, "held", "an order of this token is queued or in flight", size)
         panic = False
         if config.VAULT_ENABLED:                     # Telegram /panic: sell everything whatever KILL_SWITCH_LIQUIDATE says
             from ..vault import state as vault_state
@@ -126,9 +186,32 @@ class LiveMirror:
         n_liq = self.liquidate(conn, ctx, run_id, beat_id) if killed and (config.KILL_SWITCH_LIQUIDATE or panic) else 0
         gap = self.gap(conn)
         if ctx.m1_epoch - self.last_sweep >= SWEEP_S:
-            self.last_sweep = ctx.m1_epoch; self.sweep(conn, snap, inflight, m1)
-        return {"stage": "trading live", "wallet_sol": sol_free, "wealth": wealth, "entered": n_enter, "exited": n_exit, "dead_bags": n_dead, "in_flight": len(inflight),
-                "blocked": blocked, "skipped": skipped[:10], "gap": gap, "failed_orders": sum(1 for r in drained if not r.ok), "liquidated": n_liq}
+            self.last_sweep = ctx.m1_epoch; self.sweep(conn, snap, self.worker.pending(), m1)
+        return {"stage": "trading live", "wallet_sol": sol_free, "wealth": wealth, "entered": n_enter, "retried": n_retry, "exited": n_exit, "dead_bags": n_dead,
+                "in_flight": len(inflight), "blocked": blocked, "skipped": skipped[:10], "gap": gap, "failed_orders": sum(1 for r in drained if not r.ok), "liquidated": n_liq,
+                "awaiting_retry": len(self.failed), **({} if mark is not None else {"mark": "skipped: no consistent read of the wallet and the books (a swap mid-booking, or the balance unreadable)"})}
+
+    def _mark(self, conn, ctx) -> tuple | None:
+        """(wallet lamports, open positions' gross value, their exit cost, exposure at cost, open positions), read while no
+        swap is between its fill and its booking (the worker's ``busy``): a balance read beside a booking in progress
+        counts that trade twice or not at all. None when the worker stayed busy ``MARK_WAIT_S``: no mark this minute."""
+        if not self.worker.busy.acquire(timeout=MARK_WAIT_S):
+            return None
+        try:
+            try:                                     # orders went out this minute: a failed read must not undo the minute's rows
+                lamports = int(self.broker.rpc.get_balance(self.broker.pubkey))
+            except Exception as e:
+                log.warning("live mark skipped: the wallet balance could not be read: %s", type(e).__name__)
+                return None
+            opens = ledger.open_positions(conn, BOOK); gross_v = exit_cost = exposure = 0.0
+            for p in opens:
+                px = float(p.get("last_mark_price") or p["entry_price"] or 0.0)
+                gross = int(p["qty"]) / 10 ** int(p.get("decimals") or 6) * px
+                gross_v += gross; exposure += float(p["cost_sol"])
+                exit_cost += gross * exit_cost_fraction(gross, ctx.resqs.get(p["mint"]) or ctx.last_resq(p["mint"]), ctx.mcap(p["mint"], px), p.get("program_label"), ctx.fee(p["mint"]))
+            return lamports, gross_v, exit_cost, exposure, len(opens)
+        finally:
+            self.worker.busy.release()
 
     def liquidate(self, conn, ctx, run_id: str, beat_id: int) -> int:
         """Sell every open live position at the forced slippage while the kill switch is on (``KILL_SWITCH_LIQUIDATE``):
@@ -165,15 +248,17 @@ class LiveMirror:
         return out
 
     def sweep(self, conn, snap, inflight: set, m1: datetime) -> int:
-        """Sell whatever is left of the last week's dead-bag tokens (forced slippage; proceeds reach the wallet)."""
-        n = 0
+        """Sell whatever is left of the last week's dead-bag tokens (forced slippage; the proceeds are booked onto the
+        latest dead-bag of the mint, execution/worker.py). Never a token the book holds again: its balance is that position's."""
+        n = 0; held = {p["mint"] for p in ledger.open_positions(conn, BOOK)}
         for r in conn.execute("SELECT DISTINCT mint FROM positions WHERE book = %s AND forced_exit_kind = 'dead_bag' AND closed_at > %s",
                               (BOOK, m1 - timedelta(days=7))).fetchall():
             amt = snap.token(r["mint"])
-            if amt > 0 and r["mint"] not in inflight:
+            if amt > 0 and r["mint"] not in inflight and r["mint"] not in held:
                 n += bool(self.worker.submit(ExecRequest(decision_id=None, mint=r["mint"], pool=None, side="sell", amount_in=amt, slippage_bps=config.SLIPPAGE_FORCED_BPS,
                                                          max_slippage_bps=config.SLIPPAGE_FORCED_BPS, decimals=int(snap.decimals.get(r["mint"], 6)), forced_kind="dead_bag_sweep")))
         return n
 
     def stop(self) -> None:
+        """Waits for the order in flight (bounded, execution/worker.STOP_JOIN_S); queued orders are dropped."""
         self.worker.stop()

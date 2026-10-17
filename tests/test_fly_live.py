@@ -1,5 +1,9 @@
 """The fly on the bot wallet: entries mirrored from the paper book and sized from the wallet, exits retried then written off
-as dead-bags, live wealth marked, and entries paused when live trails its paper mirror."""
+as dead-bags, live wealth marked, and entries paused when live trails its paper mirror. Live keeps paper's clock and
+decisions: holds count from the decision's minute, a failed entry is retried while paper holds it, a buy queues behind
+the sale of its token, a tripped breaker lets entries try again after its cooldown, and every paper entry the wallet did
+not take is a decisions row of the live book."""
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -10,20 +14,30 @@ from fly_trader import config
 from fly_trader.agent import fly_live, sizing
 from fly_trader.chain.balances import Snapshot
 from fly_trader.db.connection import transaction
+from fly_trader.execution.worker import ExecResult
 
 
 class _Worker:
+    """execution/worker.ExecutionWorker's queue rules, nothing executed: one request per mint, a buy behind a lone sale."""
+
     def __init__(self):
-        self.submitted, self.inflight = [], set()
+        self.submitted, self.inflight, self.results, self.busy = [], {}, [], threading.Lock()
 
     def submit(self, req):
-        self.submitted.append(req); self.inflight.add(req.mint); return True
+        sides = self.inflight.get(req.mint)
+        if sides and not (req.side == "buy" and sides == ["sell"]):
+            return False
+        self.submitted.append(req); self.inflight.setdefault(req.mint, []).append(req.side); return True
 
     def pending(self):
         return set(self.inflight)
 
+    def selling(self):
+        return {m for m, sides in self.inflight.items() if sides == ["sell"]}
+
     def drain(self):
-        return []
+        out, self.results = self.results, []
+        return out
 
     def stop(self):
         pass
@@ -40,8 +54,13 @@ class _Rpc:
         return [{"mint": m, "amount": a, "decimals": 6} for m, a in self.tokens.items()]
 
 
-def _ctx(conn, m1):
-    return SimpleNamespace(conn=conn, m1=m1, m1_epoch=m1.timestamp(), prices={}, resqs={}, fees={}, last_resq=lambda m: 1000.0, mcap=lambda m, p: None)
+def _ctx(conn, m1, lag_s=0.0):
+    return SimpleNamespace(conn=conn, m1=m1, m1_epoch=m1.timestamp(), prices={}, resqs={}, fees={}, last_resq=lambda m: 1000.0, mcap=lambda m, p: None,
+                           fee=lambda m: None, lag_s=lag_s)
+
+
+def _mirror(w):
+    return fly_live.LiveMirror(7200.0, broker=SimpleNamespace(rpc=_Rpc(5 * config.LAMPORTS_PER_SOL), pubkey="PK"), worker=w)
 
 
 @pytest.fixture()
@@ -65,7 +84,8 @@ def test_entries_are_sized_from_the_wallet_and_exits_retry_then_dead_bag(db_conn
                          (mint, m1 - timedelta(seconds=age)))
         beat = conn.execute("INSERT INTO beats (beat_no) VALUES (1) RETURNING id").fetchone()["id"]
         out = mirror.minute(_ctx(conn, m1), run_id=str(uuid.uuid4()), beat_id=beat, line=0.01, table=table,
-                            entries=[{"mint": "LIVE_A", "decision_id": d, "score": 0.03, "info": {"resq": 1000.0, "pool": "PA", "decimals": 6}}])
+                            entries=[{"mint": "LIVE_A", "decision_id": d, "score": 0.03, "info": {"resq": 1000.0, "pool": "PA", "decimals": 6},
+                                      "hold_s": 14400.0, "strategy": "capitulation"}])
         dead = conn.execute("SELECT status, forced_exit_kind, realized_sol FROM positions WHERE book = 'live' AND mint = 'LIVE_D'").fetchone()
         mark = conn.execute("SELECT wealth FROM wealth_marks WHERE book = 'live' AND beat_id = %s", (beat,)).fetchone()
         targets = conn.execute("SELECT book_targets FROM decisions WHERE id = %s", (d,)).fetchone()["book_targets"]
@@ -75,6 +95,7 @@ def test_entries_are_sized_from_the_wallet_and_exits_retry_then_dead_bag(db_conn
     bankroll = 5.0 + 0.2 + 0.2                                                     # wallet SOL + open live positions at cost (the dead-bag is gone)
     expect, _ = sizing.size_position(0.03, 0.01, table, bankroll, 5.0, 1000.0)
     assert len(buys) == 1 and buys[0].mint == "LIVE_A" and buys[0].amount_in == int(expect * config.LAMPORTS_PER_SOL) and buys[0].decision_id == d
+    assert (buys[0].strategy, buys[0].hold_s) == ("capitulation", 14400.0)           # booked on the live position (execution/worker.py)
     assert "live" in targets and out["entered"] == 1 and out["dead_bags"] == 1 and mark is not None
 
 
@@ -95,7 +116,9 @@ def test_blocked_entries_and_the_gap_pause(db_conn, clean):
         out2 = mirror.minute(_ctx(conn, m1 + timedelta(minutes=1)), run_id=str(uuid.uuid4()), beat_id=beat + 1000000, line=0.01,
                              table=[{"lo": 0.0, "kelly": 0.4, "n": 1, "mean": 0.1, "win": 1}],
                              entries=[{"mint": "LIVE_B", "decision_id": d, "score": 0.05, "info": {"resq": 1000.0, "pool": "PB", "decimals": 6}}])
+        skip = conn.execute("SELECT rail, detail FROM decisions WHERE kind = 'blocked' AND mint = 'LIVE_B'").fetchall()
     assert out2["entered"] == 0 and out2["blocked"] == "paused" and not [r for r in w.submitted if r.side == "buy"]
+    assert [(r["rail"], r["detail"]["book"], r["detail"]["of_decision"]) for r in skip] == [("paused", "live", d)]     # the divergence is on record
 
 
 def test_a_tripped_kill_switch_liquidates_when_asked_and_only_then(db_conn, clean, monkeypatch):
@@ -191,3 +214,95 @@ def test_the_live_fly_reads_the_stack_that_taught_it(monkeypatch):
     assert pick("deployed selector #129: capitulation, refit through 2026-09-03 (blind to the calibration week from 2026-09-18)") is blind
     assert pick("deployed selector #100: capitulation (line 0.1157, 240 min)") is deployed
     assert pick("a stack refit on the fly's training days", None) is None
+
+
+def _entry(mint, did, pool="P", ref_price=None):
+    return {"mint": mint, "decision_id": did, "score": 0.03, "info": {"resq": 1000.0, "pool": pool, "decimals": 6}, "ref_price": ref_price}
+
+
+TABLE = [{"lo": 0.0, "n": 100, "mean": 0.02, "win": 0.5, "kelly": 0.4}]
+
+
+def test_paper_sells_and_buys_back_in_one_minute_and_so_does_live(db_conn, clean):
+    """The live position filled 15 s after its decision: its hold runs from the decision's minute, so it is sold in the
+    minute paper sells its twin; paper buys the token back in that minute, and the live buy queues behind the sale."""
+    w = _Worker(); mirror = _mirror(w); m1 = datetime(2026, 9, 23, 12, 0, tzinfo=timezone.utc)
+    with transaction() as conn:
+        d0 = conn.execute("INSERT INTO decisions (kind, mint, ts) VALUES ('fly_enter', 'LIVE_Q', %s) RETURNING id", (m1 - timedelta(seconds=7200),)).fetchone()["id"]
+        conn.execute("INSERT INTO positions (book, mint, pool, opened_at, entry_decision_id, qty, cost_sol, entry_price, status) "
+                     "VALUES ('live', 'LIVE_Q', 'PQ', %s, %s, 1000000, 0.2, 0.0000002, 'open')", (m1 - timedelta(seconds=7185), d0))
+        d1 = conn.execute("INSERT INTO decisions (kind, mint, ts) VALUES ('fly_enter', 'LIVE_Q', %s) RETURNING id", (m1,)).fetchone()["id"]
+        beat = conn.execute("INSERT INTO beats (beat_no) VALUES (1) RETURNING id").fetchone()["id"]
+        out = mirror.minute(_ctx(conn, m1), run_id=str(uuid.uuid4()), beat_id=beat, line=0.01, table=TABLE, entries=[_entry("LIVE_Q", d1, "PQ", 2.1e-7)])
+    assert [(r.side, r.mint) for r in w.submitted] == [("sell", "LIVE_Q"), ("buy", "LIVE_Q")] and out["entered"] == 1 and out["exited"] == 1
+    assert w.submitted[1].decision_id == d1 and w.submitted[1].ref_price == 2.1e-7                      # the paper fill it may not chase past
+
+
+def test_a_failed_entry_is_retried_while_paper_holds_it_then_given_up(db_conn, clean, monkeypatch):
+    monkeypatch.setattr(config, "ENTRY_RETRY_MIN", 2.0)
+    w = _Worker(); mirror = _mirror(w); m1 = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc); run = str(uuid.uuid4())
+    with transaction() as conn:
+        d = conn.execute("INSERT INTO decisions (kind, mint, ts) VALUES ('fly_enter', 'LIVE_R', %s) RETURNING id", (m1,)).fetchone()["id"]
+        conn.execute("INSERT INTO positions (book, mint, pool, opened_at, entry_decision_id, qty, cost_sol, entry_price, status) "
+                     "VALUES ('paper_fly', 'LIVE_R', 'PR', %s, %s, 1000000, 0.2, 0.0000002, 'open')", (m1, d))
+        beat = conn.execute("INSERT INTO beats (beat_no) VALUES (1) RETURNING id").fetchone()["id"]
+        mirror.minute(_ctx(conn, m1), run_id=run, beat_id=beat, line=0.01, table=TABLE, entries=[_entry("LIVE_R", d, "PR", 2.1e-7)])
+        first = w.submitted[-1]
+        w.inflight.clear(); w.results.append(ExecResult(first, False, error="price ran: quoted 2.3e-07 SOL per token", retryable=True))
+        out = mirror.minute(_ctx(conn, m1 + timedelta(minutes=1)), run_id=run, beat_id=beat + 1000001, line=0.01, table=TABLE, entries=[])
+        again = w.submitted[-1]
+        assert again is not first and (again.side, again.decision_id, again.ref_price) == ("buy", d, 2.1e-7) and out["retried"] == 1
+        w.inflight.clear(); w.results.append(ExecResult(again, False, error="Insufficient funds", retryable=True))
+        conn.execute("UPDATE circuit_state SET kill_switch = true WHERE id = 1")             # every rail still applies to a retry
+        out = mirror.minute(_ctx(conn, m1 + timedelta(minutes=2)), run_id=run, beat_id=beat + 1000002, line=0.01, table=TABLE, entries=[])
+        assert out["retried"] == 0 and w.submitted[-1] is again
+        conn.execute("UPDATE circuit_state SET kill_switch = false WHERE id = 1")
+        out = mirror.minute(_ctx(conn, m1 + timedelta(minutes=3)), run_id=run, beat_id=beat + 1000003, line=0.01, table=TABLE, entries=[])
+        rails = [r["rail"] for r in conn.execute("SELECT rail FROM decisions WHERE kind = 'blocked' AND mint = 'LIVE_R' ORDER BY id").fetchall()]
+    assert out["retried"] == 0 and w.submitted[-1] is again and len(mirror.failed) == 0
+    assert rails == ["price ran", "entry failed", "kill switch", "retries exhausted"]
+
+
+def test_a_failed_entry_whose_paper_position_closed_is_not_retried(db_conn, clean):
+    w = _Worker(); mirror = _mirror(w); m1 = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+    with transaction() as conn:
+        d = conn.execute("INSERT INTO decisions (kind, mint, ts) VALUES ('fly_enter', 'LIVE_S', %s) RETURNING id", (m1,)).fetchone()["id"]
+        beat = conn.execute("INSERT INTO beats (beat_no) VALUES (1) RETURNING id").fetchone()["id"]
+        mirror.minute(_ctx(conn, m1), run_id=str(uuid.uuid4()), beat_id=beat, line=0.01, table=TABLE, entries=[_entry("LIVE_S", d)])
+        w.inflight.clear(); w.results.append(ExecResult(w.submitted[-1], False, error="order_error", retryable=True))
+        out = mirror.minute(_ctx(conn, m1 + timedelta(minutes=1)), run_id=str(uuid.uuid4()), beat_id=beat + 1000001, line=0.01, table=TABLE, entries=[])
+        why = conn.execute("SELECT reason FROM decisions WHERE kind = 'blocked' AND mint = 'LIVE_S' AND rail = 'retries exhausted'").fetchone()["reason"]
+    assert out["retried"] == 0 and len(w.submitted) == 1 and why.startswith("its paper position is closed")
+
+
+def test_a_tripped_breaker_lets_entries_try_again_after_its_cooldown(db_conn, clean, monkeypatch):
+    monkeypatch.setattr(config, "CIRCUIT_COOLDOWN_S", 900.0)
+    w = _Worker(); mirror = _mirror(w); m1 = datetime(2026, 9, 26, 12, 0, tzinfo=timezone.utc)
+    with transaction() as conn:
+        d = conn.execute("INSERT INTO decisions (kind, mint, ts) VALUES ('fly_enter', 'LIVE_T', %s) RETURNING id", (m1,)).fetchone()["id"]
+        beat = conn.execute("INSERT INTO beats (beat_no) VALUES (1) RETURNING id").fetchone()["id"]
+        conn.execute("UPDATE circuit_state SET tripped = true, fail_count = 3, last_failure_ts = now() - interval '1 minute' WHERE id = 1")
+        out = mirror.minute(_ctx(conn, m1), run_id=str(uuid.uuid4()), beat_id=beat, line=0.01, table=TABLE, entries=[_entry("LIVE_T", d)])
+        assert out["blocked"] == "circuit tripped" and out["entered"] == 0
+        conn.execute("UPDATE circuit_state SET last_failure_ts = now() - interval '20 minutes' WHERE id = 1")
+        d2 = conn.execute("INSERT INTO decisions (kind, mint, ts) VALUES ('fly_enter', 'LIVE_T2', %s) RETURNING id", (m1,)).fetchone()["id"]
+        out = mirror.minute(_ctx(conn, m1 + timedelta(minutes=1)), run_id=str(uuid.uuid4()), beat_id=beat + 1000001, line=0.01, table=TABLE, entries=[_entry("LIVE_T2", d2)])
+        conn.execute("UPDATE circuit_state SET last_failure_ts = NULL WHERE id = 1")
+    assert out["blocked"] is None and out["entered"] == 1 and w.submitted[-1].mint == "LIVE_T2"
+
+
+def test_no_wealth_mark_while_a_swap_is_between_its_fill_and_its_booking(db_conn, clean, monkeypatch):
+    """The wallet read beside a booking in progress counts that trade twice or not at all: the minute goes unmarked."""
+    monkeypatch.setattr(fly_live, "MARK_WAIT_S", 0.01)
+    w = _Worker(); mirror = _mirror(w); m1 = datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc)
+    with transaction() as conn:
+        beat = conn.execute("INSERT INTO beats (beat_no) VALUES (1) RETURNING id").fetchone()["id"]
+        w.busy.acquire()
+        try:
+            out = mirror.minute(_ctx(conn, m1), run_id=str(uuid.uuid4()), beat_id=beat, line=0.01, table=TABLE, entries=[])
+        finally:
+            w.busy.release()
+        none = conn.execute("SELECT count(*) AS n FROM wealth_marks WHERE book = 'live' AND beat_id = %s", (beat,)).fetchone()["n"]
+        out2 = mirror.minute(_ctx(conn, m1 + timedelta(minutes=1)), run_id=str(uuid.uuid4()), beat_id=beat + 1000001, line=0.01, table=TABLE, entries=[])
+    assert out["wealth"] is None and out["mark"].startswith("skipped") and none == 0
+    assert out2["wealth"] == pytest.approx(5.0) and "mark" not in out2

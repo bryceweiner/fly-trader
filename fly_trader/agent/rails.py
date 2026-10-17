@@ -4,12 +4,18 @@ toggle). State lives in circuit_state / circuit_events / notional_ledger; the tr
 One circuit per trading type: ``circuit_id`` 1 is the memecoin live book (the default everywhere), 2 the Kalshi live
 books (``KALSHI_CIRCUIT``, fly_trader/kalshi), 3 the Robinhood Chain memecoin live book (``RH_CIRCUIT``,
 fly_trader/rh); ``check_drawdown`` takes the drawdown limit of the caller's type.
+
+The memecoin breakers (``HALF_OPEN``) re-arm themselves: a tripped one blocks live entries for ``CIRCUIT_COOLDOWN_S``
+after its last failure (``breaker_blocks``), then entries may try again; a success clears the trip, a failure trips it
+for another cooldown. Their paper books never stop, so a breaker waiting for a hand reset kept live and paper apart for
+as long as nobody looked. Kalshi's stays tripped until reset.
 """
 from __future__ import annotations
 
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from .. import config
 from ..db.apilog import record_event
@@ -17,6 +23,7 @@ from ..db.connection import transaction
 
 log = logging.getLogger(__name__)
 SOLANA_CIRCUIT, KALSHI_CIRCUIT, RH_CIRCUIT = 1, 2, 3
+HALF_OPEN = (SOLANA_CIRCUIT, RH_CIRCUIT)
 
 
 @dataclass
@@ -27,13 +34,24 @@ class CircuitState:
     kill_reason: str | None = None
     peak_wealth: float | None = None
     entries_paused: bool = False
+    last_failure_ts: datetime | None = None
 
 
 def load_circuit(conn, circuit_id: int = SOLANA_CIRCUIT) -> CircuitState:
     r = conn.execute("SELECT * FROM circuit_state WHERE id = %s", (circuit_id,)).fetchone()
     if not r:
         return CircuitState()
-    return CircuitState(r["fail_count"], r["tripped"], r["kill_switch"], r["kill_reason"], r["peak_wealth"], r["entries_paused"])
+    return CircuitState(r["fail_count"], r["tripped"], r["kill_switch"], r["kill_reason"], r["peak_wealth"], r["entries_paused"], r.get("last_failure_ts"))
+
+
+def breaker_blocks(c: CircuitState, now: datetime | None = None) -> bool:
+    """Whether a tripped breaker still blocks live entries: until ``CIRCUIT_COOLDOWN_S`` after its last failure (without
+    a recorded failure, until it is reset)."""
+    if not c.tripped:
+        return False
+    if c.last_failure_ts is None:
+        return True
+    return ((now or datetime.now(timezone.utc)) - c.last_failure_ts).total_seconds() < config.CIRCUIT_COOLDOWN_S
 
 
 def _event(conn, kind: str, detail: dict | None = None, circuit_id: int = SOLANA_CIRCUIT) -> None:
@@ -42,18 +60,28 @@ def _event(conn, kind: str, detail: dict | None = None, circuit_id: int = SOLANA
 
 def record_failure(conn, reason: str, circuit_id: int = SOLANA_CIRCUIT) -> CircuitState:
     r = conn.execute(
-        "UPDATE circuit_state SET fail_count = fail_count + 1, last_failure_ts = now(), updated_at = now() WHERE id = %s RETURNING fail_count, tripped", (circuit_id,)
+        "UPDATE circuit_state c SET fail_count = c.fail_count + 1, last_failure_ts = now(), updated_at = now() FROM (SELECT last_failure_ts FROM circuit_state WHERE id = %s) o "
+        "WHERE c.id = %s RETURNING c.fail_count, c.tripped, o.last_failure_ts AS prev, now() AS at", (circuit_id, circuit_id)
     ).fetchone()
     tripped = r["tripped"]
     if r["fail_count"] >= config.CIRCUIT_THRESHOLD and not tripped:
         conn.execute("UPDATE circuit_state SET tripped = true, updated_at = now() WHERE id = %s", (circuit_id,))
         _event(conn, "tripped", {"reason": reason, "fail_count": r["fail_count"]}, circuit_id)
         record_event("error", "rails", "circuit breaker tripped", {"reason": reason, "circuit": circuit_id})
+    elif tripped and circuit_id in HALF_OPEN and (r["prev"] is None or (r["at"] - r["prev"]).total_seconds() >= config.CIRCUIT_COOLDOWN_S):
+        _event(conn, "retripped", {"reason": reason, "fail_count": r["fail_count"]}, circuit_id)       # a retry after the cooldown failed too
+        record_event("error", "rails", f"circuit breaker re-tripped: entries blocked for another {config.CIRCUIT_COOLDOWN_S / 60:.0f} min",
+                     {"reason": reason, "circuit": circuit_id})
     return load_circuit(conn, circuit_id)
 
 
 def record_success(conn, circuit_id: int = SOLANA_CIRCUIT) -> None:
-    conn.execute("UPDATE circuit_state SET fail_count = 0, updated_at = now() WHERE id = %s", (circuit_id,))
+    """A success resets the failure count; on a memecoin circuit (``HALF_OPEN``) it also clears a trip."""
+    r = conn.execute("UPDATE circuit_state c SET fail_count = 0, tripped = c.tripped AND NOT %s, updated_at = now() FROM (SELECT tripped FROM circuit_state WHERE id = %s) o "
+                     "WHERE c.id = %s RETURNING o.tripped AS was, c.tripped", (circuit_id in HALF_OPEN, circuit_id, circuit_id)).fetchone()
+    if r and r["was"] and not r["tripped"]:
+        _event(conn, "rearmed", {}, circuit_id)
+        record_event("info", "rails", "circuit breaker re-armed: an order succeeded", {"circuit": circuit_id})
 
 
 def check_drawdown(conn, wealth: float, peak: float, circuit_id: int = SOLANA_CIRCUIT, drawdown: float | None = None, unit: str = "SOL") -> bool:

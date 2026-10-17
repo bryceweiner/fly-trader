@@ -3,7 +3,7 @@ the number of books, the training eligibility rules, and each book trading in it
 import json
 import math
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
@@ -81,7 +81,7 @@ class _Book:
 
     def on_minute(self, ctx):
         ctx.conn.execute("INSERT INTO events (level, source, message) VALUES ('info', 'engine_test', %s)", (self.name,))
-        self.seen = (ctx.X.shape, list(ctx.mints))
+        self.seen = (ctx.X.shape, list(ctx.mints)); self.lag = ctx.lag_s
         if self.fail:
             raise RuntimeError("boom")
         return {"ok": True}
@@ -107,9 +107,41 @@ def test_books_share_one_feature_pass_and_trade_in_their_own_savepoints(db_conn,
     monkeypatch.setattr(e, "stream_fresh", lambda m0_epoch: True)
     out = e.run_minute(m0.timestamp() + 60)
     assert calls == ["Wpump"]                                                      # one feature pass per mint, two books
+    assert good.lag > 86400                                                         # how long after its end the minute was traded (a replayed past one)
     assert good.seen == ((1, len(X_COLS)), ["Wpump"]) and good.bars["Wpump"][0] == m0.timestamp()
     assert "good" in out and "bad" not in out
     with transaction() as conn:
         left = [r["message"] for r in conn.execute("SELECT message FROM events WHERE source = 'engine_test'").fetchall()]
         conn.execute("DELETE FROM events WHERE source = 'engine_test'"); conn.execute("DELETE FROM pump_minutes WHERE mint = 'Wpump'")
     assert left == ["good"]                                                        # the failing book's writes were rolled back alone
+
+
+def test_a_quiet_minute_is_charged_the_mints_last_known_fee(db_conn):
+    """A held coin that did not trade this minute reports no fee: its sale and its mark pay the last one known (the
+    engine's own minutes, else the stream's newest row with one; RH: else the pool's measured hook fee), not the cost
+    model's generic fallback (on RH ~1 % against hook fees of 2.8-5 %)."""
+    from fly_trader import markets
+    m0 = datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc); s = _engine(); rh = me.MinuteEngine(market=markets.RH)
+    tok, pool = "0x" + "f1" * 20, "0x" + "f2" * 32
+
+    def ctx(engine, fees):
+        return me.Minute(conn=db_conn, m0=m0, m1=m0, m1_epoch=m0.timestamp(), agg={}, X=np.zeros((0, len(X_COLS)), np.float32), infos=[], mints=[], bars={},
+                         prices={}, resqs={}, fees=fees, fresh=True, trade=True, engine=engine)
+    with db_conn.cursor() as cur:
+        cur.execute("DELETE FROM pump_minutes WHERE mint IN ('Fpump', 'Npump')"); cur.execute("DELETE FROM rh_pools WHERE pool_id = %s", (pool,))
+        cur.execute("INSERT INTO pump_minutes (mint, ts, pool_id, close, resq_sol, fee_rate) VALUES ('Fpump', %s, 'P', 1.0, 50.0, 0.0115), ('Fpump', %s, 'P', 1.0, 50.0, NULL)",
+                    (m0, m0 + timedelta(minutes=1)))
+        cur.execute("INSERT INTO rh_pools (pool_id, token, currency0, currency1, is_pons, hook_fee) VALUES (%s, %s, %s, %s, true, 0.029)", (pool, tok, "0x" + "00" * 20, tok))
+    db_conn.commit()
+    try:
+        c = ctx(s, {"Gpump": 0.01, "Fpump": None})
+        assert c.fee("Gpump") == 0.01 and c.fee("Fpump") == 0.0115 and c.fee("Npump") is None
+        a = {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "buy": 1.0, "sell": 0.0, "nb": 1, "ns": 0, "n_traders": 1, "resq": 50.0, "pool": "P",
+             "program_label": "Pump.fun Amm", "fee_rate": 0.0095}
+        s._features(db_conn, "Fpump", a, m0.timestamp() + 180)
+        assert c.fee("Fpump") == 0.0095                                                # the engine's own newer minute
+        assert ctx(rh, {}).fee(tok) == 0.029 and c.cost_label("Fpump", "Pump.fun Amm") == "Pump.fun Amm"
+    finally:
+        with db_conn.cursor() as cur:
+            cur.execute("DELETE FROM pump_minutes WHERE mint IN ('Fpump', 'Npump')"); cur.execute("DELETE FROM rh_pools WHERE pool_id = %s", (pool,))
+        db_conn.commit()

@@ -27,13 +27,14 @@ from datetime import datetime, timedelta, timezone
 
 from ..db.apilog import record_event
 from ..execution import ledger
-from ..market.exit_cost import PONS_LABEL, exit_cost_fraction
+from ..market.exit_cost import PONS_LABEL, PONS_MULTIHOP_LABEL, exit_cost_fraction
 from ..markets import RH, RH_CIRCUIT
 from . import abi
 
 log = logging.getLogger(__name__)
 BOOK = RH.live_book
 NATIVE = "eth"                                                   # rh_legs / rh_base_lots asset name of native ETH
+NATIVE_ZERO = "0x" + "00" * 20                                   # positions.quote_asset of an ETH-quoted coin
 WEI = 10 ** 18
 TRANSFER = abi.event_topic("Transfer(address,address,uint256)").lower()
 DUST_ETH = 1e-6                                                  # reconciliation tolerance on native ETH
@@ -116,6 +117,18 @@ def book_sell(conn, *, intent_id: int, position: dict, eth_in_wei: int, tokens_s
                                  decision_id=decision_id, forced_kind=forced_kind, ts=ts)
 
 
+def book_sweep(conn, *, intent_id: int, position_id: int, eth_in_wei: int, lot_value_eth: float = 0.0) -> float:
+    """Book a dead-bag sweep onto the position it was written off from: ETH in (+ the mark value of an exit lot) − the
+    intent's gas adds to that position's realized P&L, and the sale's leg and intent are tied to it. Returns the amount."""
+    gas = intent_gas_wei(conn, intent_id)
+    proceeds = eth_in_wei / WEI + lot_value_eth - gas / WEI
+    ledger.credit(conn, position_id, proceeds)
+    conn.execute("UPDATE positions SET gas_q = gas_q + %s WHERE id = %s", (gas / WEI, position_id))
+    conn.execute("UPDATE rh_intents SET position_id = %s WHERE id = %s", (position_id, intent_id))
+    conn.execute("UPDATE rh_legs SET position_id = %s WHERE intent_id = %s", (position_id, intent_id))
+    return proceeds
+
+
 def charge_gas(conn, intent_id: int, position_id: int | None) -> float:
     """A failed intent's gas: onto its open position's cost when it has one (an exit that reverted), else the book's
     overhead as an aborted zero-quantity position (a failed entry). Returns the ETH charged."""
@@ -177,14 +190,18 @@ def base_mark(conn, asset: str, stale_after_s: float = 600.0) -> tuple[float | N
     return float(r["price_eth"]), bool(r["stale"]) or age > stale_after_s
 
 
-def wealth(conn, native_wei: int, reserved_wei: int, prices: dict, resqs: dict, fees: dict) -> dict:
-    """The live RH book's wealth in ETH (native − reserved + positions net of exit cost + lots at their base mark)."""
+def wealth(conn, native_wei: int, reserved_wei: int, prices: dict, resqs, fees) -> dict:
+    """The live RH book's wealth in ETH (native − reserved + positions net of exit cost + lots at their base mark).
+    ``resqs`` / ``fees``: per mint, a dict or a lookup (agent/minute_engine.Minute: the last known reserve and pool fee of a
+    coin that did not trade this minute); a coin quoted in another asset than ETH is valued at its route through the base."""
+    rq = resqs.get if isinstance(resqs, dict) else resqs; fee = fees.get if isinstance(fees, dict) else fees
     gross_v = exit_cost = exposure = 0.0; n = 0
     for p in ledger.open_positions(conn, BOOK):
         px = prices.get(p["mint"]) or float(p.get("last_mark_price") or p["entry_price"] or 0.0)
         g = int(p["qty"]) / 10 ** int(p.get("decimals") or 18) * px
         gross_v += g; exposure += float(p["cost_sol"]); n += 1
-        exit_cost += g * exit_cost_fraction(g, resqs.get(p["mint"]), None, PONS_LABEL, fees.get(p["mint"]))
+        label = PONS_LABEL if (p.get("quote_asset") or NATIVE_ZERO) in (NATIVE_ZERO, NATIVE) else PONS_MULTIHOP_LABEL
+        exit_cost += g * exit_cost_fraction(g, rq(p["mint"]), None, label, fee(p["mint"]))
     lots_v = 0.0
     for lot in open_lots(conn):
         dec = _decimals(conn, lot["asset"])

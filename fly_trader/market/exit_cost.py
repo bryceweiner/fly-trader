@@ -4,8 +4,10 @@
   in SOL (``PUMP_FEE_TIERS``): measured from 157,059 archive trades (June–September 2026, ``poolFeeRate`` against
   ``marketCapQuote``); the table reproduces the charged rate exactly on 99.7 % of them and is never more than one tier
   off. Market cap = price × the token's supply (1 billion for pump.fun tokens, 2 billion in mayhem mode). The live
-  stream reports the charged rate itself, which is used when given (``pool_fee``). A token with unknown market cap is
-  charged the highest tier.
+  stream reports the charged rate itself, which is used when given (``pool_fee``) and at least ``PUMP_FEE_FLOOR``: the
+  stream's 0.0005 (0.4 % of its minutes, 2026-10-17: single minutes of pools charging their tier in every minute
+  around them, any trader, side or size; no tier of the schedule) is no rate a swap of ours is charged, so the tier is.
+  A token with unknown market cap is charged the highest tier.
 - Jupiter Ultra platform fee: 10 bps on every PumpSwap route (``feeBps`` of ``/order`` quotes with our key, from a
   58 SOL to a 169,000 SOL market cap; no age dependence).
 - Network: the 5,000-lamport signature fee per transaction (Ultra quoted no priority or rent fees).
@@ -41,10 +43,20 @@ def pool_fee_rate(mcap_sol):
 
 
 PONS_LABEL = "Pons v4"          # a graduated Pons launch on Robinhood Chain (fly_trader/markets.RH): amounts in ETH
+# the paper books' label for a Pons coin quoted in another asset than ETH (USDG, a stock token): bought ETH→base→coin and
+# sold back the same way, so one more pool's fee (RH_HOP_FEE) and a multi-hop route's gas (RH_TX_FEE_MULTIHOP_ETH) per side.
+# Features and labels never use it: their cost model stays the one Pons swap.
+PONS_MULTIHOP_LABEL = "Pons v4 via base"
 
 
 def is_pons(program_label: str | None) -> bool:
-    return program_label == PONS_LABEL
+    return program_label in (PONS_LABEL, PONS_MULTIHOP_LABEL)
+
+
+def cost_label(program_label: str | None, quote_class: str | None) -> str | None:
+    """The label a swap of a coin quoted in ``quote_class`` (rh_meta.quote_class; None: unknown or Solana) is priced
+    under: a Pons coin quoted in another asset than ETH swaps through its base."""
+    return PONS_MULTIHOP_LABEL if is_pons(program_label) and quote_class not in (None, "eth") else program_label
 
 
 def impact_fraction(value_sol: float, res_quote_sol: float | None, program_label: str | None = None) -> float:
@@ -60,13 +72,16 @@ def impact_fraction(value_sol: float, res_quote_sol: float | None, program_label
 def fee_fraction(value_sol: float, mcap_sol: float | None, pool_fee: float | None = None, program_label: str | None = None) -> float:
     """Fees of one swap of ``value_sol`` as a fraction of it: pool fee + Jupiter's platform fee + the network fee.
     A Pons pool (Robinhood Chain, amounts in ETH): the hook's fee + tax (``pool_fee``, measured per minute; else
-    ``RH_HOOK_FEE``) + the gas of one swap (``RH_TX_FEE_ETH``); KyberSwap charges nothing (rh/kyber.check_build)."""
+    ``RH_HOOK_FEE``) + the gas of one swap (``RH_TX_FEE_ETH``); KyberSwap charges nothing (rh/kyber.check_build). Under
+    ``PONS_MULTIHOP_LABEL`` also the base pool's fee (``RH_HOP_FEE``), and a multi-hop route's gas instead."""
     if value_sol <= 0:
         return 0.0
     if is_pons(program_label):
         hf = pool_fee if pool_fee is not None and math.isfinite(pool_fee) and pool_fee > 0 else config.RH_HOOK_FEE
+        if program_label == PONS_MULTIHOP_LABEL:
+            return hf + config.RH_HOP_FEE + config.RH_TX_FEE_MULTIHOP_ETH / value_sol
         return hf + config.RH_TX_FEE_ETH / value_sol
-    pf = pool_fee if pool_fee is not None and math.isfinite(pool_fee) and pool_fee > 0 else pool_fee_rate(mcap_sol)
+    pf = pool_fee if pool_fee is not None and math.isfinite(pool_fee) and pool_fee >= PUMP_FEE_FLOOR else pool_fee_rate(mcap_sol)
     return pf + JUPITER_FEE_BPS / 1e4 + TX_FEE_LAMPORTS / config.LAMPORTS_PER_SOL / value_sol
 
 
