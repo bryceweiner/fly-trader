@@ -3,7 +3,18 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
-## Unreleased
+## 2026-10-18, release 8: The live stats follow each live order, and empty token accounts close on their own
+
+Published to Hugging Face as signed release 8. Fly #157 and selector #154 are unchanged, and so are the definitions they
+were judged on: no model, seed or infrastructure file changes.
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 8`.
+- **Rent returned by an earlier `close-empty-atas` run** is in live wealth but not in realized P&L. Closes from this
+  release on are booked.
 
 ### Live money
 
