@@ -50,10 +50,13 @@ from . import ledger
 log = logging.getLogger(__name__)
 
 _INFLIGHT = threading.Lock()  # one in-flight order at a time (plan §9)
+_UNSETTLED: dict[str, dict] = {}   # token-account closes sent whose wait ended before they landed or expired (``settle_closes``)
+_UNSETTLED_LOCK = threading.Lock()
 
 CONFIRM_POLL_S = 1.0
 BLOCKHASH_VALIDITY_BLOCKS = 150  # fallback horizon when /order carries no lastValidBlockHeight
 CLOSE_ATA_BATCH = 10
+BASE_FEE_LAMPORTS = 5_000       # one signature, no priority fee: what the signer's close transaction pays
 SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
 COMPUTE_BUDGET_PROGRAM_ID = "ComputeBudget111111111111111111111111111111"
 ASSOCIATED_TOKEN_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
@@ -87,11 +90,12 @@ def _int_or_none(v) -> int | None:
         return None
 
 
-def await_confirmation(rpc, signature: str | None, last_valid_block_height: int | None) -> tuple[str, dict | None]:
+def await_confirmation(rpc, signature: str | None, last_valid_block_height: int | None, until=None) -> tuple[str, dict | None]:
     """Poll until the signature is confirmed/finalized, fails on chain, or the chain's block height
     passes ``last_valid_block_height`` with no status for the signature (it can then never land; a
     signature already seen as processed keeps being polled until it confirms or its status disappears).
-    Sleeps 1 s between polls; there is deliberately no other timeout."""
+    Sleeps 1 s between polls; there is deliberately no other timeout, except ``until``: checked ten times a poll, its
+    True ends the wait with 'pending' (the transaction may still land until its blockhash expires)."""
     if not signature:
         return "unsent", None
     if last_valid_block_height is None:
@@ -105,7 +109,13 @@ def await_confirmation(rpc, signature: str | None, last_valid_block_height: int 
                 return "confirmed", st
         if not st and rpc.get_block_height() > last_valid_block_height:
             return "expired", st
-        time.sleep(CONFIRM_POLL_S)
+        if until is None:
+            time.sleep(CONFIRM_POLL_S)
+            continue
+        for _ in range(10):
+            if until():
+                return "pending", st
+            time.sleep(CONFIRM_POLL_S / 10)
 
 
 class LiveBroker:
@@ -185,40 +195,6 @@ class LiveBroker:
                 slip += int(step_bps)
                 log.warning("retrying %s %s after %s (code %s) with slippage %d bps",
                             side, mint, result.status, result.code, slip)
-
-    def close_token_account(self, mint: str) -> int | None:
-        """Close the bot's empty token account(s) of ``mint`` through the signer (it re-checks each is ours and empty): the
-        rent goes back to the wallet. Returns the lamports the wallet gained, net of the close's fee, measured from the
-        transaction (else the balance around it); None when nothing was sent (the wallet holds the token, or has no such
-        account) or the close never landed. Recorded as wallet_events(kind='ata_closed')."""
-        assert_signing_allowed()
-        owner = self.pubkey
-        accts = [a for a in self.rpc.get_token_accounts_by_owner(owner) if a["mint"] == mint and not a.get("is_native")]
-        if not accts or any(int(a["amount"]) > 0 for a in accts):
-            return None
-        with _INFLIGHT:                                 # no swap snapshots the wallet while the rent comes back
-            pre = int(self.rpc.get_balance(owner))
-            built = self.signer.call("close_atas", accounts=[a["address"] for a in accts])
-            if not built:
-                return None
-            sig = self.rpc.send_transaction(built[0]["tx"])
-            status, st = await_confirmation(self.rpc, sig, built[0]["last_valid_block_height"])
-            got = None
-            if status in ("confirmed", "failed_on_chain"):       # landed: the rent (or only the fee) moved
-                try:
-                    exact = tx_deltas(self.rpc.get_transaction(sig), str(owner), mint)
-                except Exception:
-                    exact = None
-                got = int(exact[0]) if exact is not None else int(self.rpc.get_balance(owner)) - pre
-        try:
-            with transaction() as conn:
-                conn.execute("INSERT INTO wallet_events (kind, pubkey, detail) VALUES ('ata_closed', %s, %s)",
-                             (owner, Jsonb({"accounts": [a["address"] for a in accts], "mint": mint, "signature": sig, "status": status, "lamports": got,
-                                            "slot": int((st or {}).get("slot") or 0), "after": "sale"})))
-        except Exception as e:
-            log.warning("wallet_events insert failed: %s", type(e).__name__)
-        log.info("closed the token account of %s after its sale: %s, %s lamports back", mint, status, got)
-        return got
 
     # ---- one attempt ----
     def _attempt(self, conn, *, decision_id, book, side, mint, input_mint, output_mint, amount_in,
@@ -329,9 +305,10 @@ class LiveBroker:
         delta = compute_delta(pre, post)
         lam = int(delta["lamports_delta"])
         tok = int(delta["token_deltas"].get(mint, 0))
-        if config.VAULT_ENABLED and chain_status == "confirmed":
-            # the vault fly's wallet also receives deposits and pays claims: take the swap's own deltas from the
-            # transaction, so SOL landing between the two snapshots never becomes part of a trade's cost or proceeds
+        if (config.VAULT_ENABLED or _UNSETTLED) and chain_status == "confirmed":
+            # the vault fly's wallet also receives deposits and pays claims, and a token-account close left unsettled may
+            # land at any time: take the swap's own deltas from the transaction, so SOL landing between the two snapshots
+            # never becomes part of a trade's cost or proceeds
             try:
                 exact = tx_deltas(self.rpc.get_transaction(signature), str(taker), mint)
             except Exception as e:
@@ -474,53 +451,131 @@ def swap_smoke(sol: float) -> None:
     print(f"net lamports delta: {net} ({net / config.LAMPORTS_PER_SOL:.9f} SOL)")
 
 
-def close_empty_atas(rpc=None, signer=None, url: str | None = None, batch: int = CLOSE_ATA_BATCH, skip_mints: set | None = None) -> dict:
-    """Close every zero-balance token account owned by the bot (rent back to the wallet). The signer builds and signs
-    the CloseAccount transactions (it re-checks that each account is ours and empty); each is recorded as
-    wallet_events(kind='ata_closed')."""
+def close_empty_atas(rpc=None, signer=None, url: str | None = None, batch: int = CLOSE_ATA_BATCH, skip_mints: set | None = None,
+                     until=None) -> dict:
+    """Close every zero-balance token account owned by the bot (rent back to the wallet) and book what each returned
+    (``_book_close``). The signer builds and signs the CloseAccount transactions (it re-checks that each account is ours
+    and empty); each is recorded as wallet_events(kind='ata_closed'). A transaction holds the in-flight lock from its
+    signing to its outcome, so no swap's balance snapshots straddle it. ``until``: checked while a close is awaited and
+    before each batch; its True starts no other and leaves the one in flight unsettled (``settle_closes`` books it; until
+    then swaps take their deltas from their own transactions)."""
     assert_signing_allowed()
     signer = signer or signer_client.get()
     owner_s = signer.call("pubkeys")["trading"]
     rpc = rpc or HttpSolanaRpc()
+    settle_closes(rpc, url=url)
     skip = set(skip_mints or ())
-    empties = [a for a in rpc.get_token_accounts_by_owner(owner_s) if int(a["amount"]) == 0 and a["mint"] not in skip and not a.get("is_native")]
-    result = {"pubkey": owner_s, "candidates": len(empties), "closed": 0, "signatures": [], "failed": []}
+    sent = {a["address"] for c in list(_UNSETTLED.values()) for a in c["accounts"]}      # a close of theirs may still land
+    empties = [a for a in rpc.get_token_accounts_by_owner(owner_s)
+               if int(a["amount"]) == 0 and a["mint"] not in skip and not a.get("is_native") and a["address"] not in sent]
+    result = {"pubkey": owner_s, "candidates": len(empties), "closed": 0, "signatures": [], "failed": [], "pending": [], "credited": 0.0}
     if not empties:
         return result
     for i in range(0, len(empties), batch):
+        if until is not None and until():
+            break
         chunk = empties[i:i + batch]
         accounts = [a["address"] for a in chunk]
-        try:
-            built = signer.call("close_atas", accounts=accounts)
-        except (PolicyError, SignerUnavailable) as e:
-            result["failed"].append({"accounts": accounts, "error": str(e)})
-            record_event("error", "close_empty_atas", "the signer refused", {"accounts": accounts, "error": str(e)})
-            continue
-        if not built:
-            continue
-        bh = {"last_valid_block_height": built[0]["last_valid_block_height"]}
-        try:
-            sig = rpc.send_transaction(built[0]["tx"])
-        except Exception as e:
-            err = f"{type(e).__name__}: {scrub(str(e))}"
-            result["failed"].append({"accounts": accounts, "error": err})
-            record_event("error", "close_empty_atas", "close transaction rejected", {"accounts": accounts, "error": err})
-            continue
-        status, _st = await_confirmation(rpc, sig, bh["last_valid_block_height"])
-        detail = {"accounts": accounts, "signature": sig, "status": status, "slot": int((_st or {}).get("slot") or 0)}
-        try:
-            with transaction(url) as conn:
-                conn.execute("INSERT INTO wallet_events (kind, pubkey, detail) VALUES ('ata_closed', %s, %s)",
-                             (owner_s, Jsonb(detail)))
-                if status == "confirmed":             # their rent is back in the wallet: no longer a deposit the books hold
-                    for m in sorted({a["mint"] for a in chunk}):
-                        ledger.refund_deposits(conn, "live", m)
-        except Exception as e:
-            log.warning("wallet_events insert failed: %s", type(e).__name__)
+        with _INFLIGHT:                                 # no swap snapshots the wallet while the rent comes back
+            try:
+                built = signer.call("close_atas", accounts=accounts)
+            except (PolicyError, SignerUnavailable) as e:
+                result["failed"].append({"accounts": accounts, "error": str(e)})
+                record_event("error", "close_empty_atas", "the signer refused", {"accounts": accounts, "error": str(e)})
+                continue
+            if not built:
+                continue
+            try:
+                sig = rpc.send_transaction(built[0]["tx"])
+            except Exception as e:
+                err = f"{type(e).__name__}: {scrub(str(e))}"
+                result["failed"].append({"accounts": accounts, "error": err})
+                record_event("error", "close_empty_atas", "close transaction rejected", {"accounts": accounts, "error": err})
+                continue
+            close = {"owner": owner_s, "last_valid_block_height": built[0]["last_valid_block_height"],
+                     "accounts": [{"address": a["address"], "mint": a["mint"], "lamports": int(a.get("lamports") or 0)} for a in chunk]}
+            status, st = await_confirmation(rpc, sig, close["last_valid_block_height"], until=until)
+            if status == "pending":
+                with _UNSETTLED_LOCK:
+                    _UNSETTLED[sig] = close
+                result["pending"].append(sig)
+                log.info("close_empty_atas: %s not landed yet; settled later", sig)
+                break
+        n, credited = _book_close(rpc, sig, close, status, st, url=url)
+        result["closed"] += n; result["credited"] += credited
         if status == "confirmed":
-            result["closed"] += len(chunk)
             result["signatures"].append(sig)
         else:
-            result["failed"].append(detail)
-    log.info("close_empty_atas: closed %d of %d (%d tx)", result["closed"], len(empties), len(result["signatures"]))
+            result["failed"].append({"accounts": accounts, "signature": sig, "status": status})
+    log.info("close_empty_atas: closed %d of %d (%d tx), %+.9f SOL booked", result["closed"], len(empties), len(result["signatures"]), result["credited"])
     return result
+
+
+def unsettled_closes() -> bool:
+    return bool(_UNSETTLED)
+
+
+def settle_closes(rpc, conn=None, url: str | None = None) -> int:
+    """Book every unsettled close that has since landed and forget those that expired; returns how many are left."""
+    for sig, close in list(_UNSETTLED.items()):
+        st = (rpc.get_signature_statuses([sig]) or [None])[0]
+        if st and st.get("err") is not None:
+            status = "failed_on_chain"
+        elif st and st.get("confirmationStatus") in ("confirmed", "finalized"):
+            status = "confirmed"
+        elif not st and rpc.get_block_height() > int(close["last_valid_block_height"]):
+            status = "expired"
+        else:
+            continue
+        _book_close(rpc, sig, close, status, st, conn=conn, url=url)
+        with _UNSETTLED_LOCK:
+            _UNSETTLED.pop(sig, None)
+    return len(_UNSETTLED)
+
+
+def _refunds(tx: dict | None, close: dict, status: str) -> tuple[dict[str, int], int]:
+    """({account: lamports it returned, less its share of the fee}, the fee) of a close transaction that landed: an account
+    it closed had its lamports before and none after. Read from the transaction, else (unreadable) from the listing the
+    close was built from with the base fee of its one signature."""
+    accts = {a["address"]: a["lamports"] for a in close["accounts"]}
+    try:
+        keys = [k.get("pubkey") if isinstance(k, dict) else str(k) for k in tx["transaction"]["message"]["accountKeys"]]
+        meta = tx["meta"]; pre, post = meta["preBalances"], meta["postBalances"]
+        gone = {k: int(pre[i]) for i, k in enumerate(keys) if k in accts and int(post[i]) == 0 and int(pre[i]) > 0}
+        fee = int(meta.get("fee") or 0)
+    except (KeyError, TypeError, ValueError, IndexError):
+        gone, fee = (dict(accts) if status == "confirmed" else {}), BASE_FEE_LAMPORTS
+    n = len(gone)
+    return {k: v - fee // n - (fee % n if i == 0 else 0) for i, (k, v) in enumerate(gone.items())} if n else {}, fee
+
+
+def _book_close(rpc, sig: str, close: dict, status: str, st: dict | None, conn=None, url: str | None = None) -> tuple[int, float]:
+    """Record a close transaction's outcome (wallet_events 'ata_closed') and book what landed onto the live book: each
+    closed account's rent less its share of the fee (ledger.book_account_close), or only the fee when it failed. Returns
+    (accounts closed, SOL booked)."""
+    refunds, fee = {}, 0
+    if status in ("confirmed", "failed_on_chain"):            # landed: the rent (or only the fee) moved
+        try:
+            tx = rpc.get_transaction(sig)
+        except Exception as e:
+            tx = None; log.warning("getTransaction of close %s failed: %s", sig[:12], type(e).__name__)
+        refunds, fee = _refunds(tx, close, status)
+    if conn is None:
+        with transaction(url) as c:
+            return _book(c, sig, close, status, st, refunds, fee)
+    return _book(conn, sig, close, status, st, refunds, fee)
+
+
+def _book(conn, sig: str, close: dict, status: str, st: dict | None, refunds: dict[str, int], fee: int) -> tuple[int, float]:
+    mint_of = {a["address"]: a["mint"] for a in close["accounts"]}
+    booked, credited = {}, 0.0
+    for addr, lam in refunds.items():
+        sol, pid = ledger.book_account_close(conn, "live", mint_of[addr], lam)
+        credited += sol; booked[addr] = {"lamports": lam, "position": pid}
+    if status == "failed_on_chain" and fee and close["accounts"]:      # nothing closed, the fee paid: the latest sale's
+        sol, pid = ledger.book_account_close(conn, "live", close["accounts"][0]["mint"], -fee, closed=False)
+        credited += sol; booked["fee"] = {"lamports": -fee, "position": pid}
+    conn.execute("INSERT INTO wallet_events (kind, pubkey, detail) VALUES ('ata_closed', %s, %s)",
+                 (close["owner"], Jsonb({"accounts": [a["address"] for a in close["accounts"]], "mints": sorted(set(mint_of.values())), "signature": sig,
+                                         "status": status, "slot": int((st or {}).get("slot") or 0), "fee": fee, "booked": booked})))
+    return len(refunds), credited

@@ -12,6 +12,8 @@
   queued or in flight, and never within ``MARK_QUIET_S`` of a boundary, when the clock's sales go out.
 - ``mid_minute``: slow wallet bookkeeping (dead-bag sweeps, the RH reconcile) runs mid-minute, after the minute's
   entries and done before the next boundary's sales.
+- The live stats follow the live orders, before anything else: once an order is booked and none waits, its mirror marks
+  the wallet at once and ``changed`` tells every listener (the console pushes its panels then, not at its next poll).
 """
 from __future__ import annotations
 
@@ -30,6 +32,7 @@ MARK_QUIET_S = 3.0            # no wallet read for a mark this close to a minute
 MID_MINUTE = (20.0, 40.0)     # seconds into a minute when slow wallet bookkeeping may start
 _MIRRORS: dict[str, object] = {}
 _MIRRORS_LOCK = threading.Lock()
+_LISTENERS: list = []
 
 
 def may_mark(now: float | None = None) -> bool:
@@ -40,6 +43,24 @@ def may_mark(now: float | None = None) -> bool:
 def mid_minute(now: float | None = None) -> bool:
     now = time.time() if now is None else now
     return MID_MINUTE[0] <= now % 60.0 < MID_MINUTE[1]
+
+
+def on_change(fn) -> None:
+    """``fn()`` runs after every live order booked and every live wealth mark (from the thread that did it)."""
+    _LISTENERS.append(fn)
+
+
+def off_change(fn) -> None:
+    if fn in _LISTENERS:
+        _LISTENERS.remove(fn)
+
+
+def changed() -> None:
+    for fn in list(_LISTENERS):
+        try:
+            fn()
+        except Exception:
+            log.debug("a live change listener failed", exc_info=True)
 
 
 def signing_refused(chain: str) -> str | None:

@@ -24,8 +24,10 @@ The paper book ``paper_fly`` keeps running as the mirror. Only after the handove
 - between minutes (``idle``), never in front of an order: the wealth mark — wallet SOL + open positions net of exit cost
   + the token accounts' deposits not yet returned (a first buy's rent, ledger.deposits_held)
   → ``wealth_marks`` (book 'live'), read once the worker has nothing queued or in flight (a balance read beside a
-  booking counts that trade twice or not at all) and not just before a boundary; the kill switch on its own peak; and
-  every ``SWEEP_S``, mid-minute, the written-off tokens are swept (what they fetch is booked onto their dead-bag).
+  booking counts that trade twice or not at all) and not just before a boundary; the kill switch on its own peak;
+  every ``SWEEP_S``, mid-minute, the written-off tokens are swept (what they fetch is booked onto their dead-bag); and
+  mid-minute, after a sale emptied a token account and every ``CLOSE_S`` (from the start), the wallet's empty token
+  accounts are closed (``close_accounts``: their rent back, booked).
 Learning is unaffected: it learns from market labels and the book's outcomes, not from these orders.
 """
 from __future__ import annotations
@@ -54,6 +56,8 @@ BOOK, MIRROR = "live", "paper_fly"
 DEAD_BAG_S, OVERDUE_S, SWEEP_S = 3 * 3600.0, 600.0, 3600.0
 GAP_TRADES, GAP_MAX = 50, 0.02
 MARK_WAIT_S = 2.0             # how long the wealth mark waits for a swap between its fill and its booking
+CLOSE_S = 3600.0              # every hour (and once after a start) the wallet's empty token accounts are looked for, not only after a sale
+CLOSE_GUARD_S = 5.0           # no wait on a token-account close comes this close to the next minute boundary
 
 
 class LiveMirror:
@@ -66,14 +70,19 @@ class LiveMirror:
             worker = ExecutionWorker(broker)
         self.broker, self.worker = broker, worker
         self.H = float(horizon_s) if horizon_s is not None else None   # the fly's longest hold, set once it runs (agent/live_first.mirror)
-        self.last_sweep = 0.0
+        self.last_sweep = self.last_close = 0.0
+        self.closer: threading.Thread | None = None   # the token-account close running (``close_accounts``)
+        self.stopping = False
         self.sent: dict[int, dict] = {}       # decision id -> {"e": its paper entry, "ts": its minute, "tries": n}: a buy queued or in flight
         self.failed: dict[int, dict] = {}     # the same for a buy that failed without moving anything: sent again while it may be
         self.exit_lock = threading.Lock()     # the live clock's thread and the engine's both send exits: once per minute
         self.exits_through: datetime | None = None
         self.due_mark: tuple | None = None    # (the minute, its beat id): the wealth mark waiting for an idle worker (``idle``)
+        self.mark_ctx: tuple | None = None    # the latest minute's, marked again after each order (``_after_order``)
+        self.mark_lock = threading.Lock()     # the worker's thread and the engine's both mark
         self.last_mark: dict | None = None
         self.wallet_sol: float | None = None
+        self.worker.on_done = self._after_order
 
     def _decision(self, conn, m1, run_id, beat_id, p, reason: str, forced: bool) -> int:
         return int(conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, size_sol, forced, reason, detail) VALUES (%s,%s,%s,%s,%s,'fly_exit',%s,%s,%s,%s) RETURNING id",
@@ -206,7 +215,7 @@ class LiveMirror:
                     conn.execute("UPDATE decisions SET book_targets = array_append(COALESCE(book_targets, '{}'), 'live') WHERE id = %s", (e["decision_id"],))
                 else:
                     skipped.append((e["mint"], "held")); self._blocked(conn, ctx, run_id, beat_id, e, "held", "an order of this token is queued or in flight", size)
-        self.due_mark = (ctx, beat_id)
+        self.due_mark = self.mark_ctx = (ctx, beat_id)
         return {"stage": "trading live", "wallet_sol": self.wallet_sol, "entered": n_enter, "retried": n_retry, "exited": ex["exited"], "liquidated": ex["liquidated"],
                 "in_flight": len(inflight), "blocked": blocked, "skipped": skipped[:10], "failed_orders": sum(1 for r in drained if not r.ok),
                 "awaiting_retry": len(self.failed)}
@@ -226,26 +235,81 @@ class LiveMirror:
 
     def idle(self) -> None:
         """Between minutes, never in front of an order (agent/live_first.py): the waiting wealth mark once the worker has
-        nothing queued or in flight, and every ``SWEEP_S``, mid-minute, the dead-bag sweep."""
+        nothing queued or in flight; every ``SWEEP_S``, mid-minute, the dead-bag sweep; and mid-minute, once a sale emptied
+        a token account or ``CLOSE_S`` passed, the empty token accounts' close on a thread of its own (``close_accounts``)."""
         now = time.time()
-        if self.due_mark is not None and live_first.may_mark(now) and not self.worker.pending():
-            self.mark_due()
+        if self.due_mark is not None and live_first.may_mark(now) and not self.worker.pending() and self.mark_due() is not None:
+            live_first.changed()
         if now - self.last_sweep >= SWEEP_S and live_first.mid_minute(now) and not self.worker.pending():
             self.last_sweep = now
             snap = snapshot_balances(self.broker.rpc, self.broker.pubkey)
             with transaction() as conn:
                 self.sweep(conn, snap, self.worker.pending(), datetime.now(timezone.utc))
+        if (self.worker.emptied or now - self.last_close >= CLOSE_S) and live_first.mid_minute(now) and not self.worker.pending() \
+                and not config.VAULT_ENABLED and not (self.closer is not None and self.closer.is_alive()):      # the vault worker closes the vault fly's
+            self.last_close = now; self.worker.emptied.clear()
+            self.closer = threading.Thread(target=self.close_accounts, args=(now,), name="runner-close", daemon=True)
+            self.closer.start()
 
-    def mark_due(self, conn=None) -> dict | None:
+    def close_accounts(self, now: float | None = None) -> dict | None:
+        """Close the wallet's empty token accounts, their rent back to it and booked (execution/broker_live.close_empty_atas:
+        a deposit's return, the fee onto the sale that emptied the account), under the worker's ``busy`` so a mark never
+        reads the wallet and the books apart. Never in front of an order: it starts mid-minute with nothing queued, and an
+        order queued meanwhile, or ``CLOSE_GUARD_S`` before the next boundary, ends the wait on the close in flight (it is
+        settled later; until then swaps take their deltas from their own transactions). Then the wallet is marked again."""
+        from ..execution.broker_live import close_empty_atas
+        now = time.time() if now is None else now
+        deadline = math.floor(now / 60.0) * 60.0 + 60.0 - CLOSE_GUARD_S
+        if self.worker.pending() or not self.worker.busy.acquire(blocking=False):
+            return None
+        try:
+            with transaction() as conn:
+                held = {p["mint"] for p in ledger.open_positions(conn, BOOK)}
+            out = close_empty_atas(rpc=self.broker.rpc, signer=self.broker.signer, skip_mints=held | self.worker.pending(),
+                                   until=lambda: self.stopping or time.time() >= deadline or bool(self.worker.pending()))
+        except Exception as e:
+            log.warning("closing the empty token accounts failed (tried again within the hour): %s: %s", type(e).__name__, e)
+            return None
+        finally:
+            self.worker.busy.release()
+        if out["closed"] or out["failed"]:
+            record_event("info" if not out["failed"] else "warning", "fly_live",
+                         f"closed {out['closed']} empty token account(s): {out['credited']:+.6f} SOL booked" + (f", {len(out['failed'])} failed" if out["failed"] else ""),
+                         {"signatures": out["signatures"], "pending": out["pending"], "failed": out["failed"][:5]})
+        if out["closed"]:
+            if not self.worker.pending() and live_first.may_mark():
+                try:
+                    self.mark_due(force=True)
+                except Exception:
+                    log.warning("live mark after the token-account close failed", exc_info=True)
+            live_first.changed()
+        return out
+
+    def _after_order(self, res) -> None:
+        """In the worker's thread, once an order is booked: the live stats come before anything else. With no order
+        waiting (none ever waits for this) and not just before a boundary, the latest minute is marked again on the wallet
+        as it now stands; then the console is told (live_first.changed)."""
+        if not self.worker.pending() and live_first.may_mark():
+            try:
+                self.mark_due(force=True)
+            except Exception:
+                log.warning("live mark after an order failed", exc_info=True)
+        live_first.changed()
+
+    def mark_due(self, conn=None, force: bool = False) -> dict | None:
         """The waiting minute's wealth mark: wallet SOL + open positions net of exit cost at the minute's prices, and the
-        kill switch on the book's peak. None when a swap was between its fill and its booking or the balance could not be
-        read: that minute goes unmarked."""
-        if self.due_mark is None:
+        kill switch on the book's peak. ``force``: the latest minute again, marked or not (an order moved the wallet).
+        None when a swap was between its fill and its booking or the balance could not be read: that minute goes unmarked."""
+        pending = self.due_mark if self.due_mark is not None else (self.mark_ctx if force else None)
+        if pending is None:
             return None
         if conn is None:
             with transaction() as c:
-                return self.mark_due(c)
-        ctx, beat_id = self.due_mark
+                return self.mark_due(c, force=force)
+        with self.mark_lock:
+            return self._mark_minute(conn, *pending)
+
+    def _mark_minute(self, conn, ctx, beat_id: int) -> dict | None:
         ctx = copy.copy(ctx); ctx.conn = conn; m1 = ctx.m1         # the minute's prices, read on this transaction
         ledger.mark_positions(conn, BOOK, ctx.prices, {}, m1)
         mark = self._mark(conn, ctx); self.due_mark = None
@@ -257,7 +321,8 @@ class LiveMirror:
         pk = conn.execute("SELECT max(wealth) AS pk FROM wealth_marks WHERE book = %s AND (%s::timestamptz IS NULL OR ts > %s)",
                           (BOOK, rebase, rebase)).fetchone(); peak = max(float(pk["pk"] or 0.0), wealth)
         conn.execute("INSERT INTO wealth_marks (beat_id, book, ts, sol_free, positions_value, exit_cost, wealth, peak, drawdown, exposure, n_open) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                     "ON CONFLICT (beat_id, book) DO NOTHING",
+                     "ON CONFLICT (beat_id, book) DO UPDATE SET sol_free = EXCLUDED.sol_free, positions_value = EXCLUDED.positions_value, exit_cost = EXCLUDED.exit_cost, "
+                     "wealth = EXCLUDED.wealth, peak = EXCLUDED.peak, drawdown = EXCLUDED.drawdown, exposure = EXCLUDED.exposure, n_open = EXCLUDED.n_open",   # marked again after an order
                      (beat_id, BOOK, m1, sol_now, deposits + gross_v - exit_cost, exit_cost, wealth, peak, (1.0 - wealth / peak) if peak > 0 else 0.0, exposure, n_open))
         if config.VAULT_ENABLED:                     # deposits, withdrawals and payouts are not performance
             from ..vault import nav as vault_nav, payout as vault_payout     # trading wallet + treasury are one book: a top-up or sweep is no loss
@@ -280,6 +345,9 @@ class LiveMirror:
             return None
         try:
             try:
+                from ..execution import broker_live
+                if broker_live.unsettled_closes():         # a close that landed since is booked (and committed) before its rent is counted
+                    broker_live.settle_closes(self.broker.rpc)
                 lamports = int(self.broker.rpc.get_balance(self.broker.pubkey))
             except Exception as e:
                 log.warning("live mark skipped: the wallet balance could not be read: %s", type(e).__name__)
@@ -324,5 +392,9 @@ class LiveMirror:
         return n
 
     def stop(self) -> None:
-        """Waits for the order in flight (bounded, execution/worker.STOP_JOIN_S); queued orders are dropped."""
+        """Waits for the order in flight (bounded, execution/worker.STOP_JOIN_S) and the token-account close (its wait ends
+        at once); queued orders are dropped."""
+        self.stopping = True
+        if self.closer is not None and self.closer.is_alive():
+            self.closer.join(30.0)
         self.worker.stop()

@@ -107,6 +107,21 @@ def deposits_held(conn, book: str) -> float:
     return float(r["s"])
 
 
+def book_account_close(conn, book: str, mint: str, lamports: int, closed: bool = True) -> tuple[float, int | None]:
+    """A close of the mint's token account moved ``lamports`` into the wallet (its rent less its share of the fee; only
+    the fee, < 0, when it failed and ``closed`` is False): the deposit the buy that opened it booked apart comes back
+    (``refund_deposits``) and the rest -- the fee, or the whole rent of an account opened before deposits were booked
+    apart -- is the realized P&L of the mint's latest closed position, whose sale emptied it. Returns (SOL credited, that
+    position); no position when the book never held the mint (an account opened for the wallet by someone else)."""
+    rest = lamports / config.LAMPORTS_PER_SOL - (refund_deposits(conn, book, mint) if closed else 0.0)
+    r = conn.execute("SELECT id FROM positions WHERE book = %s AND mint = %s AND status = 'closed' ORDER BY closed_at DESC NULLS LAST, id DESC LIMIT 1",
+                     (book, mint)).fetchone()
+    if r is None:
+        return rest, None
+    credit(conn, int(r["id"]), rest)
+    return rest, int(r["id"])
+
+
 def realize_partial(conn, *, position_id: int, qty_raw: int, cost_part: float, proceeds_sol: float, fees_sol: float,
                     price: float, ts: datetime | None = None) -> float | None:
     """Shrink an open position by qty_raw / cost_part and book proceeds − cost_part into realized_sol.

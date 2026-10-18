@@ -5,9 +5,10 @@ LiveBroker (one in-flight order at a time, balance-verified); results are draine
 opens/closes positions accordingly. A mint with a request queued or in flight takes no other, except a buy queued
 behind a lone sale of it (its paper book sold and bought the token again in one minute): the sale runs first, and the
 buy is refused as held if the sale left the position open. ``busy`` is held from a swap to its booking, so whoever reads
-the wallet and the books under it sees them agree. A sale that leaves the wallet no token of its mint closes that
-mint's empty token account and books the rent it refunds onto the position. ``stop`` lets the request in flight finish
-(bounded) and drops the queued ones: exits are retried next minute, entries by the mirror (agent/fly_live.py).
+the wallet and the books under it sees them agree. A sale that leaves the live book without its mint marks the mint's
+token account ``emptied``: the mirror closes it mid-minute with nothing queued (agent/fly_live.close_accounts), never in
+front of an order, and books the rent it returns. ``stop`` lets the request in flight finish (bounded) and drops the
+queued ones: exits are retried next minute, entries by the mirror (agent/fly_live.py).
 """
 from __future__ import annotations
 
@@ -73,6 +74,8 @@ class ExecutionWorker:
         self.busy = threading.Lock()                    # held from a request's swap to its booking
         self.thread = threading.Thread(target=self._loop, name="runner-exec", daemon=True)   # routed to the runner's log
         self.stop_flag = False
+        self.on_done = None                            # called with each result once booked (the mirror's live stats: agent/fly_live.py)
+        self.emptied: set[str] = set()                 # mints whose sale left their token account empty: closed by the mirror, mid-minute
         self.thread.start()
 
     def submit(self, req: ExecRequest) -> bool:
@@ -138,9 +141,14 @@ class ExecutionWorker:
             with self.busy:
                 res = self._execute(req)
                 if res.ok and res.closed:
-                    self._close_account(req, res)
+                    self._emptied(req)
             self._release(req)
             self.results.put(res)
+            if self.on_done is not None:
+                try:
+                    self.on_done(res)
+                except Exception:
+                    log.exception("execution worker: the after-order hook failed (the order stands)")
 
     def _execute(self, req: ExecRequest) -> ExecResult:
         from ..vault import walletlock                 # the vault fly: swap + ledger commit are one step for its snapshots
@@ -210,27 +218,10 @@ class ExecutionWorker:
         at one token that cannot be bought must not trip every entry) nor a dead-bag sweep (it says nothing of trading)."""
         return not req.retry and req.forced_kind != "dead_bag_sweep"
 
-    def _close_account(self, req: ExecRequest, res: ExecResult) -> None:
-        """The sale left the live book without this mint: close its empty token account. The rent its first buy paid comes
-        back to the wallet: the deposit booked apart on that buy's position is returned (``ledger.refund_deposits``) and only
-        the close's fee is the closing position's; a position bought before deposits were booked apart had the rent in its
-        cost, so the whole refund is its own. Not while a buy is queued behind the sale (it needs the account) or the
-        wallet still holds the token. A failure here never touches the sale: it is logged and the account stays (and its
-        deposit counts in wealth) for ``close-empty-atas``."""
-        from ..vault import walletlock
+    def _emptied(self, req: ExecRequest) -> None:
+        """The sale left the live book without this mint: its empty token account is the mirror's to close mid-minute
+        (agent/fly_live.close_accounts), not this thread's in front of the next order. Not while a buy is queued behind
+        the sale: it needs the account."""
         with self.lock:
-            if self.inflight.get(req.mint) != ["sell"]:
-                return
-        try:
-            with transaction() as conn:
-                if conn.execute("SELECT 1 FROM positions WHERE book = 'live' AND mint = %s AND status = 'open'", (req.mint,)).fetchone():
-                    return
-            with walletlock.maybe_exclusive(config.VAULT_ENABLED):
-                got = self.broker.close_token_account(req.mint)
-            if got is not None and res.position_id is not None:
-                with transaction() as conn:      # the account's deposit is back, less the close's fee: only the fee is the position's
-                    pnl = got / config.LAMPORTS_PER_SOL - ledger.refund_deposits(conn, "live", req.mint)
-                    ledger.credit(conn, res.position_id, pnl)
-                res.realized_sol = (res.realized_sol or 0.0) + pnl
-        except Exception as e:
-            log.warning("closing the token account of %s after its sale failed (the sale stands): %s: %s", req.mint, type(e).__name__, e)
+            if self.inflight.get(req.mint) == ["sell"]:
+                self.emptied.add(req.mint)

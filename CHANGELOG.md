@@ -3,6 +3,36 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## 2026-10-18, release 8: The live stats follow each live order, and empty token accounts close on their own
+
+Published to Hugging Face as signed release 8. Fly #157 and selector #154 are unchanged, and so are the definitions they
+were judged on: no model, seed or infrastructure file changes.
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 8`.
+- **Rent returned by an earlier `close-empty-atas` run** is in live wealth but not in realized P&L. Closes from this
+  release on are booked.
+
+### Live money
+
+- **The live stats follow each live order.**
+  - Once a live order is booked and no other waits, the wallet is marked at once and the console's panels update then.
+  - Before, the mark waited for the engine's next idle moment, and the race card refreshed only every 30 seconds.
+- **Empty token accounts close on their own, and their rent is booked.**
+  - A sale that empties a token account no longer closes it on the spot, which held up the next live order.
+  - The account now closes the same minute: mid-minute, on a thread of its own, while no order is waiting. The wallet
+    is also checked for empty accounts at start and every hour, so none is left holding rent.
+  - If an order arrives during a close, the order goes first. The close is booked once it lands. Until then, swaps
+    read their fills from their own transactions, so the returning rent never counts as part of a trade.
+  - Every close credits the books: the rent a first buy set aside comes back, and the close's fee goes to the sale
+    that emptied the account. If the rent was paid before deposits were tracked, the whole refund goes to that sale.
+  - Before, `close-empty-atas` and the vault's close only marked deposits as returned. The rent from accounts opened
+    before deposits were tracked reached the wallet, but no trade was credited with it.
+  - `fly-trader close-empty-atas` now leaves the live book's held tokens alone and prints what it booked.
+
 ## 2026-10-18, release 7: A live buy costs what its paper twin does, and the fly learns again
 
 Published to Hugging Face as signed release 7. Fly #157 and selector #154 are unchanged, and so are the definitions they
