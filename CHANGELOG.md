@@ -3,6 +3,19 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## Unreleased
+
+### Console
+
+- **The Overview page charts the selector's setups for the last 30 days, per chain.**
+  - A setup is a buying chance: a token the selector picked while not holding it. Picks less than 30 minutes apart
+    count once.
+  - Each UTC day shows its setups beside the trades the selector took. A setup it did not trade was vetoed (dump veto,
+    win filter).
+  - Solana and Robinhood Chain sit side by side, so a quiet market on one chain shows against the other.
+  - A day the selector book did not run, or ran only part of, is flagged. Few setups on such a day say nothing about
+    the market.
+
 ## 2026-10-18, release 8: The live stats follow each live order, and empty token accounts close on their own
 
 Published to Hugging Face as signed release 8. Fly #157 and selector #154 are unchanged, and so are the definitions they

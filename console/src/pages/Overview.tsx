@@ -1,9 +1,10 @@
 // Overview, laid out like Dashtreme's index: the selector book's KPI widgets, what the system is doing in plain words
 // beside the win rate, the fly's brain, this minute's scoring with the top scores, the race between the selector and the
-// plastic fly, the live ticker, and the paper book with its open positions (ui/api/overview.py; the brain ui/api/brain.py).
+// plastic fly, the selector's setups per day, the live ticker, and the paper book with its open positions (ui/api/overview.py;
+// the brain ui/api/brain.py).
 import { BrainPanel } from '../brain'
 import { PageHead } from '../components/ChainPicker'
-import { LineChart, RadialGauge, type Series } from '../components/Charts'
+import { BarChart, LineChart, RadialGauge, type Series } from '../components/Charts'
 import { DataTable, type Col } from '../components/DataTable'
 import { HourWheel, hourColor, type HourBucket } from '../components/HourWheel'
 import { Callout, Caption, Card, Loaded, Md, Metric, Metrics, ProgressList, RowGroup, Segmented, Widget, WidgetGrid } from '../components/ui'
@@ -218,6 +219,57 @@ function BookPanel() {
   )
 }
 
+type SetupDay = { day: string; setups: number | null; trades: number | null; live: number; ran: number }
+type SetupChain = { chain: string; name: string; setups: number; trades: number; live: number; days: SetupDay[] }
+type Setups = { tz: string; n_days: number; gap_min: number; chains: SetupChain[] }
+const dayLabel = (iso: string) => new Date(`${iso}T00:00:00Z`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
+const PARTIAL = 0.9         // a day the selector book ran less of than this is flagged
+
+/** The selector's setups per UTC day over 30 days, beside the trades it took: one chart per chain, Solana on the left,
+ *  Robinhood Chain on the right. Fewer setups is a quieter market; setups without trades are vetoes. */
+function SetupsPanel() {
+  const s = useTopic<Setups>('overview.setups')
+  return (
+    <Card title={`Setups · ${s.data?.n_days ?? 30} days`} icon="target"
+      sub="the buying chances the selector found each UTC day, and the trades it took · fewer setups is a quieter market, not a blocked bot">
+      <Loaded state={s} height={300}>
+        {(d) => (
+          <div className="row g-4">
+            {d.chains.map((c) => {
+              const last = c.days.length - 1
+              const partial = c.days.filter((x, i) => i < last && x.setups !== null && x.ran < PARTIAL)
+              const off = c.days.filter((x) => x.setups === null).length
+              return (
+                <div key={c.chain} className={`col-12 ${d.chains.length > 1 ? 'col-xl-6' : ''}`}>
+                  <div className="d-flex align-items-baseline gap-2 mb-1">
+                    <h6 className="m-0" style={{ color: '#fff' }}>{c.name}</h6>
+                    <span className="caption m-0">{int(c.setups)} setups · {int(c.trades)} selector trades · {int(c.live)} live</span>
+                  </div>
+                  <BarChart categories={c.days.map((x, i) => (i === last ? 'today' : dayLabel(x.day)))} height={260}
+                    series={[{ name: 'setups', data: c.days.map((x) => x.setups) }, { name: 'selector trades', data: c.days.map((x) => x.trades) }]}
+                    yFormat={(v) => (Number.isInteger(v) ? int(v) : '')} />
+                  {(partial.length > 0 || off > 0) && (
+                    <Caption>
+                      {off > 0 && `${off} day${off > 1 ? 's' : ''} without a bar: the selector book was not running. `}
+                      {partial.length > 0 && `Ran only part of ${partial.slice(-6).map((x) => `${dayLabel(x.day)} (${Math.round(x.ran * 100)}%)`).join(', ')}`}
+                      {partial.length > 6 && ` and ${partial.length - 6} earlier day${partial.length > 7 ? 's' : ''}`}
+                      {partial.length > 0 && ': fewer setups there say nothing of the market.'}
+                    </Caption>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </Loaded>
+      <Caption>
+        A setup is a token the selector picked while not holding it; its picks less than {s.data?.gap_min ?? 30} minutes apart count once. A setup it
+        did not trade was vetoed (dump veto, win filter). Days are UTC.
+      </Caption>
+    </Card>
+  )
+}
+
 type HourChain = { chain: string; name: string; unit: string; all: HourBucket[]; live: HourBucket[] }
 type Hours = { tz: string; archives: number; chains: HourChain[] }
 const LOCAL_SHIFT = Math.round(-new Date().getTimezoneOffset() / 60)
@@ -284,6 +336,7 @@ export default function Overview() {
       <BrainPanel variant="memecoin" />
       <ThisMinute />
       <RacePanel />
+      <SetupsPanel />
       <HoursPanel />
       <TickerCard />
       <BookPanel />

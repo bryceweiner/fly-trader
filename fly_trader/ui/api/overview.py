@@ -3,6 +3,7 @@ and the plastic fly, and the open positions. (The brain at the top of the page i
 from __future__ import annotations
 
 import csv
+import json
 import math
 import re
 from datetime import datetime, timedelta, timezone
@@ -173,8 +174,8 @@ def book(params: dict) -> dict:
 
 
 # ---------------------------------------------------------------- trades by hour of day
-def _hour_of(ts) -> int | None:
-    """The UTC hour of a timestamp: a datetime, or the text Postgres wrote into an archive ('2026-09-15 03:55:00+00')."""
+def _utc_of(ts) -> datetime | None:
+    """A timestamp in UTC: a datetime, or the text Postgres wrote into an archive ('2026-09-15 03:55:00+00')."""
     if ts is None or ts == "":
         return None
     if isinstance(ts, str):
@@ -187,7 +188,13 @@ def _hour_of(ts) -> int | None:
             return None
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc).hour
+    return ts.astimezone(timezone.utc)
+
+
+def _hour_of(ts) -> int | None:
+    """The UTC hour of a timestamp (``_utc_of``)."""
+    t = _utc_of(ts)
+    return None if t is None else t.hour
 
 
 def _num(v) -> float | None:
@@ -197,10 +204,10 @@ def _num(v) -> float | None:
         return None
 
 
-def _archive_signature() -> tuple:
-    """Every archived positions file (a reset archives what it deletes): path, mtime, size — the cache key."""
+def _archive_signature(name: str = "positions.csv") -> tuple:
+    """Every archived ``name`` file (a reset archives what it deletes): path, mtime, size — the cache key."""
     out = []
-    for p in sorted(config.PG_ARCHIVE_DIR.glob("*/positions.csv")):
+    for p in sorted(config.PG_ARCHIVE_DIR.glob(f"*/{name}")):
         try:
             st = p.stat(); out.append((str(p), st.st_mtime, st.st_size))
         except OSError:
@@ -209,17 +216,17 @@ def _archive_signature() -> tuple:
 
 
 @ttl_cache(None, maxsize=2)
-def _archived(signature: tuple) -> list[tuple[int, str, int, float | None]]:
-    """(id, book, UTC hour opened, realized) of every archived position: archives never change, a new reset adds a file."""
+def _archived(signature: tuple) -> list[tuple[int, str, datetime, float | None]]:
+    """(id, book, opened (UTC), realized) of every archived position: archives never change, a new reset adds a file."""
     rows = []
     for path, _mtime, _size in signature:
         try:
             with open(path, newline="") as f:
                 for r in csv.DictReader(f):
-                    h = _hour_of(r.get("opened_at"))
-                    if h is None or not r.get("id") or not r.get("book"):
+                    t = _utc_of(r.get("opened_at"))
+                    if t is None or not r.get("id") or not r.get("book"):
                         continue
-                    rows.append((int(r["id"]), r["book"], h, _num(r.get("realized_sol"))))
+                    rows.append((int(r["id"]), r["book"], t, _num(r.get("realized_sol"))))
         except (OSError, ValueError, csv.Error):
             continue
     return rows
@@ -250,15 +257,113 @@ def hour_buckets(rows, live_books: set[str]) -> dict[str, dict[str, list[dict]]]
 def hours(params: dict) -> dict:
     """Every memecoin trade ever made — the positions table and every reset's archive (data/pg_archive/*/positions.csv) —
     by the UTC hour it was entered, per chain (Solana, then Robinhood Chain when enabled), all books and live alone."""
-    seen: set[int] = set(); rows = []
-    for r in q("SELECT id, book, opened_at, realized_sol FROM positions WHERE opened_at IS NOT NULL"):
-        seen.add(int(r["id"])); rows.append((r["book"], _hour_of(r["opened_at"]), _num(r["realized_sol"])))
-    sig = _archive_signature()
-    for pid, book, h, realized in _archived(sig):
-        if pid not in seen:                     # a row both archived and still in the table (a failed delete) counts once
-            seen.add(pid); rows.append((book, h, realized))
+    rows, n_archives = _every_position()
     enabled = markets.enabled()
-    per = hour_buckets(rows, {m.live_book for m in enabled})
-    return {"tz": "UTC", "archives": len(sig),
+    per = hour_buckets([(book, t.hour, realized) for book, t, realized in rows], {m.live_book for m in enabled})
+    return {"tz": "UTC", "archives": n_archives,
             "chains": [{"chain": m.chain, "name": m.name, "unit": m.unit, **per.get(m.chain, {"all": _empty_hours(), "live": _empty_hours()})} for m in enabled]}
 
+
+def _every_position(books: list[str] | None = None, since: datetime | None = None) -> tuple[list[tuple[str, datetime, float | None]], int]:
+    """(book, opened (UTC), realized) of every memecoin position ever opened -- the positions table and every reset's
+    archive, a row in both counted once -- of ``books`` (all: None) opened since ``since``; and how many archives."""
+    seen: set[int] = set(); rows = []
+    for r in q("SELECT id, book, opened_at, realized_sol FROM positions WHERE opened_at IS NOT NULL" + (" AND book = ANY(%s)" if books else "")
+               + (" AND opened_at >= %s" if since else ""), tuple(x for x in (books, since) if x)):
+        seen.add(int(r["id"])); rows.append((r["book"], _utc_of(r["opened_at"]), _num(r["realized_sol"])))
+    sig = _archive_signature()
+    for pid, book, t, realized in _archived(sig):
+        if pid not in seen and (not books or book in books) and (since is None or t >= since):   # a row both archived and still in the table (a failed delete) counts once
+            seen.add(pid); rows.append((book, t, realized))
+    return rows, len(sig)
+
+
+# ---------------------------------------------------------------- setups by day
+SETUP_DAYS = 30
+SETUP_GAP = timedelta(minutes=30)       # a token's picks closer than this are one setup
+
+
+def _is_pick(kind: str, rail) -> bool:
+    """A selector's pick of a token its book did not hold: an entry, or a pick it was kept from taking (a veto, a filter),
+    never a re-pick of a token it still held."""
+    return kind.endswith("_enter") or (kind == "blocked" and (rail or "") != "held")
+
+
+@ttl_cache(None, maxsize=2)
+def _archived_picks(signature: tuple, books: tuple) -> list[tuple[int, str, str, datetime, bool]]:
+    """(id, book, token, minute (UTC), entered) of every archived pick (``_is_pick``) of ``books``."""
+    rows = []
+    for path, _mtime, _size in signature:
+        try:
+            with open(path, newline="") as f:
+                for r in csv.DictReader(f):
+                    d, kind = r.get("detail") or "", r.get("kind") or ""
+                    if not any(b in d for b in books) or not _is_pick(kind, r.get("rail")):
+                        continue
+                    try:
+                        book = json.loads(d).get("book")
+                    except ValueError:
+                        continue
+                    t = _utc_of(r.get("ts"))
+                    if book in books and t is not None and r.get("id"):
+                        rows.append((int(r["id"]), book, r.get("mint") or "", t, kind.endswith("_enter")))
+        except (OSError, csv.Error):
+            continue
+    return rows
+
+
+def selector_picks(books: list[str], since: datetime) -> list[tuple[str, str, datetime, bool]]:
+    """(book, token, minute (UTC), entered) of the selector books' picks since ``since``: the decisions table and every
+    reset's archive, a row in both counted once."""
+    seen: set[int] = set(); out = []
+    for r in q("SELECT id, detail->>'book' AS book, mint, ts, kind, rail FROM decisions WHERE ts >= %s AND detail->>'book' = ANY(%s) "
+               "AND (right(kind, 6) = '_enter' OR (kind = 'blocked' AND COALESCE(rail, '') <> 'held'))", (since, books)):
+        seen.add(int(r["id"])); out.append((r["book"], r["mint"], _utc_of(r["ts"]), r["kind"].endswith("_enter")))
+    for pid, book, mint, t, entered in _archived_picks(_archive_signature("decisions.csv"), tuple(sorted(books))):
+        if pid not in seen and t >= since:
+            seen.add(pid); out.append((book, mint, t, entered))
+    return out
+
+
+def setups_by_day(picks) -> dict[tuple[str, object], dict]:
+    """Per (book, UTC day): setups -- one token's picks, each within ``SETUP_GAP`` of the one before, dated by the first --
+    and the trades among them (its entries)."""
+    out: dict[tuple[str, object], dict] = {}; last: dict[tuple[str, str], datetime] = {}; day: dict[tuple[str, str], object] = {}
+    for book, mint, t, entered in sorted(picks, key=lambda p: (p[2], p[0], p[1])):
+        k = (book, mint)
+        if k not in last or t - last[k] > SETUP_GAP:
+            day[k] = t.date(); out.setdefault((book, day[k]), {"setups": 0, "trades": 0})["setups"] += 1
+        last[k] = t
+        if entered:
+            out.setdefault((book, t.date()), {"setups": 0, "trades": 0})["trades"] += 1
+    return out
+
+
+@topic("overview.setups", every=60)
+def setups(params: dict) -> dict:
+    """The selector's setups per UTC day over the last ``SETUP_DAYS`` days, per chain (Solana, then Robinhood Chain): the
+    buying chances its strategy stack found (``setups_by_day``), the trades its paper book took from them, and the live
+    book's. ``ran``: the share of the day's minutes the selector book ran (to the current minute today) -- a day it ran
+    only part of says nothing of the market."""
+    now = datetime.now(timezone.utc); today = now.date()
+    days = [today - timedelta(days=SETUP_DAYS - 1 - i) for i in range(SETUP_DAYS)]
+    since = datetime(days[0].year, days[0].month, days[0].day, tzinfo=timezone.utc)
+    enabled = markets.enabled(); sel = [m.selector_book for m in enabled]
+    per = setups_by_day(selector_picks(sel, since - SETUP_GAP))
+    ran = {(r["book"], r["d"]): int(r["minutes"]) for r in q(
+        """SELECT r.config->>'book' AS book, (b.ts AT TIME ZONE 'UTC')::date AS d, count(DISTINCT b.ts) AS minutes FROM beats b JOIN runs r USING (run_id)
+           WHERE b.ts >= %s AND r.config->>'book' = ANY(%s) GROUP BY 1, 2""", (since, sel))}
+    live: dict[tuple[str, object], int] = {}
+    for book, t, _ in _every_position([m.live_book for m in enabled], since)[0]:
+        live[(book, t.date())] = live.get((book, t.date()), 0) + 1
+    out = []
+    for m in enabled:
+        rows = []
+        for d in days:
+            span = 1440 if d < today else max(1, now.hour * 60 + now.minute)
+            share = min(1.0, ran.get((m.selector_book, d), 0) / span); c = per.get((m.selector_book, d)) or {"setups": 0, "trades": 0}
+            rows.append({"day": d.isoformat(), "setups": c["setups"] if share > 0 else None, "trades": c["trades"] if share > 0 else None,
+                         "live": live.get((m.live_book, d), 0), "ran": round(share, 3)})
+        out.append({"chain": m.chain, "name": m.name, "setups": sum(r["setups"] or 0 for r in rows), "trades": sum(r["trades"] or 0 for r in rows),
+                    "live": sum(r["live"] for r in rows), "days": rows})
+    return {"tz": "UTC", "n_days": SETUP_DAYS, "gap_min": int(SETUP_GAP.total_seconds() // 60), "chains": out}
