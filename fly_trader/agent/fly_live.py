@@ -22,6 +22,7 @@ The paper book ``paper_fly`` keeps running as the mirror. Only after the handove
   live trades, the mean return per trade trailing the paper mirror's same decisions by more than ``GAP_MAX`` pauses
   entries and raises an alert;
 - between minutes (``idle``), never in front of an order: the wealth mark — wallet SOL + open positions net of exit cost
+  + the token accounts' deposits not yet returned (a first buy's rent, ledger.deposits_held)
   → ``wealth_marks`` (book 'live'), read once the worker has nothing queued or in flight (a balance read beside a
   booking counts that trade twice or not at all) and not just before a boundary; the kill switch on its own peak; and
   every ``SWEEP_S``, mid-minute, the written-off tokens are swept (what they fetch is booked onto their dead-bag).
@@ -251,17 +252,17 @@ class LiveMirror:
         if mark is None:
             return None
         rebase = rails.kill_rebase_at(conn)
-        lamports, gross_v, exit_cost, exposure, n_open = mark
-        sol_now = lamports / config.LAMPORTS_PER_SOL; wealth = sol_now + gross_v - exit_cost
+        lamports, gross_v, exit_cost, exposure, n_open, deposits = mark
+        sol_now = lamports / config.LAMPORTS_PER_SOL; wealth = sol_now + deposits + gross_v - exit_cost
         pk = conn.execute("SELECT max(wealth) AS pk FROM wealth_marks WHERE book = %s AND (%s::timestamptz IS NULL OR ts > %s)",
                           (BOOK, rebase, rebase)).fetchone(); peak = max(float(pk["pk"] or 0.0), wealth)
         conn.execute("INSERT INTO wealth_marks (beat_id, book, ts, sol_free, positions_value, exit_cost, wealth, peak, drawdown, exposure, n_open) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                      "ON CONFLICT (beat_id, book) DO NOTHING",
-                     (beat_id, BOOK, m1, sol_now, gross_v - exit_cost, exit_cost, wealth, peak, (1.0 - wealth / peak) if peak > 0 else 0.0, exposure, n_open))
+                     (beat_id, BOOK, m1, sol_now, deposits + gross_v - exit_cost, exit_cost, wealth, peak, (1.0 - wealth / peak) if peak > 0 else 0.0, exposure, n_open))
         if config.VAULT_ENABLED:                     # deposits, withdrawals and payouts are not performance
             from ..vault import nav as vault_nav, payout as vault_payout     # trading wallet + treasury are one book: a top-up or sweep is no loss
-            vault_nav.mark(conn, m1, lamports + vault_payout.cached_balance(), int(round(gross_v * config.LAMPORTS_PER_SOL)),
-                           int(round(exit_cost * config.LAMPORTS_PER_SOL)))
+            vault_nav.mark(conn, m1, lamports + int(round(deposits * config.LAMPORTS_PER_SOL)) + vault_payout.cached_balance(),
+                           int(round(gross_v * config.LAMPORTS_PER_SOL)), int(round(exit_cost * config.LAMPORTS_PER_SOL)))
             ix = vault_nav.status(conn, since=rebase)
             killed = rails.check_drawdown(conn, ix["value"], ix["peak"], unit="index")
         else:
@@ -271,7 +272,8 @@ class LiveMirror:
         return self.last_mark
 
     def _mark(self, conn, ctx) -> tuple | None:
-        """(wallet lamports, open positions' gross value, their exit cost, exposure at cost, open positions), read while no
+        """(wallet lamports, open positions' gross value, their exit cost, exposure at cost, open positions, the token
+        accounts' deposits held in SOL), read while no
         swap is between its fill and its booking (the worker's ``busy``): a balance read beside a booking in progress
         counts that trade twice or not at all. None when the worker stayed busy ``MARK_WAIT_S``."""
         if not self.worker.busy.acquire(timeout=MARK_WAIT_S):
@@ -288,7 +290,7 @@ class LiveMirror:
                 gross = int(p["qty"]) / 10 ** int(p.get("decimals") or 6) * px
                 gross_v += gross; exposure += float(p["cost_sol"])
                 exit_cost += gross * exit_cost_fraction(gross, ctx.resqs.get(p["mint"]) or ctx.last_resq(p["mint"]), ctx.mcap(p["mint"], px), p.get("program_label"), ctx.fee(p["mint"]))
-            return lamports, gross_v, exit_cost, exposure, len(opens)
+            return lamports, gross_v, exit_cost, exposure, len(opens), ledger.deposits_held(conn, BOOK)
         finally:
             self.worker.busy.release()
 

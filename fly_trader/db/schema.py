@@ -131,6 +131,9 @@ BASE_DDL: list[str] = [
         realized_sol double precision, fees_sol double precision NOT NULL DEFAULT 0,
         status text NOT NULL DEFAULT 'open', forced_exit_kind text, last_swap_ts timestamptz, satiety double precision NOT NULL DEFAULT 0)""",
     "CREATE UNIQUE INDEX IF NOT EXISTS positions_open_uniq ON positions (book, mint) WHERE status = 'open'",
+    # a live buy's token-account rent (the account's close returns it): a deposit kept apart from the position's cost
+    "ALTER TABLE positions ADD COLUMN IF NOT EXISTS deposit_sol double precision",
+    "ALTER TABLE positions ADD COLUMN IF NOT EXISTS deposit_refunded boolean NOT NULL DEFAULT false",
     "CREATE INDEX IF NOT EXISTS positions_book_status_idx ON positions (book, status)",
     """CREATE TABLE IF NOT EXISTS wealth_marks (
         beat_id bigint NOT NULL, book text NOT NULL, ts timestamptz NOT NULL DEFAULT now(),

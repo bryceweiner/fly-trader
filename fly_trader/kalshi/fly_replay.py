@@ -71,8 +71,9 @@ def _governance(ds, order, ts_o, res_o, upto, scores, lines, line_log, bank, now
         for c in range(1, lines.shape[0]):
             lc = R._line_at(line_log, (c, s_), ts_o[p3], float(lines[c, s_]))
             rp = gov.picks_returns(ds.ts[r3], ds.mint[r3], ds.hold_s[r3], np.nan_to_num(scores[c, s_, p3], nan=-np.inf), lc, y[r3])
-            s1 = scores[c, s_, p1]; has = np.isfinite(s1)
-            out = gov.check((rp[np.isfinite(rp)], rf[np.isfinite(rf)]), (s1[has], ds.outcome[r1][has]), drift[c])
+            s1 = scores[c, s_, p1]; f1 = scores[0, s_, p1]; has = np.isfinite(s1) & np.isfinite(f1)
+            out = gov.check((rp[np.isfinite(rp)], rf[np.isfinite(rf)]), (s1[has], ds.outcome[r1][has]), drift[c],
+                            ic_frozen_rows=(f1[has], ds.outcome[r1][has]))                  # as live: against the frozen shadow
             counts[(c, s_)]["checks"] += 1
             for t in out["triggers"]:
                 counts[(c, s_)][t] += 1

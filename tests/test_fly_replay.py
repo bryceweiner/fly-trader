@@ -76,6 +76,21 @@ def test_rollback_checks():
     assert out["triggers"] == ["shadow", "ic", "drift"]
 
 
+def test_the_checks_judge_learning_not_the_teacher():
+    """2026-10-11..13: ev (learning rate 0, drift 0) was rolled back three times because its teacher's ranking had a bad
+    day (IC -0.10..-0.13), and the third rollback froze all learning. A channel that learned nothing trips nothing, and the
+    ic check compares the plastic fly with its frozen shadow on the same rows."""
+    rng = np.random.default_rng(1)
+    s = rng.normal(size=10000); y = -0.1 * s + rng.normal(size=10000)                    # a teacher ranking worse than chance today
+    out = gov.check(None, (s, y), 0.0, ic_frozen_rows=(s, y))
+    assert out["triggers"] == [] and out["ic"] < 0 and out["ic"] == out["ic_frozen"]     # equal to its shadow: learning did nothing wrong
+    assert gov.check(None, (s, y), 0.0)["not_counted"] == ["ic"]                          # nothing learned, nothing to roll back
+    assert gov.check(None, (s, y), 0.05, ic_frozen_rows=(s, y))["triggers"] == []         # learned, but ranks as well as its shadow
+    worse = s + 3.0 * rng.normal(size=10000) - 0.3 * y                                  # learning made the ranking worse than the shadow's
+    out = gov.check(None, (worse, y), 0.05, ic_frozen_rows=(s, y))
+    assert out["triggers"] == ["ic"] and out["ic"] < out["ic_frozen"] - gov.IC_MARGIN
+
+
 def test_unresolved_rows_are_not_trades_and_a_nan_verdict_still_stores():
     """A 240-minute hold has no label at the end of the corpus (decisions.build leaves NaN). Counting those rows put
     n=3195 mean=NaN in a finished replay's own judgement and then lost five hours of work to a JSON error."""

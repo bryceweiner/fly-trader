@@ -21,9 +21,10 @@ first (CLAUDE.md): ``on_minute`` runs before any other book's minute, ``after_mi
    (the bootstrap, D = 0) from their scores of the minutes resolved in the last seven days (``train/fly_calibrate.py``).
 
 Hourly: learning statistics (``fly_updates``), a snapshot of the plastic state (kind 'fly_plastic'; hourly for 7 days,
-then one per day), the rollback checks (``train/fly_governance.py``; a rollback restores the newest good snapshot at
-least a day old, or D = 0, pauses the checks a day, and the third within 7 days freezes learning and requests a
-re-bootstrap), and the handover (``HANDOVER_DAYS`` of racing, at least ``HANDOVER_MIN_TRADES`` trades, realized P&L
+then one per day), the rollback checks (``train/fly_governance.py``: they judge what learning did, against the frozen
+shadow; a rollback restores the newest good snapshot at least a day old, or D = 0, pauses the checks a day, and the
+third within 7 days freezes that strategy's learning -- not the other strategies' -- and requests a re-bootstrap), and
+the handover (``HANDOVER_DAYS`` of racing, at least ``HANDOVER_MIN_TRADES`` trades, realized P&L
 at least the selector's). The state file ``data/brain/plastic/state.pt`` is written atomically every minute, before
 tags are marked resolved: on restart, pending tags at or before its watermark count as applied.
 """
@@ -199,6 +200,7 @@ class FlyBook:
         self.lines = {"plastic": dict(own), "frozen": dict(own)}
         self.sizing = {"plastic": {k: list(v) for k, v in own_s.items()}, "frozen": {k: list(v) for k, v in own_s.items()}}
         self.applied_through = -math.inf; self.learning_frozen = False; self.checks_paused_until = {k: 0.0 for k in self.names}
+        self.frozen: list[str] = []          # strategies whose learning the rollback limit froze (learning_frozen: the operator's pause, all)
         self.race_started_at: float | None = None; self.last_day: int | None = None; self.last_hour: int | None = None
         self.rollbacks: dict = {k: [] for k in self.names}; self.nu_set = False; self.hour_stats = self._empty_stats(); self.last_checks: dict = {}
         s = self._read_state()
@@ -213,6 +215,7 @@ class FlyBook:
             self.nu_set = True
             self.lines, self.sizing = s["lines"], s["sizing"]
             self.applied_through, self.learning_frozen, self.checks_paused_until = s["applied_through"], s["learning_frozen"], s["checks_paused_until"]
+            self.frozen = [k for k in s.get("frozen") or [] if k in self.names]
             self.race_started_at, self.last_day, self.last_hour, self.rollbacks = s["race_started_at"], s["last_day"], s["last_hour"], s["rollbacks"]
         elif s:
             self.race_started_at = s.get("race_started_at")        # a new bootstrap keeps racing the same book
@@ -309,7 +312,7 @@ class FlyBook:
 
     def _state(self) -> dict:
         return {"bootstrap_id": self.boot_id, "cfg": self.cfg, "score": config.FLY_SCORE, "bank": self.bank.state() if self.brain is None else None, "lines": self.lines, "sizing": self.sizing,
-                "applied_through": self.applied_through, "learning_frozen": self.learning_frozen, "checks_paused_until": self.checks_paused_until,
+                "applied_through": self.applied_through, "learning_frozen": self.learning_frozen, "frozen": self.frozen, "checks_paused_until": self.checks_paused_until,
                 "race_started_at": self.race_started_at, "last_day": self.last_day, "last_hour": self.last_hour, "rollbacks": self.rollbacks,
                 "saved_at": time.time()}
 
@@ -453,7 +456,9 @@ class FlyBook:
         out = {"minute": ctx.m1.isoformat(), "eligible": len(ctx.mints), "picks": ph["picks"], "lines": self.lines["plastic"], "frozen_lines": self.lines["frozen"],
                "line": self.lines["plastic"][self.names[0]], "frozen_line": self.lines["frozen"][self.names[0]],
                "drift": max(drift.values()) if drift else 0.0, "drift_by_strategy": drift, "pending": len(self.pending), "learned": learned,
-               "learning_frozen": self.learning_frozen, "channels": self.cfg, "holds_min": {k: v / 60.0 for k, v in self.holds.items()}, "bootstrap": self.boot_id,
+               "learning_frozen": (self.brain or self).learning_frozen, "frozen_strategies": (self.brain or self).frozen, "channels": self.cfg,
+               "holds_min": {k: v / 60.0 for k, v in self.holds.items()},
+               "bootstrap": self.boot_id,
                "device": str(self.fly.net.dev)}
         if st is not None:
             out.update({k: v for k, v in st.items() if k != "entries"}); out["stage"] = "trading"
@@ -613,10 +618,17 @@ class FlyBook:
         return stats
 
     def _teach(self, tags, r: np.ndarray, now: float, pathway: str) -> dict | None:
-        """One update of ``pathway`` (None while learning is frozen: the memory only decays)."""
-        if self.learning_frozen:
+        """One update of ``pathway`` by the tags of strategies that may learn (None when none may: the memory only decays).
+        A strategy the rollback limit froze keeps decaying but learns nothing; the operator's pause freezes all. Another
+        chain's book teaches the Solana book's memory, so that book's freezes are the ones that hold."""
+        owner = self.brain if self.brain is not None else self
+        held = [self.names.index(k) for k in owner.frozen if k in self.names]
+        keep = ~np.isin(np.asarray(tags.s), held) if held else np.ones(len(tags), bool)
+        if owner.learning_frozen or not keep.any():
             self.bank.decay_to(now)
             return None
+        if not keep.all():
+            tags, r = tags.subset(keep), np.asarray(r)[keep]
         return self.bank.update(tags, torch.tensor(r, dtype=torch.float32), now, pathway=pathway)
 
     def _teach_fill(self, tags, res: np.ndarray, now: float, stats: dict) -> None:
@@ -839,7 +851,7 @@ class FlyBook:
                 H = self.holds[name]; sc = g("score") - np.nan_to_num(g("fill_score"))
                 rp = gov.picks_returns(ts, mint, H, sc, g("line"), lab); rf = gov.picks_returns(ts, mint, H, g("frozen_score"), g("frozen_line"), lab)
                 recent = ts + H + LABEL_LAG_S > now - gov.IC_HOURS * 3600.0
-                out[name] = gov.check((rp, rf), (sc[recent], lab[recent]), self._drift(j))
+                out[name] = gov.check((rp, rf), (sc[recent], lab[recent]), self._drift(j), ic_frozen_rows=(g("frozen_score")[recent], lab[recent]))
             else:
                 out[name] = gov.check(None, None, self._drift(j))
         return out
@@ -857,7 +869,7 @@ class FlyBook:
             a = np.array([r["fill_score"] for r in rows], dtype=np.float64); b = np.array([r["fill"] for r in rows], dtype=np.float64)
             ic = float(np.corrcoef(a, b)[0, 1]) if len(rows) >= 3 and a.std() > 0 and b.std() > 0 else None
             out[name] = {"n": len(rows), "ic": ic, "drift": float(self.bank.drift(j, pathway="fill")[0])}
-            if len(rows) >= FILL_IC_MIN and ic is not None and ic < 0 and not self.learning_frozen:
+            if len(rows) >= FILL_IC_MIN and ic is not None and ic < 0 and not self.learning_frozen and name not in self.frozen:
                 self.bank.reset_columns(self.bank.fill[j]); out[name]["reset"] = True
                 record_event("warning", "fly", f"{name} fill pathway back to its bootstrap: its fill predictions ran against the fills (IC {ic:+.2f} over {len(rows)})", out[name])
         return out
@@ -879,7 +891,7 @@ class FlyBook:
         good = not any(c["triggers"] for c in checks.values())
         sid = self._snapshot(conn, now, good, checks)
         for name, c in checks.items():
-            if c["triggers"] and now >= self.checks_paused_until.get(name, 0.0) and not self.learning_frozen:
+            if c["triggers"] and now >= self.checks_paused_until.get(name, 0.0) and not self.learning_frozen and name not in self.frozen:
                 self._rollback(conn, now, c, sid, name=name)
         self._prune(conn, now)
         activity.prune(activity_dir(), now - activity.KEEP_S)
@@ -895,7 +907,11 @@ class FlyBook:
                                 (self.run_id, str(path), json.dumps(note, default=str))).fetchone()["id"])
 
     def _commands(self, conn, now: float) -> None:
-        """Operator commands from the console (``send_command``): pause / resume learning, roll back now."""
+        """Operator commands from the console (``send_command``): pause / resume learning, roll back now. They act on the
+        memory, which another chain's book shares with the Solana book: only the Solana book takes them (one key: whichever
+        book's minute ran first used to take a command, and a resume reached only the book that did not need it)."""
+        if self.brain is not None:
+            return
         r = conn.execute("SELECT value FROM ui_settings WHERE key = %s", (COMMAND_KEY,)).fetchone()
         if not r or not r["value"]:
             return
@@ -912,7 +928,7 @@ class FlyBook:
         if cmd == "pause":
             self.learning_frozen = True; record_event("info", "fly", "learning paused by the operator")
         elif cmd == "resume":
-            self.learning_frozen = False; self.rollbacks = {}; record_event("info", "fly", "learning resumed by the operator")
+            self.learning_frozen = False; self.frozen = []; self.rollbacks = {}; record_event("info", "fly", "learning resumed by the operator")
         elif cmd == "rollback":
             for j, name in enumerate(self.names):
                 self._rollback(conn, now, {"triggers": ["operator"], "drift": self._drift(j)}, None, count=False, name=name)
@@ -940,10 +956,11 @@ class FlyBook:
                      (f"{name}: " + ", ".join(checks["triggers"]), json.dumps(checks, default=str), from_sid, target["id"] if target is not None else None))
         record_event("warning", "fly", f"{name} channel rolled back ({', '.join(checks['triggers'])})", {"to_snapshot": target["id"] if target is not None else "bootstrap (D = 0)", "checks": checks})
         if count and len(self.rollbacks[name]) >= ROLLBACK_LIMIT:
-            self.learning_frozen = True
+            self.frozen = sorted(set(self.frozen) | {name})       # this strategy's learning only: the others keep learning
             from ..train import pipeline
             pipeline.request_run(fly=True, reason=f"{name}: {len(self.rollbacks[name])} rollbacks in 7 days")
-            record_event("error", "fly", f"learning frozen after {len(self.rollbacks[name])} {name} rollbacks in 7 days; re-bootstrap requested", {"rollbacks": self.rollbacks})
+            record_event("error", "fly", f"{name} learning frozen after {len(self.rollbacks[name])} rollbacks in 7 days; re-bootstrap requested",
+                         {"rollbacks": self.rollbacks, "frozen": self.frozen})
 
     def _prune(self, conn, now: float) -> None:
         rows = conn.execute("SELECT id, path, ts FROM brain_snapshots WHERE kind = 'fly_plastic' AND ts < %s ORDER BY ts DESC",

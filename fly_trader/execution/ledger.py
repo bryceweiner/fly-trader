@@ -67,7 +67,9 @@ def _chain_of(book: str) -> str:
 
 def open_position(conn, *, book: str, mint: str, pool: str | None, qty_raw: int, cost_sol: float,
                   entry_price: float, decision_id: int | None, fees_sol: float, ts: datetime | None = None,
-                  hold_s: float | None = None, strategy: str | None = None) -> int:
+                  hold_s: float | None = None, strategy: str | None = None, deposit_sol: float = 0.0) -> int:
+    """``deposit_sol``: what the buy put into the mint's token account (its rent, a first live buy), kept apart from
+    ``cost_sol``: the account's close returns it (``refund_deposits``)."""
     ts = ts or datetime.now(timezone.utc)
     existing = conn.execute("SELECT id, qty, cost_sol, entry_price FROM positions WHERE book=%s AND mint=%s AND status='open'",
                             (book, mint)).fetchone()
@@ -75,16 +77,34 @@ def open_position(conn, *, book: str, mint: str, pool: str | None, qty_raw: int,
         q0, c0 = int(existing["qty"]), float(existing["cost_sol"])
         q1, c1 = q0 + qty_raw, c0 + cost_sol
         p1 = (float(existing["entry_price"] or entry_price) * q0 + entry_price * qty_raw) / max(q1, 1)
-        conn.execute("UPDATE positions SET qty=%s, cost_sol=%s, entry_price=%s, fees_sol=fees_sol+%s, last_mark_price=%s, last_mark_ts=%s WHERE id=%s",
-                     (q1, c1, p1, fees_sol, entry_price, ts, existing["id"]))
+        conn.execute("UPDATE positions SET qty=%s, cost_sol=%s, entry_price=%s, fees_sol=fees_sol+%s, last_mark_price=%s, last_mark_ts=%s, "
+                     "deposit_sol = NULLIF(COALESCE(deposit_sol, 0) + %s, 0) WHERE id=%s",
+                     (q1, c1, p1, fees_sol, entry_price, ts, deposit_sol, existing["id"]))
         return int(existing["id"])
     row = conn.execute(
         """INSERT INTO positions (book, mint, pool, opened_at, entry_decision_id, qty, cost_sol, entry_price, peak_price,
-             last_mark_price, last_mark_ts, fees_sol, status, last_swap_ts, hold_s, strategy, chain)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open',%s,%s,%s,%s) RETURNING id""",
-        (book, mint, pool, ts, decision_id, qty_raw, cost_sol, entry_price, entry_price, entry_price, ts, fees_sol, ts, hold_s, strategy, _chain_of(book)),
+             last_mark_price, last_mark_ts, fees_sol, status, last_swap_ts, hold_s, strategy, chain, deposit_sol)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open',%s,%s,%s,%s,%s) RETURNING id""",
+        (book, mint, pool, ts, decision_id, qty_raw, cost_sol, entry_price, entry_price, entry_price, ts, fees_sol, ts, hold_s, strategy, _chain_of(book),
+         deposit_sol or None),
     ).fetchone()
     return int(row["id"])
+
+
+def refund_deposits(conn, book: str, mint: str) -> float:
+    """The mint's token-account deposits not yet returned (paid by the buy that opened the account, whichever position
+    of the mint closes it), marked returned; their total in SOL. 0 when none was booked apart (a position bought before
+    deposits were: its cost holds the rent, so the whole refund is its own)."""
+    rows = conn.execute("UPDATE positions SET deposit_refunded = true WHERE book = %s AND mint = %s AND COALESCE(deposit_sol, 0) > 0 AND NOT deposit_refunded "
+                        "RETURNING deposit_sol", (book, mint)).fetchall()
+    return sum(float(r["deposit_sol"]) for r in rows)
+
+
+def deposits_held(conn, book: str) -> float:
+    """SOL the book's token accounts hold as deposits (their rent) until their close returns it: part of its wealth."""
+    r = conn.execute("SELECT COALESCE(sum(deposit_sol), 0) AS s FROM positions WHERE book = %s AND COALESCE(deposit_sol, 0) > 0 AND NOT deposit_refunded",
+                     (book,)).fetchone()
+    return float(r["s"])
 
 
 def realize_partial(conn, *, position_id: int, qty_raw: int, cost_part: float, proceeds_sol: float, fees_sol: float,

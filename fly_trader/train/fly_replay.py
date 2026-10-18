@@ -324,10 +324,10 @@ def _governance(ds, order, ts_o, scores, lines, line_log, bank, now, lags, holds
                 sc3 = np.where(other3, np.nan, sc3)
             sc3 = np.nan_to_num(sc3, nan=-np.inf)
             rp = gov.picks_returns(ds.ts[r3], ds.mint[r3], H * 60.0, sc3, lc, y[r3])
-            s1 = scores[c, s_, a1:b1]; has = np.isfinite(s1)
+            s1 = scores[c, s_, a1:b1]; f1 = scores[0, s_, a1:b1]; has = np.isfinite(s1) & np.isfinite(f1)
             if ci is not None:
                 has = has & (slots.cidx_o[a1:b1] == ci)
-            out = gov.check((rp, rf), (s1[has], y[r1][has]), drift[c])
+            out = gov.check((rp, rf), (s1[has], y[r1][has]), drift[c], ic_frozen_rows=(f1[has], y[r1][has]))   # as live: against the frozen shadow
             counts[(c, s_)]["checks"] += 1
             for t in out["triggers"]:
                 counts[(c, s_)][t] += 1
