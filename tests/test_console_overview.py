@@ -9,6 +9,7 @@ import base64
 import contextlib
 import json
 import re
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -229,6 +230,47 @@ def test_overview_answers_on_robinhood_chain(console, monkeypatch):
     assert r["unit"] == "ETH" and b["unit"] == "ETH"
     monkeypatch.setattr(config, "RH_ENABLED", False)                                          # RH off: the picker's choice falls back to Solana
     assert _ok(console.topic("overview.summary", chain="rh"))["market"]["chain"] == "sol"
+
+
+# ---------------------------------------------------------------- setups by day
+def test_a_tokens_picks_are_one_setup_until_a_gap_and_its_trades_count_on_their_day():
+    t = datetime(2026, 10, 10, 3, 0, tzinfo=timezone.utc)
+    picks = [("paper_selector", "A", t, True), ("paper_selector", "A", t + timedelta(minutes=10), False),          # one setup, taken
+             ("paper_selector", "A", t + timedelta(minutes=50), False),                                            # 40 minutes on: a new one, vetoed
+             ("paper_selector", "B", t + timedelta(hours=20, minutes=55), False), ("paper_selector", "B", t + timedelta(hours=21, minutes=10), True),   # over midnight
+             ("paper_rh_selector", "C", t, True)]
+    per = overview.setups_by_day(picks)
+    assert per[("paper_selector", t.date())] == {"setups": 3, "trades": 1}
+    assert per[("paper_selector", (t + timedelta(days=1)).date())] == {"setups": 0, "trades": 1}
+    assert per[("paper_rh_selector", t.date())] == {"setups": 1, "trades": 1}
+    assert overview._is_pick("selector_enter", None) and overview._is_pick("blocked", "dump veto (P(≤-17 %) ≥ 0.43)")
+    assert not overview._is_pick("blocked", "held") and not overview._is_pick("selector_exit", None)
+
+
+def test_setups_topic_counts_todays_picks_and_marks_the_days_the_selector_did_not_run(console, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "PG_ARCHIVE_DIR", tmp_path)                                    # no reset archives
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0); run = str(uuid.uuid4()); mint = f"FLYsetup{uuid.uuid4().hex[:8]}"
+    book = {"book": "paper_selector"}
+    with transaction() as c:
+        c.execute("INSERT INTO runs (run_id, kind, config) VALUES (%s, 'selector', %s)", (run, Jsonb(book)))
+        c.execute("INSERT INTO beats (run_id, ts, beat_no) VALUES (%s, %s, 1)", (run, now))
+        c.execute("INSERT INTO decisions (ts, kind, mint, detail) VALUES (%s, 'selector_enter', %s, %s)", (now, mint, Jsonb(book)))
+        c.execute("INSERT INTO decisions (ts, kind, mint, rail, reason, detail) VALUES (%s, 'blocked', %s, 'held', 'selector pick not taken', %s)",
+                  (now + timedelta(minutes=1), mint, Jsonb(book)))                              # a re-pick of the held token: no new setup
+    try:
+        before = {r["day"]: r for r in _ok(console.topic("overview.setups"))["chains"][0]["days"]}
+        with transaction() as c:
+            c.execute("DELETE FROM decisions WHERE mint = %s", (mint,))
+        after = {r["day"]: r for r in _ok(console.topic("overview.setups"))["chains"][0]["days"]}
+    finally:
+        with transaction() as c:
+            c.execute("DELETE FROM decisions WHERE mint = %s", (mint,)); c.execute("DELETE FROM beats WHERE run_id = %s", (run,))
+            c.execute("DELETE FROM runs WHERE run_id = %s", (run,))
+    today = now.date().isoformat()
+    assert len(before) == 30 and list(before)[-1] == today and before[today]["ran"] > 0
+    assert (before[today]["setups"] - after[today]["setups"], before[today]["trades"] - after[today]["trades"]) == (1, 1)
+    quiet_day = (now - timedelta(days=29)).date().isoformat()
+    assert before[quiet_day]["ran"] > 0 or before[quiet_day]["setups"] is None                 # no bar on a day the selector book did not run
 
 
 # ---------------------------------------------------------------- the brain
