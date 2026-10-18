@@ -153,19 +153,15 @@ def test_await_confirmation_keeps_polling_a_processed_signature(monkeypatch):
 class _ScriptBroker:
     """Fills from a script, in order; ``gate`` holds each swap until set (an order in flight); every call recorded."""
 
-    def __init__(self, fills, gate=None, refund=None):
-        self.fills, self.gate, self.refund = list(fills), gate, refund
-        self.calls, self.closed, self.started = [], [], threading.Event()
+    def __init__(self, fills, gate=None):
+        self.fills, self.gate = list(fills), gate
+        self.calls, self.started = [], threading.Event()
 
     def swap(self, conn, **kw):
         self.started.set(); self.calls.append(kw)
         if self.gate is not None:
             self.gate.wait(10)
         return self.fills.pop(0)
-
-    def close_token_account(self, mint):
-        self.closed.append(mint)
-        return self.refund
 
 
 @pytest.fixture
@@ -233,18 +229,19 @@ def test_a_dead_bag_sweep_books_its_proceeds_onto_the_written_off_position(circu
             conn.execute("DELETE FROM positions WHERE mint = %s", (mint,))
 
 
-def test_a_sale_that_empties_its_mint_closes_the_token_account_and_books_the_rent(circuit1):
+def test_a_sale_that_empties_its_mint_leaves_the_token_accounts_close_to_the_mirror(circuit1):
+    """Live money first: the worker goes on to the next order; the mirror closes the emptied account mid-minute."""
     mint = f"M{uuid.uuid4().hex[:10]}"
     with transaction() as conn:
         pid = ledger.open_position(conn, book="live", mint=mint, pool=None, qty_raw=1_000_000, cost_sol=0.2, entry_price=2e-7, decision_id=None, fees_sol=0.0)
-    fb = _ScriptBroker([_fill(-1_000_000, 250_000_000, 2.5e-7)], refund=2_034_280); w = ExecutionWorker(fb)
+    fb = _ScriptBroker([_fill(-1_000_000, 250_000_000, 2.5e-7)]); w = ExecutionWorker(fb)
     try:
         assert w.submit(_req(mint, "sell", position_id=pid))
         r = w.results.get(timeout=10)
-        assert r.ok and r.closed and fb.closed == [mint] and r.realized_sol == pytest.approx(0.05 + 0.00203428)
+        assert r.ok and r.closed and w.emptied == {mint} and r.realized_sol == pytest.approx(0.05)
         with transaction() as conn:
             p = _pos(conn, pid)
-        assert p["status"] == "closed" and p["realized_sol"] == pytest.approx(0.25 - 0.2 + 0.00203428) and w.pending() == set()
+        assert p["status"] == "closed" and p["realized_sol"] == pytest.approx(0.25 - 0.2) and w.pending() == set()
     finally:
         w.stop()
         with transaction() as conn:
@@ -257,7 +254,7 @@ def test_a_first_buys_token_account_rent_is_a_deposit_its_close_returns(circuit1
     fee is the position's."""
     mint = f"M{uuid.uuid4().hex[:10]}"; rent, fee = 1_513_840, 5_000
     buy = FillResult(True, None, None, "sig", "confirmed", 0, None, 1_000_000, -200_000_000, 2e-7, 1, rent)
-    fb = _ScriptBroker([buy, _fill(-1_000_000, 250_000_000, 2.5e-7)], refund=rent - fee); w = ExecutionWorker(fb)
+    fb = _ScriptBroker([buy, _fill(-1_000_000, 250_000_000, 2.5e-7)]); w = ExecutionWorker(fb)
     try:
         assert w.submit(_req(mint, "buy", 200_000_000))
         r1 = w.results.get(timeout=10)
@@ -267,9 +264,12 @@ def test_a_first_buys_token_account_rent_is_a_deposit_its_close_returns(circuit1
         assert w.submit(_req(mint, "sell", position_id=r1.position_id))
         r2 = w.results.get(timeout=10)
         with transaction() as conn:
-            p = _pos(conn, r1.position_id)
-        assert r2.closed and fb.closed == [mint] and p["deposit_refunded"] and p["realized_sol"] == pytest.approx(0.25 - 0.2 - fee / 1e9)
-        assert r2.realized_sol == pytest.approx(0.05 - fee / 1e9)
+            before = ledger.deposits_held(conn, "live")
+            booked = ledger.book_account_close(conn, "live", mint, rent - fee)          # the mirror's close (agent/fly_live.close_accounts)
+            p = _pos(conn, r1.position_id); after = ledger.deposits_held(conn, "live")
+        assert r2.closed and w.emptied == {mint} and r2.realized_sol == pytest.approx(0.05)
+        assert booked == (pytest.approx(-fee / 1e9), r1.position_id) and before - after == pytest.approx(rent / 1e9)
+        assert p["deposit_refunded"] and p["realized_sol"] == pytest.approx(0.25 - 0.2 - fee / 1e9)
     finally:
         w.stop()
         with transaction() as conn:
@@ -283,7 +283,7 @@ def test_a_buy_queues_behind_the_sale_of_its_mint_which_keeps_its_token_account(
     with transaction() as conn:
         pid = ledger.open_position(conn, book="live", mint=mint, pool=None, qty_raw=1_000_000, cost_sol=0.2, entry_price=2e-7, decision_id=None, fees_sol=0.0)
     gate = threading.Event()
-    fb = _ScriptBroker([_fill(-1_000_000, 250_000_000, 2.5e-7), _fill(900_000, -200_000_000, 2.2e-7)], gate=gate, refund=2_034_280); w = ExecutionWorker(fb)
+    fb = _ScriptBroker([_fill(-1_000_000, 250_000_000, 2.5e-7), _fill(900_000, -200_000_000, 2.2e-7)], gate=gate); w = ExecutionWorker(fb)
     try:
         assert w.submit(_req(mint, "sell", position_id=pid)) and fb.started.wait(10) and w.selling() == {mint}
         assert w.submit(_req(mint, "buy", 200_000_000))
@@ -291,7 +291,7 @@ def test_a_buy_queues_behind_the_sale_of_its_mint_which_keeps_its_token_account(
         assert w.selling() == set() and w.pending() == {mint}
         gate.set()
         r1, r2 = w.results.get(timeout=10), w.results.get(timeout=10)
-        assert (r1.request.side, r1.ok, r1.closed, r2.request.side, r2.ok) == ("sell", True, True, "buy", True) and fb.closed == []
+        assert (r1.request.side, r1.ok, r1.closed, r2.request.side, r2.ok) == ("sell", True, True, "buy", True) and w.emptied == set()
         with transaction() as conn:
             rows = conn.execute("SELECT status, qty FROM positions WHERE book = 'live' AND mint = %s ORDER BY id", (mint,)).fetchall()
         assert [(r["status"], int(r["qty"])) for r in rows] == [("closed", 1_000_000), ("open", 900_000)]

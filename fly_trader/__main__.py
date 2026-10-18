@@ -99,8 +99,12 @@ def _cmd_verify_fills(args):
 
 
 def _cmd_close_atas(args):
-    from .execution import broker_live
-    broker_live.close_empty_atas()
+    from .db.connection import transaction
+    from .execution import broker_live, ledger
+    with transaction() as conn:                          # a held token's account is never empty, but its buy may be landing
+        held = {p["mint"] for p in ledger.open_positions(conn, "live")}
+    r = broker_live.close_empty_atas(skip_mints=held)
+    print(f"closed {r['closed']} of {r['candidates']} empty token accounts, {r['credited']:+.9f} SOL booked; failed {len(r['failed'])}")
 
 
 def _cmd_replay_pull(args):

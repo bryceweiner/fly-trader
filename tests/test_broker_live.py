@@ -19,7 +19,7 @@ from fly_trader import config
 from fly_trader.chain.cluster_guard import SigningRefused
 from fly_trader.chain.rpc import TOKEN_PROGRAM_ID
 from fly_trader.db.connection import transaction
-from fly_trader.execution import broker_live
+from fly_trader.execution import broker_live, ledger
 from fly_trader.execution.broker_live import LiveBroker
 
 MINT = str(Pubkey.new_unique())
@@ -103,6 +103,12 @@ class FakeJup:
         if outcome == "success_first_buy":                  # the swap also opens the mint's token account: its rent leaves the wallet
             self.rpc.lamports -= BUY_LAMPORTS + BUY_FEES + RENT
             self.rpc.tokens[MINT] = self.rpc.tokens.get(MINT, 0) + BUY_TOKENS; self.rpc.rent[MINT] = RENT
+            self.rpc.landed.add(sig)
+            return {"status": "Success", "signature": sig, "slot": "5", "code": 0, "totalInputAmount": str(BUY_LAMPORTS),
+                    "totalOutputAmount": str(BUY_TOKENS), "_latency_ms": 900}
+        if outcome == "success_buy_beside_a_close":          # a token-account close lands between the swap's two snapshots
+            self.rpc.lamports -= BUY_LAMPORTS + BUY_FEES - RENT
+            self.rpc.tokens[MINT] = self.rpc.tokens.get(MINT, 0) + BUY_TOKENS
             self.rpc.landed.add(sig)
             return {"status": "Success", "signature": sig, "slot": "5", "code": 0, "totalInputAmount": str(BUY_LAMPORTS),
                     "totalOutputAmount": str(BUY_TOKENS), "_latency_ms": 900}
@@ -330,34 +336,106 @@ def test_a_buy_quoted_past_its_paper_fill_is_refused_before_signing(db_conn, gat
     assert res.ok and res.token_delta == BUY_TOKENS
 
 
-def test_closing_an_emptied_token_account_measures_the_rent_it_returns(db_conn, gate_open):
-    kp = Keypair(); owner = str(kp.pubkey()); rent, fee = 2_039_280, 5_000
+class _CloseRpc(FakeRpc):
+    """The bot's token accounts (``accts``) and close transactions: ``land`` says whether a close lands when sent."""
 
-    class Rpc(FakeRpc):
-        def send_transaction(self, tx_b64, skip_preflight=False, max_retries=3):
-            self.lamports += rent - fee; self.landed.add("closesig"); return "closesig"
+    def __init__(self, owner, accts, land=True):
+        super().__init__(10 ** 9)
+        self.owner, self.accts, self.land, self.sent = owner, accts, land, []
 
-        def get_transaction(self, sig, encoding="jsonParsed"):
-            return {"slot": 9, "transaction": {"message": {"accountKeys": [{"pubkey": owner}]}},
-                    "meta": {"err": None, "fee": fee, "preBalances": [10 ** 9], "postBalances": [10 ** 9 + rent - fee], "preTokenBalances": [], "postTokenBalances": []}}
+    def get_token_accounts_by_owner(self, pk):
+        return [dict(a) for a in self.accts]
 
-    class Signer(RawSigner):
-        closed: list = []
+    def send_transaction(self, tx_b64, skip_preflight=False, max_retries=3):
+        sig = f"closesig{len(self.sent)}"; self.sent.append(sig)
+        if self.land:
+            self.landed.add(sig)
+        return sig
 
-        def call(self, method, **p):
-            if method == "close_atas":
-                self.closed = list(p["accounts"])
-                return [{"tx": "unsigned-in-tests", "signature": "closesig", "last_valid_block_height": rpc.height + 150}]
-            return super().call(method, **p)
+    def get_transaction(self, sig, encoding="jsonParsed"):
+        gone = [a for a in self.accts if a["amount"] == 0 and a.get("closing")]
+        return {"slot": 9, "transaction": {"message": {"accountKeys": [{"pubkey": self.owner}] + [{"pubkey": a["address"]} for a in gone]}},
+                "meta": {"err": None, "fee": 5_000, "preBalances": [10 ** 9] + [a["lamports"] for a in gone],
+                         "postBalances": [10 ** 9 + sum(a["lamports"] for a in gone) - 5_000] + [0] * len(gone)}}
 
-    rpc = Rpc(10 ** 9, {MINT: 0}, {MINT: 6}); signer = Signer(kp)
-    broker = LiveBroker(rpc=rpc, jup=None, signer=signer)
+
+class _CloseSigner:
+    def __init__(self, owner, rpc, on_close=None):
+        self.owner, self.rpc, self.on_close, self.closed = owner, rpc, on_close, []
+
+    def call(self, method, **p):
+        if method == "pubkeys":
+            return {"trading": self.owner}
+        assert method == "close_atas"
+        self.closed.append(list(p["accounts"]))
+        for a in self.rpc.accts:
+            a["closing"] = a["address"] in p["accounts"]
+        if self.on_close:
+            self.on_close()
+        return [{"tx": "unsigned-in-tests", "last_valid_block_height": self.rpc.height + 150}]
+
+
+def _closed_position(conn, mint, cost, proceeds, deposit=0.0):
+    pid = ledger.open_position(conn, book="live", mint=mint, pool=None, qty_raw=1_000, cost_sol=cost, entry_price=1e-7, decision_id=None, fees_sol=0.0, deposit_sol=deposit)
+    ledger.close_position(conn, position_id=pid, exit_price=1e-7, proceeds_sol=proceeds, fees_sol=0.0, decision_id=None, forced_kind=None)
+    return pid
+
+
+def test_closing_the_empty_token_accounts_books_each_rent_onto_the_sale_that_emptied_it(db_conn, gate_open):
+    """A deposit booked apart comes back and only its share of the fee is its sale's; an account opened before deposits
+    were booked apart returns its whole rent to the mint's latest sale; a held or skipped token's account is left alone."""
+    owner = str(Keypair().pubkey()); tag = uuid.uuid4().hex[:8]; a, b, h, k = (f"MA{tag}", f"MB{tag}", f"MH{tag}", f"MK{tag}")
+    with transaction() as conn:
+        pa = _closed_position(conn, a, 0.1, 0.12, deposit=RENT / 1e9)
+        pb = _closed_position(conn, b, 0.1 + RENT / 1e9, 0.09)                  # bought before deposits were booked apart: its cost holds the rent
+    rpc = _CloseRpc(owner, [{"address": f"acct-{m}", "mint": m, "amount": n, "lamports": RENT} for m, n in ((a, 0), (b, 0), (h, 7), (k, 0))])
+    signer = _CloseSigner(owner, rpc)
     try:
-        assert broker.close_token_account(MINT) == rent - fee and signer.closed == [f"ata-{MINT[:6]}"]
-        ev = db_conn.execute("SELECT detail FROM wallet_events WHERE kind = 'ata_closed' AND pubkey = %s", (owner,)).fetchone()["detail"]
-        assert ev["mint"] == MINT and ev["lamports"] == rent - fee and ev["status"] == "confirmed"
-        rpc.tokens[MINT] = 5; signer.closed = []                                    # the wallet still holds some: nothing is closed
-        assert broker.close_token_account(MINT) is None and signer.closed == []
+        out = broker_live.close_empty_atas(rpc=rpc, signer=signer, skip_mints={k})
+        with transaction() as conn:
+            ra, rb = (conn.execute("SELECT realized_sol, deposit_refunded FROM positions WHERE id = %s", (i,)).fetchone() for i in (pa, pb))
+            ev = conn.execute("SELECT detail FROM wallet_events WHERE kind = 'ata_closed' AND pubkey = %s", (owner,)).fetchone()["detail"]
+        assert signer.closed == [[f"acct-{a}", f"acct-{b}"]] and out["closed"] == 2 and out["signatures"] == ["closesig0"]
+        assert out["credited"] == pytest.approx((RENT - 5_000) / 1e9)
+        assert ra["deposit_refunded"] and ra["realized_sol"] == pytest.approx(0.02 - 2_500 / 1e9)
+        assert rb["realized_sol"] == pytest.approx(0.09 - 0.1 - RENT / 1e9 + (RENT - 2_500) / 1e9)
+        assert ev["status"] == "confirmed" and ev["booked"][f"acct-{a}"] == {"lamports": RENT - 2_500, "position": pa} and ev["fee"] == 5_000
     finally:
         with transaction() as conn:
             conn.execute("DELETE FROM wallet_events WHERE pubkey = %s", (owner,))
+            conn.execute("DELETE FROM positions WHERE mint = ANY(%s)", ([a, b, h, k],))
+
+
+def test_a_close_cut_short_for_an_order_is_settled_once_it_lands_and_never_sent_twice(db_conn, gate_open):
+    """An order queued while a close is awaited ends the wait at once (it goes first): the close stays unsettled, its
+    accounts are not closed again, and it is booked once seen landed."""
+    owner = str(Keypair().pubkey()); mint = f"MU{uuid.uuid4().hex[:8]}"; order = {"queued": False}
+    with transaction() as conn:
+        pid = _closed_position(conn, mint, 0.1, 0.1, deposit=RENT / 1e9)
+    rpc = _CloseRpc(owner, [{"address": "acct-u", "mint": mint, "amount": 0, "lamports": RENT}], land=False)
+    signer = _CloseSigner(owner, rpc, on_close=lambda: order.update(queued=True))
+    try:
+        out = broker_live.close_empty_atas(rpc=rpc, signer=signer, until=lambda: order["queued"])
+        assert out["pending"] == ["closesig0"] and out["closed"] == 0 and broker_live.unsettled_closes()
+        again = broker_live.close_empty_atas(rpc=rpc, signer=signer)              # not landed yet: its account is not closed twice
+        assert again["candidates"] == 0 and len(signer.closed) == 1 and broker_live.unsettled_closes()
+        rpc.landed.add("closesig0")
+        assert broker_live.settle_closes(rpc) == 0 and not broker_live.unsettled_closes()
+        with transaction() as conn:
+            p = conn.execute("SELECT realized_sol, deposit_refunded FROM positions WHERE id = %s", (pid,)).fetchone()
+        assert p["deposit_refunded"] and p["realized_sol"] == pytest.approx(-5_000 / 1e9)
+    finally:
+        broker_live._UNSETTLED.clear()
+        with transaction() as conn:
+            conn.execute("DELETE FROM wallet_events WHERE pubkey = %s", (owner,))
+            conn.execute("DELETE FROM positions WHERE mint = %s", (mint,))
+
+
+def test_while_a_close_is_unsettled_a_swap_takes_its_own_transactions_deltas(db_conn, gate_open, monkeypatch):
+    """A close that may still land would put its rent between a swap's two balance snapshots: the fill is read from the
+    swap's own transaction instead."""
+    monkeypatch.setattr(broker_live, "tx_deltas", lambda tx, owner, mint: (-(BUY_LAMPORTS + BUY_FEES), BUY_TOKENS))
+    monkeypatch.setitem(broker_live._UNSETTLED, "closesig", {"owner": "x", "accounts": [], "last_valid_block_height": 10 ** 9})
+    broker, rpc, jup = _broker(["success_buy_beside_a_close"])
+    res = _swap(broker, db_conn, random.randrange(1 << 40))
+    assert res.ok and res.lamports_delta == -(BUY_LAMPORTS + BUY_FEES) and res.token_delta == BUY_TOKENS

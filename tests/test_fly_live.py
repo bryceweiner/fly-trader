@@ -3,8 +3,9 @@ as dead-bags, live wealth marked, and entries paused when live trails its paper 
 decisions: holds count from the decision's minute, a failed entry is retried while paper holds it, a buy queues behind
 the sale of its token, a tripped breaker lets entries try again after its cooldown, and every paper entry the wallet did
 not take is a decisions row of the live book. Live money first: the sales due go out at the minute boundary, once, and
-the mark, the write-offs and the gap check come after the minute's orders."""
+the mark, the write-offs, the gap check and the token accounts' close come after the minute's orders."""
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -22,7 +23,7 @@ class _Worker:
     """execution/worker.ExecutionWorker's queue rules, nothing executed: one request per mint, a buy behind a lone sale."""
 
     def __init__(self):
-        self.submitted, self.inflight, self.results, self.busy = [], {}, [], threading.Lock()
+        self.submitted, self.inflight, self.results, self.busy, self.emptied = [], {}, [], threading.Lock(), set()
 
     def submit(self, req):
         sides = self.inflight.get(req.mint)
@@ -457,3 +458,36 @@ def test_a_booked_order_marks_the_wallet_at_once_and_tells_the_console(db_conn, 
         live_first._LISTENERS.clear()
     assert none == 0 and first == pytest.approx(5.2) and [r["wealth"] for r in rows] == [pytest.approx(5.3)] and len(told) == 3
 
+
+
+def test_emptied_token_accounts_are_closed_mid_minute_and_never_in_front_of_an_order(db_conn, clean, monkeypatch):
+    """Live money first: the close of the token accounts sales emptied starts mid-minute with nothing queued, on a thread
+    of its own, never closes a held token's, and its wait ends as soon as an order is queued; then the console is told."""
+    from fly_trader.execution import broker_live
+    calls = []
+
+    def close(rpc=None, signer=None, skip_mints=None, until=None, **kw):
+        calls.append({"skip": set(skip_mints), "signer": signer, "waits": not until()})
+        w.inflight["LIVE_NEW"] = ["buy"]                                         # an order queued while the close is awaited
+        calls[-1]["ends_for_the_order"] = until()
+        w.inflight.clear()
+        return {"closed": 1, "failed": [], "pending": [], "signatures": ["s"], "credited": 0.0015}
+    monkeypatch.setattr(broker_live, "close_empty_atas", close)
+    monkeypatch.setattr(fly_live, "CLOSE_GUARD_S", -3600.0)                      # the boundary's guard is not this test's
+    monkeypatch.setattr(live_first, "may_mark", lambda now=None: True)
+    mid = {"on": False}; monkeypatch.setattr(live_first, "mid_minute", lambda now=None: mid["on"])
+    w = _Worker(); mirror = _mirror(w); mirror.broker.signer = "SIGNER"; told = []
+    mirror.last_sweep = mirror.last_close = time.time()                          # neither hourly pass is due
+    with transaction() as conn:
+        conn.execute("INSERT INTO positions (book, mint, pool, opened_at, qty, cost_sol, entry_price, status) VALUES ('live', 'LIVE_HELD', 'P', now(), 5, 0.1, 0.0000002, 'open')")
+    live_first.on_change(lambda: told.append(1))
+    try:
+        mirror.idle(); idle_before = mirror.closer                                # nothing emptied, the hourly scan not due
+        w.emptied.add("LIVE_SOLD"); mirror.idle(); not_mid = mirror.closer        # not mid-minute
+        mid["on"] = True; w.inflight["LIVE_Q"] = ["sell"]; mirror.idle(); queued = mirror.closer    # an order queued: it goes first
+        w.inflight.clear(); mirror.idle(); mirror.closer.join(10)
+    finally:
+        live_first._LISTENERS.clear()
+    assert (idle_before, not_mid, queued) == (None, None, None)
+    assert calls == [{"skip": {"LIVE_HELD"}, "signer": "SIGNER", "waits": True, "ends_for_the_order": True}]
+    assert w.emptied == set() and told == [1] and not w.busy.locked()
