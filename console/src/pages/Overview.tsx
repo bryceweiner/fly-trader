@@ -1,7 +1,7 @@
 // Overview, laid out like Dashtreme's index: the selector book's KPI widgets, what the system is doing in plain words
-// beside the win rate, the fly's brain, this minute's scoring with the top scores, the race between the selector and the
-// plastic fly, the selector's setups per day, the live ticker, and the paper book with its open positions (ui/api/overview.py;
-// the brain ui/api/brain.py).
+// beside the win rate, the money's book (its wealth and open positions), the fly's brain, this minute's scoring with the top
+// scores, the race between the selector and the plastic fly, the selector's setups per day, and the live ticker
+// (ui/api/overview.py; the brain ui/api/brain.py).
 import { BrainPanel } from '../brain'
 import { PageHead } from '../components/ChainPicker'
 import { BarChart, LineChart, RadialGauge, type Series } from '../components/Charts'
@@ -333,13 +333,13 @@ export default function Overview() {
     <>
       <PageHead title="Overview" icon="bx-home-alt" />
       <SummaryPanel />
+      <BookPanel />
       <BrainPanel variant="memecoin" />
       <ThisMinute />
       <RacePanel />
       <SetupsPanel />
       <HoursPanel />
       <TickerCard />
-      <BookPanel />
     </>
   )
 }

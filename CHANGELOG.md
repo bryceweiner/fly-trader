@@ -15,6 +15,8 @@ ships signed releases built from this development line.
   - Solana and Robinhood Chain sit side by side, so a quiet market on one chain shows against the other.
   - A day the selector book did not run, or ran only part of, is flagged. Few setups on such a day say nothing about
     the market.
+- **The book's wealth and open positions sit near the top of the Overview page,** right below the summary and above the
+  fly's brain.
 
 ## 2026-10-18, release 8: The live stats follow each live order, and empty token accounts close on their own
 
