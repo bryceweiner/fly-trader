@@ -28,6 +28,7 @@ SYSTEM = "11111111111111111111111111111111"
 BUY_LAMPORTS = 10_000_000
 BUY_TOKENS = 1_000_000
 BUY_FEES = 7_000
+RENT = 1_513_840            # a Token-2022 account's rent, as a first buy of a pump.fun mint pays it (2026-10-18)
 
 
 class FakeRpc:
@@ -38,13 +39,14 @@ class FakeRpc:
         self.height = 1_000
         self.landed: set[str] = set()
         self.status_polls = 0
+        self.rent: dict[str, int] = {}
 
     def get_balance(self, pk):
         return self.lamports
 
     def get_token_accounts_by_owner(self, pk):
         return [{"address": f"ata-{m[:6]}", "mint": m, "amount": a, "decimals": self.decimals.get(m, 6),
-                 "program": TOKEN_PROGRAM_ID} for m, a in self.tokens.items()]
+                 "program": TOKEN_PROGRAM_ID, "lamports": self.rent.get(m, 0)} for m, a in self.tokens.items()]
 
     def get_signature_statuses(self, sigs, search_history=False):
         self.status_polls += 1
@@ -98,6 +100,12 @@ class FakeJup:
             return {"status": "Success", "signature": sig, "slot": "5", "code": 0, "totalInputAmount": str(BUY_LAMPORTS),
                     "totalOutputAmount": str(BUY_TOKENS), "inputAmountResult": "9990000", "outputAmountResult": str(BUY_TOKENS),
                     "swapEvents": [], "_latency_ms": 900}
+        if outcome == "success_first_buy":                  # the swap also opens the mint's token account: its rent leaves the wallet
+            self.rpc.lamports -= BUY_LAMPORTS + BUY_FEES + RENT
+            self.rpc.tokens[MINT] = self.rpc.tokens.get(MINT, 0) + BUY_TOKENS; self.rpc.rent[MINT] = RENT
+            self.rpc.landed.add(sig)
+            return {"status": "Success", "signature": sig, "slot": "5", "code": 0, "totalInputAmount": str(BUY_LAMPORTS),
+                    "totalOutputAmount": str(BUY_TOKENS), "_latency_ms": 900}
         if outcome == "success_sell":
             self.rpc.tokens[MINT] = 0
             self.rpc.lamports += 9_990_000 - 6_000
@@ -195,6 +203,18 @@ def test_verified_buy_lands_orders_and_fills_rows(db_conn, gate_open):
     assert f["signature"] == res.signature and f["platform_fee"]["feeBps"] == 10
     assert f["pre_snapshot"]["lamports"] == 1_000_000_000 and MINT not in f["pre_snapshot"]["tokens"]
     assert f["post_snapshot"]["tokens"][MINT] == BUY_TOKENS and f["post_snapshot"]["decimals"][MINT] == 6
+
+
+def test_a_first_buy_keeps_its_token_accounts_rent_apart_from_the_trade(db_conn, gate_open):
+    """The first buy of a mint opens its token account: its rent (~0.0015 SOL) is a deposit the account's close returns,
+    not the trade. The fill's SOL, price and fee are the swap's own, as paper's are; the deposit is reported apart."""
+    broker, rpc, jup = _broker(["success_first_buy"])
+    res = _swap(broker, db_conn, random.randrange(1 << 40))
+    assert res.ok and res.lamports_delta == -(BUY_LAMPORTS + BUY_FEES) and res.deposit_lamports == RENT
+    assert res.price_sol == pytest.approx(((BUY_LAMPORTS + BUY_FEES) / 1e9) / (BUY_TOKENS / 1e6))
+    f = _fills(db_conn, [res.order_id])[0]
+    assert f["sol_delta_lamports"] == -(BUY_LAMPORTS + BUY_FEES) and f["fee_lamports"] == BUY_FEES
+    assert f["post_snapshot"]["deposits"][MINT] == RENT and MINT not in f["pre_snapshot"]["deposits"]
 
 
 def test_verified_sell(db_conn, gate_open):

@@ -415,3 +415,17 @@ def test_before_the_fly_runs_only_positions_with_their_own_hold_are_sold(db_conn
         mirror.H = 7200.0
         second = mirror.exits(conn, m1=m1 + timedelta(minutes=1), run_id=None)
     assert first["exited"] == 1 and second["exited"] == 1 and [r.mint for r in w.submitted] == ["LIVE_H1", "LIVE_H2"]
+
+
+def test_live_wealth_counts_the_token_accounts_deposits_until_their_close_returns_them(db_conn, clean, monkeypatch):
+    monkeypatch.setattr(live_first, "may_mark", lambda now=None: True)
+    w = _Worker(); mirror = _mirror(w); m1 = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+    with transaction() as conn:
+        conn.execute("INSERT INTO positions (book, mint, pool, opened_at, qty, cost_sol, entry_price, status, deposit_sol) VALUES ('live', 'LIVE_DEP', 'P', %s, 0, 0.1, 0.0000002, 'closed', 0.0015)",
+                     (m1,))                                                      # sold; its token account not closed yet
+        beat = conn.execute("INSERT INTO beats (beat_no) VALUES (1) RETURNING id").fetchone()["id"]
+        mirror.minute(_ctx(conn, m1), run_id=str(uuid.uuid4()), beat_id=beat, line=0.01, table=TABLE, entries=[])
+        mark = mirror.mark_due(conn)
+        row = conn.execute("SELECT sol_free, positions_value FROM wealth_marks WHERE book = 'live' AND beat_id = %s", (beat,)).fetchone()
+    assert mark["wealth"] == pytest.approx(5.0 + 0.0015) and row["sol_free"] == pytest.approx(5.0) and row["positions_value"] == pytest.approx(0.0015)
+

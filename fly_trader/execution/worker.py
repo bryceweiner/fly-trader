@@ -163,10 +163,13 @@ class ExecutionWorker:
                     price = fr.price_sol or (cost / max(fr.token_delta / (10 ** req.decimals), 1e-12))
                     pid = ledger.open_position(conn, book="live", mint=req.mint, pool=req.pool, qty_raw=fr.token_delta,
                                                cost_sol=cost, entry_price=price, decision_id=req.decision_id,
-                                               fees_sol=0.0, ts=ts, hold_s=req.hold_s, strategy=req.strategy)
+                                               fees_sol=0.0, ts=ts, hold_s=req.hold_s, strategy=req.strategy,
+                                               deposit_sol=max(fr.deposit_lamports, 0) / config.LAMPORTS_PER_SOL)
                     rails.record_notional(conn, cost, "entry")
                     return ExecResult(req, True, fr.fill_id, fr.signature, fr.token_delta, fr.lamports_delta, price, position_id=pid)
                 else:
+                    if fr.deposit_lamports < 0:                # the swap closed the token account itself: its deposit is back
+                        ledger.refund_deposits(conn, "live", req.mint)
                     proceeds = fr.lamports_delta / config.LAMPORTS_PER_SOL
                     price = fr.price_sol if fr.price_sol is not None else (proceeds / max(abs(fr.token_delta) / (10 ** req.decimals), 1e-12))
                     if req.forced_kind == "dead_bag_sweep":    # a written-off position's tokens: what they fetch is that position's
@@ -208,11 +211,12 @@ class ExecutionWorker:
         return not req.retry and req.forced_kind != "dead_bag_sweep"
 
     def _close_account(self, req: ExecRequest, res: ExecResult) -> None:
-        """The sale left the live book without this mint: close its empty token account (the rent its first buy paid back
-        to the wallet: about a point of a 0.15 SOL round trip, read as execution loss by the gap monitor) and book what the
-        close returned, net of its fee, onto the position the sale closed. Not while a buy is queued behind the sale (it
-        needs the account) or the wallet still holds the token. A failure here never touches the sale: it is logged and
-        the account stays for ``close-empty-atas``."""
+        """The sale left the live book without this mint: close its empty token account. The rent its first buy paid comes
+        back to the wallet: the deposit booked apart on that buy's position is returned (``ledger.refund_deposits``) and only
+        the close's fee is the closing position's; a position bought before deposits were booked apart had the rent in its
+        cost, so the whole refund is its own. Not while a buy is queued behind the sale (it needs the account) or the
+        wallet still holds the token. A failure here never touches the sale: it is logged and the account stays (and its
+        deposit counts in wealth) for ``close-empty-atas``."""
         from ..vault import walletlock
         with self.lock:
             if self.inflight.get(req.mint) != ["sell"]:
@@ -224,8 +228,9 @@ class ExecutionWorker:
             with walletlock.maybe_exclusive(config.VAULT_ENABLED):
                 got = self.broker.close_token_account(req.mint)
             if got is not None and res.position_id is not None:
-                with transaction() as conn:
-                    ledger.credit(conn, res.position_id, got / config.LAMPORTS_PER_SOL)
-                res.realized_sol = (res.realized_sol or 0.0) + got / config.LAMPORTS_PER_SOL
+                with transaction() as conn:      # the account's deposit is back, less the close's fee: only the fee is the position's
+                    pnl = got / config.LAMPORTS_PER_SOL - ledger.refund_deposits(conn, "live", req.mint)
+                    ledger.credit(conn, res.position_id, pnl)
+                res.realized_sol = (res.realized_sol or 0.0) + pnl
         except Exception as e:
             log.warning("closing the token account of %s after its sale failed (the sale stands): %s: %s", req.mint, type(e).__name__, e)

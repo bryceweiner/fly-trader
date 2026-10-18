@@ -45,6 +45,7 @@ from ..signer.policy import EXCLUDE_ROUTERS, PolicyError
 from ..db.apilog import record_event
 from ..db.connection import connect, transaction
 from ..logging_setup import scrub
+from . import ledger
 
 log = logging.getLogger(__name__)
 
@@ -73,9 +74,10 @@ class FillResult:
     code: int | None
     error: str | None
     token_delta: int
-    lamports_delta: int
+    lamports_delta: int               # the trade's SOL: the wallet's change less what went into (or came back from) the mint's token account
     price_sol: float | None
     attempts: int
+    deposit_lamports: int = 0         # SOL the swap put into the mint's token account (its rent, a first buy) or took back out (< 0)
 
 
 def _int_or_none(v) -> int | None:
@@ -339,6 +341,10 @@ class LiveBroker:
                     log.warning("fill %s: snapshot deltas (%d, %d) differ from the transaction's (%d, %d); using the transaction",
                                 signature[:12], lam, tok, exact[0], exact[1])
                 lam, tok = exact
+        # the rent a first buy pays to open the mint's token account (~0.0015 SOL) is a deposit the account's close returns,
+        # not the trade: the trade's SOL, its price and the position's cost leave it out (it is kept on the position)
+        dep = int(post.deposits.get(mint, 0)) - int(pre.deposits.get(mint, 0))
+        lam += dep
         # a confirmed sell that moved the tokens is a fill even at lam <= 0 (a rugged token's dust proceeds < fees)
         verified = (lam < 0 and tok > 0) if side == "buy" else (tok < 0 and (lam > 0 or chain_status == "confirmed"))
         jup_status = (ex or {}).get("status")
@@ -353,7 +359,7 @@ class LiveBroker:
                                         order.get("platformFee"), verified_by, pre, post)
             log.info("fill %s: %s %s token_delta=%d lamports_delta=%d price_sol=%s (%s)",
                      fill_id, side, mint, tok, lam, price, verified_by)
-            return FillResult(True, order_id, fill_id, signature, chain_status, code, error, tok, lam, price, attempt), False
+            return FillResult(True, order_id, fill_id, signature, chain_status, code, error, tok, lam, price, attempt, dep), False
         if jup_status == "Success" or chain_status == "confirmed":
             tx_info = None
             try:
@@ -506,6 +512,9 @@ def close_empty_atas(rpc=None, signer=None, url: str | None = None, batch: int =
             with transaction(url) as conn:
                 conn.execute("INSERT INTO wallet_events (kind, pubkey, detail) VALUES ('ata_closed', %s, %s)",
                              (owner_s, Jsonb(detail)))
+                if status == "confirmed":             # their rent is back in the wallet: no longer a deposit the books hold
+                    for m in sorted({a["mint"] for a in chunk}):
+                        ledger.refund_deposits(conn, "live", m)
         except Exception as e:
             log.warning("wallet_events insert failed: %s", type(e).__name__)
         if status == "confirmed":

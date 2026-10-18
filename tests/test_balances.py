@@ -27,3 +27,17 @@ def test_snapshot_sums_accounts_per_mint_and_keeps_decimals():
     assert snap.ts.tzinfo is not None and snap.token("missing") == 0
     js = snap.to_json()
     assert js["lamports"] == 42 and js["tokens"]["M"] == 12 and js["decimals"]["N"] == 9 and js["ts"].endswith("+00:00")
+
+
+def test_the_rent_held_by_each_mints_token_accounts_is_a_deposit_wrapped_sol_is_not():
+    class Rpc:
+        def get_balance(self, pk):
+            return 42
+
+        def get_token_accounts_by_owner(self, pk):
+            return [{"address": "x", "mint": "M", "amount": 5, "decimals": 6, "lamports": 2_039_280},
+                    {"address": "w", "mint": "So11111111111111111111111111111111111111112", "amount": 9, "decimals": 9, "lamports": 9_002_039_280, "is_native": True}]
+
+    snap = snapshot_balances(Rpc(), "owner")
+    assert snap.deposits == {"M": 2_039_280} and snap.to_json()["deposits"] == {"M": 2_039_280}
+

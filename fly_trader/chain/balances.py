@@ -19,25 +19,30 @@ class Snapshot:
     tokens: dict[str, int]
     ts: datetime
     decimals: dict[str, int] = field(default_factory=dict)
+    deposits: dict[str, int] = field(default_factory=dict)   # lamports held by the wallet's token accounts of each mint (their rent)
 
     def token(self, mint: str) -> int:
         return int(self.tokens.get(mint, 0))
 
     def to_json(self) -> dict:
         return {"lamports": int(self.lamports), "tokens": {m: int(a) for m, a in self.tokens.items()},
-                "decimals": {m: int(d) for m, d in self.decimals.items()}, "ts": self.ts.isoformat()}
+                "decimals": {m: int(d) for m, d in self.decimals.items()}, "deposits": {m: int(v) for m, v in self.deposits.items()},
+                "ts": self.ts.isoformat()}
 
 
 def snapshot_balances(rpc, pubkey) -> Snapshot:
     lamports = int(rpc.get_balance(str(pubkey)))
     tokens: dict[str, int] = {}
     decimals: dict[str, int] = {}
+    deposits: dict[str, int] = {}
     for acct in rpc.get_token_accounts_by_owner(str(pubkey)):
         mint = acct["mint"]
         tokens[mint] = tokens.get(mint, 0) + int(acct["amount"])
         if acct.get("decimals") is not None:
             decimals[mint] = int(acct["decimals"])
-    return Snapshot(lamports=lamports, tokens=tokens, ts=config.utcnow(), decimals=decimals)
+        if not acct.get("is_native"):                    # a wrapped-SOL account's lamports are SOL, not a deposit
+            deposits[mint] = deposits.get(mint, 0) + int(acct.get("lamports") or 0)
+    return Snapshot(lamports=lamports, tokens=tokens, ts=config.utcnow(), decimals=decimals, deposits=deposits)
 
 
 def compute_delta(pre: Snapshot, post: Snapshot) -> dict:

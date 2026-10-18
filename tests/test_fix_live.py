@@ -251,6 +251,31 @@ def test_a_sale_that_empties_its_mint_closes_the_token_account_and_books_the_ren
             conn.execute("DELETE FROM positions WHERE mint = %s", (mint,))
 
 
+def test_a_first_buys_token_account_rent_is_a_deposit_its_close_returns(circuit1):
+    """The rent a first buy pays for the mint's token account is kept apart from the position's cost (a live buy costs
+    what its paper twin does) and counted in live wealth while held; the sale's close returns it, and only the close's
+    fee is the position's."""
+    mint = f"M{uuid.uuid4().hex[:10]}"; rent, fee = 1_513_840, 5_000
+    buy = FillResult(True, None, None, "sig", "confirmed", 0, None, 1_000_000, -200_000_000, 2e-7, 1, rent)
+    fb = _ScriptBroker([buy, _fill(-1_000_000, 250_000_000, 2.5e-7)], refund=rent - fee); w = ExecutionWorker(fb)
+    try:
+        assert w.submit(_req(mint, "buy", 200_000_000))
+        r1 = w.results.get(timeout=10)
+        with transaction() as conn:
+            p = _pos(conn, r1.position_id); held = ledger.deposits_held(conn, "live")
+        assert r1.ok and p["cost_sol"] == pytest.approx(0.2) and p["deposit_sol"] == pytest.approx(rent / 1e9) and held >= rent / 1e9
+        assert w.submit(_req(mint, "sell", position_id=r1.position_id))
+        r2 = w.results.get(timeout=10)
+        with transaction() as conn:
+            p = _pos(conn, r1.position_id)
+        assert r2.closed and fb.closed == [mint] and p["deposit_refunded"] and p["realized_sol"] == pytest.approx(0.25 - 0.2 - fee / 1e9)
+        assert r2.realized_sol == pytest.approx(0.05 - fee / 1e9)
+    finally:
+        w.stop()
+        with transaction() as conn:
+            conn.execute("DELETE FROM positions WHERE mint = %s", (mint,))
+
+
 def test_a_buy_queues_behind_the_sale_of_its_mint_which_keeps_its_token_account(circuit1):
     """Paper sold the token and bought it back in one minute: the live buy waits behind the sale, runs once the sale has
     closed the position, and the token account stays for it."""
