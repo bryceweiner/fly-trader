@@ -456,7 +456,8 @@ class FlyBook:
         out = {"minute": ctx.m1.isoformat(), "eligible": len(ctx.mints), "picks": ph["picks"], "lines": self.lines["plastic"], "frozen_lines": self.lines["frozen"],
                "line": self.lines["plastic"][self.names[0]], "frozen_line": self.lines["frozen"][self.names[0]],
                "drift": max(drift.values()) if drift else 0.0, "drift_by_strategy": drift, "pending": len(self.pending), "learned": learned,
-               "learning_frozen": self.learning_frozen, "frozen_strategies": self.frozen, "channels": self.cfg, "holds_min": {k: v / 60.0 for k, v in self.holds.items()},
+               "learning_frozen": (self.brain or self).learning_frozen, "frozen_strategies": (self.brain or self).frozen, "channels": self.cfg,
+               "holds_min": {k: v / 60.0 for k, v in self.holds.items()},
                "bootstrap": self.boot_id,
                "device": str(self.fly.net.dev)}
         if st is not None:
@@ -618,10 +619,12 @@ class FlyBook:
 
     def _teach(self, tags, r: np.ndarray, now: float, pathway: str) -> dict | None:
         """One update of ``pathway`` by the tags of strategies that may learn (None when none may: the memory only decays).
-        A strategy the rollback limit froze keeps decaying but learns nothing; the operator's pause freezes all."""
-        held = [self.names.index(k) for k in self.frozen if k in self.names]
+        A strategy the rollback limit froze keeps decaying but learns nothing; the operator's pause freezes all. Another
+        chain's book teaches the Solana book's memory, so that book's freezes are the ones that hold."""
+        owner = self.brain if self.brain is not None else self
+        held = [self.names.index(k) for k in owner.frozen if k in self.names]
         keep = ~np.isin(np.asarray(tags.s), held) if held else np.ones(len(tags), bool)
-        if self.learning_frozen or not keep.any():
+        if owner.learning_frozen or not keep.any():
             self.bank.decay_to(now)
             return None
         if not keep.all():
@@ -904,7 +907,11 @@ class FlyBook:
                                 (self.run_id, str(path), json.dumps(note, default=str))).fetchone()["id"])
 
     def _commands(self, conn, now: float) -> None:
-        """Operator commands from the console (``send_command``): pause / resume learning, roll back now."""
+        """Operator commands from the console (``send_command``): pause / resume learning, roll back now. They act on the
+        memory, which another chain's book shares with the Solana book: only the Solana book takes them (one key: whichever
+        book's minute ran first used to take a command, and a resume reached only the book that did not need it)."""
+        if self.brain is not None:
+            return
         r = conn.execute("SELECT value FROM ui_settings WHERE key = %s", (COMMAND_KEY,)).fetchone()
         if not r or not r["value"]:
             return
