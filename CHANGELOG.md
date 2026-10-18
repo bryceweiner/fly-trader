@@ -3,7 +3,19 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
-## Unreleased
+## 2026-10-18, release 7: A live buy costs what its paper twin does, and the fly learns again
+
+Published to Hugging Face as signed release 7. Fly #157 and selector #154 are unchanged, and so are the definitions they
+were judged on: no model, seed or infrastructure file changes.
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 7`.
+- **New columns are added on start:** `deposit_sol` and `deposit_refunded` on `positions`.
+- **If your fly's learning froze** (the console's model page says learning is frozen), lift it with Resume learning once
+  this release runs.
 
 ### Live money
 
@@ -13,7 +25,6 @@ ships signed releases built from this development line.
   - It was booked as part of the buy, so live buys looked 1–3 % bigger than paper and their entry prices 1–3 % higher.
   - The deposit is now kept apart from the buy and counted in live wealth until the close returns it. Only the close's
     fee is the position's.
-- New column `deposit_sol` (with `deposit_refunded`) on `positions`, added on start.
 
 ### The fly
 
@@ -26,7 +37,11 @@ ships signed releases built from this development line.
   - The checks now judge only what learning did. A strategy that has learned nothing trips none. The IC check compares
     the fly with its frozen copy on the same rows instead of with zero, and the replays count it the same way.
   - Reaching the rollback limit freezes that strategy's learning only.
-  - An install whose learning froze this way can lift it with the console's resume learning.
+- **One fly's operator commands reach it.**
+  - The Solana and Robinhood Chain books share one memory. Before, whichever book's minute ran first took a pause,
+    resume or rollback, and a resume could reach only the book that did not need it.
+  - The Robinhood Chain book also kept learning into the shared memory while the Solana book was frozen.
+  - Only the Solana book takes these commands now, and the Robinhood Chain book's learning follows its pause and freezes.
 
 ## 2026-10-18, release 6: A restart never holds a sale back, and Kalshi orders go first
 
