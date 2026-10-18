@@ -12,6 +12,7 @@ It never runs trading logic itself: every control writes a Postgres row or signa
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -22,6 +23,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from starlette.staticfiles import StaticFiles
 
 from .. import config
+from ..agent import live_first
 from ..logging_setup import scrub
 from . import runtime
 from .hub import ActionError, Hub, run_action, run_topic
@@ -51,10 +53,13 @@ def create_app(*, hosts_workers: bool = True) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.hub = Hub()
+        hub = app.state.hub = Hub(); loop = asyncio.get_running_loop()
+        poke = lambda: loop.call_soon_threadsafe(hub.poke)     # noqa: E731  a live order booked or marked: every panel now
+        live_first.on_change(poke)
         try:
             yield
         finally:
+            live_first.off_change(poke)
             app.state.hub.close()
             if hosts_workers:
                 await stop_workers()

@@ -72,8 +72,11 @@ class LiveMirror:
         self.exit_lock = threading.Lock()     # the live clock's thread and the engine's both send exits: once per minute
         self.exits_through: datetime | None = None
         self.due_mark: tuple | None = None    # (the minute, its beat id): the wealth mark waiting for an idle worker (``idle``)
+        self.mark_ctx: tuple | None = None    # the latest minute's, marked again after each order (``_after_order``)
+        self.mark_lock = threading.Lock()     # the worker's thread and the engine's both mark
         self.last_mark: dict | None = None
         self.wallet_sol: float | None = None
+        self.worker.on_done = self._after_order
 
     def _decision(self, conn, m1, run_id, beat_id, p, reason: str, forced: bool) -> int:
         return int(conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, size_sol, forced, reason, detail) VALUES (%s,%s,%s,%s,%s,'fly_exit',%s,%s,%s,%s) RETURNING id",
@@ -206,7 +209,7 @@ class LiveMirror:
                     conn.execute("UPDATE decisions SET book_targets = array_append(COALESCE(book_targets, '{}'), 'live') WHERE id = %s", (e["decision_id"],))
                 else:
                     skipped.append((e["mint"], "held")); self._blocked(conn, ctx, run_id, beat_id, e, "held", "an order of this token is queued or in flight", size)
-        self.due_mark = (ctx, beat_id)
+        self.due_mark = self.mark_ctx = (ctx, beat_id)
         return {"stage": "trading live", "wallet_sol": self.wallet_sol, "entered": n_enter, "retried": n_retry, "exited": ex["exited"], "liquidated": ex["liquidated"],
                 "in_flight": len(inflight), "blocked": blocked, "skipped": skipped[:10], "failed_orders": sum(1 for r in drained if not r.ok),
                 "awaiting_retry": len(self.failed)}
@@ -228,24 +231,39 @@ class LiveMirror:
         """Between minutes, never in front of an order (agent/live_first.py): the waiting wealth mark once the worker has
         nothing queued or in flight, and every ``SWEEP_S``, mid-minute, the dead-bag sweep."""
         now = time.time()
-        if self.due_mark is not None and live_first.may_mark(now) and not self.worker.pending():
-            self.mark_due()
+        if self.due_mark is not None and live_first.may_mark(now) and not self.worker.pending() and self.mark_due() is not None:
+            live_first.changed()
         if now - self.last_sweep >= SWEEP_S and live_first.mid_minute(now) and not self.worker.pending():
             self.last_sweep = now
             snap = snapshot_balances(self.broker.rpc, self.broker.pubkey)
             with transaction() as conn:
                 self.sweep(conn, snap, self.worker.pending(), datetime.now(timezone.utc))
 
-    def mark_due(self, conn=None) -> dict | None:
+    def _after_order(self, res) -> None:
+        """In the worker's thread, once an order is booked: the live stats come before anything else. With no order
+        waiting (none ever waits for this) and not just before a boundary, the latest minute is marked again on the wallet
+        as it now stands; then the console is told (live_first.changed)."""
+        if not self.worker.pending() and live_first.may_mark():
+            try:
+                self.mark_due(force=True)
+            except Exception:
+                log.warning("live mark after an order failed", exc_info=True)
+        live_first.changed()
+
+    def mark_due(self, conn=None, force: bool = False) -> dict | None:
         """The waiting minute's wealth mark: wallet SOL + open positions net of exit cost at the minute's prices, and the
-        kill switch on the book's peak. None when a swap was between its fill and its booking or the balance could not be
-        read: that minute goes unmarked."""
-        if self.due_mark is None:
+        kill switch on the book's peak. ``force``: the latest minute again, marked or not (an order moved the wallet).
+        None when a swap was between its fill and its booking or the balance could not be read: that minute goes unmarked."""
+        pending = self.due_mark if self.due_mark is not None else (self.mark_ctx if force else None)
+        if pending is None:
             return None
         if conn is None:
             with transaction() as c:
-                return self.mark_due(c)
-        ctx, beat_id = self.due_mark
+                return self.mark_due(c, force=force)
+        with self.mark_lock:
+            return self._mark_minute(conn, *pending)
+
+    def _mark_minute(self, conn, ctx, beat_id: int) -> dict | None:
         ctx = copy.copy(ctx); ctx.conn = conn; m1 = ctx.m1         # the minute's prices, read on this transaction
         ledger.mark_positions(conn, BOOK, ctx.prices, {}, m1)
         mark = self._mark(conn, ctx); self.due_mark = None
@@ -257,7 +275,8 @@ class LiveMirror:
         pk = conn.execute("SELECT max(wealth) AS pk FROM wealth_marks WHERE book = %s AND (%s::timestamptz IS NULL OR ts > %s)",
                           (BOOK, rebase, rebase)).fetchone(); peak = max(float(pk["pk"] or 0.0), wealth)
         conn.execute("INSERT INTO wealth_marks (beat_id, book, ts, sol_free, positions_value, exit_cost, wealth, peak, drawdown, exposure, n_open) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                     "ON CONFLICT (beat_id, book) DO NOTHING",
+                     "ON CONFLICT (beat_id, book) DO UPDATE SET sol_free = EXCLUDED.sol_free, positions_value = EXCLUDED.positions_value, exit_cost = EXCLUDED.exit_cost, "
+                     "wealth = EXCLUDED.wealth, peak = EXCLUDED.peak, drawdown = EXCLUDED.drawdown, exposure = EXCLUDED.exposure, n_open = EXCLUDED.n_open",   # marked again after an order
                      (beat_id, BOOK, m1, sol_now, deposits + gross_v - exit_cost, exit_cost, wealth, peak, (1.0 - wealth / peak) if peak > 0 else 0.0, exposure, n_open))
         if config.VAULT_ENABLED:                     # deposits, withdrawals and payouts are not performance
             from ..vault import nav as vault_nav, payout as vault_payout     # trading wallet + treasury are one book: a top-up or sweep is no loss

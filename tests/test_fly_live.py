@@ -429,3 +429,31 @@ def test_live_wealth_counts_the_token_accounts_deposits_until_their_close_return
         row = conn.execute("SELECT sol_free, positions_value FROM wealth_marks WHERE book = 'live' AND beat_id = %s", (beat,)).fetchone()
     assert mark["wealth"] == pytest.approx(5.0 + 0.0015) and row["sol_free"] == pytest.approx(5.0) and row["positions_value"] == pytest.approx(0.0015)
 
+
+def test_a_booked_order_marks_the_wallet_at_once_and_tells_the_console(db_conn, clean, monkeypatch):
+    """The live stats come before anything else: once an order is booked and none waits, the latest minute is marked
+    again on the wallet as it now stands (its row updated) and the listeners -- the console's panels -- are told."""
+    monkeypatch.setattr(live_first, "may_mark", lambda now=None: True)
+    w = _Worker(); mirror = _mirror(w); m1 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc); told = []
+    assert w.on_done == mirror._after_order
+    live_first.on_change(lambda: told.append(1))
+    try:
+        with transaction() as conn:
+            beat = conn.execute("INSERT INTO beats (beat_no) VALUES (1) RETURNING id").fetchone()["id"]
+            mirror.minute(_ctx(conn, m1), run_id=str(uuid.uuid4()), beat_id=beat, line=0.01, table=TABLE, entries=[])
+        w.inflight["LIVE_W"] = ["buy"]                                                # an order still queued: no mark yet
+        mirror._after_order(None)
+        with transaction() as conn:
+            none = conn.execute("SELECT count(*) AS n FROM wealth_marks WHERE book = 'live' AND beat_id = %s", (beat,)).fetchone()["n"]
+        w.inflight.clear(); mirror.broker.rpc.lamports = 5_200_000_000                # the sale landed: 0.2 SOL more in the wallet
+        mirror._after_order(None)
+        with transaction() as conn:
+            first = conn.execute("SELECT wealth FROM wealth_marks WHERE book = 'live' AND beat_id = %s", (beat,)).fetchone()["wealth"]
+        mirror.broker.rpc.lamports = 5_300_000_000
+        mirror._after_order(None)                                                      # the same minute, marked again
+        with transaction() as conn:
+            rows = conn.execute("SELECT wealth FROM wealth_marks WHERE book = 'live' AND beat_id = %s", (beat,)).fetchall()
+    finally:
+        live_first._LISTENERS.clear()
+    assert none == 0 and first == pytest.approx(5.2) and [r["wealth"] for r in rows] == [pytest.approx(5.3)] and len(told) == 3
+

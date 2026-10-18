@@ -3,6 +3,14 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## Unreleased
+
+### Live money
+
+- **The live stats follow each live order.**
+  - Once a live order is booked and no other waits, the wallet is marked at once and the console's panels update then.
+  - Before, the mark waited for the engine's next idle moment, and the race card refreshed only every 30 seconds.
+
 ## 2026-10-18, release 7: A live buy costs what its paper twin does, and the fly learns again
 
 Published to Hugging Face as signed release 7. Fly #157 and selector #154 are unchanged, and so are the definitions they

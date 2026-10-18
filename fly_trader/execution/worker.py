@@ -73,6 +73,7 @@ class ExecutionWorker:
         self.busy = threading.Lock()                    # held from a request's swap to its booking
         self.thread = threading.Thread(target=self._loop, name="runner-exec", daemon=True)   # routed to the runner's log
         self.stop_flag = False
+        self.on_done = None                            # called with each result once booked (the mirror's live stats: agent/fly_live.py)
         self.thread.start()
 
     def submit(self, req: ExecRequest) -> bool:
@@ -141,6 +142,11 @@ class ExecutionWorker:
                     self._close_account(req, res)
             self._release(req)
             self.results.put(res)
+            if self.on_done is not None:
+                try:
+                    self.on_done(res)
+                except Exception:
+                    log.exception("execution worker: the after-order hook failed (the order stands)")
 
     def _execute(self, req: ExecRequest) -> ExecResult:
         from ..vault import walletlock                 # the vault fly: swap + ledger commit are one step for its snapshots

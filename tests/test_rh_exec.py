@@ -442,3 +442,25 @@ def test_the_rh_mark_waits_for_no_intent_between_its_snapshot_and_its_booking(ch
     finally:
         go.set(); t.join(10)
     assert "wealth" not in out and due and mark is None and m.due_mark is None and n == 0
+
+
+def test_the_rh_mirror_marks_after_each_intent_and_tells_the_console(monkeypatch):
+    """The RH executor runs its mirror's hook once each intent is booked: an intent still queued leaves the mark for later,
+    the console is told either way."""
+    from fly_trader.agent import live_first
+    from fly_trader.rh import live as rh_live
+    calls, told = [], []
+    ex = SimpleNamespace(pending=lambda: {"0xabc"}, wallet=None, on_done=None)
+    m = rh_live.RhLiveMirror(600.0, executor=ex)
+    assert ex.on_done == m._after_order
+    monkeypatch.setattr(m, "mark_due", lambda conn=None, force=False: calls.append(force))
+    monkeypatch.setattr(live_first, "may_mark", lambda now=None: True)
+    live_first.on_change(lambda: told.append(1))
+    try:
+        m._after_order(None)
+        ex.pending = lambda: set()
+        m._after_order(None)
+    finally:
+        live_first._LISTENERS.clear()
+    assert calls == [True] and len(told) == 2
+

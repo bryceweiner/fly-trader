@@ -111,6 +111,7 @@ class RhExecutor:
         self.wallet = wallet; self.planner = planner or router.plan_swap
         self.q: queue.Queue = queue.Queue(); self.results: list[RhResult] = []; self._pending: dict[str, list[RhRequest]] = {}   # token -> queued or in flight, in order
         self._mu = threading.Lock(); self._stop = threading.Event(); self.thread = None
+        self.on_done = None                    # called with each result once booked (the mirror's live stats: rh/live.py)
         if recover:
             self.recover()
         if start:
@@ -180,9 +181,14 @@ class RhExecutor:
                     self.recover()
                 except Exception:
                     log.exception("rh recovery after a missing receipt failed; the intent stays open until the next start")
-                continue
-            with self._mu:
-                self.results.append(res); self._unqueue(req)
+            else:
+                with self._mu:
+                    self.results.append(res); self._unqueue(req)
+            if self.on_done is not None:                                   # the mirror's live stats (rh/live.py)
+                try:
+                    self.on_done(res)
+                except Exception:
+                    log.exception("rh: the after-intent hook failed (the intent stands)")
 
     def stop(self, timeout: float = STOP_JOIN_S) -> None:
         """Let the intent in flight finish (its booking with it), drop the queued ones (exits are retried next minute,

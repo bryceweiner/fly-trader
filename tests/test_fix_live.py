@@ -310,3 +310,23 @@ def test_stop_waits_for_the_order_in_flight_and_drops_the_queued_ones(circuit1):
     w.stop(timeout=10)
     assert not w.thread.is_alive() and [c["mint"] for c in fb.calls] == [a] and w.pending() == set()
     assert w.results.get_nowait().request.mint == a and not w.submit(_req(b, "sell"))
+
+
+def test_the_worker_tells_its_mirror_once_an_order_is_booked(circuit1):
+    """The live stats follow the live orders: the mirror's hook runs as soon as each order is booked, after its result."""
+    mint = f"M{uuid.uuid4().hex[:10]}"; seen = []
+    fb = _ScriptBroker([_fill(1_000_000, -200_000_000, 2e-7)]); w = ExecutionWorker(fb)
+    w.on_done = lambda res: seen.append((res.request.side, res.ok, res.position_id is not None))
+    try:
+        assert w.submit(_req(mint, "buy", 200_000_000))
+        w.results.get(timeout=10)
+        for _ in range(100):
+            if seen:
+                break
+            threading.Event().wait(0.05)
+        assert seen == [("buy", True, True)]
+    finally:
+        w.stop()
+        with transaction() as conn:
+            conn.execute("DELETE FROM positions WHERE mint = %s", (mint,))
+
