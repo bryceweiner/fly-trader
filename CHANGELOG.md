@@ -3,6 +3,31 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## Unreleased
+
+### Live money
+
+- **A live buy costs what its paper twin does.**
+  - The ~0.0015 SOL that a first buy of a token pays to open its token account is a deposit. The account's close
+    returns it.
+  - It was booked as part of the buy, so live buys looked 1–3 % bigger than paper and their entry prices 1–3 % higher.
+  - The deposit is now kept apart from the buy and counted in live wealth until the close returns it. Only the close's
+    fee is the position's.
+- New column `deposit_sol` (with `deposit_refunded`) on `positions`, added on start.
+
+### The fly
+
+- **It learns again, and one strategy's trouble no longer stops the other's learning.**
+  - On 2026-10-13 the rollback checks froze all of the fly's learning after rolling ev back three times in three days.
+  - ev cannot learn (its learning rate is 0), so there was nothing to roll back. The IC check had tripped only because
+    the selector's own ev ranking had a bad day (IC −0.10 to −0.13).
+  - Capitulation, which was learning, stopped too. Five days of decay then erased what it had learned, and the
+    re-bootstrap the freeze asked for never ran.
+  - The checks now judge only what learning did. A strategy that has learned nothing trips none. The IC check compares
+    the fly with its frozen copy on the same rows instead of with zero, and the replays count it the same way.
+  - Reaching the rollback limit freezes that strategy's learning only.
+  - An install whose learning froze this way can lift it with the console's resume learning.
+
 ## 2026-10-18, release 6: A restart never holds a sale back, and Kalshi orders go first
 
 Published to Hugging Face as signed release 6. Fly #157 and selector #154 are unchanged, and so are the definitions they

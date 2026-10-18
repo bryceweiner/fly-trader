@@ -21,8 +21,8 @@ minute's live part, ``after_minute`` the rest, once the live orders are out.
    maker label the return of a bid one tick inside the ask when a later minute's ask reached it).
 
 Hourly: learning statistics (``kalshi_fly_updates``), a snapshot of the plastic state (kind 'kalshi_fly_plastic'), the
-rollback checks (train/fly_governance.py; a third rollback in 7 days freezes learning and asks kalshi/pipeline.py for a
-re-bootstrap). State: ``data/brain/plastic_kalshi/state.pt``; commands ``ui_settings['kalshi_fly_command']``; status
+rollback checks (train/fly_governance.py: they judge what learning did, against the frozen shadow; a third rollback of a
+strategy in 7 days freezes that strategy's learning and asks kalshi/pipeline.py for a re-bootstrap). State: ``data/brain/plastic_kalshi/state.pt``; commands ``ui_settings['kalshi_fly_command']``; status
 ``ui_settings['kalshi_fly_status']``; activity for the 3D view in ``data/brain/activity_kalshi/``.
 """
 from __future__ import annotations
@@ -141,6 +141,7 @@ class KalshiFlyBook:
         self.lines = {"plastic": dict(self.fly.lines), "frozen": dict(self.fly.lines)}
         self.sizing = {"plastic": {k: list(v) for k, v in self.fly.sizings.items()}, "frozen": {k: list(v) for k, v in self.fly.sizings.items()}}
         self.applied_through = -math.inf; self.learning_frozen = False; self.checks_paused_until = {k: 0.0 for k in self.names}
+        self.frozen: list[str] = []          # strategies whose learning the rollback limit froze (learning_frozen: the operator's pause, all)
         self.last_day: int | None = None; self.last_hour: int | None = None
         self.rollbacks: dict = {k: [] for k in self.names}; self.nu_set = False; self.hour_stats = self._empty_stats(); self.last_checks: dict = {}
         s = self._read_state()
@@ -148,6 +149,7 @@ class KalshiFlyBook:
             self.bank.load_state(s["bank"]); self.nu_set = True
             self.lines, self.sizing = s["lines"], s["sizing"]
             self.applied_through, self.learning_frozen, self.checks_paused_until = s["applied_through"], s["learning_frozen"], s["checks_paused_until"]
+            self.frozen = [k for k in s.get("frozen") or [] if k in self.names]
             self.last_day, self.last_hour, self.rollbacks = s["last_day"], s["last_hour"], s["rollbacks"]
         elif s:
             with transaction() as conn:
@@ -164,7 +166,8 @@ class KalshiFlyBook:
 
     def _state(self) -> dict:
         return {"bootstrap_id": self.boot_id, "cfg": self.cfg, "bank": self.bank.state(), "lines": self.lines, "sizing": self.sizing, "applied_through": self.applied_through,
-                "learning_frozen": self.learning_frozen, "checks_paused_until": self.checks_paused_until, "last_day": self.last_day, "last_hour": self.last_hour,
+                "learning_frozen": self.learning_frozen, "frozen": self.frozen, "checks_paused_until": self.checks_paused_until, "last_day": self.last_day,
+                "last_hour": self.last_hour,
                 "rollbacks": self.rollbacks, "saved_at": time.time()}
 
     def _write_state(self) -> None:
@@ -267,7 +270,7 @@ class KalshiFlyBook:
             self.last_day = day; self._calibrate(conn, ctx.m1_epoch)
         drift = {k: float(self.bank.drift(j)[0]) if self.bank.learn.shape[0] > 1 else float(self.bank.drift()[0]) for j, k in enumerate(self.names)}
         out.update({"lines": self.lines["plastic"], "frozen_lines": self.lines["frozen"], "arms": self.arms, "drift": max(drift.values()) if drift else 0.0,
-                    "drift_by_strategy": drift, "pending": len(self.pending), "learned": learned, "learning_frozen": self.learning_frozen, "channels": self.cfg,
+                    "drift_by_strategy": drift, "pending": len(self.pending), "learned": learned, "learning_frozen": self.learning_frozen, "frozen_strategies": self.frozen, "channels": self.cfg,
                     "bootstrap": self.boot_id, "device": str(self.fly.net.dev)})
         hour = int(ctx.m1_epoch // 3600)
         if self.last_hour is None:
@@ -386,12 +389,13 @@ class KalshiFlyBook:
                 self.pending.push(ss.keys, ss.ts, now + REARM_S, ss.y_dn, ss.u0, ss.k, ss.w, s=j)
             rearmed = [(datetime.fromtimestamp(now + REARM_S, timezone.utc), datetime.fromtimestamp(t, timezone.utc), tk, side, name) for t, tk, side, name in sub.keys]
         stats = {"n": int(keep.sum()), "unknown": int(sum(1 for k in out_keys if k[1] == "unknown")), "rearmed": rearmed, "keys": out_keys, "waiting": len(rearm)}
+        held = [self.names.index(k) for k in self.frozen if k in self.names]
+        learn = keep & ~np.isin(np.asarray(tags.s), held) if held else keep    # a strategy the rollback limit froze learns nothing
         if keep.any():
-            tv = tags.subset(keep)
-            if self.learning_frozen:
+            if self.learning_frozen or not learn.any():
                 self.bank.decay_to(now)
             else:
-                st = self.bank.update(tv, torch.tensor(labels[keep], dtype=torch.float32), now)
+                st = self.bank.update(tags.subset(learn), torch.tensor(labels[learn], dtype=torch.float32), now)
                 stats.update(mean_delta=st["mean_delta"][0], mean_abs_delta=st["mean_abs_delta"][0], step=st["step"][0], capped=bool(st["capped"][0]))
                 h = self.hour_stats; h["n"] += stats["n"]; h["sum_delta"] += st["mean_delta"][0] * stats["n"]; h["sum_abs"] += st["mean_abs_delta"][0] * stats["n"]
                 h["step"] += st["step"][0]; h["capped"] += int(st["capped"][0])
@@ -512,7 +516,7 @@ class KalshiFlyBook:
                 g = lambda c: np.array([r[c] for r in rows], dtype=np.float64)
                 rp = gov.picks_returns(ts, mint, hold, g("score"), g("line"), lab); rf = gov.picks_returns(ts, mint, hold, g("frozen_score"), g("frozen_line"), lab)
                 recent = np.array([r["resolved_at"].timestamp() for r in rows]) > now - gov.IC_HOURS * 3600.0
-                out[name] = gov.check((rp, rf), (g("score")[recent], lab[recent]), self._drift(j))
+                out[name] = gov.check((rp, rf), (g("score")[recent], lab[recent]), self._drift(j), ic_frozen_rows=(g("frozen_score")[recent], lab[recent]))
             else:
                 out[name] = gov.check(None, None, self._drift(j))
         return out
@@ -528,7 +532,7 @@ class KalshiFlyBook:
         good = not any(c["triggers"] for c in checks.values())
         sid = self._snapshot(conn, now, good, checks)
         for name, c in checks.items():
-            if c["triggers"] and now >= self.checks_paused_until.get(name, 0.0) and not self.learning_frozen:
+            if c["triggers"] and now >= self.checks_paused_until.get(name, 0.0) and not self.learning_frozen and name not in self.frozen:
                 self._rollback(conn, now, c, sid, name=name)
         self._prune(conn, now)
         activity.prune(kalshi_activity_dir(), now - activity.KEEP_S)
@@ -558,7 +562,7 @@ class KalshiFlyBook:
         if cmd == "pause":
             self.learning_frozen = True; record_event("info", NAME, "learning paused by the operator")
         elif cmd == "resume":
-            self.learning_frozen = False; self.rollbacks = {}; record_event("info", NAME, "learning resumed by the operator")
+            self.learning_frozen = False; self.frozen = []; self.rollbacks = {}; record_event("info", NAME, "learning resumed by the operator")
         elif cmd == "rollback":
             for j, name in enumerate(self.names):
                 self._rollback(conn, now, {"triggers": ["operator"], "drift": self._drift(j)}, None, count=False, name=name)
@@ -585,10 +589,11 @@ class KalshiFlyBook:
                      (f"{name}: " + ", ".join(checks["triggers"]), json.dumps(checks, default=str), from_sid, target["id"] if target is not None else None))
         record_event("warning", NAME, f"{name} channel rolled back ({', '.join(checks['triggers'])})", {"to_snapshot": target["id"] if target is not None else "bootstrap (D = 0)", "checks": checks})
         if count and len(self.rollbacks[name]) >= ROLLBACK_LIMIT:
-            self.learning_frozen = True
+            self.frozen = sorted(set(self.frozen) | {name})       # this strategy's learning only: the others keep learning
             from . import pipeline
             pipeline.request_run(fly=True, reason=f"{name}: {len(self.rollbacks[name])} rollbacks in 7 days")
-            record_event("error", NAME, f"learning frozen after {len(self.rollbacks[name])} {name} rollbacks in 7 days; re-bootstrap requested", {"rollbacks": self.rollbacks})
+            record_event("error", NAME, f"{name} learning frozen after {len(self.rollbacks[name])} rollbacks in 7 days; re-bootstrap requested",
+                         {"rollbacks": self.rollbacks, "frozen": self.frozen})
 
     def _prune(self, conn, now: float) -> None:
         rows = conn.execute("SELECT id, path, ts FROM brain_snapshots WHERE kind = %s AND ts < %s ORDER BY ts DESC",
