@@ -137,8 +137,8 @@ def test_live_books_trade_and_commit_before_any_paper_book(db_conn, monkeypatch)
 
 
 def test_every_chains_live_phase_runs_before_any_chains_paper_phase(monkeypatch):
-    """Live money first across chains: older minutes are caught up whole, then every chain's newest minute's live phase,
-    and only then any chain's paper phase."""
+    """Live money first across chains: older minutes are caught up whole, then every chain's newest minute's live phase
+    (the chains at once), and only then any chain's paper phase."""
     calls, engines = [], []
     for name in ("sol", "rh"):
         e = _engine([_Book(f"book_{name}")]); e.last_minute = 600.0
@@ -148,7 +148,8 @@ def test_every_chains_live_phase_runs_before_any_chains_paper_phase(monkeypatch)
         monkeypatch.setattr(e, "paper_phase", lambda ctx, out, n=name: calls.append((n, "paper")) or out)
         engines.append(e)
     ran = me.run_ready(engines, 720.0)
-    assert calls == [("sol", "whole", 660.0), ("rh", "whole", 660.0), ("sol", "live", 720.0), ("rh", "live", 720.0), ("sol", "paper"), ("rh", "paper")]
+    assert calls[:2] == [("sol", "whole", 660.0), ("rh", "whole", 660.0)] and calls[4:] == [("sol", "paper"), ("rh", "paper")]
+    assert sorted(calls[2:4]) == [("rh", "live", 720.0), ("sol", "live", 720.0)]       # side by side, either first
     assert [(m, st) for _, m, st in ran] == [(720, {"minute": 720.0})] * 2 and all(e.last_minute == 720 for e in engines)
     assert me.run_ready(engines, 720.0) == []                                       # nothing new: the loop goes idle
 

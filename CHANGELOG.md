@@ -5,6 +5,56 @@ ships signed releases built from this development line.
 
 ## Unreleased
 
+### Live money
+
+- **Minutes are processed 2–3× faster: a minute is ready a median 2.8 s after its end, down from 6.4 s.** Measured with
+  `tools/latency_probe.py` against the 2026-10-19 baseline. Figures are seconds after the minute ends:
+
+  | | Old median | New median | Old p90 | New p90 | Old max | New max |
+  |---|---|---|---|---|---|---|
+  | Stream publishes the minute | 4.3 | 2.3 | 16.3 | 9.9 | 17.6 | 41.9 |
+  | Selector done (the console's "latency") | 6.4 | 2.8 | 16.9 | 10.3 | 18.4 | 42.5 |
+  | Publish → selector done | 0.7 | 0.5 | 1.1 | 1.0 | 4.3 | 3.7 |
+
+  - The worst minute waited 41.9 s for PumpAPI's stream to publish it. The feed is now the remaining delay, not the
+    engine (see Platform).
+  - The fly's status records each minute's timing: when its rows were ready, when the fly decided and when the live
+    orders were queued (`seen_s`, `scored_s`, `orders_s`). The first minutes after the change: Solana 2.42, 2.47 and
+    2.48 s; Robinhood Chain 4.79, 4.84 and 4.85 s. That is about 50 ms from a minute's data to its live orders.
+- **The fly decides a live minute on one pass of its teacher.**
+  - It takes the selector's decision once and scores only the rows the selector would buy, the input of its learned veto.
+  - Every other row's score, its learning tag and the brain view wait until after the live orders.
+  - Live scoring takes about 6 ms, down from a median 94 ms (150–400 ms when the GPU was idle), with the same decisions
+    on 40 real minutes.
+- **Solana swaps run in parallel.**
+  - Up to four swaps are in flight at once (`EXEC_THREADS`): one per token, and each token's in order.
+  - Each fill is read from its own transaction, since another swap may land between a swap's two balance reads.
+  - If a transaction cannot be read while other swaps are in flight, the fill is recorded as unknown and entries pause
+    until `verify-fills` reconciles it.
+  - Robinhood Chain swaps stay one at a time.
+- **Nothing in front of a live order waits that need not.**
+  - The wallet's balance is read while the minute is scored.
+  - The balances before a swap are read beside Jupiter's quote and the signing, in one round trip.
+  - The signer's lookups run side by side, and a swap's confirmation is checked every slot instead of every second.
+- **The engine wakes the moment a minute is written,** instead of looking every 250 ms.
+  - The stream checks for complete minutes every 50 ms, on its own clock.
+  - Both chains run their live phases and send their boundary sales at the same time.
+  - Paper work steps aside when another chain's minute lands meanwhile.
+
+### Platform
+
+- **A stream relay is ready, but switched off.**
+  - `stream_relay/` holds PumpAPI's stream on a server near its source. It forwards only the events and fields the
+    minutes use: about 33 KB/s at the busiest minute, instead of the whole stream.
+  - It serves them over TLS with a token, and resumes without loss after a dropped connection.
+  - With `SOL_FEED=relay` it becomes the minutes' clock, and this machine's own PumpAPI connection stays as its backup.
+  - Setup is in `stream_relay/README.md`. `fly-trader relay-check` tests a relay without switching anything.
+  - New settings: `SOL_FEED` (default `pumpapi`), `STREAM_RELAY_URL`, `STREAM_RELAY_TOKEN` and `STREAM_RELAY_CA_FILE`.
+- **A Helius decoder is built, but switched off** (`SOL_FEED=helius`).
+  - It turns pump.fun and PumpSwap transactions into PumpAPI's events exactly as the archive has them: 312 of 312 events
+    per sampled slot, and trades, creates and migrations field for field.
+  - Helius's websockets deliver only about 1 MB/s in all to this machine, and drop trades when the market is busy.
+
 ### Tools
 
 - **`tools/latency_probe.py` and `tools/latency_report.py` measure the minute pipeline from outside the console.**

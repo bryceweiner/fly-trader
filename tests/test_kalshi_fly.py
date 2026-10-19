@@ -213,3 +213,20 @@ def test_training_rows_are_capped_by_a_fixed_label_blind_sample():
     assert len(a) == 400 and a.tolist() == b.tolist() and (np.diff(a) > 0).all()  # fixed by the seed, sorted, no repeats
     assert S.cap_rows(ds, idx, 8).tolist() != a.tolist()
     assert S.cap_rows(ds, idx[:300], 7).tolist() == list(range(300))              # under the cap: every row
+
+
+def test_the_final_models_train_on_their_strategys_own_rows(monkeypatch):
+    """train/strategies.final_models passes row indices; the Kalshi fit_final once took them through np.flatnonzero again,
+    training every deployed and holdout model on rows 0..n−1 instead of the strategy's candidates."""
+    from fly_trader.kalshi import strategies as KS
+    from fly_trader.train import strategies as S
+    ds = _ds(days=6, per_day=300); seen = []; real = S.cap_rows
+    monkeypatch.setattr(S, "cap_rows", lambda d, idx, seed: seen.append(np.asarray(idx).copy()) or real(d, idx, seed))
+    cand = (ds.X[:, ds.cols.index("side_ask")] >= 80) & np.isfinite(ds.fwd_h["maker"])
+    fit = S.StrategyFit("favorite", "maker", 0.0, {}, None, list(ds.cols), oos=np.zeros(len(ds.y), np.float32), spec=KALSHI)
+    monkeypatch.setattr(KALSHI, "base_mask", lambda name, X, cols, high: X[:, cols.index("side_ask")] >= 80)
+    stack = S.Stack([], list(ds.cols), [fit], "score", None, [], {}, {}, True, False, "")
+    S.final_models(ds, stack, spec=KALSHI)
+    assert np.array_equal(seen[0], np.flatnonzero(cand & KALSHI.in_universe(ds.X, ds.cols)))
+    KS.fit_final(ds, cand, np.arange(5), "maker")                                    # a mask works too
+    assert np.array_equal(seen[1], np.flatnonzero(cand))

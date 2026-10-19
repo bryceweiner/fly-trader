@@ -17,7 +17,7 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 SECRET_ENV_NAMES = ("HELIUS_API_KEY", "JUPITER_API_KEY", "BOT_PRIVATE_KEY", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH",
                     "RELAY_SECRET", "TELEGRAM_BOT_TOKEN", "VAULT_BACKUP_HF_TOKEN", "VAULT_SOLANA_RPC_URL", "SIGNER_RPC_URL",
                     "SOLANA_CHECK_RPC_URL", "HEALTHCHECK_URL", "RH_BOT_PRIVATE_KEY", "RH_RPC_URL_LOGS", "ENVIO_API_TOKEN", "QUICKNODE_API_KEY",
-                    "QUICKNODE_RH_API_KEY", "QUICKNODE_RH_API_URL", "RH_RPC_URL_TX")
+                    "QUICKNODE_RH_API_KEY", "QUICKNODE_RH_API_URL", "RH_RPC_URL_TX", "STREAM_RELAY_TOKEN")
 
 
 def utcnow() -> datetime:
@@ -102,8 +102,10 @@ SLIPPAGE_EXIT_BPS = env_int("SLIPPAGE_EXIT_BPS", 300)
 SLIPPAGE_FORCED_BPS = env_int("SLIPPAGE_FORCED_BPS", 500)
 SLIPPAGE_STEP_BPS = env_int("SLIPPAGE_STEP_BPS", 100)
 MAX_SLIPPAGE_ENTRY_BPS = env_int("MAX_SLIPPAGE_ENTRY_BPS", 300)
+EXEC_THREADS = env_int("EXEC_THREADS", 4)                            # Solana live swaps in flight at once, one per mint (execution/worker.py)
 
 HELIUS_HTTP = "https://mainnet.helius-rpc.com/"
+HELIUS_WSS = "wss://mainnet.helius-rpc.com/"
 JUPITER_SWAP_BASE = "https://api.jup.ag/swap/v2"
 JUPITER_TOKENS_BASE = "https://api.jup.ag/tokens/v2"
 JUPITER_RPS = env_float("JUPITER_RPS", 8.0)
@@ -170,6 +172,12 @@ def helius_http_url() -> str:
     if not HELIUS_API_KEY:
         raise RuntimeError("HELIUS_API_KEY is not set")
     return f"{HELIUS_HTTP}?api-key={HELIUS_API_KEY}"
+
+
+def helius_wss_url() -> str:
+    if not HELIUS_API_KEY:
+        raise RuntimeError("HELIUS_API_KEY is not set")
+    return f"{HELIUS_WSS}?api-key={HELIUS_API_KEY}"
 
 
 def summary() -> dict:
@@ -437,4 +445,12 @@ CORPUS_PULL_BEFORE = env_str("CORPUS_PULL_BEFORE", REPLAY_START)     # swap-api 
 
 # ---- PumpAPI live stream (free firehose, same events as the replay archive; the selector's parity feed) ----
 PUMPSTREAM_URL = env_str("PUMPSTREAM_URL", "wss://stream.pumpapi.io")
+# pumpapi: PumpAPI's stream alone | relay: PumpAPI's events from our relay near its source (stream_relay/, ingest/relay_feed.py)
+# build the live minutes, PumpAPI's own stream their backup | helius: our own decoder (ingest/helius_feed.py) does, but
+# Helius's websockets delivered ~1 MB/s in all to this machine (2026-10-19), lagging and dropping half the trades when busy
+SOL_FEED = env_str("SOL_FEED", "pumpapi")
+STREAM_RELAY_URL = env_str("STREAM_RELAY_URL")                       # wss://<server>:<port>/stream (stream_relay/README.md)
+STREAM_RELAY_TOKEN = env_str("STREAM_RELAY_TOKEN")                   # the relay's RELAY_TOKEN
+STREAM_RELAY_CA_FILE = env_str("STREAM_RELAY_CA_FILE")               # the CA of a self-signed relay certificate (else the usual roots)
+HELIUS_FEED_COMMITMENT = env_str("HELIUS_FEED_COMMITMENT", "processed")
 PUMP_MINUTES_KEEP_DAYS = env_int("PUMP_MINUTES_KEEP_DAYS", 7)       # older minute rows are archived to Parquet, then removed from the table

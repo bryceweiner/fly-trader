@@ -695,11 +695,17 @@ def teacher_scores(models: dict, X: np.ndarray, ts, names: list[str], cols: list
     X = np.atleast_2d(X); out = np.full((len(X), len(names)), np.nan)
     tsa = np.broadcast_to(np.asarray(ts, dtype=np.float64), (len(X),))
     for i in range(0, len(X), chunk):
-        per = strategies.decide_all(models, X[i:i + chunk], cols, tsa[i:i + chunk])
-        for j, k in enumerate(names):
-            if k in per:
-                sc = per[k]["score"]
-                out[i:i + chunk, j] = np.where(per[k]["trig"] & np.isfinite(sc), np.clip(sc, -1.0, 1.0), np.nan)
+        out[i:i + chunk] = teacher_scores_of(strategies.decide_all(models, X[i:i + chunk], cols, tsa[i:i + chunk]), names, len(X[i:i + chunk]))
+    return out
+
+
+def teacher_scores_of(per: dict, names: list[str], n: int) -> np.ndarray:
+    """``teacher_scores`` of ``n`` rows from the stack's ``strategies.decide_all`` result on them (no second pass)."""
+    out = np.full((n, len(names)), np.nan)
+    for j, k in enumerate(names):
+        if k in per:
+            sc = per[k]["score"]
+            out[:, j] = np.where(per[k]["trig"] & np.isfinite(sc), np.clip(sc, -1.0, 1.0), np.nan)
     return out
 
 

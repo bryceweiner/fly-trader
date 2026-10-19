@@ -89,3 +89,35 @@ def test_load_skill_falls_back_to_the_newest_table_on_disk(tmp_path, monkeypatch
     assert agg.skill == {"NEW": 7} and agg.skill_day == "2026-09-25"                             # the newest, two days stale
     pumpstream.load_skill(agg, datetime(2026, 9, 23, 12, tzinfo=timezone.utc).timestamp())
     assert agg.skill == {"NEW": 7} and agg.skill_day == "2026-09-23"                             # the day's own table when it exists
+
+
+def test_each_transaction_is_taken_once_from_whichever_feed_brought_it_first():
+    """Our feed and PumpAPI's both send every transaction: ours is taken unless PumpAPI's copy came first, and a PumpAPI
+    transaction may come as several events of one key (all taken)."""
+    from collections import Counter
+    from types import SimpleNamespace
+    agg = pumpstream.Aggregator(); agg.feed = SimpleNamespace(up=lambda now=None: True, wm=0.0, pending=Counter())
+    m = 1_800_000_000
+    e = {**_ev("buy", "Apump", (m + 1) * 1000, 1.0, 2.0, "t1"), "signature": "S1"}
+    agg.ingest_from(dict(e), "helius"); agg.ingest_from(dict(e), "pumpapi")
+    assert agg.row(m, "Apump").nb == 1 and agg.stats["duplicates"] == 1
+    e2 = {**e, "signature": "S2"}
+    agg.ingest_from(dict(e2), "pumpapi"); agg.ingest_from(dict(e2), "pumpapi"); agg.ingest_from(dict(e2), "helius")
+    assert agg.row(m, "Apump").nb == 3 and agg.stats["duplicates"] == 2
+    assert agg.wm_pumpapi == m + 1 and agg.max_event_s == m + 1
+
+
+def test_our_feed_is_the_minutes_clock_while_up_and_a_minute_waits_for_its_fetches():
+    from collections import Counter
+    from types import SimpleNamespace
+    m = 1_800_000_000
+    feed = SimpleNamespace(up=lambda now=None: True, wm=m + 60.9, pending=Counter())
+    agg = pumpstream.Aggregator(); agg.feed = feed; agg.last_event_wall = m + 61
+    assert agg.flush_bound(m + 61) == m + 60                    # the next second's first event completes minute m
+    feed.pending[m] = 1
+    assert agg.flush_bound(m + 61) == m                         # one of its cut-off transactions is still being fetched
+    assert agg.flush_bound(m + 61 + pumpstream.HOLD_MAX_S) == m + 60   # ... for at most HOLD_MAX_S
+    feed.pending.clear(); feed.up = lambda now=None: False; agg.wm_pumpapi = m + 61
+    assert agg.flush_bound(m + 62) == m                         # our feed down: PumpAPI's clock, its 2 s grace
+    agg.wm_pumpapi = m + 62.5
+    assert agg.flush_bound(m + 63) == m + 60

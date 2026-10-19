@@ -119,6 +119,10 @@ class LiveMirror:
                                               slippage_bps=config.SLIPPAGE_ENTRY_BPS, max_slippage_bps=config.MAX_SLIPPAGE_ENTRY_BPS, decimals=int(e["info"]["decimals"] or 6),
                                               size_sol=size, hold_s=e.get("hold_s"), strategy=e.get("strategy"), ref_price=e.get("ref_price"), retry=retry))
 
+    def read_balance(self) -> int:
+        """The wallet's SOL (lamports); started beside the minute's scoring by live_first.prefetch."""
+        return int(self.broker.rpc.get_balance(self.broker.pubkey))
+
     def _sell(self, p: dict, did: int, slip: int) -> bool:
         return self.worker.submit(ExecRequest(decision_id=did, mint=p["mint"], pool=p["pool"], side="sell", amount_in=int(p["qty"]), slippage_bps=slip,
                                               max_slippage_bps=config.SLIPPAGE_FORCED_BPS, decimals=int(p.get("decimals") or 6), position_id=int(p["id"])))
@@ -181,7 +185,7 @@ class LiveMirror:
         blocked = "kill switch" if c.kill_switch else "circuit tripped" if rails.breaker_blocks(c) else "paused" if c.entries_paused else None
         n_enter = n_retry = 0; skipped = []
         if self.failed or entries:
-            sol_free = self.broker.rpc.get_balance(self.broker.pubkey) / config.LAMPORTS_PER_SOL; self.wallet_sol = sol_free
+            sol_free = live_first.take_balance(self, ctx.m1_epoch) / config.LAMPORTS_PER_SOL; self.wallet_sol = sol_free
             reserved = treasury = 0.0
             if config.VAULT_ENABLED:                 # SOL owed to vault lockers is never traded; the treasury's idle SOL is bankroll
                 from ..vault import nav as vault_nav

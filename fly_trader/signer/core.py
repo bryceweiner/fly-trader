@@ -21,6 +21,7 @@ import os
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from solders.address_lookup_table_account import AddressLookupTable
@@ -40,6 +41,7 @@ from .rpc import Rpc
 RENT_EXEMPT_MIN = 890_880          # a 0-byte system account: the treasury PDA must keep this much
 LAMPORTS = 1_000_000_000
 SIM_MAX_ACCOUNTS = 20                # the RPC caps accounts per simulation (30, or fewer: it has said 27)
+_IO = ThreadPoolExecutor(max_workers=6, thread_name_prefix="signer-io")    # a swap's reads, side by side
 
 
 @dataclass
@@ -140,18 +142,25 @@ class Signer:
                 raise PolicyError("daily buy volume cap reached", code="cap")
         vt = VersionedTransaction.from_bytes(base64.b64decode(tx))
         chk = policy.check_swap_static(vt, me, self._resolve_alt, self.cfg.max_priority_lamports)
-        # every token account the trading wallet owns, plus the two this swap may open
-        mint_acc = self.rpc.accounts([in_m, out_m])
+        # every token account the trading wallet owns, plus the two this swap may open (the reads side by side: a live
+        # order waits on this signature)
+        tok = out_m if buy else in_m
+        f_mints = _IO.submit(self.rpc.accounts, [in_m, out_m])
+        f_spl, f_t22 = _IO.submit(self.rpc.token_accounts, me, TOKEN), _IO.submit(self.rpc.token_accounts, me, TOKEN_2022)
+        f_prices = _IO.submit(self.rpc.usd_prices, [str(tok), str(NATIVE_MINT)])
+        mint_acc = f_mints.result()
         progs = {m: (a["owner"] if a else TOKEN) for m, a in zip((in_m, out_m), mint_acc)}
-        addrs = [me] + self.rpc.token_accounts(me, TOKEN) + self.rpc.token_accounts(me, TOKEN_2022)
+        addrs = [me] + f_spl.result() + f_t22.result()
         for m in (in_m, out_m):
             a = policy.ata(me, m, progs[m])
             if a not in addrs:
                 addrs.append(a)
-        pre = self._snapshot(self.rpc.accounts(addrs), addrs)
+        f_pre = _IO.submit(self.rpc.accounts, addrs)
+        f_sims = [_IO.submit(self.rpc.simulate, tx, addrs[i:i + SIM_MAX_ACCOUNTS]) for i in range(0, len(addrs), SIM_MAX_ACCOUNTS)]   # in chunks: the RPC caps accounts per simulation
+        pre = self._snapshot(f_pre.result(), addrs)
         post_accs: list[dict | None] = []
-        for i in range(0, len(addrs), SIM_MAX_ACCOUNTS):          # in chunks: the RPC caps accounts per simulation
-            sim = self.rpc.simulate(tx, addrs[i:i + SIM_MAX_ACCOUNTS])
+        for f in f_sims:
+            sim = f.result()
             if sim.get("err") is not None:
                 raise PolicyError(f"the swap fails in simulation: {sim['err']} {(sim.get('logs') or [])[-3:]}", code="in_flight")
             post_accs += [None if a is None else {"lamports": a["lamports"], "owner": Pubkey.from_string(a["owner"]), "data": base64.b64decode(a["data"][0])}
@@ -159,9 +168,8 @@ class Signer:
         post = self._snapshot(post_accs, addrs)
         slack = policy.BASE_FEE_LAMPORTS * vt.message.header.num_required_signatures + chk.priority_lamports + 10_000
         eff = policy.check_swap_effects(pre, post, in_mint=in_m, out_mint=out_m, in_amount=int(in_amount), min_out=int(min_out), slack_lamports=slack)
-        tok = out_m if buy else in_m
         tok_acc = mint_acc[1] if buy else mint_acc[0]
-        prices = self.rpc.usd_prices([str(tok), str(NATIVE_MINT)])
+        prices = f_prices.result()
         ratio = policy.check_value("buy" if buy else "sell", eff["sol"], abs(eff["token"]), tok_acc["data"][44] if tok_acc else 0,
                                    prices.get(str(tok)), prices.get(str(NATIVE_MINT)), self.cfg.min_value_ratio)
         sigs = list(vt.signatures)

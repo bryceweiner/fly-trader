@@ -372,9 +372,39 @@ def test_the_clock_sends_every_live_chain_and_survives_a_failure(monkeypatch):
     monkeypatch.setattr(live_first, "chain_exits", exits)
     books = [SimpleNamespace(name="selector", chain="sol", run_id="S"), SimpleNamespace(name="fly", LIVE=True, chain="sol", run_id="F")]
     live_first.LiveClock(books, ["rh", "sol"], True).tick(1_800_000_000.0)                    # the RH fly's book has not loaded yet
-    assert calls == [("rh", 1_800_000_000.0, True, None), ("sol", 1_800_000_000.0, True, "F")]
+    assert sorted(calls) == [("rh", 1_800_000_000.0, True, None), ("sol", 1_800_000_000.0, True, "F")]   # the chains side by side
     assert live_first.may_mark(600.0 + 10) and not live_first.may_mark(600.0 + 58)
     assert live_first.mid_minute(600.0 + 25) and not live_first.mid_minute(600.0 + 5) and not live_first.mid_minute(600.0 + 45)
+
+
+def test_one_chains_slow_boundary_sales_never_hold_anothers_back(monkeypatch):
+    """Live money first and fast: the clock sends every chain's sales at once, not one chain after the other."""
+    monkeypatch.setattr(live_first, "chain_exits", lambda chain, m1, live, run_id=None: time.sleep(0.4) or {"exited": 0})
+    t0 = time.monotonic()
+    live_first.LiveClock([], ["rh", "sol"], True).tick(1_800_000_000.0)
+    assert time.monotonic() - t0 < 0.7
+
+
+def test_the_wallet_read_starts_with_the_minute_and_only_that_minute_takes_it(monkeypatch):
+    """The wallet's balance is read beside the minute's features and scoring; a read started for another minute is never
+    sized on: the entries read the wallet again."""
+    reads = []
+    m = SimpleNamespace(read_balance=lambda: reads.append(1) or 7)
+    monkeypatch.setitem(live_first._MIRRORS, "sol", m); monkeypatch.setattr(live_first, "signing_refused", lambda chain: None)
+    live_first.prefetch("sol", True, 120.0)
+    assert live_first.take_balance(m, 120.0) == 7 and reads == [1]
+    live_first.prefetch("sol", True, 120.0); ahead = m.balance_ahead[1]
+    assert live_first.take_balance(m, 180.0) == 7 and ahead.result() == 7 and reads == [1, 1, 1]
+    live_first.prefetch("sol", False, 240.0)                                         # the runner may not sign: nothing read ahead
+    assert m.balance_ahead is None and len(reads) == 3
+
+
+def test_a_written_minute_wakes_the_engine_at_once():
+    live_first.minute_published()
+    t0 = time.monotonic(); live_first.wait_published(5.0)
+    assert time.monotonic() - t0 < 0.5
+    t0 = time.monotonic(); live_first.wait_published(0.2)                             # nothing written since: back after its poll
+    assert time.monotonic() - t0 >= 0.15
 
 
 def test_one_mirror_per_chain_whoever_makes_it_first_and_the_runner_stops_it(monkeypatch):

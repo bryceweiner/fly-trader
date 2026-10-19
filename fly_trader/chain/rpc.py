@@ -80,6 +80,21 @@ def _request_summary(method: str, params: list | None) -> dict:
     return {"params": params}
 
 
+def _token_accounts(res, program: str) -> list[dict]:
+    out = []
+    for item in (res or {}).get("value") or []:
+        try:
+            info = item["account"]["data"]["parsed"]["info"]
+            amt = info["tokenAmount"]
+            out.append({"address": item["pubkey"], "mint": info["mint"], "amount": int(amt["amount"]),
+                        "decimals": int(amt["decimals"]), "program": program,
+                        "lamports": int(item["account"].get("lamports") or 0),
+                        "is_native": bool(info.get("isNative")), "state": info.get("state")})
+        except (KeyError, TypeError, ValueError):
+            log.warning("unparsed token account %s", item.get("pubkey") if isinstance(item, dict) else "?")
+    return out
+
+
 class HttpSolanaRpc:
     def __init__(self, url: str | None = None, timeout_s: float = RPC_TIMEOUT_S):
         self._url = url or config.helius_http_url()
@@ -184,17 +199,14 @@ class HttpSolanaRpc:
         for program in TOKEN_PROGRAM_IDS:
             res = self.call("getTokenAccountsByOwner",
                             [str(pubkey), {"programId": program}, {"encoding": "jsonParsed", "commitment": commitment}])
-            for item in (res or {}).get("value") or []:
-                try:
-                    info = item["account"]["data"]["parsed"]["info"]
-                    amt = info["tokenAmount"]
-                    out.append({"address": item["pubkey"], "mint": info["mint"], "amount": int(amt["amount"]),
-                                "decimals": int(amt["decimals"]), "program": program,
-                                "lamports": int(item["account"].get("lamports") or 0),
-                                "is_native": bool(info.get("isNative")), "state": info.get("state")})
-                except (KeyError, TypeError, ValueError):
-                    log.warning("unparsed token account %s", item.get("pubkey") if isinstance(item, dict) else "?")
+            out += _token_accounts(res, program)
         return out
+
+    def wallet_state(self, pubkey, commitment: str = COMMITMENT) -> tuple[int, list[dict]]:
+        """(lamports, ``get_token_accounts_by_owner``) in one round trip (a JSON-RPC batch): a swap's balance snapshot."""
+        res = self.batch([("getBalance", [str(pubkey), {"commitment": commitment}])] +
+                         [("getTokenAccountsByOwner", [str(pubkey), {"programId": p}, {"encoding": "jsonParsed", "commitment": commitment}]) for p in TOKEN_PROGRAM_IDS])
+        return int(res[0]["value"]), [a for r, p in zip(res[1:], TOKEN_PROGRAM_IDS) for a in _token_accounts(r, p)]
 
     def get_signature_statuses(self, sigs: list[str], search_history: bool = False) -> list[dict | None]:
         res = self.call("getSignatureStatuses", [list(sigs), {"searchTransactionHistory": bool(search_history)}])

@@ -1,8 +1,12 @@
 """Live money first and fast over paper, always (CLAUDE.md): when the live books' work runs.
 
 - ``LiveClock``: the live chains' sales due at a minute boundary go out the moment it passes, from a thread of their own
-  (``runner-live-clock``), started with the runner -- before its books load and the engine warms up, so a restart never
-  holds a sale back -- and at once for the minute it starts in (a restart may have straddled a boundary).
+  (``runner-live-clock``), every chain's side by side, started with the runner -- before its books load and the engine
+  warms up, so a restart never holds a sale back -- and at once for the minute it starts in (a restart may have
+  straddled a boundary).
+- Anything that can run beside a live order does: the engine wakes the moment a stream writes a minute
+  (``minute_published``), each chain's wallet balance is read while its minute's features and scores are computed
+  (``prefetch``), and the chains' live phases run at once (agent/minute_engine.run_ready).
 - One live mirror per chain per process (``mirror``): made by whichever comes first, the clock at a boundary or the
   fly's first live minute, and stopped by the runner when it stops (``stop_mirrors``), never by a book.
 - The engine runs every chain's newest minute for its live books first (the fly scores, its paper book plans, the
@@ -21,6 +25,7 @@ import logging
 import math
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from .. import config
@@ -33,6 +38,35 @@ MID_MINUTE = (20.0, 40.0)     # seconds into a minute when slow wallet bookkeepi
 _MIRRORS: dict[str, object] = {}
 _MIRRORS_LOCK = threading.Lock()
 _LISTENERS: list = []
+_PUBLISHED = threading.Event()
+_PREFETCH = ThreadPoolExecutor(max_workers=2, thread_name_prefix="runner-prefetch")   # the live minutes' wallet reads
+_CLOCK = ThreadPoolExecutor(max_workers=4, thread_name_prefix="runner-live-clock")    # every chain's boundary sales at once
+
+
+def minute_published() -> None:
+    """A chain's stream has written a minute (ingest/pumpstream.py, rh/minutes.py): the engine's loop wakes at once."""
+    _PUBLISHED.set()
+
+
+def wait_published(timeout: float) -> None:
+    """The engine's loop between polls: back at the next published minute, else after ``timeout``."""
+    _PUBLISHED.wait(timeout)
+    _PUBLISHED.clear()
+
+
+def prefetch(chain: str, live: bool, m1_epoch: float) -> None:
+    """At a live minute's start, the chain's wallet balance read starts on its own thread, beside the minute's features
+    and the fly's scoring; the mirror sizes the minute's entries on it (``take_balance``)."""
+    m = _MIRRORS.get(chain)
+    if m is None or not live or not hasattr(m, "read_balance") or signing_refused(chain):
+        return
+    m.balance_ahead = (m1_epoch, _PREFETCH.submit(m.read_balance))
+
+
+def take_balance(m, m1_epoch: float):
+    """The balance ``prefetch`` started for this minute (its error raised here), else read now."""
+    ahead, m.balance_ahead = getattr(m, "balance_ahead", None), None
+    return ahead[1].result() if ahead is not None and ahead[0] == m1_epoch else m.read_balance()
 
 
 def may_mark(now: float | None = None) -> bool:
@@ -164,17 +198,21 @@ class LiveClock:
             self.tick(math.floor(time.time() / 60.0) * 60.0)        # the boundary just passed (a late wake takes the newest)
 
     def tick(self, m1_epoch: float) -> None:
-        for chain in self.chains:
-            run_id = next((b.run_id for b in list(self.books) if getattr(b, "LIVE", False) and getattr(b, "chain", "sol") == chain), None)
-            try:
-                out = chain_exits(chain, m1_epoch, self.live, run_id)
-                n = (out or {}).get("exited", 0) + (out or {}).get("liquidated", 0)
-                if n:
-                    log.info("%s: %d live sale(s) sent at the minute boundary", chain, n)
-            except Exception as e:
-                log.exception("%s: live exits at the minute boundary failed", chain)
-                record_event("error", "fly_live" if chain == "sol" else "rh_live", f"live exits at the minute boundary failed: {type(e).__name__}: {str(e)[:160]}",
-                             {"chain": chain})
+        """Every live chain's sales due at the boundary, the chains side by side: one chain's slow reads never hold
+        another's sales back."""
+        list(_CLOCK.map(lambda chain: self._tick(chain, m1_epoch), self.chains))
+
+    def _tick(self, chain: str, m1_epoch: float) -> None:
+        run_id = next((b.run_id for b in list(self.books) if getattr(b, "LIVE", False) and getattr(b, "chain", "sol") == chain), None)
+        try:
+            out = chain_exits(chain, m1_epoch, self.live, run_id)
+            n = (out or {}).get("exited", 0) + (out or {}).get("liquidated", 0)
+            if n:
+                log.info("%s: %d live sale(s) sent at the minute boundary", chain, n)
+        except Exception as e:
+            log.exception("%s: live exits at the minute boundary failed", chain)
+            record_event("error", "fly_live" if chain == "sol" else "rh_live", f"live exits at the minute boundary failed: {type(e).__name__}: {str(e)[:160]}",
+                         {"chain": chain})
 
     def close(self, timeout: float = 10.0) -> None:
         self.stop_flag.set()

@@ -95,6 +95,10 @@ class RhLiveMirror:
     def wallet(self):
         return self.ex.wallet
 
+    def read_balance(self) -> int:
+        """The wallet's ETH (wei); started beside the minute's scoring by live_first.prefetch."""
+        return int(self.wallet.balance())
+
     def _decision(self, conn, m1, run_id, beat_id, p, reason: str, forced: bool) -> int:
         return int(conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, size_sol, forced, reason, detail) VALUES (%s,%s,%s,%s,%s,'fly_exit',%s,%s,%s,%s) RETURNING id",
                                 (beat_id, run_id, m1, p["mint"], p["pool"], float(p["cost_sol"]), forced, reason, json.dumps({"book": BOOK}))).fetchone()["id"])
@@ -191,7 +195,7 @@ class RhLiveMirror:
         blocked = "kill switch" if c.kill_switch else "circuit tripped" if rails.breaker_blocks(c) else "paused" if c.entries_paused else None
         n_enter = n_retry = 0; skipped = []
         if self.failed or entries:
-            reserved = reserved_wei(conn); native_eth = self.wallet.balance() / A.WEI; self.wallet_eth = native_eth
+            reserved = reserved_wei(conn); native_eth = live_first.take_balance(self, ctx.m1_epoch) / A.WEI; self.wallet_eth = native_eth
             committed = self.ex.committed_wei() / A.WEI
             bankroll = native_eth + sum(float(p["cost_sol"]) for p in opens if not self._dead(p, m1)) - reserved / A.WEI   # not a dead-bag ``after`` writes off
             cash = native_eth - reserved / A.WEI - committed

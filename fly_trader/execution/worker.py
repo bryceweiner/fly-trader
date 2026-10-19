@@ -1,13 +1,14 @@
 """Execution queue for the live book: the caller never blocks on Jupiter.
 
-The caller enqueues ExecRequest objects; one background thread executes them sequentially through
-LiveBroker (one in-flight order at a time, balance-verified); results are drained by the caller, which
+The caller enqueues ExecRequest objects; ``threads`` background threads (config.EXEC_THREADS) execute them through
+LiveBroker, several mints' swaps in flight at once and each mint's one at a time, in order (each fill is read from its
+own transaction, execution/broker_live.py); results are drained by the caller, which
 opens/closes positions accordingly. A mint with a request queued or in flight takes no other, except a buy queued
 behind a lone sale of it (its paper book sold and bought the token again in one minute): the sale runs first, and the
-buy is refused as held if the sale left the position open. ``busy`` is held from a swap to its booking, so whoever reads
-the wallet and the books under it sees them agree. A sale that leaves the live book without its mint marks the mint's
+buy is refused as held if the sale left the position open. ``busy`` is held (shared) from each swap to its booking, so
+whoever reads the wallet and the books under it alone sees them agree. A sale that leaves the live book without its mint marks the mint's
 token account ``emptied``: the mirror closes it mid-minute with nothing queued (agent/fly_live.close_accounts), never in
-front of an order, and books the rent it returns. ``stop`` lets the request in flight finish (bounded) and drops the
+front of an order, and books the rent it returns. ``stop`` lets the requests in flight finish (bounded) and drops the
 queued ones: exits are retried next minute, entries by the mirror (agent/fly_live.py).
 """
 from __future__ import annotations
@@ -15,7 +16,10 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 import traceback
+from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -64,29 +68,76 @@ class ExecResult:
     closed: bool = False          # a sale that closed its position (or swept a written-off one)
 
 
+class SharedLock:
+    """``busy``: every swap in flight holds it shared, any number at once (``shared``); a wealth mark or a token-account
+    close holds it alone (``acquire``/``release``, as a Lock), so none reads the wallet and the books while a swap is
+    between its fill and its booking. A swap waits only behind one holding it alone, never behind one waiting (live
+    money first)."""
+
+    def __init__(self):
+        self._cv = threading.Condition(); self._shared = 0; self._alone = False
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        with self._cv:
+            free = lambda: not self._shared and not self._alone
+            if not (free() if not blocking else self._cv.wait_for(free, None if timeout is None or timeout < 0 else timeout)):
+                return False
+            self._alone = True
+            return True
+
+    def release(self) -> None:
+        with self._cv:
+            self._alone = False; self._cv.notify_all()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+    @contextmanager
+    def shared(self):
+        with self._cv:
+            self._cv.wait_for(lambda: not self._alone)
+            self._shared += 1
+        try:
+            yield
+        finally:
+            with self._cv:
+                self._shared -= 1; self._cv.notify_all()
+
+
 class ExecutionWorker:
-    def __init__(self, broker):
+    def __init__(self, broker, threads: int | None = None):
         self.broker = broker
-        self.q: queue.Queue[ExecRequest] = queue.Queue()
         self.results: queue.Queue[ExecResult] = queue.Queue()
         self.inflight: dict[str, list[str]] = {}       # mint -> sides queued or in flight, in order
         self.lock = threading.Lock()
-        self.busy = threading.Lock()                    # held from a request's swap to its booking
-        self.thread = threading.Thread(target=self._loop, name="runner-exec", daemon=True)   # routed to the runner's log
+        self.cv = threading.Condition(self.lock)
+        self.waiting: dict[str, deque] = {}            # mint -> its requests not started yet, in order
+        self.ready: deque[str] = deque()               # mints whose next request may start (none of theirs in flight)
+        self.busy = SharedLock()                       # held (shared) from each swap to its booking
         self.stop_flag = False
         self.on_done = None                            # called with each result once booked (the mirror's live stats: agent/fly_live.py)
         self.emptied: set[str] = set()                 # mints whose sale left their token account empty: closed by the mirror, mid-minute
-        self.thread.start()
+        n = max(1, int(threads if threads is not None else config.EXEC_THREADS))
+        self.threads = [threading.Thread(target=self._loop, name="runner-exec" + (f"-{i}" if i else ""), daemon=True) for i in range(n)]   # routed to the runner's log
+        self.thread = self.threads[0]
+        for t in self.threads:
+            t.start()
 
     def submit(self, req: ExecRequest) -> bool:
         """Queue ``req``; False when its mint already has a request queued or in flight (a buy may queue behind a lone
-        sale of it) or the worker is stopping."""
+        sale of it) or the worker is stopping. A mint with nothing queued or in flight starts at once on a free thread."""
         with self.lock:
             sides = self.inflight.get(req.mint)
             if self.stop_flag or (sides and not (req.side == "buy" and sides == ["sell"])):
                 return False
             self.inflight.setdefault(req.mint, []).append(req.side)
-        self.q.put(req)
+            self.waiting.setdefault(req.mint, deque()).append(req)
+            if not sides:
+                self.ready.append(req.mint); self.cv.notify()
         return True
 
     def pending(self) -> set[str]:
@@ -108,37 +159,44 @@ class ExecutionWorker:
         return out
 
     def _release(self, req: ExecRequest) -> None:
+        """``req`` is done (or dropped): its mint's next request, if one is queued, may start."""
         with self.lock:
             sides = self.inflight.get(req.mint)
             if sides and req.side in sides:
                 sides.remove(req.side)
             if not sides:
                 self.inflight.pop(req.mint, None)
+            if self.waiting.get(req.mint):
+                if not self.stop_flag:
+                    self.ready.append(req.mint); self.cv.notify()
+            else:
+                self.waiting.pop(req.mint, None)
 
     def stop(self, timeout: float = STOP_JOIN_S) -> None:
-        """Let the request in flight finish — a process killed mid-swap can leave a landed swap unbooked — drop the
-        queued ones, and wait for the thread (at most ``timeout``)."""
-        self.stop_flag = True
-        while True:
-            try:
-                self._release(self.q.get_nowait())
-            except queue.Empty:
-                break
-        if self.thread.is_alive() and self.thread is not threading.current_thread():
-            self.thread.join(timeout)
-            if self.thread.is_alive():
-                log.error("execution worker: the request in flight did not finish within %.0f s of the stop", timeout)
+        """Let the requests in flight finish — a process killed mid-swap can leave a landed swap unbooked — drop the
+        queued ones, and wait for the threads (at most ``timeout`` in all)."""
+        with self.lock:
+            self.stop_flag = True
+            dropped = [r for q in self.waiting.values() for r in q]
+            self.waiting.clear(); self.ready.clear(); self.cv.notify_all()
+        for r in dropped:
+            self._release(r)
+        deadline = time.monotonic() + timeout
+        others = [t for t in self.threads if t is not threading.current_thread()]
+        for t in others:
+            t.join(max(0.0, deadline - time.monotonic()))
+        if any(t.is_alive() for t in others):
+            log.error("execution worker: a request in flight did not finish within %.0f s of the stop", timeout)
 
     def _loop(self) -> None:
-        while not self.stop_flag:
-            try:
-                req = self.q.get(timeout=1.0)
-            except queue.Empty:
-                continue
-            if self.stop_flag:                          # stopping: a queued request is dropped, never started
-                self._release(req)
-                break
-            with self.busy:
+        while True:
+            with self.lock:
+                while not self.stop_flag and not self.ready:
+                    self.cv.wait(1.0)
+                if self.stop_flag:                      # stopping: a queued request is dropped, never started
+                    return
+                mint = self.ready.popleft(); req = self.waiting[mint].popleft()
+            with self.busy.shared():
                 res = self._execute(req)
                 if res.ok and res.closed:
                     self._emptied(req)

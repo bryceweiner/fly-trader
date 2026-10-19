@@ -117,6 +117,12 @@ def _cmd_pumpstream(args):
     pumpstream.main()
 
 
+def _cmd_relay_check(args):
+    import json
+    from .ingest import relay_feed
+    print(json.dumps(relay_feed.check(args.seconds), indent=1))
+
+
 def _cmd_build_corpus_features(args):
     from .train import corpus_features
     corpus_features.main()
@@ -329,6 +335,8 @@ def build_parser() -> argparse.ArgumentParser:
     fw = sub.add_parser("fit-wallet-skill", help="fit the wallet-skill tables' hold and lookback by the selector's objective (one-off, many hours, resumable)")
     fw.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)"); fw.set_defaults(fn=_cmd_fit_wallet_skill)
     sub.add_parser("pumpstream").set_defaults(fn=_cmd_pumpstream)
+    rc = sub.add_parser("relay-check", help="connect to the stream relay (STREAM_RELAY_URL) for a while and report what arrives; switches nothing")
+    rc.add_argument("--seconds", type=float, default=30.0); rc.set_defaults(fn=_cmd_relay_check)
     sub.add_parser("build-corpus-features").set_defaults(fn=_cmd_build_corpus_features)
     sub.add_parser("assemble-replay").set_defaults(fn=_cmd_assemble_replay)
     sub.add_parser("build-corpus-meta").set_defaults(fn=_cmd_build_corpus_meta)

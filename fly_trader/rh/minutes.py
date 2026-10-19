@@ -151,4 +151,6 @@ def run_once(rpc, skill: dict | None = None, max_minutes: int = 240) -> dict:
                      (json.dumps({"through": t1}),))
         conn.execute("INSERT INTO ui_settings (key, value) VALUES ('rh_stream_status', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
                      (json.dumps({"flushed_through": datetime.fromtimestamp(t1 - 60, timezone.utc).isoformat(), "rows": n}),))
+    from ..agent import live_first
+    live_first.minute_published()                       # committed: the engine's loop wakes now, not at its next poll
     return {"minutes": (t1 - done) // 60, "rows": n, "through": t1}

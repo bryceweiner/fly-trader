@@ -6,8 +6,11 @@ learning rate and forgetting of its mushroom body (``brain/plastic.py``). Each m
 first (CLAUDE.md): ``on_minute`` runs before any other book's minute, ``after_minute`` once every chain's live orders are out.
 
 1. bars: minute start, open, close and exit cost of every traded mint with a pending tag feed the label resolver;
-2. scoring (``on_minute``): eligible minutes are scored by the plastic fly and its shadow and tagged; only minutes at or
-   above the line teach it (brain/plastic.py);
+2. scoring: with the teacher gate on, ``on_minute`` takes the teacher's decision from one pass of its stack and the fly
+   scores only the rows the teacher would trade, its learned veto's input (``_decide``); every eligible row's plastic and
+   shadow score and its tag wait for ``after_minute`` (``_score`` on the same pass). Ungated, or at a session's first
+   scored minute (the readout's ν, the fill pathways need every row), ``on_minute`` scores and tags every row (``_score``).
+   Only minutes at or above the line teach it (brain/plastic.py);
 3. trading (``on_minute``; fresh stream, trade minutes): the race rules (``agent/paper_trading.py``) at the plastic line
    and sizing plan the paper book's minute, and once the fly holds the seat the wallet's orders on its entries go out
    (agent/fly_live.py, rh/live.py; the wallet's scheduled sales left at the minute boundary, agent/live_first.py);
@@ -34,6 +37,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 import uuid
 from collections import deque
@@ -145,6 +149,7 @@ class FlyBook:
     def __init__(self, boot: dict, verdict: dict, live: bool = False, chain: str = "sol", brain: "FlyBook | None" = None):
         self.live = live; self.done = False
         self._phase: dict | None = None; self._scored_rows: list = []; self._activity: tuple | None = None   # the live phase's, written after it
+        self._live_pass: tuple | None = None     # (minute, teacher decision, teacher scores) the live phase decided on (_decide)
         self.verdict = verdict
         self.chain = chain; self.market = markets.for_chain(chain); self.brain = brain
         self.name = "fly" if chain == "sol" else f"fly_{chain}"
@@ -166,13 +171,14 @@ class FlyBook:
         b = self.brain
         if b is not None:        # another chain's book: the Solana book's fly and plastic memory, this chain's own lines and tags
             self.boot_id = b.boot_id; self.fly = b.fly; self.connectome_name = b.connectome_name; self.capture_ok = False
+            self.fly_lock = b.fly_lock                       # the chains' live phases run at once: one model, one at a time
             self.teacher_models = b.teacher_models; self.idx = b.idx; self.names = b.names; self.holds = b.holds; self.H = b.H
             self.teacher_live, self.teacher_groups = b.teacher_live, b.teacher_groups
             self.cfg = b.cfg; self.alpha = b.alpha; self.half_life = b.half_life; self.bank = b.bank
             net = self.fly.net
         else:
             self.boot_id = int(boot["id"])
-            self.fly = fly_selector.load(boot["path"])
+            self.fly = fly_selector.load(boot["path"]); self.fly_lock = threading.Lock()
             try:
                 self.connectome_name = current_connectome_path().name       # stamped on the activity files the console draws
             except Exception:
@@ -421,7 +427,12 @@ class FlyBook:
         are out."""
         conn = ctx.conn; self._phase = None
         self._commands(conn, ctx.m1_epoch)
-        scored = self._score(conn, ctx)
+        if self._fast():
+            scored = self._decide(ctx)
+        else:
+            with self.fly_lock:                              # every row on the model another chain's live phase may be using
+                scored = self._score(conn, ctx)
+        timing = {"seen_s": ctx.lag_s, "scored_s": time.time() - ctx.m1_epoch}    # after the minute's end: the engine had its rows, the fly decided
         plan = live = None
         if ctx.trade and ctx.fresh:
             if self.race_started_at is None:
@@ -434,7 +445,8 @@ class FlyBook:
                                              allow=d.get("allow"), reasons=d.get("reason"))
             if self.trades_live(conn):
                 live = self._go_live(ctx, plan["beat_id"], plan["entries"])
-        self._phase = {"m1": ctx.m1, "picks": scored["picks"], "plan": plan, "live": live}
+                timing["orders_s"] = time.time() - ctx.m1_epoch                          # the wallet's orders queued
+        self._phase = {"m1": ctx.m1, "picks": scored["picks"], "plan": plan, "live": live, "timing": timing}
         return {"minute": ctx.m1.isoformat(), "picks": scored["picks"], "live": live}
 
     def after_minute(self, ctx) -> dict:
@@ -444,6 +456,9 @@ class FlyBook:
         conn = ctx.conn
         ph = self._phase if self._phase is not None and self._phase["m1"] == ctx.m1 else {"picks": 0, "plan": None, "live": None}
         self._phase = None
+        lp, self._live_pass = self._live_pass, None
+        if lp is not None and lp[0] == ctx.m1:           # the live phase decided on its teacher's pass: every row's score and tag now
+            self._score(conn, ctx, live_pass=lp[1:])
         self._store_scored(conn)
         st = paper_trading.book_minute(ctx, ph["plan"]) if ph["plan"] is not None else None
         learned = self._learn(conn, ctx.m1_epoch)
@@ -459,7 +474,7 @@ class FlyBook:
                "learning_frozen": (self.brain or self).learning_frozen, "frozen_strategies": (self.brain or self).frozen, "channels": self.cfg,
                "holds_min": {k: v / 60.0 for k, v in self.holds.items()},
                "bootstrap": self.boot_id,
-               "device": str(self.fly.net.dev)}
+               "device": str(self.fly.net.dev), "timing": ph.get("timing")}
         if st is not None:
             out.update({k: v for k, v in st.items() if k != "entries"}); out["stage"] = "trading"
             if ph["live"] is not None:
@@ -657,7 +672,44 @@ class FlyBook:
             (book if r["book"] == self.BOOK else live)[key] = (r["status"], float(r["ret"]) if r["status"] == "closed" and r["ret"] is not None else None)
         return book, live
 
-    def _score(self, conn, ctx) -> dict:
+    def _fast(self) -> bool:
+        """Whether the live phase decides on its teacher's pass alone (``_decide``): the gate is on with its teacher loaded,
+        and no one-time choice of the session (the readout's ν, the fill pathways) needs every row of the minute first."""
+        return bool(config.FLY_TEACHER_GATE) and self.teacher_live is not None and self.nu_set and not self.fill_choice
+
+    def _decide(self, ctx) -> dict:
+        """The live phase's scoring (live money first, CLAUDE.md): one pass of the teacher's stack over the minute's rows
+        gives its decision and its scores, then the fly scores only the rows its teacher would trade -- the input of its
+        learned veto, the one place its score decides. Every other row's score, the tags that teach the fly, the brain view
+        and the blind teacher's budget wait for ``after_minute`` (``_score`` on this pass). The decision is ``_score``'s."""
+        n = len(ctx.mints)
+        if not n:
+            return self._score(ctx.conn, ctx)
+        per = strategies.decide_all(self.teacher_live, ctx.X, X_COLS, ctx.t_start)
+        td = self._teacher_decision(ctx, per)
+        tv = fly_selector.teacher_scores_of(per, self.names, n) if config.FLY_SCORE == "teacher" else None
+        V = np.full((n, len(self.names)), -np.inf); F = np.full((n, len(self.names)), np.nan)
+        need = np.asarray([i for i in range(n) if td["allow"][i] and td["strategy"][i] in self.names], dtype=int)
+        if len(need):
+            Xn = ctx.X[need]; trig = self.fly.triggers(Xn, X_COLS)
+            with self.fly_lock:                               # another chain's live phase may be scoring on the same model
+                Y, u0, k = self.fly.parts_all(Xn[:, self.idx])
+                for j, name in enumerate(self.names):         # as _score: the row's strategy, where the fly's trigger fires and its teacher scores it
+                    q = np.asarray([p for p, i in enumerate(need) if td["strategy"][i] == name and trig[p, j] and (tv is None or np.isfinite(tv[i, j]))], dtype=int)
+                    if not len(q):
+                        continue
+                    li = torch.as_tensor(q, device=Y.device); s = np.full(len(q), j)
+                    y = self._head(Y[li, j], tv, need[q], j, u0[li])
+                    with torch.no_grad():
+                        sc, _ = self.bank.predict(y, u0[li], k[li], s=s); fr = self.bank.frozen(y, u0[li], s=s)
+                    V[need[q], j] = sc[0].float().cpu().numpy(); F[need[q], j] = fr.float().cpu().numpy()
+        self._live_pass = (ctx.m1, td, tv)
+        d = self._gated(ctx, V, F, td)
+        return {"decision": d, "picks": int(d["allow"].sum())}
+
+    def _score(self, conn, ctx, live_pass: tuple | None = None) -> dict:
+        """Every eligible row scored by the plastic fly and its shadow and tagged, and the minute's decision. ``live_pass``:
+        (teacher decision, teacher scores) the live phase already decided on (``_decide``), reused."""
         n = len(ctx.mints); empty = {"strategy": np.full(n, None, dtype=object), "score": np.full(n, -1.0), "hold_s": np.zeros(n), "threshold": np.full(n, np.inf),
                                      "tables": [[] for _ in range(n)]}
         if not n:
@@ -675,8 +727,11 @@ class FlyBook:
         gated = config.FLY_TEACHER_GATE
         if config.FLY_SCORE == "teacher" and self.teacher_live is None:      # it starts from its teacher's score: none, no score
             return {"decision": no_teacher(n), "picks": 0}
-        td = self._teacher_decision(ctx) if gated and self.teacher_live is not None else None
-        tv = self._teacher_scores(ctx.X, t)
+        if live_pass is not None:
+            td, tv = live_pass
+        else:
+            td = self._teacher_decision(ctx) if gated and self.teacher_live is not None else None
+            tv = self._teacher_scores(ctx.X, t)
         for j, name in enumerate(self.names):
             loc = np.flatnonzero(trig[:, j])
             if tv is not None:
@@ -734,10 +789,12 @@ class FlyBook:
             return y_own
         return self.bank.head_for(torch.as_tensor(tv[loc, j], dtype=torch.float32, device=self.bank.dev), u0, s=np.full(len(loc), j))
 
-    def _teacher_decision(self, ctx) -> dict:
-        """The deployed selector's decision on this minute's rows, with its live fail-closed rules."""
+    def _teacher_decision(self, ctx, per: dict | None = None) -> dict:
+        """The deployed selector's decision on this minute's rows, with its live fail-closed rules. ``per``: its stack's
+        ``decide_all`` on them, when the caller has it."""
         from .selector_session import fail_closed
-        return fail_closed(self.teacher_groups, ctx.infos, strategies.decide(self.teacher_live, ctx.X, X_COLS, ctx.t_start))
+        kw = {} if per is None else {"per": per}
+        return fail_closed(self.teacher_groups, ctx.infos, strategies.decide(self.teacher_live, ctx.X, X_COLS, ctx.t_start, **kw))
 
     def _gated(self, ctx, V: np.ndarray, F: np.ndarray, td: dict | None = None) -> dict:
         """The fly's decision under its teacher: each row's strategy, trigger, line, win filter, gates, dump veto and

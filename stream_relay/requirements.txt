@@ -1,0 +1,2 @@
+websockets>=14,<17
+orjson>=3.9
