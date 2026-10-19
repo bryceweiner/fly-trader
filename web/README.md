@@ -11,6 +11,11 @@ Static site (Vite multi-page, vanilla TypeScript) plus the relay API under `rela
 | `owner.html` | For the treasury's owner only (noindex, not linked from the nav): reads the Squads v4 multisig, creates it and the spending limits L1 (trading float, daily) and L2 (claims, weekly), changes L2, revokes both. The connected Solana wallet signs; nothing goes to the relay. |
 | `terms.html`, `privacy.html` | Legal pages. |
 
+**Not published until the vault launches:** `trading.html`, `vault.html` and `owner.html`. `npm run build` leaves them
+out unless `VITE_VAULT_PAGES=1`, and no page links to them; `npm run dev` serves them as before. Launching them also means
+restoring their nav and footer links, the vault copy on the home page and the vault clauses of the legal pages
+(all in git history before the 2026-10-18 site update).
+
 Header, footer and common `<head>` live in `partials/` and are included with `<!-- @include name -->`
 (see `vite.config.ts`). Wallet support (Reown AppKit, EVM + Solana) is a dynamic import on the Trading, Vault and
 Owner pages only.
@@ -93,7 +98,7 @@ This runs `npm ci && npm run build` and assembles `../build/gandi/`:
 wsgi.py              static server + /api dispatch (owned by the relay work)
 site-headers.json    headers wsgi.py adds: {"html": {"Content-Security-Policy": …}, "all": {}}
 relay/               web/relay without tests/
-site/                dist/ — pages, /static/ (hashed, cache forever), /assets/ (og.png, hero videos, …)
+site/                dist/ — pages, /bundle/ (hashed, cache forever), /assets/ (og.png, hero videos, …)
 ```
 
 Upload the contents to the instance's app directory, replacing `site/` entirely, put `relay.json` next to
@@ -113,7 +118,9 @@ Operator checklist:
 ```
 index.html trading.html vault.html owner.html terms.html privacy.html
 partials/        head.html header.html footer.html
-public/          copied as-is: favicon.svg robots.txt sitemap.xml assets/
+public/          copied as-is: favicon.svg robots.txt sitemap.xml assets/ (assets/screens/: the home page's console
+                 panels, captured from `fly-trader ui --observe` over CDP and converted to WebP; never a wallet address
+                 or an open position)
 src/site.ts      shared behaviour (links, CA copy, burger menu, hero headline/video, year)
 src/config.ts    network constants (SPEC §5) + env overrides; no viem, it ships on every page
 src/pages/       trading.ts vault.ts owner.ts

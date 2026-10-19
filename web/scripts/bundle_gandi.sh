@@ -34,8 +34,8 @@ fi
 
 echo
 echo "== $OUT"
-(cd "$OUT" && find . -path ./site/static -prune -o -print | sed 's|^\./||' | sort)
-echo "site/static: $(find "$OUT/site/static" -type f | wc -l | tr -d ' ') hashed files, $(du -sh "$OUT/site/static" | cut -f1)"
+(cd "$OUT" && find . -path ./site/bundle -prune -o -print | sed 's|^\./||' | sort)
+echo "site/bundle: $(find "$OUT/site/bundle" -type f | wc -l | tr -d ' ') hashed files, $(du -sh "$OUT/site/bundle" | cut -f1)"
 echo "total: $(du -sh "$OUT" | cut -f1)"
 cat <<MSG
 

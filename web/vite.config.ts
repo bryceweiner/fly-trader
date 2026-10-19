@@ -5,7 +5,10 @@ import { defineConfig, loadEnv, type Plugin } from 'vite'
 import { devApi } from './dev/mock-api.ts'
 
 const root = import.meta.dirname
-const PAGES = ['index', 'trading', 'vault', 'terms', 'privacy', 'owner']
+const PAGES = ['index', 'terms', 'privacy']
+/** Built only with VITE_VAULT_PAGES=1: the public site carries no Trading or Vault page until the vault launches.
+ *  `npm run dev` (and tools/vault_demo.py) serve them either way. */
+const VAULT_PAGES = ['trading', 'vault', 'owner']
 
 /** Replaces `<!-- @include name -->` with partials/name.html. On index.html the in-page anchors stay
  *  bare (`#about`), elsewhere they point back to index.html; the current page's nav link gets aria-current. */
@@ -31,6 +34,7 @@ function includePartials(): Plugin {
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, root, '')
   const proxy = env.VITE_RELAY_PROXY
+  const pages = env.VITE_VAULT_PAGES === '1' ? [...PAGES, ...VAULT_PAGES] : PAGES
   return {
     root,
     appType: 'mpa',
@@ -41,12 +45,12 @@ export default defineConfig(({ mode }) => {
     },
     build: {
       outDir: 'dist',
-      assetsDir: 'static',
+      assetsDir: 'bundle',             // not 'static': Gandi's Apache answers /static/ itself (403), never reaching wsgi.py
       emptyOutDir: true,
       target: 'es2022',
       chunkSizeWarningLimit: 4096,
       rollupOptions: {
-        input: Object.fromEntries(PAGES.map((p) => [p, resolve(root, `${p}.html`)])),
+        input: Object.fromEntries(pages.map((p) => [p, resolve(root, `${p}.html`)])),
       },
     },
     test: {

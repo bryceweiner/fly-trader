@@ -164,7 +164,7 @@ def _content_type(full):
 def _cache_control(path_info, ctype):
     if ctype.startswith("text/html"):
         return "no-cache"
-    if path_info.startswith("/static/"):  # Vite's content-hashed bundles
+    if path_info.startswith("/bundle/"):  # Vite's content-hashed bundles (/static/ never reaches us on Gandi)
         return "public, max-age=31536000, immutable"
     return "public, max-age=3600"         # /assets/ originals and the rest keep their names across deploys
 

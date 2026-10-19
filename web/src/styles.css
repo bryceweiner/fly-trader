@@ -929,6 +929,109 @@ li code {
   font-size: 0.875rem;
 }
 
+/* hardware tables: the data-table look, but cells may wrap */
+table.data.wrap td {
+  white-space: normal;
+  min-width: 9rem;
+  vertical-align: top;
+  line-height: 1.5;
+}
+table.data.wrap td:first-child {
+  white-space: nowrap;
+  min-width: 0;
+  color: var(--text-primary);
+}
+table.data.wrap td.note {
+  font-family: var(--font-body);
+  color: var(--text-secondary);
+  min-width: 16rem;
+}
+/* on a phone each row stacks, its cells labelled from data-label */
+@media (max-width: 699px) {
+  table.data.wrap thead {
+    display: none;
+  }
+  table.data.wrap,
+  table.data.wrap tbody,
+  table.data.wrap tr,
+  table.data.wrap td {
+    display: block;
+    width: 100%;
+  }
+  table.data.wrap tr {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  table.data.wrap tr:last-child {
+    border-bottom: 0;
+  }
+  table.data.wrap td,
+  table.data.wrap td.note {
+    padding: 2px 0;
+    border: 0;
+    min-width: 0;
+    white-space: normal;
+  }
+  table.data.wrap td:first-child {
+    font-size: 0.9375rem;
+  }
+  table.data.wrap td[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    margin-top: 8px;
+    font-family: var(--font-mono);
+    font-size: 0.625rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+}
+
+/* ---------- results: console screenshots ---------- */
+
+.shots {
+  display: grid;
+  gap: 32px;
+}
+.shot {
+  margin: 0;
+  border: var(--rule) solid var(--border);
+  background: var(--bg-surface);
+  min-width: 0;
+}
+.shot > a {
+  display: block;
+  background: var(--bg-base);
+  border-bottom: var(--rule) solid var(--border);
+}
+.shot img {
+  width: 100%;
+  height: auto;
+}
+.shot figcaption {
+  padding: 18px 20px;
+  display: grid;
+  gap: 8px;
+}
+@media (min-width: 900px) {
+  .shot figcaption {
+    grid-template-columns: 240px 1fr;
+    gap: 24px;
+  }
+}
+.shot figcaption .micro {
+  color: var(--violet);
+}
+.shot.live figcaption .micro {
+  color: var(--magenta);
+}
+.shot figcaption p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.9375rem;
+  max-width: 80ch;
+}
+
 /* ---------- footer ---------- */
 
 .footer {

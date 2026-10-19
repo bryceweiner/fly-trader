@@ -3,11 +3,11 @@
 <head>
   <!-- @include head -->
   <title>$FLY Vault — fly-trader</title>
-  <meta name="description" content="Lock $FLY on Robinhood Chain and receive a weekly share of the fly's closed-trade profit in SOL. Live NAV, trades, flows and settlements.">
+  <meta name="description" content="Lock $FLY on Robinhood Chain and receive a weekly share of the fly's closed-trade profit: Solana profit in SOL, Robinhood Chain profit in ETH. Live NAV, trades, flows and settlements.">
   <link rel="canonical" href="https://fly-trader.app/vault.html">
   <meta property="og:type" content="website">
   <meta property="og:title" content="$FLY Vault — fly-trader">
-  <meta property="og:description" content="Lock $FLY, earn a weekly SOL share of the fly's closed-trade profit. Everything about the fly is public.">
+  <meta property="og:description" content="Lock $FLY, earn a weekly share of the fly's closed-trade profit in SOL and ETH. Everything that can't be traded against is public.">
   <meta property="og:url" content="https://fly-trader.app/vault.html">
   <meta property="og:image" content="https://fly-trader.app/assets/og.png">
   <meta name="twitter:card" content="summary_large_image">
@@ -21,7 +21,7 @@
     <div class="section-head">
       <span class="micro accent">Vault</span>
       <h1 class="page-title">The $FLY vault</h1>
-      <p class="lede">Lock $FLY on Robinhood Chain. Every Monday 00:00 UTC the fly pays 100 % of its closed-trade profit above the operator's deposits to lockers, split by how much they locked and for how long. You claim it in SOL.</p>
+      <p class="lede">Lock $FLY on Robinhood Chain. Every Monday 00:00 UTC the fly pays 100 % of its closed-trade profit above the operator's deposits to lockers, split by how much they locked and for how long. The fly trades memecoins on Solana and on Robinhood Chain: Solana profit is paid in SOL, Robinhood Chain profit in ETH, and one claim collects both.</p>
     </div>
 
     <div class="banners" id="banners" aria-live="polite"></div>
@@ -41,7 +41,7 @@
     </div>
 
     <div class="sub mt-0">
-      <h2 class="sub-title">Trading wallet</h2>
+      <h2 class="sub-title">Solana trading wallet</h2>
       <div class="kv four">
         <div><span class="micro">SOL balance</span><div class="v" id="w-native">—</div></div>
         <div><span class="micro">Operator deposits</span><div class="v" id="w-deposits">—</div></div>
@@ -54,7 +54,7 @@
         <div><span class="micro">Pot for the next settlement</span><div class="v lime-text" id="w-pot">—</div></div>
         <div><span class="micro">Last settlement</span><div class="v" id="w-last">—</div></div>
       </div>
-      <p class="hint mt-12">R is measured from the fly's accounts themselves (its trading wallet and its treasury): SOL + token-account rent + open positions at cost − deposits + withdrawals + claims paid. Booked P&amp;L is the sum of the fly's own closed-trade records; the two should match up to fees and rent the trade records do not see.</p>
+      <p class="hint mt-12">R is measured from the fly's accounts themselves (its trading wallet and its treasury): SOL + token-account rent + open positions at cost − deposits + withdrawals + claims paid. Booked P&amp;L is the sum of the fly's own closed-trade records; the two should match up to fees and rent the trade records do not see. The figures, the NAV chart and the tables below are the fly's Solana book; its Robinhood Chain book is settled the same way, in ETH, and what it owes you shows under your position.</p>
     </div>
 
     <!-- NAV history -->
@@ -88,9 +88,9 @@
         </div>
 
         <div class="panel" id="claim-panel">
-          <span class="micro">Claim SOL</span>
+          <span class="micro">Claim SOL and ETH</span>
           <div id="claim-body">
-            <p class="muted">Connect both wallets above: the EVM wallet that locked $FLY, and the Solana wallet that should receive the SOL.</p>
+            <p class="muted">Connect both wallets above: the EVM wallet that locked $FLY, and the Solana wallet that should receive the SOL. ETH is paid on Robinhood Chain to the EVM wallet itself.</p>
           </div>
         </div>
       </div>
@@ -131,9 +131,9 @@
       <h2 class="sub-title">How it works</h2>
       <ol class="steps">
         <li><div><h4>Lock</h4><p>Lock $FLY in the FlyVault contract. It takes two wallet confirmations: an approval for exactly that amount, then the lock. Locked $FLY starts earning at once.</p></div></li>
-        <li><div><h4>The fly trades</h4><p>The fly trades Solana memecoins from its own wallet. Every closed trade and every deposit is shown above. Its wallet address and open positions are not published, and its balance is shown rounded to 0.1 SOL in 5-minute steps, so nobody can trade ahead of it.</p></div></li>
-        <li><div><h4>Weekly settlement</h4><p>Every Monday 00:00 UTC the fly adds up its closed-trade profit, after every fee, above what the operator deposited. Open positions count at cost, so only closed trades pay. If that total is higher than everything already paid out, the difference is split between lockers by locked $FLY × time locked during the week. A week with a loss pays nothing, and the loss has to be made back before anything is paid again. A week with no lockers carries its pot to the next one.</p></div></li>
-        <li><div><h4>Claim</h4><p>Connect your EVM wallet and any Solana wallet, and sign one claim with each. The fly checks both signatures and sends all the SOL owed to your EVM address to your Solana wallet, usually within a minute. What you have earned stays yours until you claim it; it never expires.</p></div></li>
+        <li><div><h4>The fly trades</h4><p>The fly trades graduated memecoins on Solana and on Robinhood Chain from its own wallets, once a minute. Every closed Solana trade and every deposit is shown above. Its wallet addresses and open positions are not published, and its balance is shown rounded to 0.1 SOL in 5-minute steps, so nobody can trade ahead of it.</p></div></li>
+        <li><div><h4>Weekly settlement</h4><p>Every Monday 00:00 UTC the fly adds up its closed-trade profit, after every fee, above what the operator deposited. Open positions count at cost, so only closed trades pay. If that total is higher than everything already paid out, the difference is split between lockers by locked $FLY × time locked during the week. A week with a loss pays nothing, and the loss has to be made back before anything is paid again. A week with no lockers carries its pot to the next one. Robinhood Chain profit is settled at the same moment in the same way, measured in ETH, and split by the same weights.</p></div></li>
+        <li><div><h4>Claim</h4><p>Connect your EVM wallet and any Solana wallet, and sign one claim with each. The fly checks both signatures and sends all the SOL owed to your EVM address to your Solana wallet, and all the ETH owed to your EVM address on Robinhood Chain, usually within a minute. A claim needs at least 0.002 SOL or 0.0001 ETH owed; smaller amounts wait for the next one. What you have earned stays yours until you claim it; it never expires.</p></div></li>
         <li><div><h4>Withdraw</h4><p>Request a withdrawal for any part of your locked $FLY. That part stops earning immediately and can be withdrawn 7 days later. Until then you can cancel the request, which locks it again. Withdrawals cannot be paused.</p></div></li>
         <li><div><h4>Upgrades</h4><p>The contract can be upgraded only through a timelock with an 8-day public delay, longer than the 7-day withdrawal wait, so anyone who disagrees with a scheduled upgrade can leave first. Pausing blocks new locks and cancellations only.</p></div></li>
       </ol>
@@ -144,9 +144,9 @@
       <ul class="risk-list">
         <li><strong>The fly can lose money.</strong> Profit is not guaranteed. Weeks with losses pay nothing, and a drawdown can last many weeks.</li>
         <li><strong>Smart-contract risk.</strong> The vault and the timelock are code. Bugs, however unlikely, can lock or lose tokens.</li>
-        <li><strong>Operational risk.</strong> The fly runs on one server. Outages delay claims. The SOL itself sits in a multisig treasury the server cannot empty: its keys may only refill a small trading float (per day) and pay claims up to a weekly cap, so a compromised server could lose at most the float and what is left of that week's cap before the operator revokes them.</li>
-        <li><strong>Wallet risk.</strong> Anyone with your wallet keys can withdraw your $FLY or claim your SOL. Check what you sign: this page only ever asks you to approve the vault or the KyberSwap router, and to sign claim texts that start with this site's domain.</li>
-        <li><strong>Price risk.</strong> $FLY and SOL prices move. What you are paid is SOL; its dollar value can fall.</li>
+        <li><strong>Operational risk.</strong> The fly runs on one server. Outages delay claims. The SOL itself sits in a multisig treasury the server cannot empty: its keys may only refill a small trading float (per day) and pay claims up to a weekly cap, so a compromised server could lose at most the float and what is left of that week's cap before the operator revokes them. The ETH owed to lockers is kept in the fly's Robinhood Chain wallet, which that server holds, so a compromise could lose it.</li>
+        <li><strong>Wallet risk.</strong> Anyone with your wallet keys can withdraw your $FLY or claim your SOL and ETH. Check what you sign: this page only ever asks you to approve the vault or the KyberSwap router, and to sign claim texts that start with this site's domain.</li>
+        <li><strong>Price risk.</strong> $FLY, SOL and ETH prices move. What you are paid is SOL and ETH; their dollar value can fall.</li>
       </ul>
     </div>
 
