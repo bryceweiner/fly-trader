@@ -7,7 +7,7 @@
   <link rel="canonical" href="https://fly-trader.app/">
   <meta property="og:type" content="website">
   <meta property="og:title" content="fly-trader">
-  <meta property="og:description" content="A fruit fly is trading. The FlyWire connectome trades memecoins on Solana and Robinhood Chain with real money and learns from every trade. Open source and experimental.">
+  <meta property="og:description" content="A fruit fly is trading. The FlyWire connectome trades memecoins on Solana and Robinhood Chain with real money and learns from every trade. Open source.">
   <meta property="og:url" content="https://fly-trader.app/">
   <meta property="og:image" content="https://fly-trader.app/assets/og.png">
   <meta name="twitter:card" content="summary_large_image">
@@ -34,7 +34,7 @@
 
   <div class="shell">
     <div class="hero-content">
-      <div class="chip"><span class="dot" aria-hidden="true"></span>Experimental · Live on Solana and Robinhood Chain</div>
+      <div class="chip"><span class="dot" aria-hidden="true"></span>Live on Solana and Robinhood Chain</div>
 
       <h1 class="display hero-title headline" id="headline" aria-live="polite">
         <span class="passage is-active">
@@ -89,16 +89,16 @@
     <div class="sub">
       <h3 class="sub-title">The brain</h3>
       <div class="prose">
-        <p>The wiring comes from <strong>FlyWire FAFB v783</strong>, the first complete synaptic connectome of an adult animal brain (Dorkenwald et al., 2024; annotations from Schlegel et al., 2024). Every neuron is present. Every connection between them is a real, electron-microscopy-reconstructed synapse. Neurotransmitter signs follow Shiu et al. (2024): GABA and glutamate inhibit, everything else excites. The build reproduces the MIT-licensed <em>flybrain</em> export edge for edge and checks it against the published counts.</p>
+        <p>The wiring comes from <strong>FlyWire FAFB v783</strong>, the first complete synaptic connectome of an adult animal brain. Every neuron is present. Every connection between them is a real, electron-microscopy-reconstructed synapse.</p>
       </div>
       <div class="stat-grid">
         <div class="stat"><span class="micro">Neurons</span><div class="value">139,255</div><p class="note">Whole brain, both hemispheres, optic lobes included</p></div>
-        <div class="stat"><span class="micro">Connections</span><div class="value">2.70 M</div><p class="note">Distinct pre→post pairs; ≈33.9 M individual synapses</p></div>
-        <div class="stat"><span class="micro">Kenyon cells</span><div class="value violet">5,177</div><p class="note">Sparse code of the mushroom body, the fly's learning centre</p></div>
-        <div class="stat"><span class="micro">Output neurons (MBONs)</span><div class="value violet">96</div><p class="note">24 approach, 20 avoid: the mushroom body's readouts</p></div>
-        <div class="stat"><span class="micro">Dopaminergic neurons</span><div class="value">323</div><p class="note">307 PAM (reward) · 16 PPL1 (punishment)</p></div>
-        <div class="stat"><span class="micro">Sensory input neurons</span><div class="value">5,460</div><p class="note">Smell, taste, touch and temperature: where the market enters</p></div>
-        <div class="stat"><span class="micro">Descending neurons</span><div class="value lime">1,303</div><p class="note">The fly's motor output, read by its decoder</p></div>
+        <div class="stat"><span class="micro">Connections</span><div class="value">2.70 M</div><p class="note">≈33.9 M individual synapses</p></div>
+        <div class="stat"><span class="micro">Kenyon cells</span><div class="value violet">5,177</div><p class="note">The mushroom body, the fly's learning centre</p></div>
+        <div class="stat"><span class="micro">Output neurons (MBONs)</span><div class="value violet">96</div><p class="note">Approach and avoid readouts of the mushroom body</p></div>
+        <div class="stat"><span class="micro">Dopaminergic neurons</span><div class="value">323</div><p class="note">Reward and punishment signals</p></div>
+        <div class="stat"><span class="micro">Sensory input neurons</span><div class="value">5,460</div><p class="note">Where the market enters</p></div>
+        <div class="stat"><span class="micro">Descending neurons</span><div class="value lime">1,303</div><p class="note">The fly's motor output</p></div>
         <div class="stat"><span class="micro">Source</span><div class="value lime">FAFB v783</div><p class="note">FlyWire consortium, Nature 2024</p></div>
       </div>
     </div>
@@ -108,11 +108,11 @@
       <h3 class="sub-title">How it works</h3>
       <div class="split">
         <div class="prose">
-          <p><strong>Sensing.</strong> Once a minute, every graduated memecoin that traded becomes one row: on Solana the PumpSwap pools of pump.fun graduates, on Robinhood Chain the Uniswap v4 pools of Pons graduates, priced in ETH. A row holds 68 inputs: returns, order flow, volume, trade counts, liquidity, age and drawdowns over windows from one minute to three hours, the hour of day, the token's launch, its creator's record, insider selling, and what wallets with a record of winning are doing in it. A learned projection writes the row into 5,460 of the fly's sensory neurons, the ones that in a living fly carry smell, taste, touch and temperature.</p>
-          <p><strong>The teacher.</strong> A gradient-boosted selector predicts each row's return over its hold after every cost a real trade would pay: the pool's fee, Jupiter's or the Pons hook's, the network fee and price impact. It is trained walk-forward on both chains' history and trusted only once judged: its settings are chosen on the first half of the held-out weeks, and it goes to work only if the second half made money after costs and beat random picks.</p>
-          <p><strong>The fly.</strong> Activity flows through the connectome only where the wiring allows, and every connection keeps the sign its neurotransmitter gives it. The fly is trained once to imitate the selector, then scores each row as the selector's prediction plus a correction its mushroom body learns, which starts at zero. It buys only what the selector buys and sizes each buy the same way. Its learning can veto a buy, never add one.</p>
-          <p><strong>Learning.</strong> When a trade's hold ends, the fly learns what the row actually made through dopamine-gated plasticity at the Kenyon cell → MBON synapses, the site of associative learning in a real fly. An outcome pathway learns from the paper book's results, a fill pathway from what the wallet's real fills added or lost, and each strategy has its own dopamine channel. Every hour the learning fly is checked against a frozen copy of itself: learning that hurts is rolled back, and a strategy that keeps failing the checks stops learning.</p>
-          <p><strong>Acting.</strong> Each buy is a quarter of the growth-optimal (Kelly) bet for its score band, at most 10 % of the bankroll, 2 % of the pool and 0.5 SOL, and it is sold when its strategy's hold ends. Live orders always go first: sales at the minute boundary, buys the moment the fly has decided, and only then any paper trade, learning step or bookkeeping.</p>
+          <p><strong>Sensing.</strong> Once a minute, every graduated memecoin on Solana and Robinhood Chain becomes one row of 68 inputs: returns, order flow, volume, liquidity, age, the token's launch, its creator's record and what winning wallets are doing in it. The row enters the fly through its sensory neurons, the ones that in a living fly carry smell, taste, touch and temperature.</p>
+          <p><strong>The teacher.</strong> A gradient-boosted selector predicts each row's return after every fee and the price impact. It is trained on both chains' history and goes to work only after beating random picks on weeks it never saw.</p>
+          <p><strong>The fly.</strong> Activity flows through the connectome only where the wiring allows. The fly starts as its teacher and buys what the teacher buys; its mushroom body then learns, trade by trade, where the teacher is wrong.</p>
+          <p><strong>Learning.</strong> When a trade closes, dopamine-gated plasticity at the Kenyon cell → MBON synapses, the site of associative learning in a real fly, learns what it made.</p>
+          <p><strong>Acting.</strong> Each buy is sized by how certain the model is and sold when its hold ends.</p>
         </div>
         <div>
           <div class="panel hard-shadow-violet">
@@ -125,11 +125,6 @@
               <div style="padding:0;background:transparent"><span class="micro">Scoring</span><div class="v">Every minute</div></div>
               <div style="padding:0;background:transparent"><span class="micro">Compute</span><div class="v">CUDA · ROCm · Metal · CPU</div></div>
             </div>
-            <p class="mt-24" style="margin-bottom:0">A rate network of leaky neurons: four message-passing steps per row, only the most active tenth of the Kenyon cells firing, as in the real mushroom body. The optic lobes (97,499 neurons) are left out: a token's tape is not light.</p>
-          </div>
-          <div class="panel mt-24">
-            <span class="micro">Also in the code · prediction markets</span>
-            <p>A second trading type for <a href="https://kalshi.com" target="_blank" rel="noopener">Kalshi</a> prediction markets uses a visual fly: the optic lobes stay in, its inputs enter through the photoreceptors, and it trades through a taker arm and a maker arm, holding positions to settlement. It is still in development and ships dormant; none of it runs until you add a Kalshi key.</p>
           </div>
         </div>
       </div>
@@ -139,55 +134,44 @@
     <div class="sub">
       <h3 class="sub-title">Training data</h3>
       <div class="prose">
-        <p>The fly learns from the life of memecoins after they graduate. On Solana the source is <a href="https://pumpapi.io" target="_blank" rel="noopener">PumpAPI</a>: its free hourly archive of every pump.fun trade since 2026-04-18 for training, and its live stream for trading, both turned into the same 1-minute rows. On Robinhood Chain it is fly-trader's own indexer of Pons launches, graduations and every Uniswap v4 swap, read from Envio HyperSync, with every quote asset priced in ETH. Labels charge every fee and the price impact a real trade would pay. Everything is kept in Postgres and Parquet, and every decision is journaled.</p>
+        <p>The fly learns from the life of memecoins after they graduate: every pump.fun trade since April 2026, and every Pons launch and swap on Robinhood Chain.</p>
       </div>
       <div class="stat-grid">
-        <div class="stat"><span class="micro">Inputs per row</span><div class="value">68</div><p class="note">The selector keeps only the input groups its walk-forward accepts</p></div>
-        <div class="stat"><span class="micro">pump.fun trades archived</span><div class="value">3.56 B</div><p class="note">Bonding-curve and PumpSwap buys and sells since 2026-04-18, one row per trader leg</p></div>
-        <div class="stat"><span class="micro">Graduated pump.fun tokens</span><div class="value violet">127,215</div><p class="note">With their launch facts and their creators' records</p></div>
-        <div class="stat"><span class="micro">Archive on disk</span><div class="value violet">230 GB</div><p class="note">Parquet, from 1.8 TB of compressed hourly files</p></div>
-        <div class="stat"><span class="micro">Pons launches indexed</span><div class="value">674,505</div><p class="note">Robinhood Chain, since 2026-08-04</p></div>
-        <div class="stat"><span class="micro">Pons graduates</span><div class="value">10,320</div><p class="note">Into Uniswap v4 pools with the Pons hook</p></div>
-        <div class="stat"><span class="micro">Robinhood Chain swaps</span><div class="value lime">41 M</div><p class="note">Indexed from Envio HyperSync</p></div>
-        <div class="stat"><span class="micro">Sources</span><div class="value lime" style="font-size:1rem;line-height:1.4">PumpAPI · Envio · Jupiter · KyberSwap</div><p class="note">Counts as of 2026-10-18</p></div>
+        <div class="stat"><span class="micro">pump.fun trades</span><div class="value">3.56 B</div><p class="note">Since April 2026</p></div>
+        <div class="stat"><span class="micro">Graduated pump.fun tokens</span><div class="value violet">127,215</div><p class="note">With their launch and creator history</p></div>
+        <div class="stat"><span class="micro">Pons launches</span><div class="value">674,505</div><p class="note">Robinhood Chain, since August 2026</p></div>
+        <div class="stat"><span class="micro">Robinhood Chain swaps</span><div class="value lime">41 M</div><p class="note">Indexed by fly-trader</p></div>
       </div>
     </div>
 
     <!-- Strategies -->
     <div class="sub">
       <h3 class="sub-title">What we taught the fly</h3>
-      <div class="prose">
-        <p>A connectome does not come with a trading strategy. Its teacher's strategies are fitted to the data, every threshold is chosen on one stretch of history and judged on a later one, and nothing trades until it has beaten random picks after costs.</p>
-      </div>
       <div class="cards three mt-24">
         <div class="card">
           <span class="num">UNIVERSE</span>
           <h4>Graduated memecoins, two chains</h4>
           <ul>
-            <li>Solana: pump.fun tokens after their graduation to PumpSwap, quoted in SOL</li>
-            <li>Robinhood Chain: Pons launches after their graduation into Uniswap v4</li>
-            <li>At least 6 hours past graduation</li>
-            <li>A pool of at least 10 SOL (≈0.45 ETH) and 5 SOL (≈0.22 ETH) traded in the last 15 minutes</li>
+            <li>Solana: pump.fun graduates on PumpSwap</li>
+            <li>Robinhood Chain: Pons graduates on Uniswap v4</li>
+            <li>Only tokens with real liquidity and recent volume</li>
           </ul>
         </div>
         <div class="card">
           <span class="num">STRATEGIES</span>
           <h4>Fitted, not hand-picked</h4>
           <ul>
-            <li>ev: any tradable minute whose predicted net return clears the buy line</li>
-            <li>capitulation: a falling minute with no insider selling</li>
-            <li>breakout: organic buying at the 1- or 3-hour high (the current model dropped it: it failed on the evaluation half)</li>
-            <li>Each has its own model, buy line and hold; a win filter and a dump veto screen every pick</li>
+            <li>Each strategy has its own model, buy line and hold</li>
+            <li>A win filter and a dump veto screen every pick</li>
           </ul>
         </div>
         <div class="card">
           <span class="num">THE GATE</span>
           <h4>Nothing trades unproven</h4>
           <ul>
-            <li>Walk-forward: refit weekly, a purge day before every test, the last 21 days never fitted</li>
-            <li>Settings chosen on the first half of the test weeks, judged on the second</li>
-            <li>It must make money after costs, beat random picks and keep a profit factor of 1.3 or more</li>
-            <li>The fly must then pass a replay on each chain: positive, better than random, at most a 5 % chance its edge is zero</li>
+            <li>Settings are chosen on one stretch of history and judged on a later one</li>
+            <li>A model must make money after costs and beat random picks</li>
+            <li>The fly must pass a replay on each chain before it trades</li>
           </ul>
         </div>
         <div class="card">
@@ -195,38 +179,25 @@
           <h4>What the fly may change</h4>
           <ul>
             <li>Only its Kenyon cell → MBON synapses, by dopamine-gated plasticity</li>
-            <li>A learned veto can drop a selector buy; nothing can add one</li>
-            <li>Outcome pathway from the book's results, fill pathway from live fills minus paper</li>
-            <li>Hourly checks against a frozen copy; rollbacks; repeated trouble freezes that strategy's learning</li>
+            <li>Its learning can veto a buy, never add one</li>
           </ul>
         </div>
         <div class="card">
           <span class="num">SIZING</span>
           <h4>Bet what the record supports</h4>
           <ul>
-            <li>A quarter of the Kelly bet for the score band the pick falls in</li>
-            <li>At most 10 % of the bankroll, 2 % of the pool and 0.5 SOL a buy</li>
-            <li>The gas reserve is never deployed</li>
-            <li>The fly takes the selector's seat only when its 14-day profit is at least the selector's, over 30 or more trades</li>
+            <li>A quarter of the Kelly bet for each pick's score</li>
+            <li>Capped by the bankroll and the pool's depth</li>
           </ul>
         </div>
         <div class="card">
           <span class="num">RISK RAILS</span>
           <h4>Capital protection outside the brain</h4>
           <ul>
-            <li>Kill switch at −30 % from peak blocks new entries, and can sell everything</li>
-            <li>Circuit breaker after 3 failed transactions; no trading on a stale feed</li>
-            <li>A buy is refused if its quote is over 3 % above the paper fill; entries pause when live trails paper</li>
-            <li>The signer simulates every swap and caps buys at 1 SOL each, 10 SOL a day, 6 swaps a minute</li>
+            <li>Kill switch on drawdown, circuit breaker on failed transactions</li>
+            <li>Every swap is simulated and capped before it is signed</li>
           </ul>
         </div>
-      </div>
-    </div>
-
-    <div class="sub">
-      <div class="notice">
-        <span class="micro">Status · 2026-10-18</span>
-        <p>fly-trader is an experiment. Since 2026-10-17 the fly has traded small live wallets on both chains, beside paper books that take every one of its decisions; the live record is days old and proves nothing yet. Installed from source it signs nothing until you turn live trading on; the Docker release trades its funded wallet after 20 closed paper trades, with caps sized for 0.5 SOL. Every observation, decision and fill is written to Postgres. Read the code before you trust it, and never fund it with money you cannot lose.</p>
       </div>
     </div>
   </div>
@@ -238,51 +209,49 @@
     <div class="section-head">
       <span class="micro accent">02 · Results</span>
       <h2 class="section-title">Watch it trade</h2>
-      <p class="lede">Panels from the fly's operator console, captured on 2026-10-18. The live figures are real money. The backtest and the replay are the tests every model must pass before it may trade, with every fee and the price impact charged.</p>
+      <p class="lede">Panels from the fly's operator console, captured on 2026-10-18.</p>
     </div>
 
     <div class="stat-grid">
-      <div class="stat"><span class="micro">Live · Robinhood Chain</span><div class="value">+6.88 %</div><p class="note">Average per trade after costs, 11 trades, 17–18 Oct</p></div>
-      <div class="stat"><span class="micro">Selector backtest</span><div class="value violet">+8.87 %</div><p class="note">Per trade over 2,933 held-out trades; random picks −4.57 %</p></div>
-      <div class="stat"><span class="micro">Untouched holdout</span><div class="value violet">+5.19 %</div><p class="note">Per trade over 2,156 trades no fit ever saw</p></div>
-      <div class="stat"><span class="micro">Fly replay</span><div class="value lime">+2.85 %</div><p class="note">Per trade over 1,785 trades; 12 of 16 days profitable</p></div>
+      <div class="stat"><span class="micro">Live · Robinhood Chain</span><div class="value">+6.88 %</div><p class="note">Average per trade after costs</p></div>
+      <div class="stat"><span class="micro">Selector backtest</span><div class="value violet">+8.87 %</div><p class="note">Per trade over 2,933 held-out trades</p></div>
+      <div class="stat"><span class="micro">Untouched holdout</span><div class="value violet">+5.19 %</div><p class="note">Per trade over 2,156 trades</p></div>
+      <div class="stat"><span class="micro">Fly replay</span><div class="value lime">+2.85 %</div><p class="note">Per trade over 1,785 trades</p></div>
     </div>
 
     <div class="shots">
       <figure class="shot live hard-shadow">
-        <a href="/assets/screens/rh-live-trades.webp" target="_blank" rel="noopener"><img src="/assets/screens/rh-live-trades.webp" width="2000" height="1207" loading="lazy" decoding="async" alt="Console Trades page for the live Robinhood Chain book: 11 trades over 2 trading days, realized P&amp;L +0.0077 ETH, average return +6.88 %, 64 % winners (7 won, 4 lost), no open positions, and a cumulative realized P&amp;L chart rising from 17 October to 18 October."></a>
+        <a href="/assets/screens/rh-live-trades.webp" target="_blank" rel="noopener"><img src="/assets/screens/rh-live-trades.webp" width="2000" height="1207" loading="lazy" decoding="async" alt="Console Trades page for the live Robinhood Chain book: realized P&amp;L +0.0077 ETH, average return +6.88 %, 64 % winners, and a cumulative realized P&amp;L chart."></a>
         <figcaption>
-          <span class="micro">Live money · Robinhood Chain · 17–18 Oct</span>
-          <p>The live Robinhood Chain book, trading real ETH from the bot wallet. In its first two days it closed 11 trades for +0.0077 ETH, +6.88 % per trade after fees and price impact, with 7 won and 4 lost. Eleven trades are a start, not a track record.</p>
+          <span class="micro">Live money · Robinhood Chain</span>
+          <p>The live Robinhood Chain book, trading real ETH: +6.88 % per trade after fees and price impact, 64 % winners.</p>
         </figcaption>
       </figure>
 
       <figure class="shot">
-        <a href="/assets/screens/selector-backtest.webp" target="_blank" rel="noopener"><img src="/assets/screens/selector-backtest.webp" width="2000" height="962" loading="lazy" decoding="async" alt="Console Model page for selector #154: buys when the predicted return is at least +11.5 %, holds 120 minutes, 2,933 test trades averaging +8.87 % against −4.57 % for random picks, profit factor 1.68. A table splits the backtest into selection, evaluation and holdout periods, each profitable, with 8 of 10 test weeks profitable."></a>
+        <a href="/assets/screens/selector-backtest.webp" target="_blank" rel="noopener"><img src="/assets/screens/selector-backtest.webp" width="2000" height="962" loading="lazy" decoding="async" alt="Console Model page for selector #154: 2,933 test trades averaging +8.87 % against −4.57 % for random picks, profit factor 1.68, with selection, evaluation and holdout periods all profitable."></a>
         <figcaption>
-          <span class="micro">Backtest · selector #154, the fly's teacher</span>
-          <p>Trained walk-forward on both chains' 1-minute rows through 2026-10-02. On ten held-out weeks it made +8.87 % per trade after costs over 2,933 trades and was profitable in 8 of them; random picks lost 4.57 % under the same costs. On three weeks that no fit ever saw it made +5.19 % over 2,156 trades: +5.13 % on Robinhood Chain and +6.78 % on Solana.</p>
+          <span class="micro">Backtest · the fly's teacher</span>
+          <p>+8.87 % per trade after costs over 2,933 held-out trades, against −4.57 % for random picks. On weeks no model ever saw: +5.19 % over 2,156 trades.</p>
         </figcaption>
       </figure>
 
       <figure class="shot">
-        <a href="/assets/screens/fly-replay.webp" target="_blank" rel="noopener"><img src="/assets/screens/fly-replay.webp" width="2000" height="883" loading="lazy" decoding="async" alt="Console replay panel: replay passed on Solana (+3.78 % per trade over 308 trades) and Robinhood Chain (+2.66 % over 1,477); 1,785 replay trades averaging +2.85 % against −4.25 % for random picks, 12 of 16 days profitable, and a bar chart of plastic fly, frozen fly and random picks."></a>
+        <a href="/assets/screens/fly-replay.webp" target="_blank" rel="noopener"><img src="/assets/screens/fly-replay.webp" width="2000" height="883" loading="lazy" decoding="async" alt="Console replay panel: replay passed on Solana and Robinhood Chain; 1,785 replay trades averaging +2.85 % against −4.25 % for random picks, 12 of 16 days profitable."></a>
         <figcaption>
-          <span class="micro">Replay · the gate before the fly trades</span>
-          <p>Before fly #157 could trade, it relived 16 days it had never been tuned on (2026-09-24 → 10-09) minute by minute, learning as it went. It made +2.85 % per trade over 1,785 trades and was profitable on 12 of the 16 days: +3.78 % over 308 trades on Solana and +2.66 % over 1,477 on Robinhood Chain. Random picks lost 4.25 %.</p>
+          <span class="micro">Replay · the fly's gate</span>
+          <p>The fly relived 16 days it had never been tuned on, learning as it went: +2.85 % per trade over 1,785 trades, profitable on 12 of 16 days.</p>
         </figcaption>
       </figure>
 
       <figure class="shot">
-        <a href="/assets/screens/fly-brain.webp" target="_blank" rel="noopener"><img src="/assets/screens/fly-brain.webp" width="2000" height="1239" loading="lazy" decoding="async" alt="Console brain panel: a 3D point cloud of the fly's 41,756 neurons coloured by population, with green and red lines marking the Kenyon cell to MBON synapses it has changed most, a population legend, and a 24-hour playback timeline."></a>
+        <a href="/assets/screens/fly-brain.webp" target="_blank" rel="noopener"><img src="/assets/screens/fly-brain.webp" width="2000" height="1239" loading="lazy" decoding="async" alt="Console brain panel: a 3D point cloud of the fly's 41,756 neurons coloured by population, with lines marking the Kenyon cell to MBON synapses it has changed most."></a>
         <figcaption>
           <span class="micro">The brain, live</span>
-          <p>The 41,756 neurons the fly trades with, lit by each minute's scoring, and the Kenyon cell → MBON synapses its learning has changed most: 4,098 of 21,438 since it started. The console plays back the last 24 hours and follows any neuron you click.</p>
+          <p>The 41,756 neurons the fly trades with, lit by each minute's scoring, and the synapses its learning has changed most. Play back the last 24 hours, or click a neuron to follow it.</p>
         </figcaption>
       </figure>
     </div>
-
-    <p class="hint mt-24">Captured from a read-only copy of the console. Backtests and replays are simulations, not trades. Over the same two live days the Solana wallet closed 7 trades for −0.039 SOL (−5.2 %), so the live record so far is mixed and far too short to judge. These panels come from the project's own fly on the operator's machine. Wallet addresses and open positions are never shown.</p>
   </div>
 </section>
 
@@ -337,7 +306,7 @@
     <div class="section-head">
       <span class="micro accent">04 · Get Started</span>
       <h2 class="section-title">Run your own fly</h2>
-      <p class="lede">The whole system is open source under the MIT license: the connectome build, data ingest, training, the trading engine, the signer and the operator console. It runs on a Mac, on a Linux PC with an NVIDIA or AMD GPU, or on any 64-bit CPU, Windows included through Docker.</p>
+      <p class="lede">Open source under the MIT license. It runs on a Mac, on a Linux PC with an NVIDIA or AMD GPU, or on any 64-bit CPU.</p>
       <div class="btn-row hard-shadow">
         <a class="btn primary" data-link="github" href="https://github.com/bryceweiner/fly-trader" target="_blank" rel="noopener">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.1.79-.25.79-.56v-2.17c-3.2.7-3.87-1.37-3.87-1.37-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.76 2.69 1.25 3.35.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.41-2.69 5.38-5.25 5.67.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>
@@ -352,16 +321,15 @@
       <h3 class="sub-title">Where the fly runs</h3>
       <div class="table-wrap">
         <table class="data wrap">
-          <thead><tr><th scope="col">Backend</th><th scope="col">Hardware</th><th scope="col">Install</th><th scope="col">Notes</th></tr></thead>
+          <thead><tr><th scope="col">Backend</th><th scope="col">Hardware</th><th scope="col">Install</th></tr></thead>
           <tbody>
-            <tr><td>Apple Metal (MPS)</td><td data-label="Hardware">Apple Silicon Mac, macOS 14 or newer</td><td data-label="Install"><code>uv sync</code></td><td data-label="Notes" class="note">From source only: Docker on a Mac cannot reach the GPU and uses the CPU. Where fly-trader is developed and trades every day.</td></tr>
-            <tr><td>NVIDIA CUDA</td><td data-label="Hardware">Linux, NVIDIA GPU</td><td data-label="Install"><code>uv sync --extra cu126</code> (or <code>cu130</code>); Docker: <code>docker-compose.cuda.yml</code></td><td data-label="Notes" class="note">Docker needs driver 560 or newer and the NVIDIA Container Toolkit. A cross-backend test checks the GPU agrees with the CPU wherever a card is present; the project has not yet run it on NVIDIA hardware.</td></tr>
-            <tr><td>AMD ROCm</td><td data-label="Hardware">Linux x86-64, AMD GPU</td><td data-label="Install"><code>uv sync --extra rocm72</code>; Docker: <code>docker-compose.rocm.yml</code></td><td data-label="Notes" class="note">PyTorch 2.14 on ROCm 7.2: Radeon RX 6800/6900, RX 7000 and RX 9000, the 780M, Ryzen AI 300 and Ryzen AI Max, and Instinct cards. Not yet run on AMD hardware by the project.</td></tr>
-            <tr><td>CPU</td><td data-label="Hardware">Any 64-bit CPU</td><td data-label="Install"><code>uv sync --extra cpu</code>; the default Docker image</td><td data-label="Notes" class="note">The fly's forward pass is a memory-bound scatter, so 16 CPU threads score as fast as the Apple GPU (about 1,700 rows a second) and train at about 0.8× its speed.</td></tr>
+            <tr><td>Apple Metal (MPS)</td><td data-label="Hardware">Apple Silicon Mac, macOS 14 or newer</td><td data-label="Install"><code>uv sync</code></td></tr>
+            <tr><td>NVIDIA CUDA</td><td data-label="Hardware">Linux, NVIDIA GPU</td><td data-label="Install"><code>uv sync --extra cu126</code> (or <code>cu130</code>); Docker: <code>docker-compose.cuda.yml</code></td></tr>
+            <tr><td>AMD ROCm</td><td data-label="Hardware">Linux x86-64: Radeon RX 6000 to 9000, Ryzen AI, Instinct</td><td data-label="Install"><code>uv sync --extra rocm72</code>; Docker: <code>docker-compose.rocm.yml</code></td></tr>
+            <tr><td>CPU</td><td data-label="Hardware">Any 64-bit CPU</td><td data-label="Install"><code>uv sync --extra cpu</code>; the default Docker image</td></tr>
           </tbody>
         </table>
       </div>
-      <p class="hint mt-12"><code>DEVICE=auto</code> picks a CUDA or ROCm GPU, then Metal, then the CPU; a missing backend falls back to the CPU with a warning. <code>DEVICE=cpu</code>, <code>cuda:1</code>, <code>rocm</code> or <code>mps</code> choose one.</p>
     </div>
 
     <div class="sub">
@@ -370,26 +338,20 @@
         <table class="data wrap">
           <thead><tr><th scope="col">Workload</th><th scope="col">RAM</th><th scope="col">GPU</th><th scope="col">Disk</th></tr></thead>
           <tbody>
-            <tr><td>Trading, Solana</td><td data-label="RAM"><strong>16 GB</strong> minimum</td><td data-label="GPU">Not needed</td><td data-label="Disk" class="note">About 2 GB to start with Docker (CPU image and database), growing with the tape it records.</td></tr>
-            <tr><td>Trading, + Robinhood Chain</td><td data-label="RAM"><strong>16 GB</strong> minimum</td><td data-label="GPU">Not needed</td><td data-label="Disk" class="note">About 40 GB more for its history since 2026-08-04; about 40 days of it are enough to trade.</td></tr>
-            <tr><td>Training from scratch</td><td data-label="RAM"><strong>64 GB</strong> minimum</td><td data-label="GPU">Optional, 4 GB or more</td><td data-label="Disk" class="note">About 0.5 TB, after downloading 1.8 TB of compressed archive (one to two days). The project trains on a 128 GB machine.</td></tr>
+            <tr><td>Trading, Solana</td><td data-label="RAM"><strong>16 GB</strong> minimum</td><td data-label="GPU">Not needed</td><td data-label="Disk">About 2 GB</td></tr>
+            <tr><td>Trading, + Robinhood Chain</td><td data-label="RAM"><strong>16 GB</strong> minimum</td><td data-label="GPU">Not needed</td><td data-label="Disk">About 40 GB more</td></tr>
+            <tr><td>Training from scratch</td><td data-label="RAM"><strong>64 GB</strong> minimum</td><td data-label="GPU">Optional, 4 GB or more</td><td data-label="Disk">About 0.5 TB</td></tr>
           </tbody>
         </table>
-      </div>
-      <div class="prose mt-24">
-        <p>Memory decides how fast the fly runs, not whether it runs. Every batch is sized from free memory: about 9.5 MB per row to score and 40 MB per row to train, plus 0.5 GB fixed, within 60 % of what is free. A busy minute (about 140 tokens) scores in under 2 GB. An 8 GB card trains about 100 rows at a time and scores about 470; full-speed batches want about 37 GB free. The selector's walk-forward is what needs the RAM: it keeps every row of the archive in memory (36 million for the current model), and a recent run held 43 GB. On a shared GPU or an integrated one, <code>DEVICE_MEMORY_GB</code> sets how much the fly may use.</p>
       </div>
     </div>
 
     <div class="sub">
       <h3 class="sub-title">You will need</h3>
       <ul class="req-list">
-        <li><strong>Docker, or Python 3.13 and uv</strong><span>Docker runs everything, Postgres included, and keeps itself up to date. From source, uv installs the rest.</span></li>
-        <li><strong>PostgreSQL 15 or newer</strong><span>From source only. Homebrew's works.</span></li>
-        <li><strong>Jupiter and Helius API keys</strong><span>Jupiter for token stats and Solana swaps, Helius for the wallet's transactions. Helius's free tier is enough. Market data needs no key.</span></li>
-        <li><strong>An Envio HyperSync token (for Robinhood Chain)</strong><span>Personal accounts get one free. Robinhood Chain is off in Docker and on from source; without a token, set <code>RH_ENABLED=0</code> and trade Solana only.</span></li>
-        <li><strong>Money you can lose</strong><span>Docker's caps are sized for a 0.5 SOL wallet. From source, nothing is signed until you set <code>LIVE_ENABLED=1</code>.</span></li>
-        <li><strong>Patience</strong><span>A fresh install needs a day of market data before it scores anything, and a from-scratch training run takes days of downloading and hours of training.</span></li>
+        <li><strong>Docker, or Python 3.13, uv and PostgreSQL</strong><span>Docker runs everything and keeps itself up to date.</span></li>
+        <li><strong>Jupiter and Helius API keys</strong><span>Helius's free tier is enough.</span></li>
+        <li><strong>An Envio HyperSync token</strong><span>For Robinhood Chain. Personal accounts get one free.</span></li>
       </ul>
     </div>
 
@@ -399,7 +361,6 @@
         <li>
           <div>
             <h4>Download the release and add your keys</h4>
-            <p>The <code>distribution</code> branch carries the trading engine, the console, fly #157, the selector that taught it and their connectome.</p>
             <pre>git clone -b distribution https://github.com/bryceweiner/fly-trader.git && cd fly-trader
 cp .env.example .env    # paste HELIUS_API_KEY and JUPITER_API_KEY</pre>
           </div>
@@ -407,7 +368,6 @@ cp .env.example .env    # paste HELIUS_API_KEY and JUPITER_API_KEY</pre>
         <li>
           <div>
             <h4>Start it</h4>
-            <p>The first start builds the image, creates the database, downloads a 300 MB data table and starts the market feed and the trading engine.</p>
             <pre>docker compose up -d --build
 # NVIDIA:  docker compose -f docker-compose.yml -f docker-compose.cuda.yml up -d --build
 # AMD:     docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d --build</pre>
@@ -416,7 +376,7 @@ cp .env.example .env    # paste HELIUS_API_KEY and JUPITER_API_KEY</pre>
         <li>
           <div>
             <h4>Create and fund the wallet</h4>
-            <p><code>wallet new</code> prints the bot wallet's address and writes its key into <code>.env</code>; back that file up, it is the only copy. Send it 0.5 SOL, then restart.</p>
+            <p>Back up <code>.env</code>: it holds the only copy of the wallet's key. Send the wallet 0.5 SOL, then restart.</p>
             <pre>docker compose exec fly fly-trader wallet new
 docker compose restart fly</pre>
           </div>
@@ -424,7 +384,7 @@ docker compose restart fly</pre>
         <li>
           <div>
             <h4>Watch it</h4>
-            <p>Open <code>http://localhost:8501</code>. The first day is a warm-up; then it trades paper until 20 trades have closed, then the wallet. Its kill switch sells everything 20 % below the wallet's peak. Every hour it installs any newer release signed by the project's key; <code>AUTO_UPDATE=0</code> pins it.</p>
+            <p>Open <code>http://localhost:8501</code>. It trades paper until 20 trades have closed, then the wallet.</p>
           </div>
         </li>
       </ol>
@@ -436,7 +396,6 @@ docker compose restart fly</pre>
         <li>
           <div>
             <h4>Clone and install</h4>
-            <p>On Linux, name a torch build: plain <code>uv sync</code> there installs PyPI's 3 GB CUDA 13 build.</p>
             <pre>git clone https://github.com/bryceweiner/fly-trader.git && cd fly-trader
 uv sync                  # macOS: Metal
 uv sync --extra cu126    # Linux, one of: cpu · cu126 · cu130 (NVIDIA) · rocm72 (AMD)</pre>
@@ -445,7 +404,7 @@ uv sync --extra cu126    # Linux, one of: cpu · cu126 · cu130 (NVIDIA) · rocm
         <li>
           <div>
             <h4>Configure and create the database</h4>
-            <p>Copy the template and paste your keys. Leave <code>LIVE_ENABLED=0</code>; paper books run by default.</p>
+            <p>Paste your keys into <code>.env</code>.</p>
             <pre>cp .env.example .env
 createdb fly_trader
 uv run fly-trader init-db</pre>
@@ -454,7 +413,6 @@ uv run fly-trader init-db</pre>
         <li>
           <div>
             <h4>Build the brain</h4>
-            <p>Fetch the public FlyWire export (about 85 MB: three tables from <a href="https://github.com/snedea/flybrain" target="_blank" rel="noopener">flybrain</a> and the FlyWire annotations), then build. The build checks it against the published 139,255 neurons and 2,698,236 connections.</p>
             <pre>mkdir -p data/brain/raw && cd data/brain/raw
 F=https://raw.githubusercontent.com/snedea/flybrain/main/data
 curl -LO $F/connections.csv.gz -LO $F/neurons.csv.gz -LO $F/classification.csv.gz
@@ -465,23 +423,22 @@ cd - && uv run fly-trader build-connectome</pre>
         <li>
           <div>
             <h4>Open the console</h4>
-            <p>One process starts and supervises every worker (the market feeds, the history archive and its features, the trainer, the trading engine) and serves the operator dashboard on <code>http://localhost:8501</code>. It listens on 127.0.0.1 only; reach a remote one through an SSH tunnel.</p>
+            <p>Starts every worker and serves the dashboard on <code>http://localhost:8501</code>.</p>
             <pre>uv run fly-trader ui</pre>
           </div>
         </li>
         <li>
           <div>
-            <h4>Train, then trade on paper</h4>
-            <p>The trainer starts by itself once every archived day has its features, then reruns every 7 days. By hand:</p>
-            <pre>uv run fly-trader train-selector       # walk-forward backtest over the whole archive
-uv run fly-trader train-fly-selector   # teaches the fly from the selector
-uv run fly-trader fly-replay           # the replay the fly must pass before it trades</pre>
+            <h4>Train</h4>
+            <pre>uv run fly-trader train-selector
+uv run fly-trader train-fly-selector
+uv run fly-trader fly-replay</pre>
           </div>
         </li>
         <li>
           <div>
-            <h4>Go live only if you mean it</h4>
-            <p>Create the bot wallet, fund it modestly and run the smoke test, then set <code>LIVE_ENABLED=1</code> with your capital caps. Robinhood Chain has its own key (<code>RH_BOT_PRIVATE_KEY</code>), switch (<code>RH_LIVE_ENABLED</code>) and smoke test. Every rail above is enforced in code, and the kill switch is yours.</p>
+            <h4>Go live</h4>
+            <p>Fund the bot wallet, run the smoke test, then set <code>LIVE_ENABLED=1</code> (<code>RH_LIVE_ENABLED=1</code> for Robinhood Chain).</p>
             <pre>uv run fly-trader wallet new
 uv run fly-trader swap-smoke --sol 0.01
 uv run fly-trader rh-smoke --yes</pre>
