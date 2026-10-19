@@ -3,6 +3,27 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## Unreleased
+
+### Tools
+
+- **`tools/latency_probe.py` and `tools/latency_report.py` measure the minute pipeline from outside the console.**
+  - They sample, four times a second, when the stream publishes each minute, what SQL the console is running, when each
+    book's status lands, the console's CPU and every live order. The report turns that into per-minute timelines.
+  - They're read-only and need no restart. Run them before and after a change to the minute pipeline.
+  - The 2026-10-19 baseline of the old code is in `logs/latency_baseline_20261019/`. A minute was ready a median 6.4 s
+    after its end (p90 16.9 s). Almost all of that was the wait for the stream to publish the minute; everything after
+    publishing took 0.7 s.
+- **`tools/strategy_study/` re-checks the trading strategy against fresh data without saving a model.**
+  - It runs the trainer's own capitulation fit and judges it on the trainer's selection half, evaluation half and holdout.
+  - Then it compares the live selector's decisions on days after its training, sells the same trades after every hold
+    from 10 to 480 minutes, and tests floors on liquidity, volume, activity, age and wash share.
+  - It is safe to run beside live trading. The dataset is built in a separate process and read from disk, and a guard
+    stops the run if the live console's minutes slow down or its memory is squeezed.
+  - The 2026-10-19 run kept selector #154's strategy and 240-minute hold. #154 made +8.6% per Solana trade on the 16 days
+    after its training, against +8.9% in its backtest. Holds from 180 to 480 minutes did about equally well, and no
+    floor beat the noise.
+
 ## 2026-10-18, release 9: The Overview page charts each chain's setups, and the money's book comes first
 
 Published to Hugging Face as signed release 9. Fly #157 and selector #154 are unchanged, and so are the definitions they
