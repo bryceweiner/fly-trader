@@ -499,6 +499,7 @@ dependencies = [
     { name = "torch", version = "2.14.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "extra == 'extra-10-fly-trader-cu126' or (extra == 'extra-10-fly-trader-cpu' and extra == 'extra-10-fly-trader-cu130') or (extra == 'extra-10-fly-trader-cpu' and extra == 'extra-10-fly-trader-rocm72') or (extra == 'extra-10-fly-trader-cu130' and extra == 'extra-10-fly-trader-rocm72')" },
     { name = "torch", version = "2.14.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "extra == 'extra-10-fly-trader-cu130' or (extra == 'extra-10-fly-trader-cpu' and extra == 'extra-10-fly-trader-cu126') or (extra == 'extra-10-fly-trader-cu126' and extra == 'extra-10-fly-trader-rocm72') or (extra == 'extra-10-fly-trader-cpu' and extra != 'extra-10-fly-trader-cu130' and extra == 'extra-10-fly-trader-rocm72')" },
     { name = "torch", version = "2.14.1+rocm7.2", source = { registry = "https://download.pytorch.org/whl/rocm7.2" }, marker = "(sys_platform != 'emscripten' and sys_platform != 'win32' and extra == 'extra-10-fly-trader-rocm72') or (sys_platform == 'emscripten' and extra == 'extra-10-fly-trader-cu130' and extra == 'extra-10-fly-trader-rocm72') or (sys_platform == 'win32' and extra == 'extra-10-fly-trader-cu130' and extra == 'extra-10-fly-trader-rocm72') or (extra == 'extra-10-fly-trader-cpu' and extra == 'extra-10-fly-trader-cu126') or (extra == 'extra-10-fly-trader-cpu' and extra == 'extra-10-fly-trader-cu130') or (extra == 'extra-10-fly-trader-cpu' and extra == 'extra-10-fly-trader-rocm72') or (extra == 'extra-10-fly-trader-cu126' and extra == 'extra-10-fly-trader-cu130') or (extra == 'extra-10-fly-trader-cu126' and extra == 'extra-10-fly-trader-rocm72')" },
+    { name = "urllib3" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
     { name = "zstandard" },
@@ -557,6 +558,7 @@ requires-dist = [
     { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'rocm72'", specifier = ">=2.12", index = "https://download.pytorch.org/whl/rocm7.2", conflict = { package = "fly-trader", extra = "rocm72" } },
     { name = "torch", marker = "extra == 'cpu'", specifier = ">=2.12", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "fly-trader", extra = "cpu" } },
     { name = "triton-rocm", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'rocm72'", index = "https://download.pytorch.org/whl/rocm7.2", conflict = { package = "fly-trader", extra = "rocm72" } },
+    { name = "urllib3", specifier = ">=2.8" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.54.0" },
     { name = "websockets", specifier = ">=12" },
     { name = "zstandard", specifier = ">=0.25.0" },
@@ -1973,6 +1975,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e4/31/3d74fa778a63b98b7374323befcc0be5ab3bd94afd4096a0124e7379152c/tzdata-2026.4.tar.gz", hash = "sha256:f1b8bd365d8d210c55353f4d7f8d6d8561c0ba50d704b700d195a9424bba0d79", size = 199350, upload-time = "2026-09-12T12:56:03.251Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f9/bc/8737e8d54cf51106118039b83f485a4783112fab49ea9d044b234978a46e/tzdata-2026.4-py2.py3-none-any.whl", hash = "sha256:c2169a8b0a7a5e9674da5a135ccdfb2b3e671b333ed9fed17b41f73c34476e81", size = 347494, upload-time = "2026-09-12T12:56:01.67Z" },
+]
+
+[[package]]
+name = "urllib3"
+version = "2.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e3/05/b17359e1cefb4f909b5e40b1b90a496d987258916dbbf88e842c729f510e/urllib3-2.8.0.tar.gz", hash = "sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63", size = 458972, upload-time = "2026-09-15T19:29:36.253Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/92/9d/c4e665119135114480843e7ab388fa94d8480650450e6f8e26b70d323a4c/urllib3-2.8.0-py3-none-any.whl", hash = "sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3", size = 135717, upload-time = "2026-09-15T19:29:34.577Z" },
 ]
 
 [[package]]
