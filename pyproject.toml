@@ -22,6 +22,7 @@ dependencies = [
   "orjson",
   "psutil",
   "kalshi-python-async>=3.10,<3.11",
+  "urllib3>=2.8",            # kalshi-python-async imports it (configuration.py) but does not declare it
   "cryptography",
   "aiohttp",
   "coincurve>=20",           # secp256k1: vault claim signatures (EIP-191 / EIP-1271)
