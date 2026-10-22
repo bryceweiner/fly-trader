@@ -51,6 +51,22 @@ ships signed releases built from this development line.
     5%, and books it like any exit. The console waits up to 90 s and says what the sale brought, or why it failed.
   - The fly's paper book keeps its own position. An operator's sale counts neither in the live-vs-paper gap that pauses
     entries nor in what the fly learns about its fills.
+- **Live money follows the seat: until the fly wins its race, the wallet trades the selector's decisions.**
+  - Before, with `LIVE_WITHOUT_HANDOVER` on, the wallet traded the fly's decisions whoever held the seat. Those are the
+    selector's picks less what the fly's learning vetoes, so an untested fly's learning reached live money before its race.
+  - Now, until the handover, a pick the fly's learning vetoes still goes live as the selector decided it. It stays out of
+    the fly's paper book, which is what the race compares with the selector's. Once the fly holds the seat, its vetoes
+    bind the wallet too. A pick the selector itself blocks never goes live. Both chains.
+
+### The selector
+
+- **A strategy's win filter chooses only its cut-off, at the strategy's own line, and must beat having no filter.**
+  - Before, the filter searched the line too. In selector #154 it moved `ev`'s line from 0.038 to 0.115, which `ev`'s live
+    scores never reached, so `ev` stayed deployed but never traded.
+- **The book keeps the passed strategies, and the combination rule, that together do best on the selection half.**
+  - Every subset of the strategies that passed is scored as one book under each rule. A strategy the book does better
+    without is dropped in the open, as its own "combination" row with the numbers.
+  - The combination step no longer says a rule "made more" when no book cleared the bars.
 
 ### The console
 
