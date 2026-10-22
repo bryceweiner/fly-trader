@@ -68,6 +68,16 @@ ships signed releases built from this development line.
     without is dropped in the open, as its own "combination" row with the numbers.
   - The combination step no longer says a rule "made more" when no book cleared the bars.
 
+### Training
+
+- **The fly's training writes a checkpoint after every epoch, and resumes from it.**
+  - Before, a bootstrap (10–20 hours) kept its progress in memory only. A crash or a stop lost every finished epoch,
+    and training could not go on past its epoch cap.
+  - Now each epoch saves the weights, the optimiser, the history, the best epoch so far and the random state. A stopped
+    or crashed bootstrap resumes after its last finished epoch, and a finished one can train on past the cap it ran under.
+  - A checkpoint written for other training data is set aside, never resumed. The live bootstrap deletes its checkpoint
+    once the fly is saved.
+
 ### The console
 
 - **The fly decision inspector shows the token's price and volume in the minute the fly last scored it.** Each has a

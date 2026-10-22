@@ -69,6 +69,7 @@ EPOCHS, BATCH = 8, 512       # EPOCHS only caps the runtime; early stopping belo
 TOP_WEIGHT = 10.0            # loss weight of the teacher's top 1 % of training minutes
 DISTIL_TOP, DISTIL_SAMPLE = 0.05, 3_000_000
 RECAL_ROWS = 200_000
+CHECKPOINT = config.BRAIN_DIR / "policies" / "fly_bootstrap.ckpt.pt"     # the live bootstrap's epochs so far (main): a stopped run resumes
 VAL_ROWS, VAL_MIN_ROWS = 200_000, 100_000   # distillation rows held out to judge the fit; a smaller slice is too noisy to stop on
 MIN_EPOCHS = 2               # never stop on one epoch: it has nothing to be compared against
 LR_GRAPH, LR_HEAD = 1e-4, 1e-3
@@ -427,13 +428,38 @@ def _val_mse(net: FlyNet, scaler: RobustScaler, ds: DecisionSet, idx: np.ndarray
     return float(e.mean()), float(e.std() / max(len(e) ** 0.5, 1.0))
 
 
+def _resume(path, fp: dict) -> dict | None:
+    """The checkpoint at ``path`` when it was written for this same training set (``fp``): training resumes after its last
+    epoch. One written for other data is set aside (``.stale``) and training starts fresh."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    ck = model_io.torch_load(p)
+    if ck.get("fingerprint") != fp:
+        stale = p.with_name(p.name + ".stale"); p.replace(stale)
+        log.warning("fly checkpoint %s was written for other training data (%s; now %s): set aside as %s, training starts fresh",
+                    p.name, ck.get("fingerprint"), fp, stale.name)
+        return None
+    log.info("fly training resumes after epoch %d from %s", int(ck["epoch"]), p)
+    return ck
+
+
+def _write_checkpoint(path, obj: dict) -> None:
+    """``obj`` at ``path``, atomically: a run killed while writing leaves the previous epoch's checkpoint whole."""
+    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True); tmp = p.with_name(p.name + ".tmp")
+    model_io.torch_save(obj, tmp); tmp.replace(p)
+
+
 def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, batch: int = BATCH, stop: threading.Event | None = None,
               seed: int = 0, graph=None, device=None, net_kwargs: dict | None = None, model_cls=None, target_clip: tuple = (-1.0, 1.0),
-              horizon_min: int | None = None) -> tuple[FlyModel | None, dict]:
+              horizon_min: int | None = None, checkpoint=None) -> tuple[FlyModel | None, dict]:
     """Distil ``teacher`` (a StackTeacher, or anything with ``score`` and ``scaler``) into a FlyNet over the training rows
     ``rows`` (mask): one head per strategy, each learning its strategy's targets on that strategy's candidates.
     ``net_kwargs`` (``aff_rows``, ``scale``), ``model_cls`` and ``target_clip`` let another trading type (kalshi/fly.py) run
-    its own fly through this loop; the memecoin defaults are unchanged."""
+    its own fly through this loop; the memecoin defaults are unchanged. ``checkpoint``: a file written after every epoch
+    (weights, optimiser, history, the best epoch so far, the random state): a run that dies resumes after its last
+    finished epoch, and a finished one goes on past the cap it ran under when ``epochs`` is raised. A file written for
+    other training data is set aside, never resumed."""
     brain_device.seed_all(seed); rng = np.random.default_rng(seed); dev = torch.device(device) if device else _device()
     n_s = len(teacher.strategies) if isinstance(teacher, StackTeacher) else 1
     net = FlyNet(graph if graph is not None else _graph(), obs_dim=len(ds.cols), device=dev, n_strategies=n_s, **(net_kwargs or {}))
@@ -451,8 +477,18 @@ def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, 
             col = T[:, j]; hd.bias.fill_(float(np.nanmean(col)) * net.scale if np.isfinite(col).any() else 0.0); hd.weight.mul_(0.1)
     batch = min(batch, net.batch_rows(ceiling=batch, training=True))      # a training step keeps every propagation step: ~4x a forward pass
     opt = torch.optim.Adam(net.param_groups(LR_GRAPH, LR_HEAD)); n_b = max(1, len(use) // batch); total = max(1, epochs * n_b); hist = []; t0 = time.time()
-    best = best_v = prev_v = early = None
-    for ep in range(epochs):
+    best = best_v = prev_v = early = None; start = 0
+    fp = {"training_rows": int(len(idx)), "rows": int(len(use)), "val_rows": int(len(val)), "seed": int(seed), "obs_dim": int(len(ds.cols)),
+          "strategies": list(teacher.strategies) if isinstance(teacher, StackTeacher) else []}
+    ck = _resume(checkpoint, fp) if checkpoint is not None else None
+    if ck is not None:
+        net.load_state_dict(ck["state_dict"])
+        if ck.get("opt") is not None:
+            opt.load_state_dict(ck["opt"])
+        if ck.get("rng") is not None:
+            rng.bit_generator.state = ck["rng"]
+        hist, best, best_v, prev_v, early, start = list(ck["hist"]), ck.get("best"), ck.get("best_v"), ck.get("prev_v"), ck.get("early"), int(ck["epoch"]) + 1
+    for ep in range(start, epochs if early is None else start):
         perm = use[rng.permutation(len(use))]; tot = 0.0; net.train()
         for b in range(n_b):
             if stop is not None and stop.is_set():
@@ -464,24 +500,27 @@ def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, 
             loss = (w * (net.forward_all(x) - t) ** 2).sum() / w.sum().clamp(min=1e-9)
             opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0); opt.step(); tot += loss.item()
             if b % 200 == 0:
-                done = ep * n_b + b + 1; el = time.time() - t0
-                prog.update("fly: learning from the selector", done, total, epoch=ep, loss=tot / (b + 1), rows_per_s=done * batch / max(el, 1e-9),
-                            eta_s=(total - done) * el / done)
+                done = ep * n_b + b + 1; here = (ep - start) * n_b + b + 1; el = time.time() - t0      # ``here``: this run's steps (a resumed run's rate)
+                prog.update("fly: learning from the selector", done, total, epoch=ep, loss=tot / (b + 1), rows_per_s=here * batch / max(el, 1e-9),
+                            eta_s=(total - done) * el / here)
         hist.append({"epoch": ep, "mse": tot / n_b, "secs": time.time() - t0, "rows": min(len(use), n_b * batch)})
         log.info("fly epoch %d: weighted mse %.4f over %d rows (%.0fs)", ep, tot / n_b, min(len(use), n_b * batch), time.time() - t0)
-        if not len(val):
-            continue
-        vm, vse = _val_mse(net, teacher.scaler, ds, idx, T, W, val, dev, batch)
-        hist[-1]["val_mse"], hist[-1]["val_se"] = vm, vse
-        log.info("fly epoch %d: held-out weighted mse %.4f +/- %.4f over %d rows", ep, vm, vse, len(val))
-        if best_v is None or vm < best_v:
-            best_v, best = vm, {k: v.detach().clone() for k, v in net.state_dict().items()}
-        gain = None if prev_v is None else prev_v - vm
-        stop_now = ep + 1 >= MIN_EPOCHS and gain is not None and gain <= vse
-        prev_v = vm
-        if stop_now:
-            early = f"epoch {ep} moved the held-out error by {gain:+.4f}, inside its standard error {vse:.4f}"
-            log.info("fly: stopping early - %s", early)
+        if len(val):
+            vm, vse = _val_mse(net, teacher.scaler, ds, idx, T, W, val, dev, batch)
+            hist[-1]["val_mse"], hist[-1]["val_se"] = vm, vse
+            log.info("fly epoch %d: held-out weighted mse %.4f +/- %.4f over %d rows", ep, vm, vse, len(val))
+            if best_v is None or vm < best_v:
+                best_v, best = vm, {k: v.detach().clone() for k, v in net.state_dict().items()}
+            gain = None if prev_v is None else prev_v - vm
+            stop_now = ep + 1 >= MIN_EPOCHS and gain is not None and gain <= vse
+            prev_v = vm
+            if stop_now:
+                early = f"epoch {ep} moved the held-out error by {gain:+.4f}, inside its standard error {vse:.4f}"
+                log.info("fly: stopping early - %s", early)
+        if checkpoint is not None:
+            _write_checkpoint(checkpoint, {"fingerprint": fp, "epoch": ep, "state_dict": net.state_dict(), "opt": opt.state_dict(), "best": best,
+                                           "best_v": best_v, "prev_v": prev_v, "hist": hist, "rng": rng.bit_generator.state, "early": early})
+        if early is not None:
             break
     if best is not None:
         net.load_state_dict(best)                          # the epoch that generalised best, not merely the last one
@@ -617,12 +656,13 @@ def fly_decide(fly: FlyModel, X: np.ndarray, cols: list[str], values: np.ndarray
 
 
 def bootstrap(ds: DecisionSet, S: date, epochs: int = EPOCHS, stop: threading.Event | None = None, seed: int = 0, graph=None,
-              device=None, teacher=None, teacher_note: str | None = None) -> tuple[FlyModel | None, dict]:
+              device=None, teacher=None, teacher_note: str | None = None, checkpoint=None) -> tuple[FlyModel | None, dict]:
     """The one time the selector teaches: a fly ready to trade from day ``S`` on, with its own line and sizing per strategy.
     ``teacher``: the live path passes the deployed selector (``deployed_teacher``); left None, the stack is refit on the
     days before ``S − 8`` — which is what the replay wants, since there the refit is the honest out-of-sample teacher (a
     set without the stack's inputs or per-hold labels — synthetic tests — gets the single-model selector).
-    ``teacher_note`` records in the snapshot which selector taught this fly."""
+    ``teacher_note`` records in the snapshot which selector taught this fly. ``checkpoint``: the training's per-epoch
+    checkpoint file (``train_fly``)."""
     from .decisions import LEGACY_COLS
     train_end = S - timedelta(days=CALIB_DAYS + PURGE_DAYS)
     train = ds.day < train_end; uni = selector.in_universe(ds.X, ds.cols)
@@ -638,7 +678,7 @@ def bootstrap(ds: DecisionSet, S: date, epochs: int = EPOCHS, stop: threading.Ev
                 return None, {"S": str(S), "gates_ok": False, "gate_failures": ["the teacher stack has no strategy on the training days"], "teacher_stack": stack_info}
         else:
             teacher = selector.fit(ds, train, seed=7)
-    fly, fit_info = train_fly(ds, train & uni, teacher, epochs=epochs, stop=stop, seed=seed, graph=graph, device=device)
+    fly, fit_info = train_fly(ds, train & uni, teacher, epochs=epochs, stop=stop, seed=seed, graph=graph, device=device, checkpoint=checkpoint)
     if fly is None:
         return None, {"stopped": True, **fit_info}
     s_epoch = datetime(S.year, S.month, S.day, tzinfo=timezone.utc).timestamp()
@@ -793,11 +833,12 @@ def main(days: int | None = None, epochs: int | None = None, stop_event: threadi
     ds = build(days=days, horizon_min=HOLD_MIN, holds=HOLDS_MIN); S = ds.days[-1] + timedelta(days=1)
     teacher, note, taught_by = deployed_teacher(ds, ds.day < S - timedelta(days=CALIB_DAYS + PURGE_DAYS), calib_start=S - timedelta(days=CALIB_DAYS))
     log.info("fly bootstrap teacher: %s", note)
-    fly, info = bootstrap(ds, S, epochs=EPOCHS if epochs is None else epochs, stop=stop_event, teacher=teacher, teacher_note=note)
+    fly, info = bootstrap(ds, S, epochs=EPOCHS if epochs is None else epochs, stop=stop_event, teacher=teacher, teacher_note=note, checkpoint=CHECKPOINT)
     if fly is None:
-        return {"stopped": True}
+        return {"stopped": True}                     # its checkpoint stays: the next run on the same data resumes it
     info["teacher_snapshot"] = taught_by
     record_event("info", "fly_selector", "fly bootstrap", {k: info.get(k) for k in ("S", "lines", "calibration", "diagnostics", "gates_ok", "gate_failures", "teacher")})
     path, sid = save(fly, info)
+    CHECKPOINT.unlink(missing_ok=True)
     prog.update("fly: done", 1, 1, force=True, snapshot_id=sid, line=info["line"], gates_ok=info["gates_ok"], diagnostics=info["diagnostics"])
     return {**info, "snapshot_id": sid, "path": str(path)}

@@ -201,6 +201,28 @@ def test_training_stops_when_an_epoch_buys_less_than_its_own_noise(monkeypatch):
     assert si["val_rows"] == 0 and si["early_stop"] is None and si["epochs_run"] == 0              # nothing to hold out, nothing to stop
 
 
+def test_training_checkpoints_every_epoch_resumes_and_goes_past_its_cap(monkeypatch, tmp_path):
+    """A bootstrap trains for hours: every epoch writes a checkpoint, so a run that dies resumes after its last finished
+    epoch and a finished one goes on past the cap it ran under; a checkpoint written for other data is set aside."""
+    monkeypatch.setattr(fly_selector, "VAL_MIN_ROWS", 100); monkeypatch.setattr(fly_selector, "VAL_ROWS", 500)
+    monkeypatch.setattr(fly_selector, "MIN_EPOCHS", 99)                      # no early stop: the cap decides each run's length
+    torch.manual_seed(0)
+    ds = _ds(); t = Teacher(ds); rows = np.ones(len(ds.y), bool); ck = tmp_path / "fly.ckpt.pt"
+    _, a = fly_selector.train_fly(ds, rows, t, epochs=2, batch=500, graph=_graph(), device="cpu", checkpoint=ck)
+    assert ck.exists() and a["epochs_run"] == 2
+    _, b = fly_selector.train_fly(ds, rows, t, epochs=4, batch=500, graph=_graph(), device="cpu", checkpoint=ck)
+    assert [e["epoch"] for e in b["epochs"]] == [0, 1, 2, 3] and b["epochs"][:2] == a["epochs"]      # on from epoch 2, its history kept
+    ck2 = tmp_path / "stopped.ckpt.pt"
+    fly, s = fly_selector.train_fly(ds, rows, t, epochs=3, batch=500, graph=_graph(), device="cpu", checkpoint=ck2,
+                                    stop=SimpleNamespace(is_set=lambda: ck2.exists()))               # dies at the first batch after epoch 0's checkpoint
+    assert fly is None and s["stopped"]
+    fly, r = fly_selector.train_fly(ds, rows, t, epochs=3, batch=500, graph=_graph(), device="cpu", checkpoint=ck2)
+    assert fly is not None and [e["epoch"] for e in r["epochs"]] == [0, 1, 2]                       # resumed after epoch 0
+    other = _ds(n=5000)
+    _, f = fly_selector.train_fly(other, np.ones(len(other.y), bool), Teacher(other), epochs=1, batch=500, graph=_graph(), device="cpu", checkpoint=ck)
+    assert (tmp_path / "fly.ckpt.pt.stale").exists() and [e["epoch"] for e in f["epochs"]] == [0]  # other data: set aside, a fresh start
+
+
 def test_rank_corr_matches_spearman_with_ties():
     rng = np.random.default_rng(1)
     a = rng.integers(0, 20, 500).astype(float); b = a + rng.normal(scale=5, size=500); b[::7] = b[0]
