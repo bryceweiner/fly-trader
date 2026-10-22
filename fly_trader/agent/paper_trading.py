@@ -32,14 +32,17 @@ from ..market.exit_cost import exit_cost_fraction
 
 def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str, mints: list, infos: list, scores, threshold,
                 table: list | None, horizon_s: float, block: str | None = None, holds=None, strategies=None, allow=None, reasons=None,
-                tables: list | None = None, flat: bool = False) -> dict:
+                tables: list | None = None, flat: bool = False, live_allow=None) -> dict:
     """The minute's beat, exits and entries, decided and quoted but not booked: every entry and blocked pick is already a
     ``decisions`` row (the live mirror buys under the entry's id); ``book_minute`` books the rest.
 
     Optional per-row arguments (the selector's strategy stack, train/strategies.decide): ``threshold`` may be per row,
     ``holds`` (s), ``strategies``, ``tables`` (sizing) and ``allow`` / ``reasons`` (a blocked row is recorded with its reason).
     Left out, the call behaves exactly as the single-strategy engine. ``flat``: every buy the same share of the bankroll
-    (agent/sizing.size_position), the fly's rule (``config.FLY_SIZING``).
+    (agent/sizing.size_position), the fly's rule (``config.FLY_SIZING``). ``live_allow``: per row, what the wallet may buy
+    where that differs from this book: a row the book is denied (``allow``) but ``live_allow`` allows is planned for the
+    live mirror alone (``live_only``: its own entry decision, quoted and sized as the book would; never booked here, the
+    book's cash and holdings untouched) -- the fly's learned veto binds its paper book while the selector holds the seat.
 
     ``rebuy``: each token the book keeps through the minute and has a row of, this minute's verdict on buying it again --
     its score and line, and where it would (allowed, not blocked; the book's own cash aside) its sizing table and paper's
@@ -92,6 +95,19 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
                                                                        program_label=ctx.cost_label(m, i["program_label"]), pool_fee=ctx.fee(m))
                 rebuy[m] = {"score": float(sc), "threshold": thr_k, **({"table": tab_k, "ref_price": paid[m] / (q.token_delta / 10 ** int(i["decimals"]))} if q is not None and q.ok
                                                                      else {"why": blocked or (q.reason if q is not None else str(reasons[k]) if reasons is not None else "filtered")})}
+            if denied and live_allow is not None and bool(live_allow[k]) and not blocked and m not in open_mints and size > 0:
+                hold_k = float(holds[k]) if holds is not None else None      # the wallet's buy alone: this book stays as it is
+                did = conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, m_hat, size_sol, forced, reason, book_targets, detail) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,false,%s,%s,%s) RETURNING id",
+                                   (beat, run_id, m1, m, i["pool"], f"{kind}_enter", float(sc), size, f"live only ({rail} binds {book}): {strat_k + ': ' if strat_k else ''}score {sc:.3f} ≥ {thr_k:.3f}; {why}", None,
+                                    json.dumps({"book": book, "live_only": True, "score": float(sc), "threshold": thr_k, "size_sol": size, "sizing": why, "resq": i["resq"], "age_h": i["age_h"],
+                                                "price": i["price"], "strategy": strat_k, "hold_s": hold_k}))).fetchone()["id"]
+                q = broker.quote_buy(size_sol=size, price=i["price"], res_quote_sol=i["resq"], mcap_sol=i["mcap"], decimals=i["decimals"],
+                                     program_label=ctx.cost_label(m, i["program_label"]), pool_fee=ctx.fee(m))
+                if q.ok:
+                    entries.append({"mint": m, "decision_id": did, "score": float(sc), "size_sol": size, "info": i, "threshold": thr_k, "table": tab_k, "hold_s": hold_k,
+                                    "strategy": strat_k, "live_only": True, "ref_price": size / (q.token_delta / 10 ** int(i["decimals"]))})
+                else:
+                    conn.execute("UPDATE decisions SET rail = %s, reason = %s WHERE id = %s", ("paper_fill", q.reason, did))
             continue
         hold_k = float(holds[k]) if holds is not None else None
         did = conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, m_hat, size_sol, forced, reason, book_targets, detail) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,false,%s,%s,%s) RETURNING id",

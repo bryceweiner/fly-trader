@@ -3,6 +3,7 @@ gates, dump veto and fail-closed rules decide every row; the fly's learning can 
 more than FLY_LEARNED_VETO below its bootstrap score) but never add one. 2026-10-08: ungated, the live fly bought rows the
 selector rejected (-25.9 % per row) and missed rows it allowed (+16.0 %)."""
 import threading
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import numpy as np
@@ -34,8 +35,32 @@ def test_the_fly_trades_the_selectors_set_and_only_learning_can_drop_a_trade(mon
     assert d["reason"][1].startswith("selector: dump veto")                          # the selector's filter binds the fly
     assert d["strategy"][2] is None and np.isinf(d["threshold"][2])                 # no teacher trade: no fly trade, however high the fly scores it
     assert d["reason"][3].startswith("learned veto")                                 # 0.05 < 0.08 - 0.02: its learning drops the trade
+    assert d["vetoed"].tolist() == [False, False, False, True, False, False]         # only its learning's drop is a veto, not the selector's blocks
     assert d["reason"][4].startswith("selector: fail closed")                        # the selector's live fail-closed rules bind it too
     assert (d["score"] >= d["threshold"])[[0, 1, 3, 4, 5]].all()                     # every teacher row reaches the book, allowed or recorded as blocked
+
+
+def test_until_the_fly_wins_its_race_the_wallet_trades_the_selectors_decision(monkeypatch):
+    """Whoever holds the seat decides what the wallet buys. Until the fly has won its race (no handover), a teacher trade its
+    learning vetoes stays out of its paper book -- what the race measures -- but goes live as the selector decided it; once
+    the fly holds the seat its veto binds the wallet too. A row the selector itself blocks never goes live."""
+    d = {"allow": np.array([True, False, False]), "vetoed": np.array([False, True, False]), "score": np.array([0.10, 0.11, 0.12]),
+         "threshold": np.full(3, 0.069), "hold_s": np.full(3, 14400.0), "strategy": np.array(["capitulation"] * 3, dtype=object), "tables": [[]] * 3,
+         "reason": np.array(["trade", "learned veto: score 0.020 < bootstrap 0.050 - 0.02", "selector: dump veto (P(≤-17 %) ≥ 0.43)"], dtype=object)}
+    planned, sent = [], []
+    monkeypatch.setattr(fly_session.paper_trading, "plan_minute", lambda ctx, **kw: planned.append(kw) or {"beat_id": 7, "entries": ["the plan's entries"], "rebuy": {}})
+    for seat in (False, True):
+        me = SimpleNamespace(_commands=lambda conn, t: None, _fast=lambda: True, _decide=lambda c: {"decision": d, "picks": 2}, race_started_at=0.0, beat_no=0,
+                             BOOK="paper_fly", run_id="run", broker=None, KIND="fly", names=["capitulation"], holds={"capitulation": 14400.0}, has_seat=seat,
+                             trades_live=lambda conn: True, _go_live=lambda c, beat, entries, rebuy: sent.append((beat, entries)) or {"sent": len(entries)})
+        ctx = SimpleNamespace(conn=None, m1=datetime(2026, 10, 22, tzinfo=timezone.utc), m1_epoch=0.0, lag_s=0.0, trade=True, fresh=True,
+                              mints=["KEEPpump", "VETOpump", "DUMPpump"], infos=[{}] * 3)
+        fly_session.FlyBook.on_minute(me, ctx)
+    before, after = planned
+    assert before["allow"].tolist() == [True, False, False]          # the paper book: the fly's decision, its learned veto included
+    assert before["live_allow"].tolist() == [True, True, False]      # the wallet: the seat holder's, the selector's
+    assert after["live_allow"] is None                                # the fly holds the seat: its decision for both
+    assert sent == [(7, ["the plan's entries"])] * 2                  # the wallet's orders come from that one plan
 
 
 def test_the_live_phase_scores_only_the_teachers_trades_and_decides_as_the_full_scoring(monkeypatch):

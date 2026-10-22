@@ -12,8 +12,10 @@ first (CLAUDE.md): ``on_minute`` runs before any other book's minute, ``after_mi
    scored minute (the readout's ν, the fill pathways need every row), ``on_minute`` scores and tags every row (``_score``).
    Only minutes at or above the line teach it (brain/plastic.py);
 3. trading (``on_minute``; fresh stream, trade minutes): the race rules (``agent/paper_trading.py``) at the plastic line
-   and sizing plan the paper book's minute, and once the fly holds the seat the wallet's orders on its entries go out
-   (agent/fly_live.py, rh/live.py; the wallet's scheduled sales left at the minute boundary, agent/live_first.py);
+   and sizing plan the paper book's minute, and the wallet's orders go out on the seat holder's decision (agent/fly_live.py,
+   rh/live.py; the wallet's scheduled sales left at the minute boundary, agent/live_first.py): the fly's once it holds the
+   seat; before that (LIVE_WITHOUT_HANDOVER) the selector's -- the fly's learned veto binds only its paper book, which is
+   what its race measures;
 4. after the live orders (``after_minute``): the scored rows stored (``fly_scored``: pending rows keep the feature
    vector, so tags survive restarts), the paper trades booked, then outcomes: tags whose exit minute has now been seen
    teach the mushroom body's outcome pathway what the row made -- the book's realized return when it traded the row,
@@ -161,6 +163,7 @@ class FlyBook:
             conn.execute("INSERT INTO runs (run_id, kind, config, brain_snapshot_id, status) VALUES (%s,%s,%s,%s,'running')",
                          (self.run_id, self.KIND, json.dumps({"channels": self.cfg, "book": self.BOOK, "chain": chain}, default=str), self.boot_id))
             self._restore_tags(conn)
+            self.has_seat = handover.state(conn, chain) is not None     # whose decision the wallet trades (on_minute); refreshed after each minute's live orders
         record_event("info", "fly", "fly session started", {"run_id": self.run_id, "bootstrap": self.boot_id, "channels": self.cfg, "lines": self.lines["plastic"],
                                                             "pending": len(self.pending), "learning_frozen": self.learning_frozen})
         log.info("fly session: bootstrap %d on %s, channels %s, lines %s, %d pending tags", self.boot_id, brain_device.describe(self.fly.net.dev), self.cfg,
@@ -438,11 +441,14 @@ class FlyBook:
             if self.race_started_at is None:
                 self.race_started_at = ctx.m1_epoch
             self.beat_no += 1
-            d = scored["decision"]
+            d = scored["decision"]; vetoed = d.get("vetoed")
+            # until the fly has won its race the selector holds the seat: its decision goes live, and the fly's learned veto
+            # binds only the paper book (the race measures it)
+            live_allow = d["allow"] | vetoed if vetoed is not None and vetoed.any() and not self.has_seat else None
             plan = paper_trading.plan_minute(ctx, book=self.BOOK, run_id=self.run_id, beat_no=self.beat_no, broker=self.broker, kind=self.KIND, mints=ctx.mints,
                                              infos=ctx.infos, scores=d["score"], threshold=d["threshold"], table=None, horizon_s=self.holds[self.names[0]],
                                              holds=d["hold_s"], strategies=d["strategy"], tables=d["tables"], flat=config.FLY_SIZING == "flat",
-                                             allow=d.get("allow"), reasons=d.get("reason"))
+                                             allow=d.get("allow"), reasons=d.get("reason"), live_allow=live_allow)
             if self.trades_live(conn):
                 live = self._go_live(ctx, plan["beat_id"], plan["entries"], plan["rebuy"])
                 timing["orders_s"] = time.time() - ctx.m1_epoch                          # the wallet's orders queued
@@ -486,6 +492,7 @@ class FlyBook:
             self.last_hour = hour
         elif hour > self.last_hour:
             self.last_hour = hour; self._hourly(conn, ctx.m1_epoch)
+        self.has_seat = handover.state(conn, self.chain) is not None     # for the next live phase: a handover, or the seat cleared by hand
         self._write_capture()
         self._write_state()
         if learned.get("keys"):          # a row still waiting for its live fill keeps its features (tags survive restarts)
@@ -801,11 +808,12 @@ class FlyBook:
         """The fly's decision under its teacher: each row's strategy, trigger, line, win filter, gates, dump veto and
         fail-closed rules are the deployed selector's (agent/selector_session.fail_closed), so a fresh bootstrap trades the
         selector's set; the fly drops a teacher trade only where its learning has moved its score more than
-        ``FLY_LEARNED_VETO`` below its bootstrap score. A row the teacher blocks is recorded with the teacher's reason."""
+        ``FLY_LEARNED_VETO`` below its bootstrap score (``vetoed``: those rows, which go live as the selector decided them
+        while it holds the seat, ``on_minute``). A row the teacher blocks is recorded with the teacher's reason."""
         n = len(ctx.mints)
         td = td if td is not None else self._teacher_decision(ctx)
         strat = np.full(n, None, dtype=object); score = np.full(n, -1.0); hold = np.zeros(n); thr = np.full(n, np.inf)
-        tables = [[] for _ in range(n)]; allow = np.zeros(n, bool); reason = np.full(n, "", dtype=object)
+        tables = [[] for _ in range(n)]; allow = np.zeros(n, bool); vetoed = np.zeros(n, bool); reason = np.full(n, "", dtype=object)
         for i in range(n):
             s_ = td["strategy"][i]
             if s_ is None or s_ not in self.names:
@@ -817,10 +825,10 @@ class FlyBook:
             if not td["allow"][i]:
                 reason[i] = f"selector: {td['reason'][i]}"
             elif np.isfinite(v) and np.isfinite(f) and v < f - config.FLY_LEARNED_VETO:
-                reason[i] = f"learned veto: score {v:.3f} < bootstrap {f:.3f} - {config.FLY_LEARNED_VETO:g}"
+                reason[i] = f"learned veto: score {v:.3f} < bootstrap {f:.3f} - {config.FLY_LEARNED_VETO:g}"; vetoed[i] = True
             else:
                 allow[i] = True; reason[i] = "trade"
-        return {"strategy": strat, "score": score, "hold_s": hold, "threshold": thr, "tables": tables, "allow": allow, "reason": reason}
+        return {"strategy": strat, "score": score, "hold_s": hold, "threshold": thr, "tables": tables, "allow": allow, "vetoed": vetoed, "reason": reason}
 
     def _capture(self, H: torch.Tensor, trig: np.ndarray, t: float) -> None:
         """The console's brain view: this minute's mean activity over the rows some strategy's trigger fired on (every
