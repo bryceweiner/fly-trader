@@ -128,3 +128,30 @@ def test_a_paper_quote_is_what_the_booking_writes(db_conn):
         conn.execute("DELETE FROM positions WHERE book = %s", (BOOK,)); conn.execute("DELETE FROM fills WHERE book = %s", (BOOK,))
     assert q.ok and q.position_id is None and (q.price, q.token_delta, q.fee_sol) == (f.price, f.token_delta, f.fee_sol)
     assert sale == pytest.approx(s.sol_delta) and not broker.quote_buy(size_sol=0.2, price=None, mcap_sol=None, decimals=6, **kw).ok
+
+
+def test_the_plan_judges_each_token_it_keeps_again_at_the_minutes_price(db_conn, monkeypatch):
+    """A token the book keeps is judged again every minute it has a row (a live mirror retries a failed entry only on a buy
+    again, agent/fly_live.py): a buy carries paper's fill at this minute's price for what the book paid, anything else why not."""
+    monkeypatch.setattr(config, "CAPITAL_SOL", 5.0)
+    table = [{"lo": 0.0, "n": 100, "mean": 0.02, "win": 0.7, "kelly": 0.4}]
+    run = str(uuid.uuid4()); broker = PaperBroker(BOOK); m0 = datetime(2026, 9, 13, 12, 0, tzinfo=timezone.utc); kept = ["HELDpump", "LOWpump", "VETOpump"]
+    with transaction() as conn:
+        conn.execute("DELETE FROM positions WHERE book = %s", (BOOK,)); conn.execute("DELETE FROM wealth_marks WHERE book = %s", (BOOK,))
+        conn.execute("UPDATE circuit_state SET kill_switch = false, entries_paused = false WHERE id = 1")
+        st = paper_trading.trade_minute(_ctx(conn, m0, kept), book=BOOK, run_id=run, beat_no=1, broker=broker, kind="selector", mints=kept,
+                                        infos=[_info(m) for m in kept], scores=np.array([0.05] * 3), threshold=0.01, table=table, horizon_s=600.0)
+        ref0 = {e["mint"]: e["ref_price"] for e in st["entries"]}
+        mints = kept + ["NEWpump"]
+        plan = paper_trading.plan_minute(_ctx(conn, m0 + timedelta(minutes=1), mints, price=1.1), book=BOOK, run_id=run, beat_no=2, broker=broker, kind="selector",
+                                         mints=mints, infos=[{**_info(m), "price": 1.1} for m in mints], scores=np.array([0.05, 0.005, 0.05, 0.05]), threshold=0.01,
+                                         table=table, horizon_s=600.0, allow=np.array([True, True, False, True]),
+                                         reasons=np.array(["trade", "trade", "dump veto", "trade"], dtype=object))
+        conn.execute("DELETE FROM positions WHERE book = %s", (BOOK,)); conn.execute("DELETE FROM wealth_marks WHERE book = %s", (BOOK,))
+        conn.execute("DELETE FROM decisions WHERE run_id = %s", (run,)); conn.execute("DELETE FROM fills WHERE book = %s", (BOOK,))
+    again = plan["rebuy"]
+    assert st["entered"] == 3 and set(again) == set(kept)                                   # NEWpump is not kept: a plain entry or pick
+    assert (again["HELDpump"]["score"], again["HELDpump"]["threshold"], again["HELDpump"]["table"]) == (0.05, 0.01, table)
+    assert again["HELDpump"]["ref_price"] == pytest.approx(1.1 * ref0["HELDpump"])          # the same size at this minute's price
+    assert again["LOWpump"] == {"score": 0.005, "threshold": 0.01, "why": "score 0.005 < 0.010"}
+    assert again["VETOpump"] == {"score": 0.05, "threshold": 0.01, "why": "dump veto"}

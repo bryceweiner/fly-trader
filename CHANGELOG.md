@@ -40,6 +40,23 @@ ships signed releases built from this development line.
   - The stream checks for complete minutes every 50 ms, on its own clock.
   - Both chains run their live phases and send their boundary sales at the same time.
   - Paper work steps aside when another chain's minute lands meanwhile.
+- **A failed live entry is tried again only while the fly would still buy the token, at that minute's price.**
+  - Before, every retry was checked against its decision's price. Once a token ran more than 3% (`MAX_ENTRY_CHASE`),
+    every retry was refused as "price ran" until the two retry minutes were up: a runner missed once was missed for good.
+  - Each minute's plan now says, for every token paper holds, whether it would buy it again and what paper would pay at
+    that minute's price. A retry goes out on that minute's score and against that price, or waits, recorded as
+    "no longer a buy" with the score against its line. Both chains.
+- **Sell now: any open live position can be sold from the Overview's open positions, on both chains.**
+  - After a confirmation, the wallet sells the whole position at once, at the exit's slippage of 3% stepping up to at most
+    5%, and books it like any exit. The console waits up to 90 s and says what the sale brought, or why it failed.
+  - The fly's paper book keeps its own position. An operator's sale counts neither in the live-vs-paper gap that pauses
+    entries nor in what the fly learns about its fills.
+
+### The console
+
+- **The fly decision inspector shows the token's price and volume in the minute the fly last scored it.** Each has a
+  green or red arrow for its move over the five minutes before: the price against the close five minutes earlier, the
+  volume against the five minutes' average. Both are plain decimals, never scientific notation.
 
 ### Platform
 

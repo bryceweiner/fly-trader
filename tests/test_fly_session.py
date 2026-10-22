@@ -77,3 +77,20 @@ def test_outcomes_join_both_books_by_the_rows_decision(db_conn):
     me = SimpleNamespace(BOOK="paper_fly", KIND="fly", market=SimpleNamespace(live_book="live"))
     book, live = FlyBook._outcomes(me, db_conn, [(t, mint, "capitulation"), (t + 60, mint, "capitulation")])
     assert book == {(t, mint, "capitulation"): ("closed", pytest.approx(0.2))} and live == {(t, mint, "capitulation"): ("open", None)}
+
+
+def test_outcomes_leave_out_the_wallets_position_the_operator_sold(db_conn):
+    """An operator's Sell Now is no fill of the fly's: the wallet's position it closed is left out (as an aborted RH buy),
+    so the row resolves on its book's outcome alone and teaches the fill pathway nothing."""
+    from types import SimpleNamespace
+
+    from fly_trader.agent.fly_session import FlyBook
+    t = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc).timestamp(); mint = "OUTCOME_OP_TEST"
+    d = db_conn.execute("INSERT INTO decisions (ts, mint, kind, detail) VALUES (%s, %s, 'fly_enter', %s) RETURNING id",
+                        (datetime.fromtimestamp(t + 60, timezone.utc), mint, '{"strategy": "capitulation", "book": "paper_fly"}')).fetchone()["id"]
+    for book, realized, kind in (("paper_fly", 0.02, None), ("live", -0.03, "operator")):
+        db_conn.execute("INSERT INTO positions (book, mint, entry_decision_id, qty, cost_sol, realized_sol, status, forced_exit_kind) VALUES (%s, %s, %s, 1, 0.1, %s, 'closed', %s)",
+                        (book, mint, d, realized, kind))
+    me = SimpleNamespace(BOOK="paper_fly", KIND="fly", market=SimpleNamespace(live_book="live"))
+    book, live = FlyBook._outcomes(me, db_conn, [(t, mint, "capitulation")])
+    assert book == {(t, mint, "capitulation"): ("closed", pytest.approx(0.2))} and live == {}

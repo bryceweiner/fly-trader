@@ -39,7 +39,12 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
     Optional per-row arguments (the selector's strategy stack, train/strategies.decide): ``threshold`` may be per row,
     ``holds`` (s), ``strategies``, ``tables`` (sizing) and ``allow`` / ``reasons`` (a blocked row is recorded with its reason).
     Left out, the call behaves exactly as the single-strategy engine. ``flat``: every buy the same share of the bankroll
-    (agent/sizing.size_position), the fly's rule (``config.FLY_SIZING``)."""
+    (agent/sizing.size_position), the fly's rule (``config.FLY_SIZING``).
+
+    ``rebuy``: each token the book keeps through the minute and has a row of, this minute's verdict on buying it again --
+    its score and line, and where it would (allowed, not blocked; the book's own cash aside) its sizing table and paper's
+    fill price at this minute's price for what the book paid (``ref_price``), else why not (``why``). A live mirror tries
+    a failed entry again only on such a buy, at that price (agent/fly_live.py, rh/live.py)."""
     conn, m1 = ctx.conn, ctx.m1
     beat = conn.execute("INSERT INTO beats (run_id, ts, beat_no, n_slots_active, notes) VALUES (%s,%s,%s,%s,%s) RETURNING id",
                         (run_id, m1, beat_no, len(mints), json.dumps({"minute": m1.isoformat(), "mints_traded": len(ctx.agg), "book": book}))).fetchone()["id"]
@@ -55,6 +60,7 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
         exits.append((p, held, kw, broker.quote_sell(position=p, **kw)))
     leaving = {int(p["id"]) for p, *_ in exits}
     opens_now = [p for p in opens_before if int(p["id"]) not in leaving]; open_mints = {p["mint"] for p in opens_now}
+    paid = {p["mint"]: float(p["cost_sol"]) for p in opens_now}; rebuy = {}        # a token it keeps: what it paid, this minute's verdict on buying it again
     cash = ledger.paper_cash(conn, book) + sum(q for *_, q in exits); n_enter = 0; picks = []; entries = []; buys = []
     bankroll = cash + sum(float(p["cost_sol"]) for p in opens_now)         # wealth at cost: the sizing base (agent/sizing.py)
     from ..markets import for_book
@@ -65,8 +71,11 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
                or ("paused" if circuit and circuit["entries_paused"] else None) or ("book halted" if rails.book_halted(conn, book) else None))
     thr_v = np.broadcast_to(np.asarray(threshold, dtype=np.float64), (len(mints),)) if len(mints) else np.array([])
     for k, (m, i, sc) in enumerate(zip(mints, infos, scores)):
-        thr_k = float(thr_v[k])
+        thr_k = float(thr_v[k]); strat_k = None if strategies is None else strategies[k]
         if not np.isfinite(sc) or sc < thr_k:
+            if m in paid:
+                rebuy[m] = {"score": float(sc), "threshold": thr_k,
+                            "why": f"{strat_k + ': ' if strat_k else ''}score {sc:.3f} < {thr_k:.3f}" if np.isfinite(thr_k) else "no strategy picks it"}
             continue
         picks.append((m, float(sc)))
         tab_k = tables[k] if tables is not None else table
@@ -78,8 +87,13 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
                          (beat, run_id, m1, m, i["pool"], float(sc), size, rail, why if rail == "sizing" else f"{kind} pick not taken",
                           json.dumps({"book": book, "score": float(sc), "threshold": thr_k, "sizing": why,
                                       "strategy": None if strategies is None else strategies[k]})))
+            if m in paid:                # it keeps the token: would this minute buy it again, and paper's fill now for what it paid
+                q = None if blocked or denied else broker.quote_buy(size_sol=paid[m], price=i["price"], res_quote_sol=i["resq"], mcap_sol=i["mcap"], decimals=i["decimals"],
+                                                                       program_label=ctx.cost_label(m, i["program_label"]), pool_fee=ctx.fee(m))
+                rebuy[m] = {"score": float(sc), "threshold": thr_k, **({"table": tab_k, "ref_price": paid[m] / (q.token_delta / 10 ** int(i["decimals"]))} if q is not None and q.ok
+                                                                     else {"why": blocked or (q.reason if q is not None else str(reasons[k]) if reasons is not None else "filtered")})}
             continue
-        hold_k = float(holds[k]) if holds is not None else None; strat_k = None if strategies is None else strategies[k]
+        hold_k = float(holds[k]) if holds is not None else None
         did = conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, m_hat, size_sol, forced, reason, book_targets, detail) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,false,%s,%s,%s) RETURNING id",
                            (beat, run_id, m1, m, i["pool"], f"{kind}_enter", float(sc), size, f"{strat_k + ': ' if strat_k else ''}score {sc:.3f} ≥ {thr_k:.3f}; {why}", [book],
                             json.dumps({"book": book, "score": float(sc), "threshold": thr_k, "size_sol": size, "sizing": why, "resq": i["resq"], "age_h": i["age_h"], "price": i["price"],
@@ -94,7 +108,7 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
         else:
             conn.execute("UPDATE decisions SET rail = %s, reason = %s WHERE id = %s", ("paper_fill", q.reason, did))
     return {"book": book, "run_id": run_id, "kind": kind, "broker": broker, "beat_id": beat, "exits": exits, "buys": buys, "entries": entries,
-            "entered": n_enter, "picks": picks, "blocked": blocked, "market": market}
+            "entered": n_enter, "picks": picks, "blocked": blocked, "market": market, "rebuy": rebuy}
 
 
 def book_minute(ctx, plan: dict) -> dict:

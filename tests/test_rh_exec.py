@@ -411,12 +411,35 @@ def test_the_rh_mirror_retries_a_failed_entry_and_records_what_it_did_not_take(c
         req = ex.q.get_nowait(); ex._pending.clear()
         ex.results.append(RhResult(req, False, "price ran: quoted 1.1e-06 ETH per token", retryable=True))
         ctx.m1 = now + timedelta(minutes=1); ctx.m1_epoch += 60
-        out = m.minute(ctx, run_id=run, beat_id=beat + 1000001, entries=[])
+        out = m.minute(ctx, run_id=run, beat_id=beat + 1000001, entries=[], rebuy={})          # the minute has no row of it: no verdict, it waits
+        assert out["retried"] == 0 and ex.q.empty() and did in m.failed
+        ctx.m1 = now + timedelta(minutes=2); ctx.m1_epoch += 60
+        out = m.minute(ctx, run_id=run, beat_id=beat + 1000002, entries=[], rebuy={TOKEN: {"score": 0.1, "threshold": 0.0, "table": None, "ref_price": 1.2e-6}})
         again = ex.q.get_nowait()
-        rows = conn.execute("SELECT rail, detail FROM decisions WHERE run_id = %s AND kind = 'blocked'", (run,)).fetchall()
+        rows = conn.execute("SELECT rail, detail FROM decisions WHERE run_id = %s AND kind = 'blocked' ORDER BY id", (run,)).fetchall()
         _drop_minute_rows(conn, run)
-    assert out["retried"] == 1 and again is not req and (again.decision_id, again.retry, again.ref_price) == (did, 1, 1.0e-6)
-    assert [(r["rail"], r["detail"]["book"], r["detail"]["of_decision"]) for r in rows] == [("price ran", "live_rh", did)]
+    assert out["retried"] == 1 and again is not req and (again.decision_id, again.retry, again.ref_price) == (did, 1, 1.2e-6)     # this minute's price, not its decision's
+    assert [(r["rail"], r["detail"]["book"], r["detail"]["of_decision"]) for r in rows] == [("price ran", "live_rh", did), ("no longer a buy", "live_rh", did)]
+
+
+def test_the_rh_mirror_sells_now_once_as_an_operator_exit(chain):
+    """The operator's Sell Now on Robinhood Chain: one sale intent of the whole position at the exit's slippage stepping up
+    to the forced one, marked 'operator', under a forced exit decision; refused while an intent of the token is queued."""
+    from fly_trader.rh.live import RhLiveMirror
+    ex = chain.ex(); m = RhLiveMirror(600.0, executor=ex)
+    with transaction() as conn:
+        pid = conn.execute("INSERT INTO positions (book, mint, opened_at, qty, cost_sol, entry_price, status, chain) "
+                           "VALUES ('live_rh', %s, now(), 1000, 0.01, 1e-6, 'open', 'rh') RETURNING id", (TOKEN,)).fetchone()["id"]
+        did = m.sell_now(conn, pid)
+        req = ex.q.get_nowait()
+        with pytest.raises(ValueError, match="in flight"):
+            m.sell_now(conn, pid)
+        d = conn.execute("SELECT kind, forced, reason FROM decisions WHERE id = %s", (did,)).fetchone()
+        conn.execute("DELETE FROM decisions WHERE id = %s", (did,)); conn.execute("DELETE FROM positions WHERE id = %s", (pid,))
+    ex._pending.clear()
+    assert (req.kind, req.position_id, req.forced_kind, req.decision_id, req.amount_in) == ("sell", pid, "operator", did, 1000) and ex.q.empty()
+    assert (req.slippage_bps, req.max_slippage_bps) == (config.SLIPPAGE_EXIT_BPS, config.SLIPPAGE_FORCED_BPS)
+    assert (d["kind"], d["forced"], d["reason"]) == ("fly_exit", True, "sold now by the operator")
 
 
 def test_the_rh_mark_waits_for_no_intent_between_its_snapshot_and_its_booking(chain, monkeypatch):

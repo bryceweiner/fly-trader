@@ -150,6 +150,30 @@ def chain_exits(chain: str, m1_epoch: float, live: bool, run_id: str | None = No
         return mirror(chain).exits(conn, m1=datetime.fromtimestamp(m1_epoch, timezone.utc), run_id=run_id)
 
 
+SELL_NOW_WAIT_S = 90.0        # how long the operator's Sell Now waits for its sale to be booked (an RH sale can take a minute)
+
+
+def sell_now(chain: str, position_id: int, wait_s: float = SELL_NOW_WAIT_S) -> dict:
+    """The operator's Sell Now (the console's open positions, ui/api/overview.py): the chain's mirror sells one open live
+    position at once (its ``sell_now``), then this waits up to ``wait_s`` for the sale to be booked. {"booked", "realized",
+    "cost", "error"} (not booked and no error: not filled yet); ValueError with the reason when nothing was sent."""
+    m = mirror_of(chain)
+    if m is None:
+        raise ValueError("this chain's live mirror is not running in this console")
+    why = signing_refused(chain)
+    if why:
+        raise ValueError(f"its wallet may not sign: {why}")
+    with transaction() as conn:
+        did = m.sell_now(conn, position_id)
+    res = m.sale_result(did, wait_s)
+    with transaction() as conn:
+        p = conn.execute("SELECT status, realized_sol, cost_sol FROM positions WHERE id = %s", (position_id,)).fetchone()
+    booked = p is not None and p["status"] == "closed"
+    return {"booked": booked, "realized": float(p["realized_sol"]) if booked and p["realized_sol"] is not None else None,
+            "cost": float(p["cost_sol"]) if p is not None else None,
+            "error": None if booked or res is None else (res.error or "it sold only part of the position: the rest stays open")}
+
+
 def idle_mirrors() -> None:
     """Between minutes: each mirror's bookkeeping that waits for an idle wallet (the wealth mark, sweeps, the reconcile)."""
     for chain, m in list(_MIRRORS.items()):

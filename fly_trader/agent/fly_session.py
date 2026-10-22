@@ -444,7 +444,7 @@ class FlyBook:
                                              holds=d["hold_s"], strategies=d["strategy"], tables=d["tables"], flat=config.FLY_SIZING == "flat",
                                              allow=d.get("allow"), reasons=d.get("reason"))
             if self.trades_live(conn):
-                live = self._go_live(ctx, plan["beat_id"], plan["entries"])
+                live = self._go_live(ctx, plan["beat_id"], plan["entries"], plan["rebuy"])
                 timing["orders_s"] = time.time() - ctx.m1_epoch                          # the wallet's orders queued
         self._phase = {"m1": ctx.m1, "picks": scored["picks"], "plan": plan, "live": live, "timing": timing}
         return {"minute": ctx.m1.isoformat(), "picks": scored["picks"], "live": live}
@@ -517,26 +517,26 @@ class FlyBook:
         """The chain's live mirror, one per process and owned by the runner (agent/live_first.py); None until made."""
         return live_first.mirror_of(self.chain)
 
-    def _go_live(self, ctx, beat_id: int, entries: list) -> dict:
+    def _go_live(self, ctx, beat_id: int, entries: list, rebuy: dict) -> dict:
         """The wallet's orders of this minute, in their own savepoint: a wallet RPC timeout must not roll back the paper plan."""
         try:
             with ctx.conn.transaction():
-                return self._live(ctx, beat_id, entries)
+                return self._live(ctx, beat_id, entries, rebuy)
         except Exception as e:
             log.exception("%s: live minute %s failed; the paper minute stands", self.name, ctx.m1.isoformat())
             record_event("error", "fly_live", f"live minute failed: {type(e).__name__}: {str(e)[:160]}", {"chain": self.chain, "minute": ctx.m1.isoformat()})
             return {"stage": f"live minute failed: {type(e).__name__}"}
 
-    def _live(self, ctx, beat_id: int, entries: list) -> dict:
+    def _live(self, ctx, beat_id: int, entries: list, rebuy: dict) -> dict:
         """Mirror this minute's entries on the bot wallet (agent/fly_live.py; Robinhood Chain: the ETH wallet, rh/live.py)
-        while signing is allowed."""
+        while signing is allowed; a failed entry goes again only where this minute would buy its token again (``rebuy``)."""
         why = self._signing()
         if why:
             return {"stage": f"live gated: {why}"}
         mirror = live_first.mirror(self.chain, self.H)          # the clock may have made it while this book was loading
         if self.chain != "sol":
-            return mirror.minute(ctx, run_id=self.run_id, beat_id=beat_id, entries=entries)
-        return mirror.minute(ctx, run_id=self.run_id, beat_id=beat_id, entries=entries, line=self.lines["plastic"][self.names[0]],
+            return mirror.minute(ctx, run_id=self.run_id, beat_id=beat_id, entries=entries, rebuy=rebuy)
+        return mirror.minute(ctx, run_id=self.run_id, beat_id=beat_id, entries=entries, rebuy=rebuy, line=self.lines["plastic"][self.names[0]],
                              table=self.sizing["plastic"][self.names[0]])
 
     def _live_after(self, ctx, beat_id: int) -> dict:
@@ -663,8 +663,9 @@ class FlyBook:
             return {}, {}
         ts = sorted({datetime.fromtimestamp(t + 60.0, timezone.utc) for t, _, _ in keys}); mints = sorted({m for _, m, _ in keys})
         rows = conn.execute("SELECT d.ts, d.mint, d.detail->>'strategy' AS strategy, p.book, p.status, p.realized_sol / NULLIF(p.cost_sol, 0) AS ret "
-                            "FROM decisions d JOIN positions p ON p.entry_decision_id = d.id AND p.book = ANY(%s) "     # an aborted RH buy (no tokens, gas only) was no trade
-                            "AND COALESCE(p.forced_exit_kind, '') <> 'aborted' WHERE d.kind = %s AND d.ts = ANY(%s) AND d.mint = ANY(%s)",
+                            "FROM decisions d JOIN positions p ON p.entry_decision_id = d.id AND p.book = ANY(%s) "     # an aborted RH buy (no tokens, gas only) was no trade,
+                            "AND COALESCE(p.forced_exit_kind, '') NOT IN ('aborted', 'operator') "                    # an operator's Sell Now no fill of the fly's
+                            "WHERE d.kind = %s AND d.ts = ANY(%s) AND d.mint = ANY(%s)",
                             ([self.BOOK, self.market.live_book], f"{self.KIND}_enter", ts, mints)).fetchall()
         book: dict = {}; live: dict = {}
         for r in rows:

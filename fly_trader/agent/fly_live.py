@@ -82,6 +82,7 @@ class LiveMirror:
         self.mark_lock = threading.Lock()     # the worker's thread and the engine's both mark
         self.last_mark: dict | None = None
         self.wallet_sol: float | None = None
+        self.sale_waits: dict[int, list] = {}   # decision id -> [Event, result]: an operator's Sell Now waiting for its sale (``sell_now``)
         self.worker.on_done = self._after_order
 
     def _decision(self, conn, m1, run_id, beat_id, p, reason: str, forced: bool) -> int:
@@ -123,9 +124,10 @@ class LiveMirror:
         """The wallet's SOL (lamports); started beside the minute's scoring by live_first.prefetch."""
         return int(self.broker.rpc.get_balance(self.broker.pubkey))
 
-    def _sell(self, p: dict, did: int, slip: int) -> bool:
+    def _sell(self, p: dict, did: int, slip: int, forced_kind: str | None = None) -> bool:
         return self.worker.submit(ExecRequest(decision_id=did, mint=p["mint"], pool=p["pool"], side="sell", amount_in=int(p["qty"]), slippage_bps=slip,
-                                              max_slippage_bps=config.SLIPPAGE_FORCED_BPS, decimals=int(p.get("decimals") or 6), position_id=int(p["id"])))
+                                              max_slippage_bps=config.SLIPPAGE_FORCED_BPS, decimals=int(p.get("decimals") or 6), position_id=int(p["id"]),
+                                              forced_kind=forced_kind))
 
     def _held(self, p: dict, m1: datetime) -> tuple[float, float]:
         """(seconds held, its hold): from its entry decision's minute (paper's clock), not from its fill. A position that
@@ -166,11 +168,39 @@ class LiveMirror:
             record_event("error", "fly_live", f"kill switch: liquidating {n_liq} open live position(s)", {"positions": n_liq})
         return {"exited": n_exit, "liquidated": n_liq}
 
-    def minute(self, ctx, *, run_id: str, beat_id: int, entries: list, line: float, table: list | None) -> dict:
+    def sell_now(self, conn, position_id: int) -> int:
+        """The operator's Sell Now (the console's open positions, agent/live_first.sell_now): one open position of this book
+        sold at once, at the exit's slippage stepping up to the forced one, and booked by the worker like any exit, as a
+        forced 'operator' exit (the live-vs-paper gap and the fly's fill pathway leave it out). Its decision id; ValueError
+        with the reason when nothing was sent (the caller's transaction then rolls its decision back)."""
+        with self.exit_lock:                     # the clock's boundary sales check the same in-flight set: one sale per position
+            p = next((p for p in ledger.open_positions(conn, BOOK) if int(p["id"]) == int(position_id)), None)
+            if p is None:
+                raise ValueError("this position is no longer open")
+            if p["mint"] in self.worker.pending():
+                raise ValueError("an order of this token is already queued or in flight")
+            did = self._decision(conn, datetime.now(timezone.utc), None, None, p, "sold now by the operator", True)
+            self.sale_waits[did] = [threading.Event(), None]
+            if not self._sell(p, did, config.SLIPPAGE_EXIT_BPS, "operator"):
+                self.sale_waits.pop(did, None)
+                raise ValueError("an order of this token is already queued or in flight")
+        return did
+
+    def sale_result(self, did: int, timeout: float):
+        """The worker's result of a ``sell_now`` sale once booked, waiting at most ``timeout`` s (None: not yet)."""
+        w = self.sale_waits.get(did)
+        if w is None:
+            return None
+        w[0].wait(timeout)
+        self.sale_waits.pop(did, None)
+        return w[1]
+
+    def minute(self, ctx, *, run_id: str, beat_id: int, entries: list, line: float, table: list | None, rebuy: dict | None = None) -> dict:
         """The minute's entries, sent the moment the fly has decided (agent/fly_session.FlyBook.on_minute): the worker's
         results first (a failed buy is kept for another try), the minute's sales if the clock has not sent them, then the
-        retries and the paper entries. The wallet is read only when there is something to buy; the wealth mark waits for
-        ``idle``."""
+        retries and the paper entries. A retry goes out only where this minute would buy its token again (``rebuy``,
+        agent/paper_trading.plan_minute), on this minute's score and against this minute's price, never its decision's.
+        The wallet is read only when there is something to buy; the wealth mark waits for ``idle``."""
         conn, m1 = ctx.conn, ctx.m1
         drained = self.worker.drain()
         for r in drained:
@@ -199,13 +229,16 @@ class LiveMirror:
                 if over:
                     self.failed.pop(did); skipped.append((e["mint"], "retries exhausted"))
                     self._blocked(conn, ctx, run_id, beat_id, e, "retries exhausted", f"{over}; last error: {(f.get('error') or '')[:200]}", tries=f["tries"]); continue
-                rail = blocked or ("stale minute" if stale else None) or ("held" if e["mint"] in held_mints else None)
+                v = (rebuy or {}).get(e["mint"]) or {"why": "not scored this minute"}       # this minute's verdict on buying it again
+                e = {**e, **{k: v[k] for k in ("score", "threshold", "table", "ref_price") if k in v}}   # its score and price now, not its decision's
+                rail = blocked or ("stale minute" if stale else None) or ("held" if e["mint"] in held_mints else None) or (None if "ref_price" in v else "no longer a buy")
                 size, why = (0.0, "") if rail else sizing.size_position(e["score"], e.get("threshold", line), e.get("table") or table or [], bankroll, cash,
                                                                         ctx.resqs.get(e["mint"]) or e["info"]["resq"], flat=config.FLY_SIZING == "flat")
                 if rail or size <= 0:
-                    skipped.append((e["mint"], rail or why)); self._blocked(conn, ctx, run_id, beat_id, e, rail or "sizing", f"retry not sent: {rail or why}", size, retry=True); continue
+                    why = v["why"] if rail == "no longer a buy" else rail or why
+                    skipped.append((e["mint"], why)); self._blocked(conn, ctx, run_id, beat_id, e, rail or "sizing", f"retry not sent: {why}", size, retry=True); continue
                 if self._buy(e, size, retry=f["tries"]):
-                    self.failed.pop(did); self.sent[did] = {**f, "tries": f["tries"] + 1}
+                    self.failed.pop(did); self.sent[did] = {**f, "e": e, "tries": f["tries"] + 1}
                     n_enter += 1; n_retry += 1; cash -= size; held_mints.add(e["mint"])
             for e in entries:
                 if e["mint"] in held_mints:
@@ -299,6 +332,9 @@ class LiveMirror:
             except Exception:
                 log.warning("live mark after an order failed", exc_info=True)
         live_first.changed()
+        w = self.sale_waits.get(res.request.decision_id) if res is not None else None
+        if w is not None:                        # an operator's Sell Now waiting for this sale (``sell_now``)
+            w[1] = res; w[0].set()
 
     def mark_due(self, conn=None, force: bool = False) -> dict | None:
         """The waiting minute's wealth mark: wallet SOL + open positions net of exit cost at the minute's prices, and the
@@ -367,10 +403,12 @@ class LiveMirror:
             self.worker.busy.release()
 
     def gap(self, conn) -> dict:
-        """Live vs its paper mirror on the same decisions; pauses entries when live trails by more than ``GAP_MAX`` per trade."""
+        """Live vs its paper mirror on the same decisions; pauses entries when live trails by more than ``GAP_MAX`` per trade.
+        An operator's Sell Now (forced 'operator') is the operator's choice, not an execution gap: left out."""
         rows = conn.execute(f"""SELECT l.realized_sol / NULLIF(l.cost_sol, 0) AS rl, p.realized_sol / NULLIF(p.cost_sol, 0) AS rp
                                FROM positions l JOIN positions p ON p.entry_decision_id = l.entry_decision_id AND p.book = '{MIRROR}' AND p.status = 'closed'
-                               WHERE l.book = '{BOOK}' AND l.status = 'closed' AND l.entry_decision_id IS NOT NULL ORDER BY l.closed_at DESC LIMIT %s""", (GAP_TRADES,)).fetchall()
+                               WHERE l.book = '{BOOK}' AND l.status = 'closed' AND l.entry_decision_id IS NOT NULL AND COALESCE(l.forced_exit_kind, '') <> 'operator'
+                               ORDER BY l.closed_at DESC LIMIT %s""", (GAP_TRADES,)).fetchall()
         rl = np.array([r["rl"] for r in rows if r["rl"] is not None and r["rp"] is not None], dtype=np.float64)
         rp = np.array([r["rp"] for r in rows if r["rl"] is not None and r["rp"] is not None], dtype=np.float64)
         out = {"trades": int(len(rl)), "live_mean": float(rl.mean()) if len(rl) else None, "mirror_mean": float(rp.mean()) if len(rp) else None}

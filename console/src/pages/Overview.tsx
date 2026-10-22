@@ -6,6 +6,7 @@ import { BrainPanel } from '../brain'
 import { PageHead } from '../components/ChainPicker'
 import { BarChart, LineChart, RadialGauge, type Series } from '../components/Charts'
 import { DataTable, type Col } from '../components/DataTable'
+import { ActionButton } from '../components/feedback'
 import { HourWheel, hourColor, type HourBucket } from '../components/HourWheel'
 import { Callout, Caption, Card, Loaded, Md, Metric, Metrics, ProgressList, RowGroup, Segmented, Widget, WidgetGrid } from '../components/ui'
 import { useApp, type Market } from '../context'
@@ -54,8 +55,9 @@ type Minute = {
 }
 type RaceBook = { book: string; title: string; pnl: number | null; n: number; daily: number[] }
 type Race = { hidden: boolean; unit: string; handover?: boolean; success?: string | null; caption?: string | null; metrics?: RaceBook[]; series?: Series[]; days?: string[] }
-type Position = { mint: string; token: string; strategy: string; held_min: number; exits_in_min: number; cost: number; ret: number | null }
-type Book = { unit: string; history: [string, number][]; positions: Position[]; live?: boolean; book?: string; title?: string; sub?: string }
+type Position = { id: number; mint: string; token: string; strategy: string; held_min: number; exits_in_min: number; cost: number; ret: number | null }
+type Book = { unit: string; history: [string, number][]; positions: Position[]; live?: boolean; book?: string; title?: string; sub?: string; observer?: boolean
+  sell?: { from_pct: number; to_pct: number } }
 
 /** Python's %g: significant digits, trailing zeros dropped, an exponent outside 1e-4..1e±digits. */
 function g(x: number | null | undefined, digits = 6): string {
@@ -187,16 +189,30 @@ function RacePanel() {
   )
 }
 
-/** The selector book: its whole wealth history, and the open positions. */
+/** The money's book: its whole wealth history, and the open positions (a live one can be sold now, after a confirmation). */
 function BookPanel() {
-  const { chain } = useApp()
+  const { chain, market } = useApp()
   const b = useTopic<Book>('overview.book', { chain })
-  const cols = (u: string): Col<Position>[] => [
+  const sellCol = (d: Book): Col<Position> => ({
+    key: 'sell', label: '', value: () => '',
+    render: (r) => (
+      <ActionButton label="Sell now" icon="payments" name="overview.sell_now" body={{ chain, position_id: r.id }} variant="outline-danger" disabled={d.observer}
+        help={d.observer ? 'This console only observes: sell from the console that hosts the workers.' : undefined}
+        confirm={{
+          title: `Sell ${r.token} now?`, confirmLabel: 'Sell now', danger: true,
+          body: <>Sells all of it from the {market?.name ?? chain} wallet now, at market: slippage from {d.sell?.from_pct}% stepping up to at most {d.sell?.to_pct}%.
+            The result is booked on the live book. Cost {g(r.cost, 4)} {d.unit}{r.ret === null ? '' : `, ${pctPts(r.ret, 2, true)} gross at the last mark`}.
+            The fly's paper book keeps its own position. A sale cannot be undone.</>,
+        }} />
+    ),
+  })
+  const cols = (d: Book): Col<Position>[] => [
+    ...(d.live && d.sell ? [sellCol(d)] : []),
     { key: 'token', label: 'token', render: (r) => <TokenButton chain={chain} mint={r.mint} token={r.token} /> },
     { key: 'strategy', label: 'strategy' },
     { key: 'held_min', label: 'held (min)', num: true, render: (r) => num(r.held_min, 0) },
     { key: 'exits_in_min', label: 'exits in (min)', num: true, render: (r) => num(r.exits_in_min, 0) },
-    { key: 'cost', label: `cost (${u})`, num: true, render: (r) => g(r.cost, 4) },
+    { key: 'cost', label: `cost (${d.unit})`, num: true, render: (r) => g(r.cost, 4) },
     { key: 'ret', label: 'return (gross)', num: true, render: (r) => (r.ret === null ? null : <span className={`text-${tone(r.ret)}`}>{pctPts(r.ret, 2, true)}</span>) },
   ]
   return (
@@ -211,7 +227,7 @@ function BookPanel() {
       <div className="col-12 col-xl-5 d-flex">
         <Card title="Open positions" icon="open" className="flex-fill">
           <Loaded state={b}>
-            {(d) => d.positions.length ? <DataTable rows={d.positions} cols={cols(d.unit)} pageSize={10} filename="open-positions" /> : <Caption>None open.</Caption>}
+            {(d) => d.positions.length ? <DataTable rows={d.positions} cols={cols(d)} pageSize={10} filename="open-positions" /> : <Caption>None open.</Caption>}
           </Loaded>
         </Card>
       </div>

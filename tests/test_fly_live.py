@@ -1,6 +1,7 @@
 """The fly on the bot wallet: entries mirrored from the paper book and sized from the wallet, exits retried then written off
 as dead-bags, live wealth marked, and entries paused when live trails its paper mirror. Live keeps paper's clock and
-decisions: holds count from the decision's minute, a failed entry is retried while paper holds it, a buy queues behind
+decisions: holds count from the decision's minute, a failed entry is retried while paper holds it and the minute would
+buy it again (on that minute's score, against that minute's price), a buy queues behind
 the sale of its token, a tripped breaker lets entries try again after its cooldown, and every paper entry the wallet did
 not take is a decisions row of the live book. Live money first: the sales due go out at the minute boundary, once, and
 the mark, the write-offs, the gap check and the token accounts' close come after the minute's orders."""
@@ -258,18 +259,82 @@ def test_a_failed_entry_is_retried_while_paper_holds_it_then_given_up(db_conn, c
         mirror.minute(_ctx(conn, m1), run_id=run, beat_id=beat, line=0.01, table=TABLE, entries=[_entry("LIVE_R", d, "PR", 2.1e-7)])
         first = w.submitted[-1]
         w.inflight.clear(); w.results.append(ExecResult(first, False, error="price ran: quoted 2.3e-07 SOL per token", retryable=True))
-        out = mirror.minute(_ctx(conn, m1 + timedelta(minutes=1)), run_id=run, beat_id=beat + 1000001, line=0.01, table=TABLE, entries=[])
+        buy = {"LIVE_R": {"score": 0.04, "threshold": 0.01, "table": TABLE, "ref_price": 2.3e-7}}      # the minute would buy it again, at its own price
+        out = mirror.minute(_ctx(conn, m1 + timedelta(minutes=1)), run_id=run, beat_id=beat + 1000001, line=0.01, table=TABLE, entries=[], rebuy=buy)
         again = w.submitted[-1]
-        assert again is not first and (again.side, again.decision_id, again.ref_price) == ("buy", d, 2.1e-7) and out["retried"] == 1
+        assert again is not first and (again.side, again.decision_id, again.ref_price) == ("buy", d, 2.3e-7) and out["retried"] == 1
         w.inflight.clear(); w.results.append(ExecResult(again, False, error="Insufficient funds", retryable=True))
         conn.execute("UPDATE circuit_state SET kill_switch = true WHERE id = 1")             # every rail still applies to a retry
-        out = mirror.minute(_ctx(conn, m1 + timedelta(minutes=2)), run_id=run, beat_id=beat + 1000002, line=0.01, table=TABLE, entries=[])
+        out = mirror.minute(_ctx(conn, m1 + timedelta(minutes=2)), run_id=run, beat_id=beat + 1000002, line=0.01, table=TABLE, entries=[], rebuy=buy)
         assert out["retried"] == 0 and w.submitted[-1] is again
         conn.execute("UPDATE circuit_state SET kill_switch = false WHERE id = 1")
-        out = mirror.minute(_ctx(conn, m1 + timedelta(minutes=3)), run_id=run, beat_id=beat + 1000003, line=0.01, table=TABLE, entries=[])
+        out = mirror.minute(_ctx(conn, m1 + timedelta(minutes=3)), run_id=run, beat_id=beat + 1000003, line=0.01, table=TABLE, entries=[], rebuy=buy)
         rails = [r["rail"] for r in conn.execute("SELECT rail FROM decisions WHERE kind = 'blocked' AND mint = 'LIVE_R' ORDER BY id").fetchall()]
     assert out["retried"] == 0 and w.submitted[-1] is again and len(mirror.failed) == 0
     assert rails == ["price ran", "entry failed", "kill switch", "retries exhausted"]
+
+
+def test_a_retry_goes_out_only_while_the_minute_would_buy_the_token_again_and_against_its_price(db_conn, clean, monkeypatch):
+    """A runner refused as "price ran" is judged again each minute, on that minute's score: not sent while the fly would not
+    buy it now (nor where the minute has no row of it), sent against that minute's price once it would."""
+    monkeypatch.setattr(config, "ENTRY_RETRY_MIN", 3.0)
+    w = _Worker(); mirror = _mirror(w); m1 = datetime(2026, 9, 24, 13, 0, tzinfo=timezone.utc); run = str(uuid.uuid4())
+    with transaction() as conn:
+        d = conn.execute("INSERT INTO decisions (kind, mint, ts) VALUES ('fly_enter', 'LIVE_RB', %s) RETURNING id", (m1,)).fetchone()["id"]
+        conn.execute("INSERT INTO positions (book, mint, pool, opened_at, entry_decision_id, qty, cost_sol, entry_price, status) "
+                     "VALUES ('paper_fly', 'LIVE_RB', 'PRB', %s, %s, 1000000, 0.2, 0.0000002, 'open')", (m1, d))
+        beat = conn.execute("INSERT INTO beats (beat_no) VALUES (1) RETURNING id").fetchone()["id"]
+        mirror.minute(_ctx(conn, m1), run_id=run, beat_id=beat, line=0.01, table=TABLE, entries=[_entry("LIVE_RB", d, "PRB", 2.1e-7)])
+        first = w.submitted[-1]
+        w.inflight.clear(); w.results.append(ExecResult(first, False, error="price ran: quoted 2.3e-07 SOL per token", retryable=True))
+        out = mirror.minute(_ctx(conn, m1 + timedelta(minutes=1)), run_id=run, beat_id=beat + 1000001, line=0.01, table=TABLE, entries=[],
+                            rebuy={"LIVE_RB": {"score": 0.008, "threshold": 0.01, "why": "capitulation: score 0.008 < 0.010"}})
+        assert out["retried"] == 0 and w.submitted[-1] is first and d in mirror.failed
+        out = mirror.minute(_ctx(conn, m1 + timedelta(minutes=2)), run_id=run, beat_id=beat + 1000002, line=0.01, table=TABLE, entries=[], rebuy={})
+        assert out["retried"] == 0 and w.submitted[-1] is first and d in mirror.failed
+        out = mirror.minute(_ctx(conn, m1 + timedelta(minutes=3)), run_id=run, beat_id=beat + 1000003, line=0.01, table=TABLE, entries=[],
+                            rebuy={"LIVE_RB": {"score": 0.05, "threshold": 0.01, "table": TABLE, "ref_price": 2.6e-7}})
+        again = w.submitted[-1]
+        rows = conn.execute("SELECT rail, reason, m_hat FROM decisions WHERE kind = 'blocked' AND mint = 'LIVE_RB' ORDER BY id").fetchall()
+    assert out["retried"] == 1 and again is not first and (again.decision_id, again.ref_price, again.retry) == (d, 2.6e-7, 1) and d not in mirror.failed
+    assert [(r["rail"], r["reason"], float(r["m_hat"])) for r in rows] == [
+        ("price ran", "price ran: quoted 2.3e-07 SOL per token", 0.03),
+        ("no longer a buy", "retry not sent: capitulation: score 0.008 < 0.010", 0.008),
+        ("no longer a buy", "retry not sent: not scored this minute", 0.03)]
+
+
+def test_sell_now_sends_one_operator_sale_booked_like_any_exit(db_conn, clean):
+    """The operator's Sell Now: one sale of the whole position at the exit's slippage stepping up to the forced one, marked
+    'operator', under a forced exit decision; refused while an order of the token is in flight; its result reaches the waiter."""
+    w = _Worker(); mirror = _mirror(w)
+    with transaction() as conn:
+        pid = conn.execute("INSERT INTO positions (book, mint, pool, opened_at, qty, cost_sol, entry_price, status) "
+                           "VALUES ('live', 'LIVE_SN', 'PSN', now(), 1000000, 0.2, 0.0000002, 'open') RETURNING id").fetchone()["id"]
+        did = mirror.sell_now(conn, pid)
+        req = w.submitted[-1]
+        with pytest.raises(ValueError, match="in flight"):
+            mirror.sell_now(conn, pid)
+        d = conn.execute("SELECT kind, forced, reason, detail FROM decisions WHERE id = %s", (did,)).fetchone()
+    assert (req.side, req.position_id, req.forced_kind, req.decision_id, req.amount_in) == ("sell", pid, "operator", did, 1000000) and len(w.submitted) == 1
+    assert (req.slippage_bps, req.max_slippage_bps) == (config.SLIPPAGE_EXIT_BPS, config.SLIPPAGE_FORCED_BPS)
+    assert (d["kind"], d["forced"], d["reason"], d["detail"]["book"]) == ("fly_exit", True, "sold now by the operator", "live")
+    res = ExecResult(req, True, realized_sol=0.01, closed=True)
+    mirror._after_order(res)
+    assert mirror.sale_result(did, 0.1) is res and mirror.sale_result(did, 0.1) is None
+
+
+def test_the_live_gap_leaves_out_an_operators_sale(db_conn, clean, monkeypatch):
+    """Live vs its paper mirror measures execution: a position the operator sold (a loss paper did not take) is left out."""
+    monkeypatch.setattr(fly_live, "GAP_TRADES", 1)
+    w = _Worker(); mirror = _mirror(w); t = datetime(2100, 1, 1, 12, 0, tzinfo=timezone.utc)
+    with transaction() as conn:
+        for k, (rl, rp, kind, closed) in enumerate([(-0.5, 0.1, "operator", t + timedelta(days=1)), (0.05, 0.06, None, t)]):     # the operator's sale is the newest
+            d = conn.execute("INSERT INTO decisions (kind, mint, ts) VALUES ('fly_enter', %s, %s) RETURNING id", (f"LIVE_G{k}", t)).fetchone()["id"]
+            for book, ret, fk in (("live", rl, kind), ("paper_fly", rp, None)):
+                conn.execute("INSERT INTO positions (book, mint, opened_at, closed_at, entry_decision_id, qty, cost_sol, entry_price, realized_sol, status, forced_exit_kind) "
+                             "VALUES (%s, %s, %s, %s, %s, 1, 1.0, 0.000001, %s, 'closed', %s)", (book, f"LIVE_G{k}", t, closed, d, ret, fk))
+        g = mirror.gap(conn)
+    assert g["trades"] == 1 and g["live_mean"] == pytest.approx(0.05) and not g.get("paused")
 
 
 def test_a_failed_entry_whose_paper_position_closed_is_not_retried(db_conn, clean):
