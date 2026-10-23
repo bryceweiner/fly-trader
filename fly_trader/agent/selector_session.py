@@ -164,7 +164,8 @@ class SelectorBook:
             return status
         handed = handover.state(conn, self.chain) is not None and ctx.engine.has_book("fly" if self.chain == "sol" else f"fly_{self.chain}")
         self.beat_no += 1
-        extra = {} if d is None else {"holds": d["hold_s"], "strategies": d["strategy"], "allow": d["allow"], "reasons": d["reason"], "tables": d["tables"]}
+        extra = {} if d is None else {"holds": d["hold_s"], "strategies": d["strategy"], "allow": d["allow"], "reasons": d["reason"], "tables": d["tables"],
+                                      "size_margins": d.get("size_margin"), "correctness": d.get("pclean")}
         st = paper_trading.trade_minute(ctx, book=self.BOOK, run_id=self.run_id, beat_no=self.beat_no, broker=self.broker, kind=self.KIND, mints=ctx.mints, infos=ctx.infos,
                                         scores=scores, threshold=thr, table=getattr(self.model, "sizing", None), horizon_s=self.horizon_s,
                                         block="handed over to the fly" if handed else None, **extra)

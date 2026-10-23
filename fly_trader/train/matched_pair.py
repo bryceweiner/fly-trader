@@ -129,12 +129,28 @@ def _fly(ds, out: Path, sub: str, models: dict, exclude_days, epochs, match_days
 def _fmt(book: dict) -> str:
     f = lambda v, p=2: "-" if v is None else f"{v * 100:+.{p}f}%"      # noqa: E731
     w = "-" if book.get("win") is None else f"{book['win'] * 100:.1f}%"
+    g = book.get("growth_bp")
     return (f"{book.get('n') or 0:>6} trades  win {w:>6}  mean {f(book.get('mean')):>8}  "
-            f"total {f(book.get('total'), 1):>9}  random {f(book.get('random_mean')):>8}")
+            f"total {f(book.get('total'), 1):>9}  random {f(book.get('random_mean')):>8}"
+            + ("" if g is None else f"  Kelly growth {g:+7.1f} bp/trade ({book.get('sized_trades')} sized)"))
 
 
 def report_text(rep: dict) -> str:
-    lines = [f"Out of sample: {rep['days'][0]} .. {rep['days'][1]} ({rep['rows']} tradable minutes); net returns per trade at fixed size.", rep.get("note", ""), ""]
+    lines = [f"Out of sample: {rep['days'][0]} .. {rep['days'][1]} ({rep['rows']} tradable minutes); net returns per trade at fixed size; "
+             "the selector's Kelly growth at its own bands (correctness on Solana where kept).", rep.get("note", ""), ""]
+    for c in rep.get("correctness") or []:
+        g = ((c.get("evaluation") or {}).get("growth_per_trade") or {}); bp = lambda v: "-" if v is None else f"{1e4 * v:+.1f} bp"      # noqa: E731
+        tab = (c.get("params") or {}).get("table") or []
+        lines.append(f"{c['name']}: {'KEPT' if c['passed'] else 'rejected'} -- {c['reason']}")
+        if g:
+            lines.append(f"  evaluation half, Kelly growth per trade: EV bands {bp(g.get('ev_bands'))} ({g.get('n_ev')}), correctness bands "
+                         f"{bp(g.get('correctness_bands'))} ({g.get('n_correctness')})")
+        if tab:
+            p0 = (c.get("params") or {}).get("p0") or 0.0
+            lines.append("  bands (selection half): " + "  ".join(f"[from {100 * (p0 + b['lo']):.0f} %: n {b['n']} mean {100 * (b['mean'] or 0):+.1f}% "
+                                                                  f"win {100 * (b['win'] or 0):.0f}% Kelly {b['kelly']:.2f}]" for b in tab))
+    if rep.get("correctness"):
+        lines.append("")
     for chain, books in rep["chains"].items():
         lines.append(f"== {chain}")
         for who in ("selector", "fly"):
@@ -172,6 +188,7 @@ def main(out, last_day, epochs: int | None = None, match_days: int | None = None
         rep = json.loads(oos_path.read_text())
     else:
         rep = FS.oos_report(ds, sel.blind["models"], fly_b, hold)
+        rep["correctness"] = [c for c in (sel.metrics.get("components") or []) if str(c.get("name", "")).startswith("correctness:")]
         own = rep["chains"]["all"]["fly"]["all"]
         rep["evidence"] = {"book": "the blind fly's own picks, every chain", "days": rep["days"], "trades": own.get("n"), "mean": own.get("mean"),
                            "total": own.get("total"), "win": own.get("win"), "random_mean": own.get("random_mean")}

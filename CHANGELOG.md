@@ -20,6 +20,35 @@ ships signed releases built from this development line.
     half an hour (2026-10-23).
   - A routine day's build (~80 s) no longer runs beside the live minute pipeline either, and neither does corpus_meta's
     rebuild, which the child now runs before its builds: 36-82 s every 30 minutes until now.
+- **On Solana a strategy with a correctness model sizes by it: the EV line screens, P(clean) sets the Kelly band.**
+  - Inside the EV line's picks the EV margin carried no information: its rank correlation with the outcome was +0.00 /
+    +0.08 / +0.01 on the selection, evaluation and holdout periods, and #560's margin bands were flat to inverted
+    (the 2026-10-23 study). P(clean) ranked the same picks at +0.14 to +0.24 on Solana.
+  - A row that clears its strategy's line is sized by the band of its P(clean) above the bands' floor (``p0``, the lowest
+    P(clean) among the selection half's trades), with the same Kelly per band, `KELLY_FRACTION` and caps as before.
+  - The lowest band is Kelly 0: a pick in it is blocked ("correctness N % below M % (its lowest band, Kelly 0)").
+  - Robinhood Chain keeps its EV bands (neutral in the study); its rows still carry their P(clean).
+  - The live mirrors size the wallet's buys, and its retries, at the same margin; the fly's gated buys are sized as the
+    selector sizes them. A model without a correctness model (#560) trades exactly as before.
+
+### The selector
+
+- **A per-strategy correctness model: P(clean), trained on all of the strategy's candidates.**
+  - Clean: net ≥ +5 % over the strategy's hold, and no checkpoint of the hold grid up to it below -15 %.
+  - Walk-forward on every candidate of the strategy (its base mask and fitted trigger in the universe, whatever its EV
+    score), from the strategy's own inputs; cached like the strategies' walk-forwards.
+  - Its Kelly bands are built on the selection half's trades at the strategy's line, and its lowest band is the gate. It
+    is kept only when that gate improves the book on the selection half, passes on the evaluation half and beats
+    random removal; else the strategy keeps its EV bands. Its record holds Kelly growth per trade on the evaluation half,
+    EV bands against correctness bands.
+  - Memecoins only; Kalshi's stack is unchanged.
+- **The random-removal test clips each trade to -100 % … +300 %.** Unclipped, one Robinhood Chain moonshot (+226,678 %)
+  decided it: #560's capitulation win filter lost, filtered 377 against random 2,524.
+
+### The console
+
+- **Correctness %: every decision records its strategy's P(clean)** (`correctness` in the decision's detail), shown in the
+  decision inspector and the Overview's open positions.
 
 ### Training
 
@@ -41,6 +70,8 @@ ships signed releases built from this development line.
     instead of a calibration week. At bootstrap the live fly (teacher score, teacher gate) trades the selector's own picks.
   - The default bootstrap, every model definition and the live fly and selector are unchanged.
   - `decisions.build` can pin its last day, and frees its per-day frames before the sort: a ~52 GB peak instead of ~78.
+  - The report adds the selector book's Kelly growth per trade at its own bands, and each strategy's correctness verdict
+    with its bands.
 
 ## 2026-10-23, release 10: A retrained selector trades `ev` again, and live money follows the seat
 

@@ -161,7 +161,10 @@ def book(params: dict) -> dict:
     slippage stepping up to the forced one (``sell``, in percent)."""
     mk = market_param(params); live = bool(system_state(mk)["live_money"]); BOOK = mk.live_book if live else mk.selector_book; u = mk.unit
     hist = _series(marks([BOOK]), [BOOK])
-    rows = q("SELECT id, mint, opened_at, cost_sol, entry_price, last_mark_price, hold_s, strategy FROM positions WHERE book = %s AND status = 'open' ORDER BY opened_at", (BOOK,))
+    rows = q("""SELECT p.id, p.mint, p.opened_at, p.cost_sol, p.entry_price, p.last_mark_price, p.hold_s, p.strategy,
+                       (d.detail->>'correctness')::float AS correctness
+                FROM positions p LEFT JOIN decisions d ON d.id = p.entry_decision_id
+                WHERE p.book = %s AND p.status = 'open' ORDER BY p.opened_at""", (BOOK,))
     out = []
     if rows:
         hold = int((system_state(mk).get("model") or {}).get("run", {}).get("horizon_min") or 30)
@@ -170,6 +173,7 @@ def book(params: dict) -> dict:
             held = (now - r["opened_at"]).total_seconds() / 60
             out.append({"id": int(r["id"]), "mint": r["mint"], "token": names.get(r["mint"], r["mint"][:6]), "strategy": r["strategy"] or "—", "held_min": held,
                         "exits_in_min": max(0.0, (float(r["hold_s"]) / 60 if r["hold_s"] else hold) - held), "cost": float(r["cost_sol"]),
+                        "correctness": float(r["correctness"]) if r["correctness"] is not None else None,
                         "ret": (float(r["last_mark_price"]) / float(r["entry_price"]) - 1) * 100 if r["entry_price"] and r["last_mark_price"] else None})
     return {"unit": u, "history": hist[0]["data"] if hist else [], "positions": out, "live": live, "book": BOOK,
             "title": "Live wealth" if live else "Paper wealth", "sub": "the bot wallet since it started trading" if live else "the selector book since it started",

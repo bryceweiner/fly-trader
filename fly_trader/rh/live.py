@@ -235,12 +235,12 @@ class RhLiveMirror:
                     self.failed.pop(did); skipped.append((mint, "retries exhausted"))
                     self._blocked(conn, ctx, run_id, beat_id, e, "retries exhausted", f"{over}; last error: {(f.get('error') or '')[:200]}", tries=f["tries"]); continue
                 v = (rebuy or {}).get(e["mint"]) or {"why": "not scored this minute"}       # this minute's verdict on buying it again
-                e = {**e, **{k: v[k] for k in ("score", "threshold", "table", "ref_price") if k in v}}   # its score and price now, not its decision's
+                e = {**e, **{k: v[k] for k in ("score", "threshold", "table", "ref_price", "size_margin", "correctness") if k in v}}   # its score and price now, not its decision's
                 pool = pool_of(conn, e["info"].get("pool")); quote = ((pool or {}).get("quote_asset") or ZERO).lower()
                 rail = (blocked or ("stale minute" if stale else None) or ("held" if mint in held_mints else None) or (None if "ref_price" in v else "no longer a buy")
                         or ("base mark stale" if A.base_mark(conn, quote)[1] else None))
                 size, why = (0.0, "") if rail else sizing.size_position(e["score"], e.get("threshold", 0.0), e.get("table") or [], bankroll, cash,
-                                                                        ctx.resqs.get(e["mint"]) or e["info"]["resq"], flat=config.FLY_SIZING == "flat", market=RH)
+                                                                        ctx.resqs.get(e["mint"]) or e["info"]["resq"], flat=config.FLY_SIZING == "flat", market=RH, margin=e.get("size_margin"))
                 if rail or size <= 0:
                     why = v["why"] if rail == "no longer a buy" else rail or why
                     skipped.append((mint, why)); self._blocked(conn, ctx, run_id, beat_id, e, rail or "sizing", f"retry not sent: {why}", size, retry=True); continue
@@ -256,7 +256,7 @@ class RhLiveMirror:
                 if stale_mark:
                     skipped.append((mint, "base mark stale")); self._blocked(conn, ctx, run_id, beat_id, e, "base mark stale", f"no fresh ETH mark of its quote {quote}"); continue
                 size, why = sizing.size_position(e["score"], e.get("threshold", 0.0), e.get("table") or [], bankroll, cash, e["info"]["resq"],
-                                                 flat=config.FLY_SIZING == "flat", market=RH)
+                                                 flat=config.FLY_SIZING == "flat", market=RH, margin=e.get("size_margin"))
                 if blocked or size <= 0:
                     skipped.append((mint, blocked or why)); self._blocked(conn, ctx, run_id, beat_id, e, blocked or "sizing", why, size); continue
                 if self._buy(e, mint, quote, pool, size):

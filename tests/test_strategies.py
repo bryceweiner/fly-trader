@@ -71,7 +71,9 @@ def test_stack_finds_the_planted_edge_and_decides_like_it(monkeypatch):
     X = ds.X[:200]; d = S.decide(models, X, ds.cols, float(ds.ts[0]))
     good = X[:, ds.cols.index("imb_5m")] > 1.2
     assert (d["strategy"][good] == "ev").mean() > 0.8 and (d["strategy"][~good] == None).mean() > 0.8   # noqa: E711
-    assert set(np.unique(d["reason"])) <= {"trade", "no strategy fires", "win filter (meta-label)"} | {r for r in d["reason"] if "veto" in r or "gated" in r}
+    assert set(np.unique(d["reason"])) <= ({"trade", "no strategy fires", "win filter (meta-label)"}
+                                           | {r for r in d["reason"] if "veto" in r or "gated" in r or r.startswith("correctness")})
+    assert any(n.startswith("correctness: ") for n in names)          # the correctness component is judged (kept or not)
 
 
 def test_a_fit_that_clears_nothing_records_what_it_reached(monkeypatch):

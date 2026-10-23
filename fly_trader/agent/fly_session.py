@@ -477,7 +477,8 @@ class FlyBook:
             plan = paper_trading.plan_minute(ctx, book=self.BOOK, run_id=self.run_id, beat_no=self.beat_no, broker=self.broker, kind=self.KIND, mints=ctx.mints,
                                              infos=ctx.infos, scores=d["score"], threshold=d["threshold"], table=None, horizon_s=self.holds[self.names[0]],
                                              holds=d["hold_s"], strategies=d["strategy"], tables=d["tables"], flat=config.FLY_SIZING == "flat",
-                                             allow=d.get("allow"), reasons=d.get("reason"), live_allow=live_allow)
+                                             allow=d.get("allow"), reasons=d.get("reason"), live_allow=live_allow,
+                                             size_margins=d.get("size_margin"), correctness=d.get("pclean"))
             if self.trades_live(conn):
                 live = self._go_live(ctx, plan["beat_id"], plan["entries"], plan["rebuy"])
                 timing["orders_s"] = time.time() - ctx.m1_epoch                          # the wallet's orders queued
@@ -843,21 +844,25 @@ class FlyBook:
         td = td if td is not None else self._teacher_decision(ctx)
         strat = np.full(n, None, dtype=object); score = np.full(n, -1.0); hold = np.zeros(n); thr = np.full(n, np.inf)
         tables = [[] for _ in range(n)]; allow = np.zeros(n, bool); vetoed = np.zeros(n, bool); reason = np.full(n, "", dtype=object)
+        t_m = td.get("size_margin"); t_c = td.get("pclean"); size_margin = np.full(n, np.nan); pclean = np.full(n, np.nan)
         for i in range(n):
             s_ = td["strategy"][i]
             if s_ is None or s_ not in self.names:
                 continue
             j = self.names.index(s_); v, f = V[i, j], F[i, j]
             # the selector's own score, line and sizing table for the row: a gated fly buy is sized exactly as the selector
-            # sizes it (agent/sizing.size_position; FLY_SIZING=kelly: the same Kelly band, fraction and caps; flat: flat)
+            # sizes it (agent/sizing.size_position; FLY_SIZING=kelly: the same Kelly band, fraction and caps; flat: flat),
+            # its correctness bands at the selector's own P(clean) margin included
             strat[i] = s_; score[i] = float(td["score"][i]); thr[i] = float(td["threshold"][i]); hold[i] = self.holds[s_]; tables[i] = td["tables"][i]
+            size_margin[i] = float(t_m[i]) if t_m is not None else np.nan; pclean[i] = float(t_c[i]) if t_c is not None else np.nan
             if not td["allow"][i]:
                 reason[i] = f"selector: {td['reason'][i]}"
             elif np.isfinite(v) and np.isfinite(f) and v < f - config.FLY_LEARNED_VETO:
                 reason[i] = f"learned veto: score {v:.3f} < bootstrap {f:.3f} - {config.FLY_LEARNED_VETO:g}"; vetoed[i] = True
             else:
                 allow[i] = True; reason[i] = "trade"
-        return {"strategy": strat, "score": score, "hold_s": hold, "threshold": thr, "tables": tables, "allow": allow, "vetoed": vetoed, "reason": reason}
+        return {"strategy": strat, "score": score, "hold_s": hold, "threshold": thr, "tables": tables, "allow": allow, "vetoed": vetoed, "reason": reason,
+                "size_margin": size_margin, "pclean": pclean}
 
     def _capture(self, H: torch.Tensor, trig: np.ndarray, t: float) -> None:
         """The console's brain view: this minute's mean activity over the rows some strategy's trigger fired on (every

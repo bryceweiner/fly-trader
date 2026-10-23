@@ -840,11 +840,13 @@ def bootstrap_matched(ds: DecisionSet, teacher: StackTeacher, fit: np.ndarray, e
     return fly, info
 
 
-def _book(ds: DecisionSet, picks: np.ndarray, strat: np.ndarray, holds: dict, day0, pool: np.ndarray, trig: dict) -> dict:
+def _book(ds: DecisionSet, picks: np.ndarray, strat: np.ndarray, holds: dict, day0, pool: np.ndarray, trig: dict, fracs: np.ndarray | None = None) -> dict:
     """One book's trades on the holdout (``strategies.score_holdout``'s rules: each pick on its strategy's hold and net
     label, one position per token across the book's strategies), combined and per strategy, each with its random picks:
     the combined book's among ``pool`` on the set's own hold (as score_holdout), a strategy's among its triggered rows of
-    ``pool`` on its own hold. ``picks``: row indices; ``strat``: each pick's strategy."""
+    ``pool`` on its own hold. ``picks``: row indices; ``strat``: each pick's strategy. ``fracs`` (per row of ``ds``): each
+    pick's band Kelly fraction as the book sizes it (correctness bands where they size it, else the EV margin's): adds
+    ``growth_bp``, the mean log growth per trade at ``config.KELLY_FRACTION`` of it, returns clipped to [-100 %, +300 %]."""
     from . import strategies
     from .decisions import random_trades, summarize
     n_all = len(ds.y); hold = np.zeros(n_all); ret = np.full(n_all, np.nan, np.float32); who = np.full(n_all, None, dtype=object)
@@ -853,11 +855,17 @@ def _book(ds: DecisionSet, picks: np.ndarray, strat: np.ndarray, holds: dict, da
         if len(r):
             hold[r] = H * 60.0; ret[r] = _hold_label(ds, H)[r]; who[r] = name
     tr = taken_idx(ds.ts, ds.mint, hold, picks) if len(picks) else np.zeros(0, int)
-    out = {"all": {**strategies.score_trades(ds, tr, ret, day0).dict(), "random_mean": summarize(random_trades(ds, pool, max(1, len(tr)))).get("mean")}}
+
+    def sized(t):
+        if fracs is None or not len(t):
+            return {}
+        g = strategies._kelly_growth(fracs[t], ret[t])
+        return {"growth_bp": None if g is None else round(1e4 * g, 2), "sized_trades": int((fracs[t] > 0).sum())}
+    out = {"all": {**strategies.score_trades(ds, tr, ret, day0).dict(), "random_mean": summarize(random_trades(ds, pool, max(1, len(tr)))).get("mean"), **sized(tr)}}
     for name, H in holds.items():
         ts_ = tr[who[tr] == name]
         rnd = summarize(random_trades(ds, pool & trig[name], max(1, len(ts_)), hold_s=H * 60.0, returns=_hold_label(ds, H)))
-        out[name] = {**strategies.score_trades(ds, ts_, ret, day0).dict(), "random_mean": rnd.get("mean"), "hold_min": H}
+        out[name] = {**strategies.score_trades(ds, ts_, ret, day0).dict(), "random_mean": rnd.get("mean"), "hold_min": H, **sized(ts_)}
     return out
 
 
@@ -877,10 +885,13 @@ def oos_report(ds: DecisionSet, models: dict, fly: FlyModel, days: list) -> dict
     rows = np.flatnonzero(pool_all); names = list((models.get("strategies") or {}))
     holds = {k: int(v["hold_min"]) for k, v in models["strategies"].items()}
     s_str = np.full(len(rows), None, dtype=object); s_ok = np.zeros(len(rows), bool); f_str = np.full(len(rows), None, dtype=object)
-    tr_rows = {k: np.zeros(len(ds.y), bool) for k in names}
+    tr_rows = {k: np.zeros(len(ds.y), bool) for k in names}; s_frac = np.zeros(len(ds.y))      # the selector's band Kelly per row, as it sizes it
     for i in range(0, len(rows), MATCH_CHUNK):
         sl = rows[i:i + MATCH_CHUNK]; X = ds.X[sl]
         d = strategies.decide(models, X, ds.cols, ds.ts[sl]); s_str[i:i + MATCH_CHUNK] = d["strategy"]; s_ok[i:i + MATCH_CHUNK] = d["allow"]
+        for j in np.flatnonzero(d["allow"]):
+            mg = d["size_margin"][j] if np.isfinite(d["size_margin"][j]) else d["score"][j] - d["threshold"][j]
+            s_frac[sl[j]] = (sizing.band_for(d["tables"][j] or [], mg) or {}).get("kelly") or 0.0
         f_str[i:i + MATCH_CHUNK] = fly_decide(fly, X, ds.cols)["strategy"]
         tg = fly.triggers(X, ds.cols)
         for j, k in enumerate(fly.strategies):
@@ -893,7 +904,7 @@ def oos_report(ds: DecisionSet, models: dict, fly: FlyModel, days: list) -> dict
         cm = np.ones(len(rows), bool) if chain == "all" else ch[rows] == chain
         pool = pool_all if chain == "all" else pool_all & (ch == chain)
         s_pick = cm & s_ok; f_pick = cm & np.array([x is not None for x in f_str], bool)
-        out["chains"][chain] = {"selector": _book(ds, rows[s_pick], s_str[s_pick], holds, days[0], pool, tr_rows),
+        out["chains"][chain] = {"selector": _book(ds, rows[s_pick], s_str[s_pick], holds, days[0], pool, tr_rows, fracs=s_frac),
                                 "fly": _book(ds, rows[f_pick], f_str[f_pick], {k: h for k, h in holds.items() if k in fly.strategies}, days[0], pool, tr_rows)}
     return out
 

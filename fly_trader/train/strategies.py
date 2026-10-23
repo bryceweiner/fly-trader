@@ -89,6 +89,17 @@ PREDICT_CHUNK = 2_000_000       # rows scored at once out of sample: the block's
 # book's observed rate (~48 trades a day) that is ~1,000 trades, an order of magnitude above MIN_LINE_TRADES.
 HOLDOUT_DAYS = 21
 CACHE_DIR = config.CORPUS_DIR / "stack_cache"
+# Correctness (2026-10-24, the ideal-asset study): inside the EV line's picks the EV margin carries no information (rank
+# correlation with the outcome +0.00 / +0.08 / +0.01 on selection / evaluation / holdout), while a classifier of a "clean"
+# trade -- net ≥ CLEAN_RET over the strategy's hold and no checkpoint (HOLDS_MIN up to the hold) below CLEAN_DD -- trained on
+# all of the strategy's candidates ranks them (+0.14 to +0.24 on Solana). The EV line stays the first screen; the Kelly
+# bands are built on P(clean) instead of the margin, and the lowest band is Kelly 0: the gate. CLEAN_CHAINS only (Solana;
+# Robinhood Chain was neutral, and keeps its EV bands).
+CLEAN_RET, CLEAN_DD = 0.05, -0.15
+CLEAN_CHAINS = ("sol",)
+# The random-removal test clips each trade to [-100 %, +300 %]: unclipped, one Robinhood Chain moonshot (+226,678 %) decided
+# it for #560's capitulation win filter (filtered 377 against random 2,524).
+RANDOM_REMOVAL_CAP = 3.0
 
 
 def _rss_gb() -> float:
@@ -177,11 +188,13 @@ def beats_random_removal(ds: DecisionSet, pick_before: np.ndarray, pick_after: n
                          hold_before=None, returns_before=None) -> tuple[bool, dict]:
     """A filter must beat dropping the same number of trades at random from the unfiltered trades. Each book is scored
     with its own holds and returns: the filtered book's arrays hold nothing for a row the filter removed — a zero there
-    would let a token re-enter within its own hold, and its return would count as zero profit rather than what it made."""
+    would let a token re-enter within its own hold, and its return would count as zero profit rather than what it made.
+    Every return is clipped to [-100 %, ``RANDOM_REMOVAL_CAP``], so no single moonshot decides the comparison."""
     hb = hold_s if hold_before is None else hold_before
     rb = returns if returns_before is None else returns_before
     t0 = taken_idx(ds.ts, ds.mint, hb, np.flatnonzero(pick_before)); t1 = taken_idx(ds.ts, ds.mint, hold_s, np.flatnonzero(pick_after))
-    r0 = np.nan_to_num(np.asarray(rb[t0], dtype=np.float64)); after = float(np.nansum(returns[t1]))
+    r0 = np.clip(np.nan_to_num(np.asarray(rb[t0], dtype=np.float64)), -1.0, RANDOM_REMOVAL_CAP)
+    after = float(np.clip(np.nan_to_num(np.asarray(returns[t1], dtype=np.float64)), -1.0, RANDOM_REMOVAL_CAP).sum())
     k = max(0, len(t0) - len(t1))
     if k == 0 or len(t0) == 0:
         return after >= float(r0.sum()), {"filtered_total": after, "random_total": float(r0.sum()), "removed": 0}
@@ -382,6 +395,9 @@ class StrategyFit:
     passed: bool = False
     reason: str = ""
     spec: object = None                                            # the StackSpec it was fitted under (None: MEMECOIN)
+    clean_p: np.ndarray = field(repr=False, default=None)         # OOS P(clean) on all its candidates (fit_correctness)
+    clean_on: np.ndarray = field(repr=False, default=None)        # the rows correctness sizes and gates (CLEAN_CHAINS)
+    clean: dict | None = None                                      # kept correctness: {"p0", "cut", "table", "chains", "ret", "dd"}
 
     @property
     def hold(self):
@@ -393,6 +409,8 @@ class StrategyFit:
         p = rows & uni & sp.base_mask(self.name, X, c, self.high) & trigger_mask(self.name, self.thr, X, c, sp) & (self.oos >= self.line)
         if self.meta_cut is not None and self.meta_p is not None:
             p &= self.meta_p >= self.meta_cut
+        if self.clean is not None and self.clean_p is not None:        # correctness: its lowest band is Kelly 0, the gate
+            p &= ~(self.clean_on & np.isfinite(self.clean_p) & (self.clean_p < self.clean["cut"]))
         if self.hours:
             hr = ((ds.ts // 3600) % 24).astype(int); p &= ~np.isin(hr, self.hours)
         for lo, hi in self.regimes:
@@ -458,6 +476,60 @@ def fit_strategy(ds: DecisionSet, name: str, cols: list[str], uni: np.ndarray, s
     return StrategyFit(name, H, float(line), thr, high, cols, oos=oos[H], selection=best.dict(), trials=trials, best_seen=seen.dict() if seen else {}, spec=sp)
 
 
+# ---------------------------------------------------------------- correctness: P(clean) per strategy
+def clean_label(ds: DecisionSet, H: int, spec: "StackSpec | None" = None) -> np.ndarray:
+    """1 where a trade held ``H`` minutes is clean -- net ≥ ``CLEAN_RET`` and no checkpoint of ``HOLDS_MIN`` up to ``H``
+    below ``CLEAN_DD`` (a missing checkpoint is skipped) -- 0 where not, NaN where the hold's own label is missing."""
+    sp = spec or memecoin_spec()
+    out = np.full(len(ds.y), np.nan, np.float32); r = sp.label(ds, H)
+    if r is None:
+        return out
+    worst = np.full(len(ds.y), np.inf)
+    for h in HOLDS_MIN:
+        rh = sp.label(ds, h) if h <= H else None
+        if rh is not None:
+            worst = np.fmin(worst, np.where(np.isfinite(rh), rh, np.inf))
+    ok = np.isfinite(r)
+    out[ok] = ((r[ok] >= CLEAN_RET) & (worst[ok] > CLEAN_DD)).astype(np.float32)
+    return out
+
+
+def rows_on_chains(X: np.ndarray, cols: list[str], chains) -> np.ndarray:
+    """Which rows of ``X`` belong to ``chains`` ("sol", "rh"): from the ``chain_rh`` input; a set without it is Solana's."""
+    X = np.atleast_2d(X)
+    if "chain_rh" not in cols:
+        return np.full(len(X), "sol" in chains)
+    rh = X[:, cols.index("chain_rh")] > 0.5
+    return np.where(rh, "rh" in chains, "sol" in chains)
+
+
+def fit_correctness(ds: DecisionSet, f: StrategyFit, uni: np.ndarray, stop=None) -> np.ndarray:
+    """Out-of-sample P(clean) (``clean_label`` over the strategy's hold) on ALL of the strategy's candidates -- its base
+    mask and fitted trigger in the universe, whatever their EV score -- from the strategy's own inputs, walk-forward; NaN
+    off them. Cached like the strategies' walk-forwards (one classifier walk-forward is about an hour)."""
+    sp = f.spec or memecoin_spec(); X, c = ds.X, ds.cols; ci = np.asarray([c.index(x) for x in f.cols])
+    y = clean_label(ds, f.hold_min, sp)
+    rows = uni & sp.base_mask(f.name, X, c, f.high) & trigger_mask(f.name, f.thr, X, c, sp) & np.isfinite(y)
+    thr = sorted((k, None if v is None or not np.isfinite(v) else round(float(v), 10)) for k, v in f.thr.items())
+    tag = f"{sp.name}|{f.name}|clean{CLEAN_RET:g}/{CLEAN_DD:g}|hold{f.hold_min}|high{f.high}|thr{thr}"
+    log.info("correctness %s: %d candidate rows, %.1f %% clean, %d inputs, hold %d min", f.name, int(rows.sum()),
+             100.0 * float(np.nanmean(y[rows])) if rows.any() else 0.0, len(ci), f.hold_min)
+    yi = np.nan_to_num(y).astype(np.int8)
+    return _cached(ds, f.cols, tag, stop, lambda: wf_classify(ds, rows, lambda idx: X[np.ix_(idx, ci)], yi, 2, stop)[:, 1])
+
+
+def _kelly_growth(fracs: np.ndarray, r: np.ndarray) -> float | None:
+    """Mean log growth per trade at ``config.KELLY_FRACTION`` of each trade's band fraction, returns clipped to [-100 %, +300 %]."""
+    r = np.clip(np.asarray(r, dtype=np.float64), -1.0, RANDOM_REMOVAL_CAP); ok = np.isfinite(r)
+    if not ok.any():
+        return None
+    return float(np.log1p(np.clip(config.KELLY_FRACTION * np.asarray(fracs, dtype=np.float64)[ok] * r[ok], -0.999999, None)).mean())
+
+
+def _band_kelly(table: list, margins: np.ndarray) -> np.ndarray:
+    return np.array([((sizing.band_for(table, m) or {}).get("kelly") or 0.0) if np.isfinite(m) else 0.0 for m in np.asarray(margins, dtype=np.float64)])
+
+
 # ---------------------------------------------------------------- meta-label, veto, gates
 def fit_meta(ds: DecisionSet, s: StrategyFit, uni: np.ndarray, sel: np.ndarray, day0, stop=None) -> tuple[np.ndarray, float | None, dict]:
     """Nested: a classifier of P(net return > 0 over the strategy's hold) on its OOS candidates (primary score ≥ 0 and
@@ -497,6 +569,9 @@ def system_pick(ds: DecisionSet, fits: list[StrategyFit], rows: np.ndarray, uni:
         pk = f.pick(ds, rows, uni)
         if combine == "kelly" and tables and tables.get(f.name):
             v = np.array([((sizing.band_for(tables[f.name], m) or {}).get("kelly") or 0.0) for m in (f.oos[pk] - f.line)])
+            if f.clean is not None and f.clean_p is not None:         # where correctness sizes the strategy, its bands decide
+                on = f.clean_on[pk] & np.isfinite(f.clean_p[pk])
+                v[on] = _band_kelly(f.clean["table"], f.clean_p[pk][on] - f.clean["p0"])
             kv = np.full(N, -np.inf); kv[pk] = v + 1e-9 * f.oos[pk]
         else:
             kv = np.where(pk, f.oos, -np.inf)
@@ -707,6 +782,43 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
                            info["trials"], best=info.get("best_seen")))
         if not ok:
             f.meta_p, f.meta_cut = old
+    # 4b. correctness per strategy (memecoins): P(clean) on all its candidates. On CLEAN_CHAINS its Kelly bands replace the
+    # EV margin's -- built on the selection half's trades at the strategy's own line, the lowest band forced to Kelly 0 --
+    # and that lowest band is a filter, judged as the win filter is (selection, evaluation, random removal).
+    if sp.name == "memecoin":
+        on = np.isin(ds.chains(), CLEAN_CHAINS)
+        for f in fits:
+            if stop is not None and stop.is_set():
+                break
+            p = fit_correctness(ds, f, uni, stop)
+            hold = sp.hold_s(ds, f.hold_min); y_r = sp.label(ds, f.hold_min)
+            t = taken_idx(ds.ts, ds.mint, hold, np.flatnonzero(f.pick(ds, sel, uni) & on & np.isfinite(p)))
+            if len(t) < 2 * sizing.MIN_BAND_TRADES:
+                comps.append(_comp(f"correctness: {f.name}", False, f"{len(t)} selection-half trades on {'+'.join(CLEAN_CHAINS)}: too few for two bands")); continue
+            p0 = float(np.min(p[t])); table = sizing.build_table(p[t] - p0, y_r[t])
+            if len(table) < 2:
+                comps.append(_comp(f"correctness: {f.name}", False, "its trades make a single band: nothing to size or gate by")); continue
+            table[0] = {**table[0], "kelly": 0.0, "gate": True}           # the lowest band never trades: the gate
+            clean = {"p0": p0, "cut": p0 + float(table[1]["lo"]), "table": table, "chains": list(CLEAN_CHAINS), "ret": CLEAN_RET, "dd": CLEAN_DD}
+            before_s = score_pick(ds, *system_pick(ds, fits, sel, uni, combine, tables)[:3], day0)
+            pk0, hd0, rt0, _ = system_pick(ds, fits, ev, uni, combine, tables)
+            f.clean_p, f.clean_on, f.clean = p, on, clean
+            after_sel = score_pick(ds, *system_pick(ds, fits, sel, uni, combine, tables)[:3], day0)
+            pk1, hd1, rt1, _ = system_pick(ds, fits, ev, uni, combine, tables)
+            ev_s = score_pick(ds, pk1, hd1, rt1, day0)
+            rnd_ok, rnd = beats_random_removal(ds, pk0, pk1, hd1, rt1, day0, hold_before=hd0, returns_before=rt0)
+            # the record: Kelly growth per trade of the strategy's evaluation-half trades on those chains, EV bands vs correctness bands
+            te = taken_idx(ds.ts, ds.mint, hold, np.flatnonzero(f.pick(ds, ev, uni) & on & np.isfinite(p)))
+            f.clean = None; te0 = taken_idx(ds.ts, ds.mint, hold, np.flatnonzero(f.pick(ds, ev, uni) & on)); f.clean = clean
+            growth = {"ev_bands": _kelly_growth(_band_kelly(tables.get(f.name) or [], f.oos[te0] - f.line), y_r[te0]), "n_ev": int(len(te0)),
+                      "correctness_bands": _kelly_growth(_band_kelly(table, p[te] - p0), y_r[te]), "n_correctness": int(len(te))}
+            ok = better(after_sel, before_s) and passes(ev_s, fallback=not after_sel.admissible) and rnd_ok
+            comps.append(_comp(f"correctness: {f.name}", ok, "its lowest band improves the book on the selection half, passes on the evaluation half and beats random "
+                               "removal; its bands size the strategy" if ok else "rejected (selection, evaluation or random-removal test): EV bands kept",
+                               after_sel.dict(), {**ev_s.dict(), "random_removal": rnd, "growth_per_trade": growth},
+                               {"p0": p0, "cut": clean["cut"], "table": table, "chains": list(CLEAN_CHAINS)}))
+            if not ok:
+                f.clean_p, f.clean_on, f.clean = None, None, None
     # 5. veto
     veto = None
     pk, hd, rt, who = system_pick(ds, fits, tested, uni, combine, tables)
@@ -823,9 +935,15 @@ def final_models(ds: DecisionSet, stack: Stack, exclude_days: list | None = None
             mr = np.flatnonzero(uni & sp.base_mask(f.name, ds.X, ds.cols, f.high) & trigger_mask(f.name, f.thr, ds.X, ds.cols, sp) & np.isfinite(f.oos) & (f.oos >= 0) & np.isfinite(y) & keep)
             mc, ms = fit_classifier(np.c_[ds.X[np.ix_(mr, ci)], f.oos[mr]], (y[mr] > 0).astype(np.int8), seed=99)
             meta = {"model": mc, "scaler": ms, "cut": f.meta_cut}
+        clean = None
+        if f.clean is not None:                                       # correctness: P(clean) refit on all its candidates
+            yc = clean_label(ds, f.hold_min, sp)
+            cr = np.flatnonzero(uni & sp.base_mask(f.name, ds.X, ds.cols, f.high) & trigger_mask(f.name, f.thr, ds.X, ds.cols, sp) & np.isfinite(yc) & keep)
+            cc, cs = fit_classifier(ds.X[np.ix_(cr, ci)], yc[cr].astype(np.int8), seed=99)
+            clean = {"model": cc, "scaler": cs, **{k: f.clean[k] for k in ("p0", "cut", "table", "chains", "ret", "dd")}}
         out["strategies"][f.name] = {"gbm": gbm, "scaler": scaler, "cols": list(f.cols), "line": f.line, "hold_min": f.hold_min, "thr": dict(f.thr), "high": f.high,
                                      "meta": meta, "hours": list(f.hours), "regimes": list(f.regimes), "sizing": stack.tables.get(f.name) or [],
-                                     "selection": f.selection, "evaluation": f.evaluation}
+                                     "clean": clean, "selection": f.selection, "evaluation": f.evaluation}
     if stack.veto is not None:
         pk, hd, rt, _ = system_pick(ds, stack.fits, np.ones(len(ds.y), bool), uni, stack.combine, stack.tables)
         rows = np.flatnonzero(pk & np.isfinite(rt) & keep); ci = np.asarray([ds.cols.index(x) for x in stack.cols])
@@ -856,13 +974,22 @@ def decide_all(models: dict, X: np.ndarray, cols: list[str], t_start, spec: "Sta
             idx = np.flatnonzero(ok)
             p = m["meta"]["model"].predict_proba(m["meta"]["scaler"].transform(np.c_[X[np.ix_(idx, ci)], sc[idx]]))[:, list(m["meta"]["model"].classes_).index(1)]
             low = np.zeros(n, bool); low[idx] = p < m["meta"]["cut"]; why[low] = "win filter (meta-label)"
+        cl = m.get("clean"); pc = np.full(n, np.nan); on = np.zeros(n, bool)
+        if cl is not None and ok.any():                                # correctness, behind the EV line (the first screen)
+            idx = np.flatnonzero(ok); cls = list(cl["model"].classes_)
+            pr = cl["model"].predict_proba(cl["scaler"].transform(X[np.ix_(idx, ci)]))
+            pc[idx] = pr[:, cls.index(1)] if 1 in cls else 0.0
+            on = rows_on_chains(X, cols, cl["chains"])
+            low = ok & on & (pc < cl["cut"]) & (why == "")
+            why[low] = [f"correctness {v * 100:.0f} % below {cl['cut'] * 100:.0f} % (its lowest band, Kelly 0)" for v in pc[low]]
         gated = ok & np.isin(hour, m.get("hours", [])) & (why == "")
         why[gated] = [f"hour {h} UTC gated" for h in hour[gated]]
         if m.get("regimes") and "mkt_vol_1h" in cols:
             mv = X[:, cols.index("mkt_vol_1h")]
             for lo, hi in m["regimes"]:
                 why[ok & (mv >= lo) & (mv < hi) & (why == "")] = "market-volume regime gated"
-        out[name] = {"trig": trig, "score": sc, "allow": ok & (why == ""), "why": why, "line": m["line"], "hold_min": m["hold_min"], "sizing": m["sizing"]}
+        out[name] = {"trig": trig, "score": sc, "allow": ok & (why == ""), "why": why, "line": m["line"], "hold_min": m["hold_min"], "sizing": m["sizing"],
+                     "pclean": pc, "clean_on": on, "clean": None if cl is None else {k: cl[k] for k in ("p0", "cut", "table", "chains")}}
     v = models.get("veto")
     if v is not None and out:
         any_ok = np.zeros(n, bool)
@@ -882,21 +1009,33 @@ def decide_all(models: dict, X: np.ndarray, cols: list[str], t_start, spec: "Sta
 def decide(models: dict, X: np.ndarray, cols: list[str], t_start, spec: "StackSpec | None" = None, per: dict | None = None) -> dict:
     """The selector's decision for each row of one minute (``t_start`` = the minute's start): which strategy trades it,
     its predicted net return, hold, line and sizing table, and whether a filter blocks it (with the reason). ``per``: this
-    minute's ``decide_all`` when the caller has it already (one pass over the stack)."""
+    minute's ``decide_all`` when the caller has it already (one pass over the stack).
+    Correctness: ``pclean`` is the chosen strategy's P(clean) (NaN without one); where it sizes the row (its chains),
+    ``tables`` holds its correctness bands and ``size_margin`` the margin they are read at (P(clean) − its p0), else NaN
+    and the row is sized by its EV margin (score − line), as before."""
     sp = spec or memecoin_spec()
     X = np.atleast_2d(X); n = len(X); per = decide_all(models, X, cols, t_start, sp) if per is None else per
     best_key = np.full(n, -np.inf); strat = np.full(n, None, dtype=object); score = np.full(n, -1.0); hold = np.zeros(n)
     thr = np.full(n, np.inf); tables = [[] for _ in range(n)]; allow = np.zeros(n, bool); reason = np.full(n, "no strategy fires", dtype=object)
+    pclean = np.full(n, np.nan); size_margin = np.full(n, np.nan)
     for name, d in per.items():
-        sc = d["score"]; margin = sc - d["line"]
-        key = (np.array([((sizing.band_for(d["sizing"], v) or {}).get("kelly") or 0.0) if np.isfinite(v) else -np.inf for v in margin]) + 1e-9 * sc
-               if models.get("combine") == "kelly" and d["sizing"] else sc)
+        sc = d["score"]; margin = sc - d["line"]; cl = d.get("clean"); pc = d.get("pclean")
+        by_c = (d["clean_on"] & np.isfinite(pc)) if cl is not None else np.zeros(n, bool)
+        cm = (pc - cl["p0"]) if cl is not None else np.full(n, np.nan)
+        if models.get("combine") == "kelly" and (d["sizing"] or cl is not None):
+            key = np.array([(((sizing.band_for(cl["table"] if by_c[i] else d["sizing"], cm[i] if by_c[i] else margin[i]) or {}).get("kelly") or 0.0)
+                             if np.isfinite(margin[i]) else -np.inf) for i in range(n)]) + 1e-9 * sc
+        else:
+            key = sc
         take = d["trig"] & (sc >= d["line"]) & (key > best_key)
         best_key = np.where(take, key, best_key)
         for i in np.flatnonzero(take):
-            strat[i] = name; score[i] = sc[i]; hold[i] = sp.hold_seconds(d["hold_min"]) if getattr(sp, "hold_seconds", None) else d["hold_min"] * 60.0; thr[i] = d["line"]; tables[i] = d["sizing"]
+            strat[i] = name; score[i] = sc[i]; hold[i] = sp.hold_seconds(d["hold_min"]) if getattr(sp, "hold_seconds", None) else d["hold_min"] * 60.0; thr[i] = d["line"]
+            tables[i] = cl["table"] if by_c[i] else d["sizing"]; size_margin[i] = cm[i] if by_c[i] else np.nan
+            pclean[i] = pc[i] if pc is not None else np.nan
             allow[i] = bool(d["allow"][i]); reason[i] = d["why"][i] or "trade"
-    return {"strategy": strat, "score": score, "hold_s": hold, "threshold": thr, "tables": tables, "allow": allow, "reason": reason}
+    return {"strategy": strat, "score": score, "hold_s": hold, "threshold": thr, "tables": tables, "allow": allow, "reason": reason,
+            "pclean": pclean, "size_margin": size_margin}
 
 
 # ---------------------------------------------------------------- the memecoin stack's spec (every default above)

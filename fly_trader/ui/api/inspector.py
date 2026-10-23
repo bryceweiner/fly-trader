@@ -168,7 +168,7 @@ def token(params: dict) -> dict:
     latest = [r for r in reversed(series) if r["ts"] == last_ts]
     series = _compact(series, ("ts", "strategy", "score", "frozen_score", "line", "label", "state", "teacher_allow"))
     decisions = q("""SELECT id, ts, kind, m_hat, size_sol, rail, reason, COALESCE(detail->>'book', book_targets[1]) AS book, detail->>'strategy' AS strategy,
-                            (detail->>'threshold')::float AS threshold
+                            (detail->>'threshold')::float AS threshold, (detail->>'correctness')::float AS correctness
                      FROM decisions WHERE mint = %s AND (detail->>'book' = ANY(%s) OR book_targets && %s::text[]) ORDER BY id DESC LIMIT 200""", (mint, books, books))
     for d in decisions:
         d["action"], d["actor"] = action_of(d["kind"]), actor_of(d["kind"], d["book"])
