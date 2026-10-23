@@ -6,9 +6,10 @@ identical to the replay archive. From Asia it falls behind and reconnects about 
 ``SOL_FEED=relay`` (ingest/relay_feed.py: PumpAPI's events from our relay near its source, stream_relay/) or
 ``SOL_FEED=helius`` (ingest/helius_feed.py: the same events decoded from Helius). Each transaction is taken once from
 whichever feed brought it first (``Aggregator.ingest_from``), and the backup's clock counts only while the primary is down.
-This worker keeps only what the selector needs: PumpSwap (``pump-amm``, SOL-quoted)
-buys and sells of pump.fun-origin mints (a ``pump`` mint, or a pump.fun graduate without the suffix: one whose migration
-the stream saw or ``corpus_meta`` holds, reloaded every 5 minutes), aggregated per (mint, minute) into the same fields ``train/mature.py``
+This worker keeps only what the selector needs: SOL-quoted buys and sells in PumpSwap (``pump-amm``) and Meteora DLMM pools
+(``corpus_meta.UNIVERSE_POOLS``; DLMM since 2026-10-23) of pump.fun-origin mints (a ``pump`` mint, or a pump.fun graduate
+without the suffix: one whose migration the stream saw or ``corpus_meta`` holds, reloaded every 5 minutes), aggregated per
+(mint, minute) into the same fields ``train/mature.py``
 derives from the archive, with the same filters: legs in a pool created directly rather than by a pump.fun migration
 (``createPool`` with ``poolCreatedBy`` other than ``pump``; the owner can pull its unburned liquidity) are dropped — such pools
 go to ``pump_pools`` as they are created, and the blocked set is reloaded from that table (archive backfill included) at
@@ -22,7 +23,9 @@ publishes the newest complete minute for the engine the moment it is written (th
 Lifecycle: ``create`` events go to ``pump_events`` as they arrive; at ``migrate`` a ``corpus_meta`` row is written
 with the creation facts and the creator's point-in-time history (``train/corpus_meta.creator_history``, the training
 definition); 61 minutes after a graduation its own 60-minute outcome is filled from the stream's minutes so later
-graduations by the same creator see it, as in training. Minute rows older than ``PUMP_MINUTES_KEEP_DAYS`` are archived
+graduations by the same creator see it, as in training. A graduation's quote asset goes to ``corpus_meta.grad_quote`` (at the
+migration, or for an older graduate from trades in its own pool in another quote: ``corpus_meta.record_grad_quotes``), so its
+quote-unit inputs are read as SOL only when they are (``corpus_meta.sol_select``). Minute rows older than ``PUMP_MINUTES_KEEP_DAYS`` are archived
 to ``data/corpus/stream/<day>.parquet`` before removal. Database failures keep the data in memory for the next attempt.
 """
 from __future__ import annotations
@@ -48,7 +51,7 @@ from .. import config
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..logging_setup import setup
-from ..train.corpus_meta import CURVE_COLS, blocked_pool_ids, creator_history, curve_facts, pumpfun_graduates
+from ..train.corpus_meta import CURVE_COLS, UNIVERSE_POOLS, blocked_pool_ids, creator_history, curve_facts, pumpfun_graduates, record_grad_quotes
 from ..train.flow import minute_wallet_cols
 
 log = logging.getLogger(__name__)
@@ -89,6 +92,7 @@ class Aggregator:
         self.pending_creates: list[tuple[str, dict]] = []                 # creates not yet written to pump_events
         self.blocked: set[str] = set()                                     # pool ids of directly created (custom) PumpSwap pools
         self.grads: set[str] = set()                                       # pump.fun graduates whose mint lacks the "pump" suffix
+        self.quote_seen: set[tuple] = set(); self.pending_quotes: list[tuple] = []   # (mint, pool, quote) of graduates' pools in another quote
         self.pending_pools: list[tuple] = []                               # custom pools not yet written to pump_pools
         self.flushed_through: datetime | None = None                       # start of the newest complete minute written
         self.insiders: dict[str, frozenset] = {}                           # mint → creator/bundle/early wallets (token_insiders)
@@ -106,7 +110,7 @@ class Aggregator:
         if not sig:
             return None
         if a in ("buy", "sell"):
-            return (sig, e.get("poolId") or "") if e.get("pool") == "pump-amm" else (sig, "curve", e.get("mint"))
+            return (sig, "curve", e.get("mint")) if e.get("pool") == "pump" else (sig, e.get("poolId") or "")
         if a in ("create", "migrate"):
             return (sig, a)
         if a == "createPool":
@@ -161,7 +165,13 @@ class Aggregator:
             self._curve(e)
             return
         if a in ("buy", "sell"):
-            if pool != "pump-amm" or e.get("quoteMint") != WSOL or not self.pumpfun(mint):
+            if pool not in UNIVERSE_POOLS or not self.pumpfun(mint):
+                return
+            if e.get("quoteMint") != WSOL:
+                if pool == "pump-amm":                  # maybe the graduate's own pool, seeded in another quote: its graduation's quote
+                    k = (mint, e.get("poolId"), e.get("quoteMint"))
+                    if k[1] and k[2] and k not in self.quote_seen:
+                        self.quote_seen.add(k); self.pending_quotes.append(k)
                 return
             if e.get("poolId") in self.blocked:
                 self.stats["dropped_custom_pool"] += 1
@@ -264,6 +274,19 @@ class Aggregator:
     def block(self, pool_ids) -> None:
         self.blocked.update(pool_ids); self.stats["blocked_pools"] = len(self.blocked)
 
+    def write_quotes(self) -> int:
+        """Graduation quotes learnt from graduates' own pools (``corpus_meta.record_grad_quotes``); kept on failure."""
+        rows, self.pending_quotes = self.pending_quotes, []
+        if not rows:
+            return 0
+        try:
+            with transaction() as conn:
+                return record_grad_quotes(conn, rows)
+        except Exception:
+            self.pending_quotes = (rows + self.pending_quotes)[-MAX_PENDING_CREATES:]
+            log.exception("graduation quotes failed; %d queued for the next attempt", len(self.pending_quotes))
+            return 0
+
     def write_pools(self) -> int:
         """Persist custom pools seen on the stream (training excludes the same pools); on failure they stay queued."""
         rows, self.pending_pools = self.pending_pools, []
@@ -292,8 +315,8 @@ class Aggregator:
                 ct = datetime.fromtimestamp(c["ts"] / 1000, timezone.utc) if c else None
                 h = creator_history(conn, c.get("creator") if c else None, ct, g)
                 conn.execute("""INSERT INTO corpus_meta (mint, graduated_at, create_ts, creator, dev_sol, dev_tokens, dev_share, supply, mayhem, uri, name, symbol, ttg_min, rq0, pool_id,
-                                                         prior_launches, prior_grads, prior_known, prior_rug_share, prior_moon_share)
-                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (mint) DO UPDATE SET
+                                                         prior_launches, prior_grads, prior_known, prior_rug_share, prior_moon_share, grad_quote)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (mint) DO UPDATE SET
                                   graduated_at = COALESCE(corpus_meta.graduated_at, EXCLUDED.graduated_at),
                                   create_ts = COALESCE(corpus_meta.create_ts, EXCLUDED.create_ts), creator = COALESCE(corpus_meta.creator, EXCLUDED.creator),
                                   dev_sol = COALESCE(corpus_meta.dev_sol, EXCLUDED.dev_sol), dev_tokens = COALESCE(corpus_meta.dev_tokens, EXCLUDED.dev_tokens),
@@ -303,12 +326,13 @@ class Aggregator:
                                   ttg_min = COALESCE(corpus_meta.ttg_min, EXCLUDED.ttg_min), rq0 = COALESCE(corpus_meta.rq0, EXCLUDED.rq0), pool_id = COALESCE(corpus_meta.pool_id, EXCLUDED.pool_id),
                                   prior_launches = COALESCE(corpus_meta.prior_launches, EXCLUDED.prior_launches), prior_grads = COALESCE(corpus_meta.prior_grads, EXCLUDED.prior_grads),
                                   prior_known = COALESCE(corpus_meta.prior_known, EXCLUDED.prior_known), prior_rug_share = COALESCE(corpus_meta.prior_rug_share, EXCLUDED.prior_rug_share),
-                                  prior_moon_share = COALESCE(corpus_meta.prior_moon_share, EXCLUDED.prior_moon_share), updated_at = now()""",
+                                  prior_moon_share = COALESCE(corpus_meta.prior_moon_share, EXCLUDED.prior_moon_share),
+                                  grad_quote = COALESCE(corpus_meta.grad_quote, EXCLUDED.grad_quote), updated_at = now()""",
                              (mint, g, ct, c.get("creator") if c else None, c.get("dev_sol") if c else None, c.get("dev_tokens") if c else None,
                               (float(c["dev_tokens"]) / float(c["supply"])) if c and c.get("dev_tokens") and c.get("supply") else None,
                               c.get("supply") if c else None, c.get("mayhem") if c else None, c.get("uri") if c else None, c.get("name") if c else None, c.get("symbol") if c else None,
                               ((e["timestamp"] - c["ts"]) / 60000.0) if c else None, e.get("quoteInPool"), e.get("poolId"),
-                              h["prior_launches"], h["prior_grads"], h["prior_known"], h["prior_rug_share"], h["prior_moon_share"]))
+                              h["prior_launches"], h["prior_grads"], h["prior_known"], h["prior_rug_share"], h["prior_moon_share"], e.get("quoteMint")))
                 conn.execute("INSERT INTO corpus_tokens (mint, graduated_at, grad_slot, source, status) VALUES (%s,%s,%s,'stream','pending') ON CONFLICT (mint) DO NOTHING",
                              (mint, g, int(e.get("block") or 0)))
                 st = self.curve.pop(mint, None)
@@ -529,7 +553,7 @@ async def _housekeeping(stop: threading.Event | None, agg: Aggregator, io: dict)
                 log.exception("minute flush failed; rows kept for the next attempt")
             published = agg.flushed_through != before
             if published or now - last_status >= 5.0:     # a minute was written: the engine hears of it now, not at the next 5 s status
-                agg.write_creates(); agg.write_pools()
+                agg.write_creates(); agg.write_pools(); agg.write_quotes()
                 _status(agg, {"events_per_s": io["rate_n"] / max(now - io["rate_t"], 1e-9), "pending_minutes": len(agg.minutes), "lag_s": now - io["last_msg"],
                               "connected": io["connected"] or bool(agg.feed and agg.feed.up(now)), "pumpapi_connected": io["connected"], "last_error": io["last_error"],
                               "source": agg.feed.source if agg.feed is not None and agg.feed.up(now) else "pumpapi", "feed": agg.feed.status() if agg.feed is not None else None,
@@ -588,7 +612,7 @@ async def _run(stop: threading.Event | None, agg: Aggregator) -> None:
         agg.flush(int(time.time() // 60) * 60 + 60)
     except Exception:
         log.exception("final minute flush failed")
-    agg.write_creates(); agg.write_pools()
+    agg.write_creates(); agg.write_pools(); agg.write_quotes()
 
 
 def main(stop_event: threading.Event | None = None) -> None:

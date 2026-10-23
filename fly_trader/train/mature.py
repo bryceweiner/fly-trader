@@ -2,8 +2,10 @@
 as feature rows — the population the live bot actually meets on Jupiter's lists, as opposed to the first 12 hours
 after graduation covered by ``replay_assemble``.
 
-Stage 1 (``aggregate_day``): all ``pump-amm`` trade legs of pump.fun-origin mints (suffix ``pump``, or a pump.fun graduate
-without it: ``corpus_meta.pumpfun_graduates``; SOL-quoted) of a UTC day,
+Stage 1 (``aggregate_day``): all PumpSwap (``pump-amm``) and Meteora DLMM trade legs (``UNIVERSE_POOLS``: since
+2026-10-23 a coin's DLMM pool competes for its minute like any other pool, and is the only SOL market of a coin graduated
+into a USDC, stock-token or other-coin pool) of pump.fun-origin mints (suffix ``pump``, or a pump.fun graduate without it:
+``corpus_meta.pumpfun_graduates``; SOL-quoted) of a UTC day,
 except legs in pools created directly rather than by a pump.fun migration (``pump_pools``: their owner can pull the unburned
 liquidity, and the withdrawal is not in the trade data, so the price just stops after a pump),
 with causal filters only (the live stream applies the same ones): quote reserve 0.001–100,000 SOL, a leg more than 50× away
@@ -51,7 +53,7 @@ from ..db.connection import transaction
 from ..market.exit_cost import PUMP_SUPPLY
 from ..market.features import FEATURE_VERSION, FIDX, TokenMeta, TokenState
 from .corpus_features import SCHEMA as FEAT_SCHEMA, PRE_COLS, _epoch_s, _row
-from .corpus_meta import blocked_pool_ids, pumpfun_graduates
+from .corpus_meta import UNIVERSE_POOLS, blocked_pool_ids, pumpfun_graduates
 from .flow import FLOW_COLS, MARKET_COLS, N_SKILL, SKILL_COLS, UNKNOWN, FlowWindow, MarketWindow
 
 log = logging.getLogger(__name__)
@@ -240,7 +242,7 @@ def aggregate_table(files: list[str], skill, blocked: list[str] | None = None, i
     # and per (mint, minute) the pool with the most legs
     con.execute(f"""CREATE TEMP TABLE raw AS SELECT mint, ts, slot, trader, side, sol, price, quote_in_pool, {pool_sel}
                     FROM read_parquet(?, union_by_name = true)
-                    WHERE pool = 'pump-amm' AND price > 0 AND (mint LIKE '%pump' OR mint IN (SELECT mint FROM grads))
+                    WHERE pool IN ({", ".join(f"'{x}'" for x in UNIVERSE_POOLS)}) AND price > 0 AND (mint LIKE '%pump' OR mint IN (SELECT mint FROM grads))
                       AND quote_in_pool BETWEEN 0.001 AND 100000 {quote_filter} {pool_filter}""", [files])
     con.execute("""CREATE TEMP TABLE banded AS SELECT * EXCLUDE (pref) FROM (
                       SELECT *, median(price) OVER (PARTITION BY mint ORDER BY ts, slot ROWS BETWEEN 200 PRECEDING AND 1 PRECEDING) AS pref FROM raw)

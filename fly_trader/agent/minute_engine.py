@@ -49,7 +49,7 @@ from ..db.connection import transaction
 from ..market.exit_cost import PUMP_SUPPLY
 from ..market.exit_cost import cost_at_size, cost_label
 from ..market.features import FEATURES, FIDX, TokenMeta, TokenState
-from ..train.corpus_meta import FEATURE_COLS as META_COLS
+from ..train.corpus_meta import FEATURE_COLS as META_COLS, sol_select
 from ..train.decisions import MIN_RESQ_SOL, MIN_VOL_15M_SOL, X_COLS
 from ..train.flow import FlowWindow, MarketWindow
 from ..train.mature import MASKED
@@ -155,7 +155,7 @@ class MinuteEngine:
             if self.rh:                                  # Robinhood Chain: rh_meta, the same columns (rh/meta.py), plus the quote class
                 r = conn.execute("SELECT graduated_at, supply, quote_class, " + ", ".join(META_COLS) + " FROM rh_meta WHERE mint = %s", (mint,)).fetchone()
             else:
-                r = conn.execute("SELECT graduated_at, supply, " + ", ".join(META_COLS) + " FROM corpus_meta WHERE mint = %s", (mint,)).fetchone()
+                r = conn.execute("SELECT graduated_at, supply, " + sol_select(META_COLS) + " FROM corpus_meta WHERE mint = %s", (mint,)).fetchone()
             hit = self.meta_cache[mint] = {"row": dict(r) if r else None, "at": time.time()}
         return hit["row"]
 
@@ -209,7 +209,8 @@ class MinuteEngine:
 
     # ---- one minute ----
     def _aggregate(self, conn, m0: datetime, m1: datetime) -> dict[str, dict]:
-        """PumpAPI minutes: every SOL-quoted PumpSwap pump.fun token, the same fields as the archive. Robinhood Chain: the
+        """PumpAPI minutes: every pump.fun token's SOL-quoted PumpSwap or Meteora DLMM pool with the most legs that minute, the
+        same fields as the archive. Robinhood Chain: the
         rh_minutes of graduated Pons pools in ETH (rh/minutes.py), under the same keys."""
         if self.rh:
             rows = conn.execute("SELECT mint, pool_id, open, high, low, close, buy_eth, sell_eth, n_buys, n_sells, n_traders, resq_eth, fee_rate, "

@@ -3,7 +3,7 @@
 **A fruit-fly connectome that trades memecoins on Solana and Robinhood Chain, and Kalshi prediction markets.**
 Website: [fly-trader.app](https://fly-trader.app) · Token: $FLY (coming soon) · X community: coming soon
 
-fly-trader trains the central brain of the [FlyWire](https://flywire.ai) adult *Drosophila* connectome (41,756 neurons, 1.04 M synapses; FAFB v783) to trade memecoins once they graduate: PumpSwap tokens from [pump.fun](https://pump.fun) on Solana, and Uniswap v4 tokens from Pons on Robinhood Chain. A gradient-boosted selector learns which tokens to buy from 1-minute market data at real trading costs, on both chains' rows together. The fly starts as that selector: it scores every token with the selector's own prediction and buys only what the selector buys. Its mushroom body then learns, from what those trades earn, where the selector is wrong. A second trading type trades [Kalshi](https://kalshi.com) prediction markets with its own fly. Every decision is journaled to Postgres.
+fly-trader trains the central brain of the [FlyWire](https://flywire.ai) adult *Drosophila* connectome (41,756 neurons, 1.04 M synapses; FAFB v783) to trade memecoins once they graduate: [pump.fun](https://pump.fun) graduates on Solana, in their PumpSwap and Meteora DLMM pools, and Uniswap v4 tokens from Pons on Robinhood Chain. A gradient-boosted selector learns which tokens to buy from 1-minute market data at real trading costs, on both chains' rows together. The fly starts as that selector: it scores every token with the selector's own prediction and buys only what the selector buys. Its mushroom body then learns, from what those trades earn, where the selector is wrong. A second trading type trades [Kalshi](https://kalshi.com) prediction markets with its own fly. Every decision is journaled to Postgres.
 
 It is an experiment. No performance is claimed. The fly trades a paper book; once it has earned the selector's seat (the handover) and signing is allowed (`LIVE_ENABLED=1` and the live prerequisites), its decisions also trade the bot wallet. Live execution is default-deny.
 
@@ -19,7 +19,7 @@ Jupiter Tokens v2 ─────▶ token stats (history for future inputs)
 
 | Piece | Where | What |
 |---|---|---|
-| Market data | `fly_trader/ingest/replay_pull.py`, `pumpstream.py` | Every PumpSwap trade of pump.fun tokens, from the free hourly archive (training) and the live stream (trading), aggregated to the same 1-minute candles |
+| Market data | `fly_trader/ingest/replay_pull.py`, `pumpstream.py` | Every SOL-quoted PumpSwap and Meteora DLMM trade of pump.fun tokens, from the free hourly archive (training) and the live stream (trading), aggregated to the same 1-minute candles |
 | Robinhood Chain | `fly_trader/rh` | Pons launches that graduated into Uniswap v4 pools: its own indexer on Envio HyperSync (the official RPC when HyperSync fails), the quote assets' ETH prices and the same 1-minute rows, in ETH; its own books, bankroll and circuit; live swaps through KyberSwap with a Uniswap v4 fallback |
 | Features | `fly_trader/market/features.py`, `train/mature.py` | One engine for training and trading: returns, volatility, order flow, volume, liquidity, trade counts, age, drawdowns, launch facts and creator history |
 | Costs | `fly_trader/market/exit_cost.py` | Measured, not assumed: the PumpSwap pool fee by market cap (1.25 % → 0.30 %), Jupiter's 10 bps, the network fee, and constant-product price impact |

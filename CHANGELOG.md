@@ -67,6 +67,16 @@ ships signed releases built from this development line.
     graduate the moment it sees the migration and reloads `corpus_meta`'s every 5 minutes. Their custom pools stay blocked.
   - On 2026-10-21 they add 1,582 mints to the day's 10,754 and 5.5 % of its volume. No existing row changes.
   - The corpus is rebuilt to include them (aggregation version 5). The current selector and fly keep trading through it.
+- **Solana: a pump.fun coin's Meteora DLMM pools make its minutes too.**
+  - Each minute keeps the pool with the most legs, as before, now among the coin's SOL-quoted PumpSwap and DLMM pools.
+    The stream and the corpus apply the same rule: on 2026-10-22 15:00 UTC both gave 24,552 minute rows for 3,078 coins.
+  - In that hour 99 % of minutes kept their pool, 210 minutes of 39 coins moved to a DLMM pool, and 101 coins gained 937
+    minutes. Coins graduated into a pool quoted in TTWO, PUMP, WBTC or USDC (Dacity, Macca, pill, baton, Au) have their
+    only SOL market there.
+  - A graduation's quote asset is now kept (`corpus_meta.grad_quote`): from the migration, or for an older coin from trades
+    in its own pool. A coin graduated in another quote has its dev buy and seed reserve in that quote's units, so those two
+    inputs read as unknown for it, live and in training. 17 % of graduations on 2026-10-20 were not in SOL.
+  - Paper fills charge the minute's pool fee, so a DLMM minute costs that pool's dynamic fee.
 
 ### The selector
 
