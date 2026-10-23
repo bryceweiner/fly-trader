@@ -14,6 +14,12 @@ ships signed releases built from this development line.
     that chain's seat goes back to the selector. A seat recorded for another fly is cleared when the fly starts (an
     install that ran release 10). A seat set by hand, naming no fly, stays.
   - An untested fly races `HANDOVER_DAYS` (14) before it trades live (Bryce, 2026-10-23).
+- **Every corpus build runs in a child process at the lowest CPU priority, not only big rebuilds.**
+  - Only more than three stale aggregates went to the child. A restart that killed one after its aggregates but before
+    its features left 20 days to re-feature in the console's own interpreter: ~80 s a day, 16 GB and a whole core, for
+    half an hour (2026-10-23).
+  - A routine day's build (~80 s) no longer runs beside the live minute pipeline either, and neither does corpus_meta's
+    rebuild, which the child now runs before its builds: 36-82 s every 30 minutes until now.
 
 ## 2026-10-23, release 10: A retrained selector trades `ev` again, and live money follows the seat
 

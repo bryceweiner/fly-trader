@@ -23,9 +23,9 @@ graduation is inside the archive (``corpus_meta.graduated_at``, the source live 
 Output: ``data/corpus/features_mature/<day>/part.parquet``. Both outputs carry a version in their Parquet metadata
 (``AGG_VERSION``, ``market.features.FEATURE_VERSION``); ``loop_once`` rebuilds any file from another version and moves
 the old one to ``data/corpus/_mature_stale/``. ``AGG_VERSION`` only says when the files are rebuilt: it is not a model
-definition (``train/selector.DATA_VERSION``), so a rebuild never retires a model. A rebuild of more than
-``BULK_REBUILD_DAYS`` days runs in a child process at the lowest CPU priority (``loop_once_apart``), never beside the
-console's live minute pipeline. Feature parts also record how many of their mints had a known graduation
+definition (``train/selector.DATA_VERSION``), so a rebuild never retires a model. The console builds in a child process
+at the lowest CPU priority (``loop_once_apart``), never beside its live minute pipeline; ``fly-trader build-mature`` is
+that child. Feature parts also record how many of their mints had a known graduation
 (``fly_known``); a part is rebuilt once ``corpus_meta`` dates more of them (older days are backfilled after newer ones).
 """
 from __future__ import annotations
@@ -62,7 +62,6 @@ MATURE_FEAT_DIR = config.CORPUS_DIR / "features_mature"
 STALE_DIR = config.CORPUS_DIR / "_mature_stale"
 AGG_VERSION = 5          # 2: causal price band and per-minute dominant pool; 3: directly created (custom) PumpSwap pools excluded; 4: wallet flow columns (train/flow.py);
                          # 5: pump.fun graduates whose mint lacks the "pump" suffix included (corpus_meta.pumpfun_graduates)
-BULK_REBUILD_DAYS = 3    # more stale aggregates than this are rebuilt by a child process at the lowest CPU priority (live money first)
 KNOWN_REBUILD_FRAC, KNOWN_REBUILD_MIN = 0.01, 25     # a part is rebuilt once corpus_meta dates this many more of its mints
 MASKED = ["logsigners_15m", "logsigners_1h", "hawkes", "log_since_last", "vpin_15m"]
 EXTRA = ["traders_15m", "traders_1h", "n_trades_1m"] + FLOW_COLS + SKILL_COLS + MARKET_COLS
@@ -412,19 +411,22 @@ def _knows_more(part: Path, grads: dict) -> bool:
     return grew >= max(KNOWN_REBUILD_MIN, KNOWN_REBUILD_FRAC * len(mints))
 
 
-def stale_aggregates() -> list[Path]:
-    """Aggregates the next round rebuilds: another aggregation (or skill) version, with their hour files at hand."""
-    return [f for f in sorted(MATURE_DIR.glob("*.parquet")) if agg_stale(f) and _hour_files(date.fromisoformat(f.stem))]
+META_FAILED = 3              # build-mature --meta: corpus_meta's rebuild failed, so no day was built (the round is tried again)
 
 
-def loop_once_apart(stop_event: threading.Event | None = None) -> int | None:
-    """One build round in a child process (``fly-trader build-mature``) at the lowest CPU priority, waited for. A version
-    change re-aggregates and re-features every day (~100 s a day, ~5 h for the whole archive): that work must not share the
-    console's interpreter with the live minute pipeline (CLAUDE.md, live money first). On stop the child is ended; every
-    file is written atomically, so an ended round loses only its unfinished day. Its exit code, or None when stopped."""
+def loop_once_apart(stop_event: threading.Event | None = None, meta: bool = False) -> int | None:
+    """One build round in a child process (``fly-trader build-mature``) at the lowest CPU priority, waited for: every round
+    the console runs. A version change re-aggregates and re-features every day (~100 s a day, ~5 h for the whole archive),
+    and a routine day still costs ~80 s and ~16 GB: none of it may share the console's interpreter with the live minute
+    pipeline (CLAUDE.md, live money first). Until 2026-10-23 only more than three stale aggregates went to the child, so a
+    restart that killed a child after its aggregates but before its features left the console re-featuring 20 days
+    itself. On stop the child is ended; every file is written atomically, so an ended round loses only its unfinished
+    day. ``meta``: the child first rebuilds ``corpus_meta`` (36-82 s on 2026-10-23, every 30 minutes; the console's replay
+    worker ran it in its own interpreter until then), and builds only once that succeeded (else ``META_FAILED``). Its
+    exit code, or None when stopped."""
     nice = ["/usr/bin/nice", "-n", "19"] if os.path.exists("/usr/bin/nice") else []      # not preexec_fn: unsafe in a threaded process
-    proc = subprocess.Popen([*nice, sys.executable, "-m", "fly_trader", "build-mature"], stdout=subprocess.DEVNULL)
-    log.info("mature build: %d stale day(s), rebuilt by child process %d at the lowest CPU priority", len(stale_aggregates()), proc.pid)
+    proc = subprocess.Popen([*nice, sys.executable, "-m", "fly_trader", "build-mature", *(["--meta"] if meta else [])], stdout=subprocess.DEVNULL)
+    log.info("mature build round in child process %d at the lowest CPU priority", proc.pid)
     while proc.poll() is None:
         if stop_event is not None and stop_event.is_set():
             proc.terminate()
@@ -495,6 +497,16 @@ def _loop_once() -> int:
     return n
 
 
-def main() -> None:
+def main(meta: bool = False) -> int:
+    """``fly-trader build-mature``: one build round (``loop_once``); ``meta``: ``corpus_meta.rebuild`` first, which the
+    round's day builds read (graduations, custom pools), and no build when it fails (``META_FAILED``)."""
     logging_setup.setup("replay")
+    if meta:
+        from . import corpus_meta
+        try:
+            corpus_meta.rebuild()
+        except Exception:
+            log.exception("corpus_meta rebuild failed; the mature build waits for the next round")
+            return META_FAILED
     print(f"processed {loop_once()} day steps")
+    return 0

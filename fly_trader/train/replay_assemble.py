@@ -12,6 +12,8 @@ swap-api puller writes, so ``train/corpus_features.py`` needs no changes:
 * a ``corpus_tokens`` row (source 'replay', status 'done') with the graduation time and slot from the migrate event.
 
 DuckDB scans the day's hourly trade files with the graduated-mint list pushed down; a day is ~2–3 GB on disk.
+After the new days (and every 30 minutes) ``corpus_meta`` is rebuilt and a corpus build round runs, both in one child
+process at the lowest CPU priority (``mature.loop_once_apart(meta=True)``), never in the console's interpreter.
 """
 from __future__ import annotations
 
@@ -27,7 +29,7 @@ import pyarrow.parquet as pq
 from .. import config, logging_setup
 from ..db.connection import transaction
 from ..ingest.corpus_pull import CANDLE_SCHEMA, TRADE_SCHEMA
-from . import corpus_meta, mature
+from . import mature
 
 log = logging.getLogger(__name__)
 CANDLE_SCHEMA_R = CANDLE_SCHEMA.append(pa.field("resq_sol", pa.float64()))
@@ -157,18 +159,14 @@ def assemble_loop(stop_event: threading.Event | None = None, idle_s: float = 60.
             except Exception:
                 log.exception("assemble %s failed", d)
         if days or time.time() - _last_meta[0] > 1800:
-            try:
-                corpus_meta.rebuild(); _last_meta[0] = time.time()
+            try:            # corpus_meta's rebuild, then the build round: one child at the lowest CPU priority, never the console's interpreter
+                rc = mature.loop_once_apart(stop_event, meta=True)
+                if rc == mature.META_FAILED:
+                    log.warning("corpus_meta rebuild failed (its log: replay.log); the round is tried again")
+                else:
+                    _last_meta[0] = time.time()
             except Exception:
-                log.exception("corpus_meta rebuild failed; mature build waits for the next round")
-            else:
-                try:
-                    if len(mature.stale_aggregates()) > mature.BULK_REBUILD_DAYS:
-                        mature.loop_once_apart(stop_event)          # a version change's rebuild: hours of work, kept out of the console
-                    else:
-                        mature.loop_once()
-                except Exception:
-                    log.exception("mature universe build failed")
+                log.exception("corpus build round failed")
         end = time.time() + idle_s
         while time.time() < end and not (stop_event is not None and stop_event.is_set()):
             time.sleep(1.0)

@@ -199,7 +199,7 @@ def _cmd_selector_eval(args):
 
 def _cmd_build_mature(args):
     from .train import mature
-    mature.main()
+    return mature.main(meta=args.meta)
 
 
 def _cmd_build_corpus_meta(args):
@@ -360,7 +360,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("build-corpus-features").set_defaults(fn=_cmd_build_corpus_features)
     sub.add_parser("assemble-replay").set_defaults(fn=_cmd_assemble_replay)
     sub.add_parser("build-corpus-meta").set_defaults(fn=_cmd_build_corpus_meta)
-    sub.add_parser("build-mature").set_defaults(fn=_cmd_build_mature)
+    p_bm = sub.add_parser("build-mature", help="one corpus build round (the console's replay worker runs it as a child process)")
+    p_bm.add_argument("--meta", action="store_true", help="rebuild corpus_meta first (the replay worker's round)")
+    p_bm.set_defaults(fn=_cmd_build_mature)
     p_rc = sub.add_parser("rh-build-corpus", help="build the due Robinhood Chain corpus days (the stream starts it as a child process)")
     p_rc.add_argument("--days", type=int, default=31, help="days at most per run (each run reads every minute's fee once)")
     p_rc.set_defaults(fn=_cmd_rh_build_corpus)
