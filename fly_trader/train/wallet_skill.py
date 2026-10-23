@@ -71,8 +71,12 @@ def build_wallet_day(d: date, out_dir: Path | None = None) -> int:
         return 0
     trades, aggs, parts = inp
     con = duckdb.connect()
-    con.execute("""CREATE TEMP TABLE legs AS SELECT mint, trader, ts, side, sol, price FROM read_parquet(?, union_by_name = true)
-                   WHERE pool = 'pump-amm' AND mint LIKE '%pump' AND price > 0 AND sol > 0 AND trader IS NOT NULL""", [trades])
+    cols = [c[0] for c in con.execute("SELECT * FROM read_parquet(?, union_by_name = true) LIMIT 0", [trades]).description]
+    quote_filter = "AND (quote_mint IS NULL OR quote_mint = 'So11111111111111111111111111111111111111112')" if "quote_mint" in cols else ""
+    # the universe's legs (mature.aggregate_table): pump.fun's coins, SOL-quoted (a leg in another quote is not a SOL amount)
+    con.execute(f"""CREATE TEMP TABLE legs AS SELECT mint, trader, ts, side, sol, price FROM read_parquet(?, union_by_name = true)
+                    WHERE pool = 'pump-amm' AND mint LIKE '%pump' AND price > 0 AND sol > 0
+                      AND trader IS NOT NULL {quote_filter}""", [trades])
     con.execute("CREATE TEMP TABLE closes AS SELECT mint, ts AS mts, close FROM read_parquet(?) ORDER BY mint, mts", [aggs])
     con.execute("CREATE TEMP TABLE ec AS SELECT mint, ts AS mts, exit_cost_0p1 AS ec FROM read_parquet(?)", [parts])
     out = []
