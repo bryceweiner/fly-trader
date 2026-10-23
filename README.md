@@ -139,7 +139,7 @@ Every knob is an environment variable read by `fly_trader/config.py`; `.env.exam
 
 ```
 init-db  wallet {new,show} [--key-file]  ui [--port] [--host] [--observe]  run  status  health  ready-for-restart  worker {start,stop,status} [name]
-pumpstream  replay-pull  refetch-pool-ids  discover [--once]  fit-wallet-skill [--days]
+pumpstream  replay-pull  refetch-pool-ids  refetch-archive  discover [--once]  fit-wallet-skill [--days]
 assemble-replay  build-corpus-meta  build-mature  build-corpus-features  backtest-corpus [--max-tokens --days --fees --only --universe]
 train-selector [--days]  train-fly-selector [--days --epochs --device]  fly-replay [--days --device --start-day]
 selector-eval  reset-training [--no-archive]  models convert  apply-release DIR [--bootstrap]

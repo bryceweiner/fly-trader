@@ -103,9 +103,10 @@ def rebuild(outcome_batch: int = 20000) -> int:
     n_pp = backfill_pump_pools()               # before mature.loop_once aggregates the new days
     creates =con.execute(f"""SELECT mint, min(ts) AS create_ts, arg_min(signer, ts) AS creator, arg_min(quote_amount, ts) AS dev_sol,
                               arg_min(initial_buy, ts) AS dev_tokens, arg_min(supply, ts) AS supply, arg_min(mayhem, ts) AS mayhem, arg_min(uri, ts) AS uri,
-                              arg_min(name, ts) AS name, arg_min(symbol, ts) AS symbol, arg_min(sig, ts) AS sig FROM read_parquet('{ev}') WHERE action = 'create' AND pool = 'pump' GROUP BY mint""").df()
+                              arg_min(name, ts) AS name, arg_min(symbol, ts) AS symbol, arg_min(sig, ts) AS sig FROM read_parquet('{ev}', union_by_name = true)
+                              WHERE action = 'create' AND pool = 'pump' GROUP BY mint""").df()
     migr = con.execute(f"""SELECT mint, min(ts) AS g, arg_min(quote_in_pool, ts) AS rq0, arg_min(pool_id, ts) AS pool_id
-                           FROM read_parquet('{ev}') WHERE action = 'migrate' AND pool = 'pump-amm' GROUP BY mint""").df()
+                           FROM read_parquet('{ev}', union_by_name = true) WHERE action = 'migrate' AND pool = 'pump-amm' GROUP BY mint""").df()
     con.close()
     meta = migr.merge(creates, on="mint", how="left")
     meta["ttg_min"] = (meta["g"] - meta["create_ts"]).dt.total_seconds() / 60.0

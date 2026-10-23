@@ -87,11 +87,21 @@ def _skill_version() -> str:
     return skill_version()
 
 
+def _inputs_newer(p: Path) -> bool:
+    """A day's hour files written after its aggregate: an hour fetched late, or the archive downloaded again
+    (``replay_pull.refetch_main``) to keep more venues' legs."""
+    try:
+        t = p.stat().st_mtime
+        return any(os.path.getmtime(f) > t for f in _hour_files(date.fromisoformat(p.stem)))
+    except (OSError, ValueError):
+        return False
+
+
 def agg_stale(path) -> bool:
-    """An aggregate to rebuild: another aggregation version, or skill buckets from another skill version while its day now
-    has a table of the version in force (days without a table keep 'none')."""
+    """An aggregate to rebuild: another aggregation version, hour files newer than it, or skill buckets from another skill
+    version while its day now has a table of the version in force (days without a table keep 'none')."""
     p = Path(path)
-    if part_version(p) != AGG_VERSION:
+    if part_version(p) != AGG_VERSION or _inputs_newer(p):
         return True
     want = _skill_version()
     return want != "none" and (SKILL_DIR / f"{p.stem}.parquet").exists() and agg_skill(p) != want
@@ -425,6 +435,18 @@ def loop_once_apart(stop_event: threading.Event | None = None) -> int | None:
     if proc.returncode:
         log.warning("mature build child %d exited %d (its log: replay.log)", proc.pid, proc.returncode)
     return proc.returncode
+
+
+def try_loop_once() -> int | None:
+    """``loop_once`` unless another process holds the build lock (then None at once): the archive refetch rebuilds the
+    days it rewrote without waiting hours behind a rebuild that will see them anyway."""
+    MATURE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(MATURE_DIR / ".build.lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None
+        return _loop_once()
 
 
 def loop_once() -> int:

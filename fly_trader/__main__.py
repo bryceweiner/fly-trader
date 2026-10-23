@@ -128,6 +128,12 @@ def _cmd_build_corpus_features(args):
     corpus_features.main()
 
 
+def _cmd_refetch_archive(args):
+    from .ingest import replay_pull
+    out = replay_pull.refetch_main()
+    print(f"archive refetch: {out['done']} of {out['planned']} hours rewritten, {out['failed']} failed")
+
+
 def _cmd_refetch_pool_ids(args):
     from .ingest import replay_pull
     print(f"{replay_pull.refetch_missing_pool_id()} archive hours marked for re-download (run the replay worker or fly-trader replay-pull)")
@@ -341,6 +347,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("assemble-replay").set_defaults(fn=_cmd_assemble_replay)
     sub.add_parser("build-corpus-meta").set_defaults(fn=_cmd_build_corpus_meta)
     sub.add_parser("build-mature").set_defaults(fn=_cmd_build_mature)
+    sub.add_parser("refetch-archive", help="download older archive hours again to keep every venue's SOL legs (run apart from the console, under nice)").set_defaults(fn=_cmd_refetch_archive)
     sub.add_parser("selector-eval").set_defaults(fn=_cmd_selector_eval)
     ts_ = sub.add_parser("train-selector"); ts_.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
     ts_.set_defaults(fn=_cmd_train_selector)

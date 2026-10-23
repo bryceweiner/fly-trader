@@ -110,6 +110,14 @@ ships signed releases built from this development line.
 
 ### Platform
 
+- **The archive's hour files keep every venue's SOL-quoted trades, not only pump.fun's curve and PumpSwap.**
+  - Meteora DLMM and DAMM, Raydium, Orca and other launchpads' curves add about a third to the rows (~90 MB an hour).
+    The lifecycle events keep the quote mint. Both files are written atomically and the trades file says what it keeps.
+  - `fly-trader refetch-archive` downloads the older hours again in its own process, 2 at a time (`REFETCH_PARALLEL`).
+    It starts no download while the live stream is more than 15 s behind (`REFETCH_MAX_LAG_S`), leaves the newest 6 hours
+    to the console, and rebuilds each finished day itself. About 4,500 hours, roughly 2.7 TB of downloads; run it under
+    `nice -n 19` only after the console runs this code. Progress: `ui_settings['replay_refetch_status']`.
+  - A day is rebuilt whenever one of its hour files is newer than its aggregate.
 - **A stream relay is ready, but switched off.**
   - `stream_relay/` holds PumpAPI's stream on a server near its source. It forwards only the events and fields the
     minutes use: about 33 KB/s at the busiest minute, instead of the whole stream.

@@ -441,6 +441,11 @@ REPLAY_URL = env_str("REPLAY_URL", "https://replay.pumpapi.io")
 REPLAY_START = env_str("REPLAY_START", "2026-04-18")
 REPLAY_PARALLEL = env_int("REPLAY_PARALLEL", 4)                     # concurrent hour downloads (~2-4 MB/s each)
 REPLAY_ASSEMBLE = env_bool("REPLAY_ASSEMBLE", True)                  # 0: download and parse only (no assembly / corpus_meta / mature rounds)
+# ``fly-trader refetch-archive`` (ingest/replay_pull.refetch_main): hours written before the hour files kept every venue's SOL
+# legs are downloaded again, beside the console, at these settings; it starts no download while the live stream lags
+REFETCH_PARALLEL = env_int("REFETCH_PARALLEL", 2)                    # concurrent hour downloads
+REFETCH_MAX_LAG_S = env_float("REFETCH_MAX_LAG_S", 15.0)             # the live stream's newest event this far behind its status: wait
+REFETCH_SKIP_RECENT_H = env_int("REFETCH_SKIP_RECENT_H", 6)          # the newest hours are the console's replay worker's
 REPLAY_DIR = CORPUS_DIR / "replay"
 CORPUS_PULL_BEFORE = env_str("CORPUS_PULL_BEFORE", REPLAY_START)     # swap-api puller only handles graduations before the replay archive begins
 
