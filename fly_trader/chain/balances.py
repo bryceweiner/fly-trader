@@ -31,11 +31,14 @@ class Snapshot:
 
 
 def snapshot_balances(rpc, pubkey) -> Snapshot:
-    lamports = int(rpc.get_balance(str(pubkey)))
+    if hasattr(rpc, "wallet_state"):                     # one round trip (chain/rpc.HttpSolanaRpc)
+        lamports, accts = rpc.wallet_state(str(pubkey)); lamports = int(lamports)
+    else:
+        lamports, accts = int(rpc.get_balance(str(pubkey))), rpc.get_token_accounts_by_owner(str(pubkey))
     tokens: dict[str, int] = {}
     decimals: dict[str, int] = {}
     deposits: dict[str, int] = {}
-    for acct in rpc.get_token_accounts_by_owner(str(pubkey)):
+    for acct in accts:
         mint = acct["mint"]
         tokens[mint] = tokens.get(mint, 0) + int(acct["amount"])
         if acct.get("decimals") is not None:

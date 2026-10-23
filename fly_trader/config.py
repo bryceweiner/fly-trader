@@ -17,7 +17,7 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 SECRET_ENV_NAMES = ("HELIUS_API_KEY", "JUPITER_API_KEY", "BOT_PRIVATE_KEY", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH",
                     "RELAY_SECRET", "TELEGRAM_BOT_TOKEN", "VAULT_BACKUP_HF_TOKEN", "VAULT_SOLANA_RPC_URL", "SIGNER_RPC_URL",
                     "SOLANA_CHECK_RPC_URL", "HEALTHCHECK_URL", "RH_BOT_PRIVATE_KEY", "RH_RPC_URL_LOGS", "ENVIO_API_TOKEN", "QUICKNODE_API_KEY",
-                    "QUICKNODE_RH_API_KEY", "QUICKNODE_RH_API_URL", "RH_RPC_URL_TX")
+                    "QUICKNODE_RH_API_KEY", "QUICKNODE_RH_API_URL", "RH_RPC_URL_TX", "STREAM_RELAY_TOKEN")
 
 
 def utcnow() -> datetime:
@@ -102,8 +102,10 @@ SLIPPAGE_EXIT_BPS = env_int("SLIPPAGE_EXIT_BPS", 300)
 SLIPPAGE_FORCED_BPS = env_int("SLIPPAGE_FORCED_BPS", 500)
 SLIPPAGE_STEP_BPS = env_int("SLIPPAGE_STEP_BPS", 100)
 MAX_SLIPPAGE_ENTRY_BPS = env_int("MAX_SLIPPAGE_ENTRY_BPS", 300)
+EXEC_THREADS = env_int("EXEC_THREADS", 4)                            # Solana live swaps in flight at once, one per mint (execution/worker.py)
 
 HELIUS_HTTP = "https://mainnet.helius-rpc.com/"
+HELIUS_WSS = "wss://mainnet.helius-rpc.com/"
 JUPITER_SWAP_BASE = "https://api.jup.ag/swap/v2"
 JUPITER_TOKENS_BASE = "https://api.jup.ag/tokens/v2"
 JUPITER_RPS = env_float("JUPITER_RPS", 8.0)
@@ -161,8 +163,9 @@ RESET_ON_START = env_bool("RESET_ON_START", True)  # wipe the paper book and its
 HANDOVER_DAYS = env_int("HANDOVER_DAYS", 14)                        # days of racing first; 0 = as soon as the trades are in
 HANDOVER_MIN_TRADES = env_int("HANDOVER_MIN_TRADES", 30)            # closed paper_fly trades required
 HANDOVER_BEAT_SELECTOR = env_bool("HANDOVER_BEAT_SELECTOR", True)   # and realized P&L at least the paper selector's over the window
-# Trade the wallet as soon as signing is allowed, without waiting for the handover: the fly's teacher-gated decisions (the
-# selector's buys and sizes, less what its learning vetoes) are mirrored onto the wallet whoever holds the seat.
+# Trade the wallet as soon as signing is allowed, without waiting for the handover: the seat holder's decisions are
+# mirrored onto the wallet -- the selector's buys and sizes until the fly wins its race (the fly's learned veto binds only
+# its paper book, which the race measures), the fly's teacher-gated decisions (less what its learning vetoes) after.
 LIVE_WITHOUT_HANDOVER = env_bool("LIVE_WITHOUT_HANDOVER", False)
 
 
@@ -170,6 +173,12 @@ def helius_http_url() -> str:
     if not HELIUS_API_KEY:
         raise RuntimeError("HELIUS_API_KEY is not set")
     return f"{HELIUS_HTTP}?api-key={HELIUS_API_KEY}"
+
+
+def helius_wss_url() -> str:
+    if not HELIUS_API_KEY:
+        raise RuntimeError("HELIUS_API_KEY is not set")
+    return f"{HELIUS_WSS}?api-key={HELIUS_API_KEY}"
 
 
 def summary() -> dict:
@@ -341,6 +350,12 @@ V3_FACTORY = env_str("V3_FACTORY", "0x1f7d7550b1b028f7571e69a784071f0205fd2efa")
 V3_QUOTER_V2 = env_str("V3_QUOTER_V2", "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7")
 RH_WETH = env_str("RH_WETH", "0x0bd7d308f8e1639fab988df18a8011f41eacad73")      # SwapRouter02.WETH9()
 RH_USDG = env_str("RH_USDG", "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168")
+# Robinhood Chain's other Uniswap v4 pools (rh/v4_universe.py): a Pons coin's own pools elsewhere and plain v4 memecoins
+RH_V4_ENABLED = env_bool("RH_V4_ENABLED", True)                     # find, check and index them (0: Pons pools only, as before 2026-10-23)
+RH_V4_QUOTES = tuple(a.strip().lower() for a in env_str("RH_V4_QUOTES", RH_USDG).split(",") if a.strip())   # beside ETH and WETH: a plain memecoin's quote
+RH_V4_HOOKS = tuple(a.strip().lower() for a in env_str("RH_V4_HOOKS", "").split(",") if a.strip())          # hooks allowed besides none (fees outside the Swap event)
+RH_V4_CHECKS_PER_SLOT = env_int("RH_V4_CHECKS_PER_SLOT", 1)          # contract checks a minute (each ~10 reads of the public RPC)
+RH_V4_BACKFILL_RPM = env_float("RH_V4_BACKFILL_RPM", 30)             # fly-trader rh-v4-backfill's own HyperSync pace (the console keeps its share)
 KYBER_API = env_str("KYBER_API", "https://aggregator-api.kyberswap.com/robinhood/api/v1")
 KYBER_ROUTER = env_str("KYBER_ROUTER", "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5")  # MetaAggregationRouterV2: the only router a built Kyber tx may call
 KYBER_CLIENT_ID = env_str("KYBER_CLIENT_ID", "fly-trader")
@@ -432,9 +447,22 @@ REPLAY_URL = env_str("REPLAY_URL", "https://replay.pumpapi.io")
 REPLAY_START = env_str("REPLAY_START", "2026-04-18")
 REPLAY_PARALLEL = env_int("REPLAY_PARALLEL", 4)                     # concurrent hour downloads (~2-4 MB/s each)
 REPLAY_ASSEMBLE = env_bool("REPLAY_ASSEMBLE", True)                  # 0: download and parse only (no assembly / corpus_meta / mature rounds)
+# ``fly-trader refetch-archive`` (ingest/replay_pull.refetch_main): hours written before the hour files kept every venue's SOL
+# legs are downloaded again, beside the console, at these settings; it starts no download while the live stream lags
+REFETCH_PARALLEL = env_int("REFETCH_PARALLEL", 2)                    # concurrent hour downloads
+REFETCH_MAX_LAG_S = env_float("REFETCH_MAX_LAG_S", 15.0)             # the live stream's newest event this far behind its status: wait
+REFETCH_SKIP_RECENT_H = env_int("REFETCH_SKIP_RECENT_H", 6)          # the newest hours are the console's replay worker's
 REPLAY_DIR = CORPUS_DIR / "replay"
 CORPUS_PULL_BEFORE = env_str("CORPUS_PULL_BEFORE", REPLAY_START)     # swap-api puller only handles graduations before the replay archive begins
 
 # ---- PumpAPI live stream (free firehose, same events as the replay archive; the selector's parity feed) ----
 PUMPSTREAM_URL = env_str("PUMPSTREAM_URL", "wss://stream.pumpapi.io")
+# pumpapi: PumpAPI's stream alone | relay: PumpAPI's events from our relay near its source (stream_relay/, ingest/relay_feed.py)
+# build the live minutes, PumpAPI's own stream their backup | helius: our own decoder (ingest/helius_feed.py) does, but
+# Helius's websockets delivered ~1 MB/s in all to this machine (2026-10-19), lagging and dropping half the trades when busy
+SOL_FEED = env_str("SOL_FEED", "pumpapi")
+STREAM_RELAY_URL = env_str("STREAM_RELAY_URL")                       # wss://<server>:<port>/stream (stream_relay/README.md)
+STREAM_RELAY_TOKEN = env_str("STREAM_RELAY_TOKEN")                   # the relay's RELAY_TOKEN
+STREAM_RELAY_CA_FILE = env_str("STREAM_RELAY_CA_FILE")               # the CA of a self-signed relay certificate (else the usual roots)
+HELIUS_FEED_COMMITMENT = env_str("HELIUS_FEED_COMMITMENT", "processed")
 PUMP_MINUTES_KEEP_DAYS = env_int("PUMP_MINUTES_KEEP_DAYS", 7)       # older minute rows are archived to Parquet, then removed from the table

@@ -116,6 +116,34 @@ def test_live_money_first_the_entries_go_out_before_any_paper_trade_is_booked(db
     assert cash1 == pytest.approx(cash0 + quoted - float(new[0]["cost_sol"]))
 
 
+def test_a_row_only_the_seat_holder_buys_is_planned_for_the_wallet_and_never_booked(db_conn, monkeypatch):
+    """While the selector holds the seat, a teacher trade the fly's learning vetoes stays out of the fly's paper book but is
+    planned for the wallet (agent/fly_session.py): its own entry decision, quoted and sized; the book records the veto as why
+    it did not buy, books only its own pick and pays for that alone. A row the selector itself blocks goes nowhere."""
+    monkeypatch.setattr(config, "CAPITAL_SOL", 5.0)
+    table = [{"lo": 0.0, "n": 100, "mean": 0.02, "win": 0.7, "kelly": 0.4}]; veto = "learned veto: score 0.020 < bootstrap 0.050 - 0.02"
+    run = str(uuid.uuid4()); broker = PaperBroker(BOOK); m0 = datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc); mints = ["KEEPpump", "VETOpump", "DUMPpump"]
+    with transaction() as conn:
+        conn.execute("DELETE FROM positions WHERE book = %s", (BOOK,)); conn.execute("DELETE FROM wealth_marks WHERE book = %s", (BOOK,))
+        conn.execute("UPDATE circuit_state SET kill_switch = false, entries_paused = false WHERE id = 1")
+        cash0 = ledger.paper_cash(conn, BOOK)
+        st = paper_trading.trade_minute(_ctx(conn, m0, mints), book=BOOK, run_id=run, beat_no=1, broker=broker, kind="fly", mints=mints,
+                                        infos=[_info(m) for m in mints], scores=np.array([0.05] * 3), threshold=0.01, table=table, horizon_s=600.0,
+                                        allow=np.array([True, False, False]), reasons=np.array(["trade", veto, "selector: dump veto"], dtype=object),
+                                        live_allow=np.array([True, True, False]))
+        rows = conn.execute("SELECT mint, kind, rail, book_targets FROM decisions WHERE run_id = %s ORDER BY id", (run,)).fetchall()
+        opened = ledger.open_positions(conn, BOOK); cash1 = ledger.paper_cash(conn, BOOK)
+        conn.execute("DELETE FROM positions WHERE book = %s", (BOOK,)); conn.execute("DELETE FROM wealth_marks WHERE book = %s", (BOOK,))
+        conn.execute("DELETE FROM decisions WHERE run_id = %s", (run,)); conn.execute("DELETE FROM fills WHERE book = %s", (BOOK,))
+    live = {e["mint"]: e for e in st["entries"]}
+    assert set(live) == {"KEEPpump", "VETOpump"} and live["VETOpump"]["live_only"] and "live_only" not in live["KEEPpump"]
+    assert st["entered"] == 1 and [p["mint"] for p in opened] == ["KEEPpump"]                 # the paper book bought only its own pick
+    assert cash1 == pytest.approx(cash0 - float(opened[0]["cost_sol"]))                        # and paid for that alone
+    assert [(r["kind"], r["rail"], r["book_targets"]) for r in rows if r["mint"] == "VETOpump"] == [("blocked", veto, None), ("fly_enter", None, None)]
+    assert live["VETOpump"]["size_sol"] > 0 and live["VETOpump"]["ref_price"] > 1.0 and live["VETOpump"]["hold_s"] is None
+    assert [r["kind"] for r in rows if r["mint"] == "DUMPpump"] == ["blocked"]                 # the selector's own block: no entry anywhere
+
+
 def test_a_paper_quote_is_what_the_booking_writes(db_conn):
     broker = PaperBroker(BOOK); kw = dict(res_quote_sol=500.0, program_label=None, pool_fee=0.0125)
     q = broker.quote_buy(size_sol=0.2, price=1e-6, mcap_sol=1000.0, decimals=6, **kw)
@@ -128,3 +156,30 @@ def test_a_paper_quote_is_what_the_booking_writes(db_conn):
         conn.execute("DELETE FROM positions WHERE book = %s", (BOOK,)); conn.execute("DELETE FROM fills WHERE book = %s", (BOOK,))
     assert q.ok and q.position_id is None and (q.price, q.token_delta, q.fee_sol) == (f.price, f.token_delta, f.fee_sol)
     assert sale == pytest.approx(s.sol_delta) and not broker.quote_buy(size_sol=0.2, price=None, mcap_sol=None, decimals=6, **kw).ok
+
+
+def test_the_plan_judges_each_token_it_keeps_again_at_the_minutes_price(db_conn, monkeypatch):
+    """A token the book keeps is judged again every minute it has a row (a live mirror retries a failed entry only on a buy
+    again, agent/fly_live.py): a buy carries paper's fill at this minute's price for what the book paid, anything else why not."""
+    monkeypatch.setattr(config, "CAPITAL_SOL", 5.0)
+    table = [{"lo": 0.0, "n": 100, "mean": 0.02, "win": 0.7, "kelly": 0.4}]
+    run = str(uuid.uuid4()); broker = PaperBroker(BOOK); m0 = datetime(2026, 9, 13, 12, 0, tzinfo=timezone.utc); kept = ["HELDpump", "LOWpump", "VETOpump"]
+    with transaction() as conn:
+        conn.execute("DELETE FROM positions WHERE book = %s", (BOOK,)); conn.execute("DELETE FROM wealth_marks WHERE book = %s", (BOOK,))
+        conn.execute("UPDATE circuit_state SET kill_switch = false, entries_paused = false WHERE id = 1")
+        st = paper_trading.trade_minute(_ctx(conn, m0, kept), book=BOOK, run_id=run, beat_no=1, broker=broker, kind="selector", mints=kept,
+                                        infos=[_info(m) for m in kept], scores=np.array([0.05] * 3), threshold=0.01, table=table, horizon_s=600.0)
+        ref0 = {e["mint"]: e["ref_price"] for e in st["entries"]}
+        mints = kept + ["NEWpump"]
+        plan = paper_trading.plan_minute(_ctx(conn, m0 + timedelta(minutes=1), mints, price=1.1), book=BOOK, run_id=run, beat_no=2, broker=broker, kind="selector",
+                                         mints=mints, infos=[{**_info(m), "price": 1.1} for m in mints], scores=np.array([0.05, 0.005, 0.05, 0.05]), threshold=0.01,
+                                         table=table, horizon_s=600.0, allow=np.array([True, True, False, True]),
+                                         reasons=np.array(["trade", "trade", "dump veto", "trade"], dtype=object))
+        conn.execute("DELETE FROM positions WHERE book = %s", (BOOK,)); conn.execute("DELETE FROM wealth_marks WHERE book = %s", (BOOK,))
+        conn.execute("DELETE FROM decisions WHERE run_id = %s", (run,)); conn.execute("DELETE FROM fills WHERE book = %s", (BOOK,))
+    again = plan["rebuy"]
+    assert st["entered"] == 3 and set(again) == set(kept)                                   # NEWpump is not kept: a plain entry or pick
+    assert (again["HELDpump"]["score"], again["HELDpump"]["threshold"], again["HELDpump"]["table"]) == (0.05, 0.01, table)
+    assert again["HELDpump"]["ref_price"] == pytest.approx(1.1 * ref0["HELDpump"])          # the same size at this minute's price
+    assert again["LOWpump"] == {"score": 0.005, "threshold": 0.01, "why": "score 0.005 < 0.010"}
+    assert again["VETOpump"] == {"score": 0.05, "threshold": 0.01, "why": "dump veto"}

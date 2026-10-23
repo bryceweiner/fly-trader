@@ -77,7 +77,7 @@ def assemble_day(d: date) -> tuple[int, int]:
     t0 = time.time(); nxt = d + timedelta(days=1)
     con = duckdb.connect()
     ev_files = _files(d, "events", range(24))
-    grads = con.execute("SELECT mint, min(ts) AS g, arg_min(slot, ts) AS slot, arg_min(quote_in_pool, ts) AS rq0 FROM read_parquet(?) "
+    grads = con.execute("SELECT mint, min(ts) AS g, arg_min(slot, ts) AS slot, arg_min(quote_in_pool, ts) AS rq0 FROM read_parquet(?, union_by_name = true) "
                         "WHERE action = 'migrate' AND pool = 'pump-amm' AND mint IS NOT NULL GROUP BY mint", [ev_files]).fetchall()
     if not grads:
         return 0, 0
@@ -87,8 +87,9 @@ def assemble_day(d: date) -> tuple[int, int]:
                 [v for g in grads for v in (g[0], g[1])])
     # every trade leg of a graduated mint within [g − 30 min, g + 36 h]
     con.execute("CREATE TEMP TABLE tr0 AS SELECT t.mint, t.ts, t.slot, t.pool, t.trader, t.side, t.sol, t.tokens, t.price, t.quote_in_pool, "
-                "epoch_ms(t.ts) - epoch_ms(g.g) AS rel_ms FROM read_parquet(?) t JOIN grads g USING (mint) "
-                "WHERE t.ts >= g.g - INTERVAL 30 MINUTE AND t.ts < g.g + INTERVAL 36 HOUR AND t.price > 0 "
+                "epoch_ms(t.ts) - epoch_ms(g.g) AS rel_ms FROM read_parquet(?, union_by_name = true) t JOIN grads g USING (mint) "
+                "WHERE t.pool IN ('pump', 'pump-amm') "          # the hour files also keep other venues' SOL legs since 2026-10-23
+                "AND t.ts >= g.g - INTERVAL 30 MINUTE AND t.ts < g.g + INTERVAL 36 HOUR AND t.price > 0 "
                 "AND (t.pool = 'pump' OR t.quote_in_pool BETWEEN 0.001 AND 100000)", [tr_files])
     band_amm(con, "tr0", "tr")
     (cdir := config.CORPUS_DIR / "candles").mkdir(parents=True, exist_ok=True); (tdir := config.CORPUS_DIR / "trades").mkdir(parents=True, exist_ok=True)
@@ -162,7 +163,10 @@ def assemble_loop(stop_event: threading.Event | None = None, idle_s: float = 60.
                 log.exception("corpus_meta rebuild failed; mature build waits for the next round")
             else:
                 try:
-                    mature.loop_once()
+                    if len(mature.stale_aggregates()) > mature.BULK_REBUILD_DAYS:
+                        mature.loop_once_apart(stop_event)          # a version change's rebuild: hours of work, kept out of the console
+                    else:
+                        mature.loop_once()
                 except Exception:
                     log.exception("mature universe build failed")
         end = time.time() + idle_s

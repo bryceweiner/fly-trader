@@ -117,9 +117,35 @@ def _cmd_pumpstream(args):
     pumpstream.main()
 
 
+def _cmd_relay_check(args):
+    import json
+    from .ingest import relay_feed
+    print(json.dumps(relay_feed.check(args.seconds), indent=1))
+
+
 def _cmd_build_corpus_features(args):
     from .train import corpus_features
     corpus_features.main()
+
+
+def _cmd_rh_build_corpus(args):
+    from .logging_setup import setup
+    from .rh import corpus
+    setup("rh_corpus")
+    print(f"rh corpus: {corpus.run_locked(max_days=args.days)}")
+
+
+def _cmd_rh_v4_backfill(args):
+    from .rh import v4_universe
+    out = v4_universe.backfill_main(keys=not args.no_keys, history=not args.no_history)
+    print(f"rh v4 backfill: {out.get('keys', 0)} pool keys imported; history of {out.get('pools', 0)} live pools in {out.get('steps', 0)} steps; "
+          f"{out.get('outcomes', 0)} first-hour outcomes")
+
+
+def _cmd_refetch_archive(args):
+    from .ingest import replay_pull
+    out = replay_pull.refetch_main()
+    print(f"archive refetch: {out['done']} of {out['planned']} hours rewritten, {out['failed']} failed")
 
 
 def _cmd_refetch_pool_ids(args):
@@ -329,10 +355,20 @@ def build_parser() -> argparse.ArgumentParser:
     fw = sub.add_parser("fit-wallet-skill", help="fit the wallet-skill tables' hold and lookback by the selector's objective (one-off, many hours, resumable)")
     fw.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)"); fw.set_defaults(fn=_cmd_fit_wallet_skill)
     sub.add_parser("pumpstream").set_defaults(fn=_cmd_pumpstream)
+    rc = sub.add_parser("relay-check", help="connect to the stream relay (STREAM_RELAY_URL) for a while and report what arrives; switches nothing")
+    rc.add_argument("--seconds", type=float, default=30.0); rc.set_defaults(fn=_cmd_relay_check)
     sub.add_parser("build-corpus-features").set_defaults(fn=_cmd_build_corpus_features)
     sub.add_parser("assemble-replay").set_defaults(fn=_cmd_assemble_replay)
     sub.add_parser("build-corpus-meta").set_defaults(fn=_cmd_build_corpus_meta)
     sub.add_parser("build-mature").set_defaults(fn=_cmd_build_mature)
+    p_rc = sub.add_parser("rh-build-corpus", help="build the due Robinhood Chain corpus days (the stream starts it as a child process)")
+    p_rc.add_argument("--days", type=int, default=31, help="days at most per run (each run reads every minute's fee once)")
+    p_rc.set_defaults(fn=_cmd_rh_build_corpus)
+    p_v4 = sub.add_parser("rh-v4-backfill", help="import every Robinhood Chain v4 pool key, then backfill the live v4 pools' history (run apart from the console, under nice)")
+    p_v4.add_argument("--no-keys", action="store_true", help="skip the pool-key import")
+    p_v4.add_argument("--no-history", action="store_true", help="skip the live pools' history")
+    p_v4.set_defaults(fn=_cmd_rh_v4_backfill)
+    sub.add_parser("refetch-archive", help="download older archive hours again to keep every venue's SOL legs (run apart from the console, under nice)").set_defaults(fn=_cmd_refetch_archive)
     sub.add_parser("selector-eval").set_defaults(fn=_cmd_selector_eval)
     ts_ = sub.add_parser("train-selector"); ts_.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
     ts_.set_defaults(fn=_cmd_train_selector)

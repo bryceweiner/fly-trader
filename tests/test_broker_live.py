@@ -439,3 +439,33 @@ def test_while_a_close_is_unsettled_a_swap_takes_its_own_transactions_deltas(db_
     broker, rpc, jup = _broker(["success_buy_beside_a_close"])
     res = _swap(broker, db_conn, random.randrange(1 << 40))
     assert res.ok and res.lamports_delta == -(BUY_LAMPORTS + BUY_FEES) and res.token_delta == BUY_TOKENS
+
+
+def test_a_swap_takes_its_fill_from_its_own_transaction(db_conn, gate_open, monkeypatch):
+    """Several swaps are in flight at once (execution/worker.py): a swap's fill is its own transaction's deltas, never the
+    wallet's change between its two snapshots, which another swap may have moved."""
+    monkeypatch.setattr(broker_live, "tx_deltas", lambda tx, owner, mint: (-(BUY_LAMPORTS + 1), BUY_TOKENS))
+    broker, rpc, jup = _broker(["success_buy"])
+    res = _swap(broker, db_conn, random.randrange(1 << 40))
+    assert res.ok and res.lamports_delta == -(BUY_LAMPORTS + 1) and res.token_delta == BUY_TOKENS
+
+
+def test_beside_other_swaps_an_unreadable_transaction_is_an_unknown_fill_never_a_snapshot_guess(db_conn, gate_open, monkeypatch):
+    """With another swap in flight the snapshots cannot stand in for a transaction that cannot be read: the fill is unknown
+    and entries pause until it is reconciled (verify-fills)."""
+    broker, rpc, jup = _broker(["success_buy"])
+    monkeypatch.setattr(broker, "_landed", lambda sig: None)
+    monkeypatch.setitem(broker_live._SWAPS, "active", 1)                              # another swap in flight meanwhile
+    did = random.randrange(1 << 40)
+    with transaction() as conn:
+        before = conn.execute("SELECT entries_paused FROM circuit_state WHERE id = 1").fetchone()["entries_paused"]
+    try:
+        with pytest.raises(RuntimeError, match="other swaps"):
+            _swap(broker, db_conn, did)
+        f = _fills(db_conn, [o["id"] for o in _orders(db_conn, did)])
+        with transaction() as conn:
+            paused = conn.execute("SELECT entries_paused FROM circuit_state WHERE id = 1").fetchone()["entries_paused"]
+        assert [r["verified_by"] for r in f] == ["unknown"] and paused
+    finally:
+        with transaction() as conn:
+            conn.execute("UPDATE circuit_state SET entries_paused = %s WHERE id = 1", (before,))

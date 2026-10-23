@@ -50,6 +50,12 @@ export function sig(x: Num, digits = 4, signed = false): string {
   return (signed && v >= 0 ? '+' : '') + s
 }
 
+/** Significant digits as a plain decimal, never scientific notation: 3.079e-7 → "0.0000003079". */
+export function plain(x: Num, digits = 4): string {
+  const v = n(x)
+  return v === null ? '—' : v.toLocaleString('en-US', { maximumSignificantDigits: digits })
+}
+
 export function sci(x: Num, digits = 3): string {
   const v = n(x)
   return v === null ? '—' : v.toExponential(digits)

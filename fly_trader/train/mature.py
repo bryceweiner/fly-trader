@@ -2,7 +2,10 @@
 as feature rows — the population the live bot actually meets on Jupiter's lists, as opposed to the first 12 hours
 after graduation covered by ``replay_assemble``.
 
-Stage 1 (``aggregate_day``): all ``pump-amm`` trade legs of pump.fun-origin mints (suffix ``pump``, SOL-quoted) of a UTC day,
+Stage 1 (``aggregate_day``): all PumpSwap (``pump-amm``) and Meteora DLMM trade legs (``UNIVERSE_POOLS``: since
+2026-10-23 a coin's DLMM pool competes for its minute like any other pool, and is the only SOL market of a coin graduated
+into a USDC, stock-token or other-coin pool) of pump.fun-origin mints (suffix ``pump``, or a pump.fun graduate without it:
+``corpus_meta.pumpfun_graduates``; SOL-quoted) of a UTC day,
 except legs in pools created directly rather than by a pump.fun migration (``pump_pools``: their owner can pull the unburned
 liquidity, and the withdrawal is not in the trade data, so the price just stops after a pump),
 with causal filters only (the live stream applies the same ones): quote reserve 0.001–100,000 SOL, a leg more than 50× away
@@ -19,7 +22,10 @@ mask as absent), Jupiter stats stay masked. Age and price-vs-graduation come fro
 graduation is inside the archive (``corpus_meta.graduated_at``, the source live uses too); older tokens carry NaN age.
 Output: ``data/corpus/features_mature/<day>/part.parquet``. Both outputs carry a version in their Parquet metadata
 (``AGG_VERSION``, ``market.features.FEATURE_VERSION``); ``loop_once`` rebuilds any file from another version and moves
-the old one to ``data/corpus/_mature_stale/``. Feature parts also record how many of their mints had a known graduation
+the old one to ``data/corpus/_mature_stale/``. ``AGG_VERSION`` only says when the files are rebuilt: it is not a model
+definition (``train/selector.DATA_VERSION``), so a rebuild never retires a model. A rebuild of more than
+``BULK_REBUILD_DAYS`` days runs in a child process at the lowest CPU priority (``loop_once_apart``), never beside the
+console's live minute pipeline. Feature parts also record how many of their mints had a known graduation
 (``fly_known``); a part is rebuilt once ``corpus_meta`` dates more of them (older days are backfilled after newer ones).
 """
 from __future__ import annotations
@@ -29,6 +35,8 @@ import logging
 import math
 import os
 import shutil
+import subprocess
+import sys
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -45,14 +53,16 @@ from ..db.connection import transaction
 from ..market.exit_cost import PUMP_SUPPLY
 from ..market.features import FEATURE_VERSION, FIDX, TokenMeta, TokenState
 from .corpus_features import SCHEMA as FEAT_SCHEMA, PRE_COLS, _epoch_s, _row
-from .corpus_meta import blocked_pool_ids
+from .corpus_meta import UNIVERSE_POOLS, blocked_pool_ids, pumpfun_graduates
 from .flow import FLOW_COLS, MARKET_COLS, N_SKILL, SKILL_COLS, UNKNOWN, FlowWindow, MarketWindow
 
 log = logging.getLogger(__name__)
 MATURE_DIR = config.CORPUS_DIR / "mature"
 MATURE_FEAT_DIR = config.CORPUS_DIR / "features_mature"
 STALE_DIR = config.CORPUS_DIR / "_mature_stale"
-AGG_VERSION = 4          # 2: causal price band and per-minute dominant pool; 3: directly created (custom) PumpSwap pools excluded; 4: wallet flow columns (train/flow.py)
+AGG_VERSION = 5          # 2: causal price band and per-minute dominant pool; 3: directly created (custom) PumpSwap pools excluded; 4: wallet flow columns (train/flow.py);
+                         # 5: pump.fun graduates whose mint lacks the "pump" suffix included (corpus_meta.pumpfun_graduates)
+BULK_REBUILD_DAYS = 3    # more stale aggregates than this are rebuilt by a child process at the lowest CPU priority (live money first)
 KNOWN_REBUILD_FRAC, KNOWN_REBUILD_MIN = 0.01, 25     # a part is rebuilt once corpus_meta dates this many more of its mints
 MASKED = ["logsigners_15m", "logsigners_1h", "hawkes", "log_since_last", "vpin_15m"]
 EXTRA = ["traders_15m", "traders_1h", "n_trades_1m"] + FLOW_COLS + SKILL_COLS + MARKET_COLS
@@ -79,11 +89,21 @@ def _skill_version() -> str:
     return skill_version()
 
 
+def _inputs_newer(p: Path) -> bool:
+    """A day's hour files written after its aggregate: an hour fetched late, or the archive downloaded again
+    (``replay_pull.refetch_main``) to keep more venues' legs."""
+    try:
+        t = p.stat().st_mtime
+        return any(os.path.getmtime(f) > t for f in _hour_files(date.fromisoformat(p.stem)))
+    except (OSError, ValueError):
+        return False
+
+
 def agg_stale(path) -> bool:
-    """An aggregate to rebuild: another aggregation version, or skill buckets from another skill version while its day now
-    has a table of the version in force (days without a table keep 'none')."""
+    """An aggregate to rebuild: another aggregation version, hour files newer than it, or skill buckets from another skill
+    version while its day now has a table of the version in force (days without a table keep 'none')."""
     p = Path(path)
-    if part_version(p) != AGG_VERSION:
+    if part_version(p) != AGG_VERSION or _inputs_newer(p):
         return True
     want = _skill_version()
     return want != "none" and (SKILL_DIR / f"{p.stem}.parquet").exists() and agg_skill(p) != want
@@ -200,25 +220,30 @@ def days_ready() -> list[date]:
     return out
 
 
-def aggregate_table(files: list[str], skill, blocked: list[str] | None = None, insiders: dict | None = None) -> pa.Table:
+def aggregate_table(files: list[str], skill, blocked: list[str] | None = None, insiders: dict | None = None, grads: list[str] | None = None) -> pa.Table:
     """A day's minute aggregates from its hour files, with ``skill`` (wallet → decile table, or None) as the day's skill
     table — ``aggregate_day``'s SQL, also used to rebuild the skill inputs under a candidate table (train/wallet_skill.fit).
-    ``blocked`` (pool ids) and ``insiders`` (mint -> wallets) are read from Postgres when not given; a caller that aggregates
-    many days hands them in once, rather than opening two connections per day."""
+    ``blocked`` (pool ids), ``insiders`` (mint -> wallets) and ``grads`` (pump.fun graduates without the ``pump`` suffix)
+    are read from Postgres when not given; a caller that aggregates many days hands them in once, rather than opening
+    connections per day."""
     con = duckdb.connect()
     cols = [c[0] for c in con.execute("SELECT * FROM read_parquet(?, union_by_name = true) LIMIT 0", [files]).description]
     quote_filter = "AND (quote_mint IS NULL OR quote_mint = 'So11111111111111111111111111111111111111112')" if "quote_mint" in cols else ""
     pool_sel = "pool_id" if "pool_id" in cols else "NULL AS pool_id"
-    if blocked is None:
+    if blocked is None or grads is None:
         with transaction() as conn:
-            blocked = blocked_pool_ids(conn)
+            blocked = blocked_pool_ids(conn) if blocked is None else blocked
+            grads = pumpfun_graduates(conn) if grads is None else grads
     con.register("blocked", pa.table({"pool_id": pa.array(blocked, pa.string())}))
+    con.register("grads", pa.table({"mint": pa.array(grads, pa.string())}))
     pool_filter = "AND (pool_id IS NULL OR pool_id NOT IN (SELECT pool_id FROM blocked))" if "pool_id" in cols else ""
     # causal filters only (nothing later in the day decides which earlier trades exist); the live stream applies the same:
-    # no directly created pool, reserve band, a leg within 50x of the median of the mint's previous 200 legs, and per (mint, minute) the pool with the most legs
+    # pump.fun's coins only, no directly created pool, reserve band, a leg within 50x of the median of the mint's previous 200 legs,
+    # and per (mint, minute) the pool with the most legs
     con.execute(f"""CREATE TEMP TABLE raw AS SELECT mint, ts, slot, trader, side, sol, price, quote_in_pool, {pool_sel}
                     FROM read_parquet(?, union_by_name = true)
-                    WHERE pool = 'pump-amm' AND price > 0 AND mint LIKE '%pump' AND quote_in_pool BETWEEN 0.001 AND 100000 {quote_filter} {pool_filter}""", [files])
+                    WHERE pool IN ({", ".join(f"'{x}'" for x in UNIVERSE_POOLS)}) AND price > 0 AND (mint LIKE '%pump' OR mint IN (SELECT mint FROM grads))
+                      AND quote_in_pool BETWEEN 0.001 AND 100000 {quote_filter} {pool_filter}""", [files])
     con.execute("""CREATE TEMP TABLE banded AS SELECT * EXCLUDE (pref) FROM (
                       SELECT *, median(price) OVER (PARTITION BY mint ORDER BY ts, slot ROWS BETWEEN 200 PRECEDING AND 1 PRECEDING) AS pref FROM raw)
                     WHERE pref IS NULL OR price BETWEEN pref / 50 AND pref * 50""")
@@ -260,7 +285,8 @@ def aggregate_table(files: list[str], skill, blocked: list[str] | None = None, i
     return tab
 
 
-def aggregate_day(d: date) -> int:
+def aggregate_day(d: date, blocked: list[str] | None = None, grads: list[str] | None = None) -> int:
+    """Aggregate day ``d`` (``aggregate_table``); ``blocked`` and ``grads`` as there, read here when not given."""
     t0 = time.time(); files = _hour_files(d)
     if not files:
         return 0
@@ -269,7 +295,7 @@ def aggregate_day(d: date) -> int:
         return 0
     MATURE_DIR.mkdir(parents=True, exist_ok=True)
     skill = skill_table_for(d)
-    tab = aggregate_table(files, skill)
+    tab = aggregate_table(files, skill, blocked=blocked, grads=grads)
     write_part(tab, MATURE_DIR / f"{d.isoformat()}.parquet", AGG_VERSION, {"fly_skill": _skill_version() if skill is not None else "none"})
     n_mints = len(pa.compute.unique(tab["mint"]))
     with transaction() as conn:
@@ -386,6 +412,46 @@ def _knows_more(part: Path, grads: dict) -> bool:
     return grew >= max(KNOWN_REBUILD_MIN, KNOWN_REBUILD_FRAC * len(mints))
 
 
+def stale_aggregates() -> list[Path]:
+    """Aggregates the next round rebuilds: another aggregation (or skill) version, with their hour files at hand."""
+    return [f for f in sorted(MATURE_DIR.glob("*.parquet")) if agg_stale(f) and _hour_files(date.fromisoformat(f.stem))]
+
+
+def loop_once_apart(stop_event: threading.Event | None = None) -> int | None:
+    """One build round in a child process (``fly-trader build-mature``) at the lowest CPU priority, waited for. A version
+    change re-aggregates and re-features every day (~100 s a day, ~5 h for the whole archive): that work must not share the
+    console's interpreter with the live minute pipeline (CLAUDE.md, live money first). On stop the child is ended; every
+    file is written atomically, so an ended round loses only its unfinished day. Its exit code, or None when stopped."""
+    nice = ["/usr/bin/nice", "-n", "19"] if os.path.exists("/usr/bin/nice") else []      # not preexec_fn: unsafe in a threaded process
+    proc = subprocess.Popen([*nice, sys.executable, "-m", "fly_trader", "build-mature"], stdout=subprocess.DEVNULL)
+    log.info("mature build: %d stale day(s), rebuilt by child process %d at the lowest CPU priority", len(stale_aggregates()), proc.pid)
+    while proc.poll() is None:
+        if stop_event is not None and stop_event.is_set():
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            log.info("mature build child %d ended on stop", proc.pid)
+            return None
+        time.sleep(2.0)
+    if proc.returncode:
+        log.warning("mature build child %d exited %d (its log: replay.log)", proc.pid, proc.returncode)
+    return proc.returncode
+
+
+def try_loop_once() -> int | None:
+    """``loop_once`` unless another process holds the build lock (then None at once): the archive refetch rebuilds the
+    days it rewrote without waiting hours behind a rebuild that will see them anyway."""
+    MATURE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(MATURE_DIR / ".build.lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None
+        return _loop_once()
+
+
 def loop_once() -> int:
     """One build round. A file lock serialises rounds across processes (the console's replay worker and the CLI)."""
     MATURE_DIR.mkdir(parents=True, exist_ok=True)
@@ -407,8 +473,12 @@ def _loop_once() -> int:
                 _retire(MATURE_FEAT_DIR / dd.isoformat() / "part.parquet", f"feat_{dd}")
             with transaction() as conn:
                 conn.execute("DELETE FROM mature_days WHERE day = %s", (d,))
-    for d in days_ready():
-        aggregate_day(d); n += 1
+    days = days_ready()
+    if days:
+        with transaction() as conn:                 # the custom pools and suffix-less graduates once a round, not once a day
+            blocked, pf = blocked_pool_ids(conn), pumpfun_graduates(conn)
+        for d in days:
+            aggregate_day(d, blocked=blocked, grads=pf); n += 1
     grads = _graduations()          # corpus_meta.rebuild reads the day's events before every round, so its graduations are known
     for f in sorted(MATURE_DIR.glob("*.parquet"), reverse=True):
         d = date.fromisoformat(f.stem)

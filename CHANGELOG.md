@@ -3,6 +3,235 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## 2026-10-23, release 10: A retrained selector trades `ev` again, and live money follows the seat
+
+Published to Hugging Face as signed release 10. It ships selector #560 and fly #561 in place of selector #154 and fly
+#157:
+
+- **Selector #560** is fitted through 2026-10-20 on this release's rules and trades `ev` again besides `capitulation`. On
+  the 18 days 2026-10-03..10-20, out of sample for both, its holdout-blind copy made +9.71 % per trade over 393 trades
+  (62 % winners, profit factor 2.08); #154 made +9.64 % over 392 (58 %, 1.95).
+- **Fly #561** is taught by it. Its own decisions reach the wallet only once it wins its 14-day race (Live money below).
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 10`.
+- **The corpus is rebuilt once on start,** because the Solana universe changed: about 5 hours in a child process at the
+  lowest CPU priority. The rebuild retires no model.
+- **New tables and columns are added on start:** `corpus_meta.grad_quote`; on Robinhood Chain, `rh_v4_keys`,
+  `rh_v4_tokens` and new `rh_pools` and `rh_meta` columns.
+- **Robinhood Chain installs:** run `fly-trader rh-v4-backfill` once, under `nice -n 19` and apart from the console, so
+  v4 pools older than the console's watch are found.
+- **New settings:** `EXEC_THREADS` (default 4), `SOL_FEED` (default `pumpapi`), `STREAM_RELAY_URL`, `STREAM_RELAY_TOKEN`,
+  `STREAM_RELAY_CA_FILE`, `HELIUS_FEED_COMMITMENT`, `REFETCH_PARALLEL`, `REFETCH_MAX_LAG_S` and `REFETCH_SKIP_RECENT_H`.
+- **On an install whose fly already won its race, fly #561 inherits that seat** and trades live without racing first.
+  The next release makes every new fly race.
+
+### Live money
+
+- **Minutes are processed 2–3× faster: a minute is ready a median 2.8 s after its end, down from 6.4 s.** Measured with
+  `tools/latency_probe.py` against the 2026-10-19 baseline. Figures are seconds after the minute ends:
+
+  | | Old median | New median | Old p90 | New p90 | Old max | New max |
+  |---|---|---|---|---|---|---|
+  | Stream publishes the minute | 4.3 | 2.3 | 16.3 | 9.9 | 17.6 | 41.9 |
+  | Selector done (the console's "latency") | 6.4 | 2.8 | 16.9 | 10.3 | 18.4 | 42.5 |
+  | Publish → selector done | 0.7 | 0.5 | 1.1 | 1.0 | 4.3 | 3.7 |
+
+  - The worst minute waited 41.9 s for PumpAPI's stream to publish it. The feed is now the remaining delay, not the
+    engine (see Platform).
+  - The fly's status records each minute's timing: when its rows were ready, when the fly decided and when the live
+    orders were queued (`seen_s`, `scored_s`, `orders_s`). The first minutes after the change: Solana 2.42, 2.47 and
+    2.48 s; Robinhood Chain 4.79, 4.84 and 4.85 s. That is about 50 ms from a minute's data to its live orders.
+- **The fly decides a live minute on one pass of its teacher.**
+  - It takes the selector's decision once and scores only the rows the selector would buy, the input of its learned veto.
+  - Every other row's score, its learning tag and the brain view wait until after the live orders.
+  - Live scoring takes about 6 ms, down from a median 94 ms (150–400 ms when the GPU was idle), with the same decisions
+    on 40 real minutes.
+- **Solana swaps run in parallel.**
+  - Up to four swaps are in flight at once (`EXEC_THREADS`): one per token, and each token's in order.
+  - Each fill is read from its own transaction, since another swap may land between a swap's two balance reads.
+  - If a transaction cannot be read while other swaps are in flight, the fill is recorded as unknown and entries pause
+    until `verify-fills` reconciles it.
+  - Robinhood Chain swaps stay one at a time.
+- **Nothing in front of a live order waits that need not.**
+  - The wallet's balance is read while the minute is scored.
+  - The balances before a swap are read beside Jupiter's quote and the signing, in one round trip.
+  - The signer's lookups run side by side, and a swap's confirmation is checked every slot instead of every second.
+- **The engine wakes the moment a minute is written,** instead of looking every 250 ms.
+  - The stream checks for complete minutes every 50 ms, on its own clock.
+  - Both chains run their live phases and send their boundary sales at the same time.
+  - Paper work steps aside when another chain's minute lands meanwhile.
+- **A failed live entry is tried again only while the fly would still buy the token, at that minute's price.**
+  - Before, every retry was checked against its decision's price. Once a token ran more than 3% (`MAX_ENTRY_CHASE`),
+    every retry was refused as "price ran" until the two retry minutes were up: a runner missed once was missed for good.
+  - Each minute's plan now says, for every token paper holds, whether it would buy it again and what paper would pay at
+    that minute's price. A retry goes out on that minute's score and against that price, or waits, recorded as
+    "no longer a buy" with the score against its line. Both chains.
+- **Sell now: any open live position can be sold from the Overview's open positions, on both chains.**
+  - After a confirmation, the wallet sells the whole position at once, at the exit's slippage of 3% stepping up to at most
+    5%, and books it like any exit. The console waits up to 90 s and says what the sale brought, or why it failed.
+  - The fly's paper book keeps its own position. An operator's sale counts neither in the live-vs-paper gap that pauses
+    entries nor in what the fly learns about its fills.
+- **Live money follows the seat: until the fly wins its race, the wallet trades the selector's decisions.**
+  - Before, with `LIVE_WITHOUT_HANDOVER` on, the wallet traded the fly's decisions whoever held the seat. Those are the
+    selector's picks less what the fly's learning vetoes, so an untested fly's learning reached live money before its race.
+  - Now, until the handover, a pick the fly's learning vetoes still goes live as the selector decided it. It stays out of
+    the fly's paper book, which is what the race compares with the selector's. Once the fly holds the seat, its vetoes
+    bind the wallet too. A pick the selector itself blocks never goes live. Both chains.
+- **A Robinhood Chain minute is written in milliseconds at any hour, not up to 2.5 s late in the UTC day.**
+  - Writing each minute re-read every swap since 00:00 UTC to warm the price filter (the median of a coin's previous 200
+    prices that day): about 130,000 swaps and 2.1–2.5 s by 23:59, in front of that minute's live entries.
+  - It now reads only each coin's last 200 prices that day: 0.03–0.07 s at 23:59. On 18 real ranges (single minutes at
+    23:59, noon and now, 240 minutes, across midnight, a whole day, and four quote assets) the rows are identical.
+- **The Robinhood Chain corpus is built in a child process, never in the stream's thread.**
+  - At 00:00 UTC the stream built the previous day's training files itself: about 30 s on 2026-10-23, after that minute's
+    write and before the next one's. The other v4 pools (The universe) add several times the swaps.
+  - The stream now only looks at the files and starts `fly-trader rh-build-corpus` at the lowest CPU priority, one at a
+    time.
+- **Two reads the latency probe caught after the 2026-10-23 restart are cheap now, and off the live path.**
+  - The Solana stream reloads the blocked custom pools every 5 minutes on the loop that flushes its minutes. Since the
+    suffix-less graduates, that read probed `corpus_meta` once per pool row: up to 3.5 s. It now joins the two tables
+    (the same 32,308 pools, 1.9 s → 65 ms on a copy) and runs on a thread.
+  - `build-mature` read the same pools for every day of a rebuild; it now reads them once per round.
+  - The Robinhood Chain corpus read every coin's median fee over all of `rh_minutes` (13 s) for every day it built. It now
+    reads them once per run, in the middle of a minute, and a run builds up to 31 days.
+
+### The universe
+
+- **Solana: pump.fun graduates whose mint does not end in "pump" are traded too.**
+  - They are 4–22 % of a day's graduations (40–60 a day this week), with the same launchpad, creator history, burned pool
+    liquidity and token rules as the rest. A mint-suffix test dropped them in the stream, the corpus and the wallet skill.
+  - A coin now counts as pump.fun's when its mint ends in "pump" or a pump.fun migration recorded it: the stream adds a
+    graduate the moment it sees the migration and reloads `corpus_meta`'s every 5 minutes. Their custom pools stay blocked.
+  - On 2026-10-21 they add 1,582 mints to the day's 10,754 and 5.5 % of its volume. No existing row changes.
+  - The corpus is rebuilt to include them (aggregation version 5). The current selector and fly keep trading through it.
+- **Solana: a pump.fun coin's Meteora DLMM pools make its minutes too.**
+  - Each minute keeps the pool with the most legs, as before, now among the coin's SOL-quoted PumpSwap and DLMM pools.
+    The stream and the corpus apply the same rule: on 2026-10-22 15:00 UTC both gave 24,552 minute rows for 3,078 coins.
+  - In that hour 99 % of minutes kept their pool, 210 minutes of 39 coins moved to a DLMM pool, and 101 coins gained 937
+    minutes. Coins graduated into a pool quoted in TTWO, PUMP, WBTC or USDC (Dacity, Macca, pill, baton, Au) have their
+    only SOL market there.
+  - A graduation's quote asset is now kept (`corpus_meta.grad_quote`): from the migration, or for an older coin from trades
+    in its own pool. A coin graduated in another quote has its dev buy and seed reserve in that quote's units, so those two
+    inputs read as unknown for it, live and in training. 17 % of graduations on 2026-10-20 were not in SOL.
+  - Paper fills charge the minute's pool fee, so a DLMM minute costs that pool's dynamic fee.
+- **Robinhood Chain: a Pons coin's own Uniswap v4 pools elsewhere, and plain v4 memecoins, are traded too.**
+  - The stream already read every PoolManager log and kept only the Pons pools'. In one hour on 2026-10-23, 1,480 v4
+    pools traded 40,960 times; the Pons pools made 3,375 of those swaps. 85 hookless pools pairing a coin with ETH, WETH or
+    USDG cleared the bot's floors, with 17,051 swaps.
+  - A pool is looked at once it trades: its last half hour must clear the RH book's floors (reserve and 15-minute
+    volume, in ETH). Of 1.07 million v4 pools on the chain, only those few hundred a day are registered.
+  - A new pool qualifies when it pairs a coin with ETH, WETH or USDG (`RH_V4_QUOTES`) and has no hook. A graduated Pons
+    coin's other pool may use any priced quote.
+  - Hooked pools stay out unless named in `RH_V4_HOOKS`. In a hookless pool the Swap event's amounts equal the
+    PoolManager's token flows exactly (230 swaps measured). The dynamic-fee hook of ORBIO's and ZZZ's other USDG pools
+    (`0x08e5…a080`) moved up to 6 times more than its Swap events show. The Pons coins' main outside pools are hookless,
+    with fees of 0.8–3 %.
+  - A plain coin's contract is checked first, busiest coins first, one a minute (`RH_V4_CHECKS_PER_SLOT`). It is refused
+    when its owner or an admin role can mint, upgrade, blacklist, pause, set taxes or hooks, or switch trading; when it
+    has a built-in tax; when it is not 18 decimals; and when it is a major, stablecoin or tokenized stock. On 15 known
+    coins the check matched a manual review.
+  - Its creator is the sender of its first pool's initialization, with the same history inputs as a Pons deployer. Its
+    age counts from that pool. What only a Pons launch records reads as unknown.
+  - Nothing of this runs in front of a minute: the stream keeps the pass's logs after the minute is written, and the rest
+    runs mid-minute once that minute is written and no live order waits on either chain. Only the contract checks read
+    the network: the public RPC, once per read, never after 40 s into the minute.
+  - A pool goes live with its coin's meta in one commit, between two passes, so the stream indexes every swap from the
+    next block on. A plain coin trades only after the engine has watched it for 3 hours, the longest feature window.
+  - `fly-trader rh-v4-backfill` (its own process) imports every pool's key since block 0, so pools older than the
+    console's watch can be found. It then backfills each live pool's history before it went live.
+  - A coin with several live pools takes each minute from the one with the most swaps, as on Solana. A non-Pons pool's
+    swaps carry its LP fee. WETH counts as ETH.
+
+### The selector
+
+- **A strategy's win filter chooses only its cut-off, at the strategy's own line, and must beat having no filter.**
+  - Before, the filter searched the line too. In selector #154 it moved `ev`'s line from 0.038 to 0.115, which `ev`'s live
+    scores never reached, so `ev` stayed deployed but never traded.
+- **The book keeps the passed strategies, and the combination rule, that together do best on the selection half.**
+  - Every subset of the strategies that passed is scored as one book under each rule. A strategy the book does better
+    without is dropped in the open, as its own "combination" row with the numbers.
+  - The combination step no longer says a rule "made more" when no book cleared the bars.
+
+### Training
+
+- **A corpus rebuild never retires a model.**
+  - The corpus build versions (`mature.AGG_VERSION`, `rh/corpus.RH_AGG_VERSION`) say when the corpus files are rebuilt,
+    not what a model's inputs, labels or costs mean. They are no longer part of a model's definitions.
+  - Before, raising one retired every selector and fly and stopped all trading until a retrain and replay, even for data
+    already in the corpus. Models, flies and replay verdicts that still carry the old keys stay current.
+  - A changed or missing definition still retires a model, as before.
+- **A rebuild of more than three days runs in a child process at the lowest CPU priority.**
+  - Re-featuring the whole archive takes about 5 hours (~100 s a day). It no longer shares the console's interpreter with
+    the live minute pipeline. A day's routine build stays in the console, as before.
+- **The wallet skill counts SOL-quoted legs only.** A leg quoted in another token counted its amount as SOL.
+- **The fly's training writes a checkpoint after every epoch, and resumes from it.**
+  - Before, a bootstrap (10–20 hours) kept its progress in memory only. A crash or a stop lost every finished epoch,
+    and training could not go on past its epoch cap.
+  - Now each epoch saves the weights, the optimiser, the history, the best epoch so far and the random state. A stopped
+    or crashed bootstrap resumes after its last finished epoch, and a finished one can train on past the cap it ran under.
+  - A checkpoint written for other training data is set aside, never resumed. The live bootstrap deletes its checkpoint
+    once the fly is saved.
+- **A new fly may race once its calibration week made money over 30 trades, the race's own minimum (was 100).**
+  - The wallet trades the selector's decisions until the fly wins its race, so the calibration week need not prove more
+    than the race will. A quiet week (2026-10-15..21) gave the new fly 88 trades at +2.96%, which the old bar refused.
+  - A losing calibration week still never deploys a fly. The Kalshi fly keeps 100.
+
+### The console
+
+- **The fly decision inspector shows the token's price and volume in the minute the fly last scored it.** Each has a
+  green or red arrow for its move over the five minutes before: the price against the close five minutes earlier, the
+  volume against the five minutes' average. Both are plain decimals, never scientific notation.
+- **The Overview's open positions table fits its card without scrolling sideways, from 1200 px wide up.**
+  - The card takes seven twelfths of the row and the wealth chart five, the other way round from before. The chart
+    still shows its whole history.
+  - The table's headers wrap onto two lines, its cells pad less, and a long token name ends in an ellipsis.
+
+### Platform
+
+- **The archive's hour files keep every venue's SOL-quoted trades, not only pump.fun's curve and PumpSwap.**
+  - Meteora DLMM and DAMM, Raydium, Orca and other launchpads' curves add about a third to the rows (~90 MB an hour).
+    The lifecycle events keep the quote mint. Both files are written atomically and the trades file says what it keeps.
+  - `fly-trader refetch-archive` downloads the older hours again in its own process, 2 at a time (`REFETCH_PARALLEL`).
+    It starts no download while the live stream is more than 15 s behind (`REFETCH_MAX_LAG_S`), leaves the newest 6 hours
+    to the console, and rebuilds each finished day itself. About 4,500 hours, roughly 2.7 TB of downloads; run it under
+    `nice -n 19` only after the console runs this code. Progress: `ui_settings['replay_refetch_status']`.
+  - A day is rebuilt whenever one of its hour files is newer than its aggregate.
+- **The stream relay forwards pump.fun graduates without the "pump" suffix and every SOL-quoted DLMM trade.**
+- **A stream relay is ready, but switched off.**
+  - `stream_relay/` holds PumpAPI's stream on a server near its source. It forwards only the events and fields the
+    minutes use: about 33 KB/s at the busiest minute, instead of the whole stream.
+  - It serves them over TLS with a token, and resumes without loss after a dropped connection.
+  - With `SOL_FEED=relay` it becomes the minutes' clock, and this machine's own PumpAPI connection stays as its backup.
+  - Setup is in `stream_relay/README.md`. `fly-trader relay-check` tests a relay without switching anything.
+  - New settings: `SOL_FEED` (default `pumpapi`), `STREAM_RELAY_URL`, `STREAM_RELAY_TOKEN` and `STREAM_RELAY_CA_FILE`.
+- **A Helius decoder is built, but switched off** (`SOL_FEED=helius`).
+  - It turns pump.fun and PumpSwap transactions into PumpAPI's events exactly as the archive has them: 312 of 312 events
+    per sampled slot, and trades, creates and migrations field for field.
+  - Helius's websockets deliver only about 1 MB/s in all to this machine, and drop trades when the market is busy.
+
+### Tools
+
+- **`tools/latency_probe.py` and `tools/latency_report.py` measure the minute pipeline from outside the console.**
+  - They sample, four times a second, when the stream publishes each minute, what SQL the console is running, when each
+    book's status lands, the console's CPU and every live order. The report turns that into per-minute timelines.
+  - They're read-only and need no restart. Run them before and after a change to the minute pipeline.
+  - The 2026-10-19 baseline of the old code is in `logs/latency_baseline_20261019/`. A minute was ready a median 6.4 s
+    after its end (p90 16.9 s). Almost all of that was the wait for the stream to publish the minute; everything after
+    publishing took 0.7 s.
+- **`tools/strategy_study/` re-checks the trading strategy against fresh data without saving a model.**
+  - It runs the trainer's own capitulation fit and judges it on the trainer's selection half, evaluation half and holdout.
+  - Then it compares the live selector's decisions on days after its training, sells the same trades after every hold
+    from 10 to 480 minutes, and tests floors on liquidity, volume, activity, age and wash share.
+  - It is safe to run beside live trading. The dataset is built in a separate process and read from disk, and a guard
+    stops the run if the live console's minutes slow down or its memory is squeezed.
+  - The 2026-10-19 run kept selector #154's strategy and 240-minute hold. #154 made +8.6% per Solana trade on the 16 days
+    after its training, against +8.9% in its backtest. Holds from 180 to 480 minutes did about equally well, and no
+    floor beat the noise.
+
 ## 2026-10-18, release 9: The Overview page charts each chain's setups, and the money's book comes first
 
 Published to Hugging Face as signed release 9. Fly #157 and selector #154 are unchanged, and so are the definitions they

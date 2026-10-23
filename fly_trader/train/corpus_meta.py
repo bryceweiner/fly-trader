@@ -19,6 +19,10 @@ the stream fills ``own_dd60``/``own_max60`` from its own minutes at that time, t
 the assembled candle files. Runs inside the ``replay`` worker after each assembly round and as
 ``fly-trader build-corpus-meta``. It first copies the archive's directly created PumpSwap pools into ``pump_pools``
 (``backfill_pump_pools``), which the stream and ``train/mature.py`` exclude from the universe (``blocked_pool_ids``).
+
+The universe's coins are pump.fun's: a mint ending in ``pump`` or one this table holds (a pump.fun migration recorded it).
+Since 2026-10-23 the second half counts too: 4-22 % of daily graduations carry a mint without the suffix, with the same
+launchpad, creator history, burned pool liquidity and token rules as the rest (``pumpfun_graduates``).
 """
 from __future__ import annotations
 
@@ -35,9 +39,37 @@ from .. import config
 from ..db.connection import transaction
 
 log = logging.getLogger(__name__)
+WSOL = "So11111111111111111111111111111111111111112"
+# Inputs in the graduation's quote units: SOL for a SOL graduation, but USDC, a stock token's or another coin's units when
+# pump.fun seeded the pool in those (17 % of graduations on 2026-10-20). They are SOL inputs only when the quote is SOL or
+# not known (the archive before 2026-10-23 did not keep it); otherwise they read as unknown (``sol_select``).
+QUOTE_UNIT_COLS = ("dev_sol", "rq0")
+# the venues whose SOL legs make a pump.fun coin's minutes, live (ingest/pumpstream.py) and in training (train/mature.py):
+# its PumpSwap pools and, since 2026-10-23, its Meteora DLMM pools (each minute keeps the pool with the most legs)
+UNIVERSE_POOLS = ("pump-amm", "meteora-dlmm")
 CURVE_COLS = ["bundle_share", "dev_hold_share", "dev_sold_frac", "grad_hhi"]
 FEATURE_COLS = ["ttg_min", "dev_sol", "dev_share", "mayhem", "rq0", "prior_launches", "prior_grads", "prior_known", "prior_rug_share", "prior_moon_share",
                 *CURVE_COLS, "curve_known"]
+
+
+def sol_select(cols) -> str:
+    """The SELECT list for ``cols`` of ``corpus_meta`` with ``QUOTE_UNIT_COLS`` as SOL inputs: NULL (unknown) when the
+    graduation's pool was seeded in another quote (``grad_quote``). Live (agent/minute_engine.py) and training
+    (``load_features``) read them the same way."""
+    return ", ".join(f"CASE WHEN grad_quote IS NULL OR grad_quote = '{WSOL}' THEN {c} END AS {c}" if c in QUOTE_UNIT_COLS else c for c in cols)
+
+
+def record_grad_quotes(conn, seen) -> int:
+    """``seen``: (mint, pool id, quote mint) of trades the stream saw in a graduate's own pool (``corpus_meta.pool_id``):
+    that pool's quote is the graduation's. Fills ``grad_quote`` where it is still unknown (graduations before the archive
+    kept the migration's quote). Returns rows updated."""
+    seen = [t for t in seen if all(t)]
+    if not seen:
+        return 0
+    cur = conn.cursor()
+    cur.executemany("UPDATE corpus_meta SET grad_quote = %s, updated_at = now() WHERE mint = %s AND pool_id = %s AND grad_quote IS NULL",
+                    [(q, m, p) for m, p, q in seen])
+    return max(cur.rowcount, 0)
 
 
 def curve_facts(create_slot: int | None, creator: str | None, supply: float | None, initial_buy: float | None, wallets: dict) -> tuple[dict, list[tuple[str, str]]]:
@@ -99,9 +131,12 @@ def rebuild(outcome_batch: int = 20000) -> int:
     n_pp = backfill_pump_pools()               # before mature.loop_once aggregates the new days
     creates =con.execute(f"""SELECT mint, min(ts) AS create_ts, arg_min(signer, ts) AS creator, arg_min(quote_amount, ts) AS dev_sol,
                               arg_min(initial_buy, ts) AS dev_tokens, arg_min(supply, ts) AS supply, arg_min(mayhem, ts) AS mayhem, arg_min(uri, ts) AS uri,
-                              arg_min(name, ts) AS name, arg_min(symbol, ts) AS symbol, arg_min(sig, ts) AS sig FROM read_parquet('{ev}') WHERE action = 'create' AND pool = 'pump' GROUP BY mint""").df()
-    migr = con.execute(f"""SELECT mint, min(ts) AS g, arg_min(quote_in_pool, ts) AS rq0, arg_min(pool_id, ts) AS pool_id
-                           FROM read_parquet('{ev}') WHERE action = 'migrate' AND pool = 'pump-amm' GROUP BY mint""").df()
+                              arg_min(name, ts) AS name, arg_min(symbol, ts) AS symbol, arg_min(sig, ts) AS sig FROM read_parquet('{ev}', union_by_name = true)
+                              WHERE action = 'create' AND pool = 'pump' GROUP BY mint""").df()
+    ev_cols = [c[0] for c in con.execute(f"SELECT * FROM read_parquet('{ev}', union_by_name = true) LIMIT 0").description]
+    gq = "arg_min(quote_mint, ts) FILTER (WHERE quote_mint IS NOT NULL)" if "quote_mint" in ev_cols else "NULL::VARCHAR"     # kept since 2026-10-23
+    migr = con.execute(f"""SELECT mint, min(ts) AS g, arg_min(quote_in_pool, ts) AS rq0, arg_min(pool_id, ts) AS pool_id, {gq} AS grad_quote
+                           FROM read_parquet('{ev}', union_by_name = true) WHERE action = 'migrate' AND pool = 'pump-amm' GROUP BY mint""").df()
     con.close()
     meta = migr.merge(creates, on="mint", how="left")
     meta["ttg_min"] = (meta["g"] - meta["create_ts"]).dt.total_seconds() / 60.0
@@ -140,12 +175,13 @@ def rebuild(outcome_batch: int = 20000) -> int:
     meta = meta.merge(hist[["mint", "prior_grads", "prior_known", "prior_rug_share", "prior_moon_share"]], on="mint", how="left")
     meta["graduated_at"] = meta["g"]
     cols = ["mint", "graduated_at", "create_ts", "creator", "dev_sol", "dev_tokens", "dev_share", "supply", "mayhem", "uri", "name", "symbol", "ttg_min", "rq0", "pool_id",
-            "prior_launches", "prior_grads", "prior_known", "prior_rug_share", "prior_moon_share", "own_dd60", "own_max60", "own_alive6h"]
+            "prior_launches", "prior_grads", "prior_known", "prior_rug_share", "prior_moon_share", "own_dd60", "own_max60", "own_alive6h", "grad_quote"]
+    keep_known = {"grad_quote"}             # the archive's quote when it has one, else the stream's (record_grad_quotes)
     rows = [tuple(_pg(v) for v in rec) for rec in meta[cols].itertuples(index=False, name=None)]
     with transaction() as conn:
         conn.cursor().executemany(
             "INSERT INTO corpus_meta (" + ",".join(cols) + ") VALUES (" + ",".join(["%s"] * len(cols)) + ") ON CONFLICT (mint) DO UPDATE SET " +
-            ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c != "mint") + ", updated_at = now()", rows)
+            ", ".join(f"{c} = COALESCE(EXCLUDED.{c}, corpus_meta.{c})" if c in keep_known else f"{c} = EXCLUDED.{c}" for c in cols if c != "mint") + ", updated_at = now()", rows)
     n_cr = _backfill_creates(creates)
     n_curve = update_curve_facts()
     log.info("corpus_meta rebuilt: %d graduated tokens (%d with creator, %d with outcomes), %d archive creates added to pump_events, %d custom pools to pump_pools, "
@@ -300,9 +336,20 @@ def backfill_pump_pools() -> int:
 
 
 def blocked_pool_ids(conn) -> list[str]:
-    """Blocked pools that can carry universe legs. The stream and ``train/mature.py`` both keep only pump.fun-origin mints
-    (suffix ``pump``) before this check, so pools of other mints never match either way."""
-    return [r["pool_id"] for r in conn.execute("SELECT pool_id FROM pump_pools WHERE mint IS NULL OR right(mint, 4) = 'pump'").fetchall()]
+    """Blocked pools that can carry universe legs: those of pump.fun's coins (a ``pump`` mint or a graduate in this table).
+    The stream and ``train/mature.py`` keep only those coins before this check, so pools of other mints never match either
+    way (and the set stays ~10 % of ``pump_pools``). Read as two halves joined on the indexes: one ``corpus_meta`` probe per
+    pool row took 3.5 s (2026-10-23)."""
+    return [r["pool_id"] for r in conn.execute("""SELECT pool_id FROM pump_pools WHERE mint IS NULL OR right(mint, 4) = 'pump'
+                                                  UNION ALL
+                                                  SELECT p.pool_id FROM pump_pools p JOIN corpus_meta c ON c.mint = p.mint
+                                                  WHERE right(p.mint, 4) <> 'pump'""").fetchall()]
+
+
+def pumpfun_graduates(conn) -> list[str]:
+    """pump.fun graduates whose mint does not end in ``pump`` (a migration recorded them here): universe coins as much as
+    the suffixed ones, which the stream and the archive aggregation recognise by the suffix alone."""
+    return [r["mint"] for r in conn.execute("SELECT mint FROM corpus_meta WHERE right(mint, 4) <> 'pump'").fetchall()]
 
 
 def creator_history(conn, creator: str | None, create_ts, graduated_at) -> dict:
@@ -328,7 +375,7 @@ def creator_history(conn, creator: str | None, create_ts, graduated_at) -> dict:
 
 def load_features() -> pd.DataFrame:
     with transaction() as conn:
-        rows = conn.execute("SELECT mint, " + ", ".join(FEATURE_COLS) + " FROM corpus_meta").fetchall()
+        rows = conn.execute("SELECT mint, " + sol_select(FEATURE_COLS) + " FROM corpus_meta").fetchall()
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=["mint"] + FEATURE_COLS)

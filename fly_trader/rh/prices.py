@@ -175,9 +175,9 @@ def scan_asset(conn, rpc, asset: str, hops: list[dict], lo: int, hi: int, state:
 
 
 def base_eth(conn, asset: str | None, ts) -> tuple[float | None, bool]:
-    """(ETH per whole unit of ``asset`` at minute ``ts``, stale). ETH itself is 1. The last mark at or before the minute;
-    stale when older than ``STALE_S`` or flagged stale."""
-    if asset is None or int(asset, 16) == 0:
+    """(ETH per whole unit of ``asset`` at minute ``ts``, stale). ETH itself is 1, and so is WETH (a plain v4 memecoin's pool
+    may be quoted in either). The last mark at or before the minute; stale when older than ``STALE_S`` or flagged stale."""
+    if asset is None or int(asset, 16) == 0 or asset.lower() == config.RH_WETH.lower():
         return 1.0, False
     r = conn.execute("SELECT ts, price_eth, stale FROM rh_base_prices WHERE asset = %s AND ts <= %s ORDER BY ts DESC LIMIT 1", (asset.lower(), ts)).fetchone()
     if r is None:
@@ -195,7 +195,7 @@ def run_once(max_ranges: int = 1, rpc=None) -> dict:
     with transaction() as conn:
         top = conn.execute("SELECT block, detail FROM rh_scan WHERE name = 'rh'").fetchone()
         rows = conn.execute("SELECT DISTINCT a.asset, a.decimals, a.ref_path FROM rh_assets a JOIN rh_pools p ON p.quote_asset = a.asset "
-                            "WHERE p.is_pons AND a.class <> 'eth'").fetchall()
+                            "WHERE (p.is_pons OR p.indexed) AND a.class <> 'eth'").fetchall()
     if not top:
         return out
     through = int(top["block"])

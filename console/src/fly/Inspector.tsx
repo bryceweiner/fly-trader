@@ -9,7 +9,7 @@ import { useFeedback } from '../components/feedback'
 import { Callout, Caption, Card, Empty, Expander, Icon, KVList, Loaded, Md, Metric, Metrics, ProgressList, RowGroup, Segmented, Toggle, Widget, WidgetGrid,
   type WidgetColor } from '../components/ui'
 import { useStored, useTopic } from '../lib/hooks'
-import { ago, amount, dt, int, num, pct, shortAddr, tone, usd } from '../lib/format'
+import { ago, amount, dt, hm, int, num, pct, plain, shortAddr, tone, usd } from '../lib/format'
 
 type Scored = { ts: string; strategy: string; side?: string; score: number | null; frozen_score: number | null; line: number | null; label: number | null; state: string; teacher_allow?: boolean | null }
 type Latest = Scored & { hold_min?: number | null; frozen_line?: number | null; bootstrap_id?: number | null }
@@ -27,9 +27,10 @@ type Fill = { id: number; ts: string; book: string; side: string; amount: number
 type Pathway = { kc: number; mbon: number; delta: number; ratio: number; strategy: string; valence: string; kc_type: string | null; mbon_type: string | null }
 type Pathways = { mode: string; items: Pathway[]; note: string | null; changed: number; reference: string | null; bootstrap: number | null; running: boolean
   n_pairs?: number; drift: Record<string, number> }
+type Minute = { ts: string; price: number | null; volume: number | null; price_5m: number | null; volume_5m: number }
 type TokenData = {
   chain: string; chain_name: string; unit: string; mint: string; label: string; symbol: string | null; name: string | null; graduated_at: string | null; creator: string | null
-  explorer: string; books: { selector: string; fly: string; live: string }; fly_score: string; teacher_gate: boolean; learned_veto: number
+  explorer: string; books: { selector: string; fly: string; live: string }; minute?: Minute | null; fly_score: string; teacher_gate: boolean; learned_veto: number
   series: Scored[]; stats: Stat[]; total: Stat | null; latest: Latest[]; explain: string; decisions: Decision[]; positions: Position[]; fills: Fill[]
   pnl: { closed: number; realized: number; open: number; wins: number }; pathways: Pathways
 }
@@ -170,6 +171,23 @@ function DecisionTable({ rows, unit, kalshi }: { rows: Decision[]; unit: string;
   return <DataTable rows={rows} cols={cols} filename="inspector-decisions" empty={kalshi ? 'No decisions on the Kalshi books.' : "No decisions on this chain's books."} />
 }
 
+/** The token's price and volume in the newest scored minute, each with an up/down arrow against the five minutes before. */
+function MinuteWidgets({ m, unit, scored }: { m: Minute; unit: string; scored: boolean }) {
+  const dp = m.price !== null && m.price_5m ? m.price / m.price_5m - 1 : null
+  const dv = m.volume !== null && m.volume_5m > 0 ? m.volume / m.volume_5m - 1 : null
+  const which = scored ? 'the minute the fly last scored it' : 'its newest traded minute (the fly has not scored it)'
+  return (
+    <Metrics min={320}>
+      <Metric compact label={`Price · ${hm(m.ts)}`} value={m.price === null ? '—' : `${plain(m.price)} ${unit}`}
+        delta={dp === null ? 'no price five minutes before' : `${pct(dp, 1)} over 5 min`} tone={dp ? 'normal' : 'off'} icon="candlestick"
+        help={`The close of ${which}, ${dt(m.ts)} UTC, in ${unit} per token; the arrow is its change from the close five minutes earlier.`} />
+      <Metric compact label={`Volume · ${hm(m.ts)}`} value={m.volume === null ? '—' : `${plain(m.volume)} ${unit}`}
+        delta={dv !== null ? `${pct(dv, 0)} vs 5-min average` : m.volume ? 'up from none in the five minutes before' : 'no volume'} tone={dv || (dv === null && m.volume) ? 'normal' : 'off'}
+        icon="chart" help={`Buys plus sells in ${which}, ${dt(m.ts)} UTC; the arrow compares it with the mean volume of the five minutes before (a minute without trades counts as none).`} />
+    </Metrics>
+  )
+}
+
 /** What the fly would do with the newest scored minute, as colour widgets (states, not text). */
 function VerdictWidgets({ d }: { d: TokenData }) {
   const r = d.latest[0]
@@ -229,6 +247,7 @@ function TokenBody({ chain, mint, mode, setMode }: { chain: string; mint: string
                 <a className="btn btn-sm btn-light" href={d.explorer} target="_blank" rel="noreferrer"><Icon name="external" />{chain === 'sol' ? 'Solscan' : 'Explorer'}</a>
               </span>
             </div>
+            {d.minute && <><MinuteWidgets m={d.minute} unit={u} scored={d.latest.length > 0} /><div className="mt-3" /></>}
             <VerdictWidgets d={d} />
             <div className="mt-3" />
             <WidgetGrid min={320}>

@@ -125,6 +125,20 @@ def _explain_token(latest: list[dict], chain: str) -> str:
     return "\n\n".join(out)
 
 
+def _minute_bar(chain: str, mint: str, at) -> dict | None:
+    """The token's minute at ``at`` (the newest scored minute; None: its newest traded minute): its close and its volume
+    (buys + sells, in its chain's unit), with the close five minutes earlier and the mean volume of the five minutes before
+    it (a minute without trades counts as none) -- the inspector's up/down arrows."""
+    tbl, vol = ("rh_minutes", "COALESCE(buy_eth, 0) + COALESCE(sell_eth, 0)") if chain == "rh" else ("pump_minutes", "COALESCE(buy_sol, 0) + COALESCE(sell_sol, 0)")
+    cur = q1(f"SELECT ts, close, {vol} AS volume FROM {tbl} WHERE mint = %s{' AND ts <= %s' if at else ''} ORDER BY ts DESC LIMIT 1", (mint, at) if at else (mint,))
+    if not cur:
+        return None
+    then = q1(f"SELECT close FROM {tbl} WHERE mint = %s AND ts <= %s - interval '5 minutes' AND close IS NOT NULL ORDER BY ts DESC LIMIT 1", (mint, cur["ts"]))
+    before = q1(f"SELECT sum({vol}) AS v FROM {tbl} WHERE mint = %s AND ts >= %s - interval '5 minutes' AND ts < %s", (mint, cur["ts"], cur["ts"]))
+    return {"ts": cur["ts"], "price": _f(cur["close"]), "volume": _f(cur["volume"]), "price_5m": _f(then["close"]) if then else None,
+            "volume_5m": (_f(before["v"]) or 0.0) / 5.0}
+
+
 @topic("inspector.token", every=10)
 def token(params: dict) -> dict:
     """One memecoin token through the fly's eyes and the books' ledgers."""
@@ -175,7 +189,7 @@ def token(params: dict) -> dict:
     return {"chain": chain, "chain_name": m.name, "unit": m.unit, "mint": mint, "label": labels([mint]).get(mint, mint[:6] + "…"),
             "symbol": meta.get("symbol"), "name": meta.get("name"), "graduated_at": meta.get("graduated_at"), "creator": meta.get("creator"),
             "explorer": explorer(chain, "address", mint), "books": {"selector": m.selector_book, "fly": m.fly_book, "live": m.live_book},
-            "fly_score": config.FLY_SCORE, "teacher_gate": bool(config.FLY_TEACHER_GATE), "learned_veto": config.FLY_LEARNED_VETO,
+            "minute": _minute_bar(chain, mint, last_ts), "fly_score": config.FLY_SCORE, "teacher_gate": bool(config.FLY_TEACHER_GATE), "learned_veto": config.FLY_LEARNED_VETO,
             "series": series, "stats": stats, "total": total, "latest": latest, "explain": _explain_token(latest, chain),
             "decisions": decisions, "positions": positions, "fills": fills,
             "pnl": {"closed": len(closed), "realized": sum(_f(p["realized_sol"]) or 0.0 for p in closed), "open": sum(1 for p in positions if p["status"] == "open"),

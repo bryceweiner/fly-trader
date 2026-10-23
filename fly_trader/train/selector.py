@@ -39,32 +39,33 @@ from ..db.connection import transaction
 from ..market.features import FEATURE_VERSION
 from . import model_io, progress as prog
 from .decisions import HOLD_MIN, MIN_RESQ_SOL, MIN_VOL_15M_SOL, X_COLS, DecisionSet, build, evaluate, random_trades, rank_corr, summarize, taken_rows
-from .mature import AGG_VERSION
 from .scaling import RobustScaler
 
 log = logging.getLogger(__name__)
 SELECTOR_DIR = config.BRAIN_DIR / "selectors"
 # the data and model definitions a selector was trained on (the input columns by hash, so dropping or adding one retires
 # old models); a model from other definitions is never loaded or shown. The fly has its own (train/fly_selector.FLY_VERSION),
-# so a change to the fly never retires a selector.
+# so a change to the fly never retires a selector. The corpus build versions (mature.AGG_VERSION, rh/corpus.RH_AGG_VERSION)
+# are not definitions: they say when the corpus files are rebuilt (which tokens and legs a day holds), not what a model's
+# inputs, labels or costs mean, so a rebuild never retires a model (until 2026-10-23 they were keys here, and widening the
+# universe to data already in the corpus would have stopped all trading until a retrain).
 def _skill_version() -> str:
     from .wallet_skill import skill_version
     return skill_version()
 
 
 def _rh_version() -> dict:
-    """The Robinhood Chain half of the combined dataset: its aggregation, skill space and cost constants (a model trained
-    before RH rows existed, or on other RH definitions, is not current). Not RH_ENABLED: whether an install indexes and
+    """The Robinhood Chain half of the combined dataset: its skill space and cost constants (a model trained before RH
+    rows existed, or on other RH definitions, is not current). Not RH_ENABLED: whether an install indexes and
     trades RH is its own choice, and a combined model trades Solana alone (until 2026-10-10 an install with RH off
     computed "chains": "sol", refused the shipped combined models and crash-looped at boot)."""
     from .. import config
-    from ..rh.corpus import RH_AGG_VERSION
     from ..rh.wallet_skill import skill_version as rh_skill
-    return {"chains": "sol+rh-1", "rh_agg": RH_AGG_VERSION, "rh_skill": rh_skill(),
+    return {"chains": "sol+rh-1", "rh_skill": rh_skill(),
             "rh_costs": f"pons-kyber-1:{config.RH_ETH_PER_SOL:g}:{config.RH_LABEL_SIZE_ETH:g}:{config.RH_TX_FEE_ETH:g}:{config.RH_HOOK_FEE:g}"}
 
 
-DATA_VERSION = {"agg": AGG_VERSION, "features": FEATURE_VERSION, "costs": "real-fees-sized-1", "selector": "multi-1",
+DATA_VERSION = {"features": FEATURE_VERSION, "costs": "real-fees-sized-1", "selector": "multi-1",
                 "cols": hashlib.sha1(",".join(X_COLS).encode()).hexdigest()[:8], "skill": _skill_version(), "meta": "rug-1", **_rh_version()}
 WARMUP_DAYS, BLOCK_DAYS = 21, 7      # walk-forward: the first 21 days only train; every later day is tested, refit every 7 days
 MIN_AGE_H = 6.0                      # trade only tokens at least this long past graduation (unknown age = graduated before the archive); fitted, see decisions.HOLD_MIN
@@ -81,9 +82,21 @@ def in_universe(X: np.ndarray, cols: list[str]) -> np.ndarray:
     return (X[:, c["age_known"]] == 0) | (np.expm1(X[:, c["log_age_h"]]) >= MIN_AGE_H)
 
 
+RETIRED_KEYS = ("agg", "rh_agg")     # the corpus build versions, dropped from the definitions 2026-10-23
+
+
+def defs_match(stored, current: dict) -> bool:
+    """A stored definitions record (a fly's or a replay verdict's ``data``) equals ``current`` once the keys retired from the
+    definitions (``RETIRED_KEYS``, when ``current`` no longer has them) are set aside. Retiring a key never retires a fly;
+    every other difference still does, an extra key included (a distilled fly's ``distil`` keeps it out)."""
+    if not isinstance(stored, dict):
+        return False
+    return {k: v for k, v in stored.items() if k in current or k not in RETIRED_KEYS} == current
+
+
 def is_current(meta: dict | None) -> bool:
     """Trained on every definition in ``DATA_VERSION``. Keys a model carries that are no longer definitions (the fly's,
-    which moved to ``FLY_VERSION``) are ignored; a model saved before the column hash existed is judged on the rest."""
+    which moved to ``FLY_VERSION``; the corpus build versions) are ignored; a model saved before the column hash existed is judged on the rest."""
     d = (meta or {}).get("data")
     return bool(meta) and isinstance(d, dict) and all(d.get(k) == v for k, v in DATA_VERSION.items() if k != "cols" or "cols" in d)
 

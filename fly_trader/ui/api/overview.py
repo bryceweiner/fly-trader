@@ -1,5 +1,5 @@
 """Overview: what the system is doing in plain words, the book the money is in (live, else the selector's paper book), this minute's scoring, the race between the selector
-and the plastic fly, and the open positions. (The brain at the top of the page is ui/api/brain.py.)"""
+and the plastic fly, and the open positions, each live one with its Sell Now (``overview.sell_now``). (The brain at the top of the page is ui/api/brain.py.)"""
 from __future__ import annotations
 
 import csv
@@ -11,8 +11,9 @@ from datetime import datetime, timedelta, timezone
 from ... import config, markets
 from ...agent.selector_session import pinned_snapshot
 from ...db.queries import q, q1
+from .. import runtime
 from ..cache import ttl_cache
-from ..hub import topic
+from ..hub import ActionError, action, topic
 from ..state import ago, backtest_line, labels, market_info, market_param, pct, system_state
 
 MAX_POINTS = 1500             # a 240 px line chart cannot show more; a month of minute marks is ~45,000 per book
@@ -156,21 +157,51 @@ def race(params: dict) -> dict:
 @topic("overview.book", every=15)
 def book(params: dict) -> dict:
     """The money's book — live while live money trades, else the selector's paper book: its whole wealth history and
-    its open positions (held, exits in, cost, gross return)."""
+    its open positions (held, exits in, cost, gross return). A live position can be sold now (``sell_now``) at the exit's
+    slippage stepping up to the forced one (``sell``, in percent)."""
     mk = market_param(params); live = bool(system_state(mk)["live_money"]); BOOK = mk.live_book if live else mk.selector_book; u = mk.unit
     hist = _series(marks([BOOK]), [BOOK])
-    rows = q("SELECT mint, opened_at, cost_sol, entry_price, last_mark_price, hold_s, strategy FROM positions WHERE book = %s AND status = 'open' ORDER BY opened_at", (BOOK,))
+    rows = q("SELECT id, mint, opened_at, cost_sol, entry_price, last_mark_price, hold_s, strategy FROM positions WHERE book = %s AND status = 'open' ORDER BY opened_at", (BOOK,))
     out = []
     if rows:
         hold = int((system_state(mk).get("model") or {}).get("run", {}).get("horizon_min") or 30)
         now = datetime.now(timezone.utc); names = labels([r["mint"] for r in rows])
         for r in rows:
             held = (now - r["opened_at"]).total_seconds() / 60
-            out.append({"mint": r["mint"], "token": names.get(r["mint"], r["mint"][:6]), "strategy": r["strategy"] or "—", "held_min": held,
+            out.append({"id": int(r["id"]), "mint": r["mint"], "token": names.get(r["mint"], r["mint"][:6]), "strategy": r["strategy"] or "—", "held_min": held,
                         "exits_in_min": max(0.0, (float(r["hold_s"]) / 60 if r["hold_s"] else hold) - held), "cost": float(r["cost_sol"]),
                         "ret": (float(r["last_mark_price"]) / float(r["entry_price"]) - 1) * 100 if r["entry_price"] and r["last_mark_price"] else None})
     return {"unit": u, "history": hist[0]["data"] if hist else [], "positions": out, "live": live, "book": BOOK,
-            "title": "Live wealth" if live else "Paper wealth", "sub": "the bot wallet since it started trading" if live else "the selector book since it started"}
+            "title": "Live wealth" if live else "Paper wealth", "sub": "the bot wallet since it started trading" if live else "the selector book since it started",
+            "observer": isinstance(runtime.sup(), runtime.Observer), "sell": {"from_pct": config.SLIPPAGE_EXIT_BPS / 100, "to_pct": config.SLIPPAGE_FORCED_BPS / 100}}
+
+
+@action("overview.sell_now")
+def sell_now(body: dict) -> dict:
+    """The operator's Sell Now on the open positions: one open position of the chain's live book sold at once and booked
+    (agent/live_first.sell_now), waiting for the sale; the message says what it brought, or why it was not sold."""
+    mk = market_param(body)
+    try:
+        pid = int(body.get("position_id"))
+    except (TypeError, ValueError):
+        raise ActionError("position_id must be a position id", 400)
+    pos = q1("SELECT mint, status FROM positions WHERE id = %s AND book = %s", (pid, mk.live_book))
+    if pos is None:
+        raise ActionError(f"Position {pid} is not in the live book {mk.live_book}.", 404)
+    if pos["status"] != "open":
+        raise ActionError("This position is no longer open.")
+    from ...agent import live_first
+    name = labels([pos["mint"]]).get(pos["mint"], pos["mint"][:6])
+    try:
+        out = live_first.sell_now(mk.chain, pid)
+    except ValueError as e:
+        raise ActionError(f"{name} was not sold: {e}.")
+    if out["booked"]:
+        r, c = out["realized"], out["cost"]
+        return {**out, "message": f"Sold {name}" + (f": {r:+.6g} {mk.unit}" + (f" ({r / c * 100:+.1f}%)" if c else "") if r is not None else "")}
+    if out["error"]:
+        raise ActionError(f"The sale of {name} failed: {out['error']}. The position is still open.")
+    return {**out, "message": f"Selling {name}: sent, booked when it fills"}
 
 
 # ---------------------------------------------------------------- trades by hour of day

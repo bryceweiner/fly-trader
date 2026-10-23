@@ -102,7 +102,7 @@ def apply_release(release_dir: Path, bootstrap: bool = False) -> dict:
     if not ok:
         raise ReleaseError(f"the release's fly is not deployable on this code: {why}")
     v = seed["verdict"]
-    if not v.get("passed") or v.get("data") != fly_selector.verdict_version():
+    if not v.get("passed") or not fly_selector.selector.defs_match(v.get("data"), fly_selector.verdict_version()):
         raise ReleaseError("the release's replay verdict did not pass on this code's definitions")
     ids: dict[str, int] = {}
     with transaction() as conn:

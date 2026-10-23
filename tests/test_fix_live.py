@@ -304,12 +304,53 @@ def test_a_buy_queues_behind_the_sale_of_its_mint_which_keeps_its_token_account(
 def test_stop_waits_for_the_order_in_flight_and_drops_the_queued_ones(circuit1):
     a, b = f"M{uuid.uuid4().hex[:10]}", f"M{uuid.uuid4().hex[:10]}"
     gate = threading.Event()
-    fb = _ScriptBroker([_fill(-5, 5), _fill(-5, 5)], gate=gate); w = ExecutionWorker(fb)
+    fb = _ScriptBroker([_fill(-5, 5), _fill(-5, 5)], gate=gate); w = ExecutionWorker(fb, threads=1)    # one thread: b waits in the queue
     assert w.submit(_req(a, "sell")) and fb.started.wait(10) and w.submit(_req(b, "sell"))
     threading.Timer(0.3, gate.set).start()
     w.stop(timeout=10)
     assert not w.thread.is_alive() and [c["mint"] for c in fb.calls] == [a] and w.pending() == set()
     assert w.results.get_nowait().request.mint == a and not w.submit(_req(b, "sell"))
+
+
+def test_swaps_of_different_mints_run_at_once_and_each_mints_in_order(circuit1):
+    """Live money fast: one token's swap in flight never holds another token's back; one token's sale and buy-back still
+    run one after the other."""
+    a, b = f"M{uuid.uuid4().hex[:10]}", f"M{uuid.uuid4().hex[:10]}"
+    gate = threading.Event()
+    fb = _ScriptBroker([_fill(-5, 5), _fill(-5, 5), _fill(5, -5)], gate=gate); w = ExecutionWorker(fb, threads=3)
+    try:
+        assert w.submit(_req(a, "sell")) and w.submit(_req(b, "sell")) and w.submit(_req(a, "buy", 5))
+        for _ in range(100):
+            if len(fb.calls) >= 2:
+                break
+            threading.Event().wait(0.02)
+        assert sorted((c["mint"], c["side"]) for c in fb.calls) == sorted([(a, "sell"), (b, "sell")])   # both sales in flight, a's buy behind its sale
+        gate.set()
+        got = [w.results.get(timeout=10) for _ in range(3)]
+        assert [(c["mint"], c["side"]) for c in fb.calls if c["mint"] == a] == [(a, "sell"), (a, "buy")]       # a's buy ran once its sale was done
+        assert all(r.ok for r in got) and w.pending() == set()
+    finally:
+        gate.set(); w.stop()
+        with transaction() as conn:
+            conn.execute("DELETE FROM positions WHERE mint = ANY(%s)", ([a, b],))
+
+
+def test_a_wealth_mark_waits_for_every_swap_in_flight_and_never_holds_one_back():
+    from fly_trader.execution.worker import SharedLock
+    busy = SharedLock()
+    with busy.shared():
+        with busy.shared():                                                         # two swaps in flight at once
+            assert not busy.acquire(blocking=False) and not busy.acquire(timeout=0.05)
+    assert busy.acquire(timeout=0.1)                                                # none in flight: the mark reads alone
+    started = threading.Event()
+
+    def swap():
+        with busy.shared():
+            started.set()
+    t = threading.Thread(target=swap); t.start()
+    assert not started.wait(0.1)                                                    # a swap waits only while a mark holds it
+    busy.release(); t.join(2)
+    assert started.is_set()
 
 
 def test_the_worker_tells_its_mirror_once_an_order_is_booked(circuit1):

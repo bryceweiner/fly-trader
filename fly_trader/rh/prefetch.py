@@ -112,7 +112,7 @@ def selections(conn) -> list[dict]:
             H.selection([config.PONS_HOOK], [[index.FEE_TOPIC]])]
     hops: dict = {}
     for r in conn.execute("SELECT DISTINCT a.asset, a.ref_path::text AS ref_path FROM rh_assets a JOIN rh_pools p ON p.quote_asset = a.asset "
-                          "WHERE p.is_pons AND a.class <> 'eth' AND a.ref_path IS NOT NULL").fetchall():
+                          "WHERE (p.is_pons OR p.indexed) AND a.class <> 'eth' AND a.ref_path IS NOT NULL").fetchall():
         for h in json.loads(r["ref_path"]):
             hops.setdefault(prices._hop_key(h), h)
     plain = sorted({h["emitter"].lower() for h in hops.values() if not prices._is_id(h["pool"])})

@@ -73,6 +73,20 @@ def test_row_weights_take_one_line_per_row():
     assert plastic.row_weights(sc, torch.tensor([[0.05, 0.25, 0.25], [0.2, 0.2, 0.4]])).tolist() == [[1, 0, 1], [0, 1, 0]]
 
 
+def test_a_new_fly_may_race_on_the_races_own_trade_minimum():
+    """The wallet trades the selector's decisions until a fly wins its race, so a bootstrap's calibration week need only show
+    a profit over the race's own minimum of trades (a quiet week gave the 2026-10-22 fly 88, under the old 100); a losing
+    week still never deploys it, and the Kalshi fly keeps 100."""
+    from fly_trader import config
+    from fly_trader.kalshi import fly as KF
+    from fly_trader.train import fly_selector
+    meta = lambda n, mean=0.03, data=fly_selector.FLY_VERSION: {"data": data, "gates_ok": True, "calibration": {"trades": n, "mean": mean}}
+    assert fly_selector.deployable(meta(88))[0] and fly_selector.deployable(meta(config.HANDOVER_MIN_TRADES), fly_selector.FLY_VERSION)[0]
+    ok, why = fly_selector.deployable(meta(config.HANDOVER_MIN_TRADES - 1)); assert not ok and "too few" in why
+    assert not fly_selector.deployable(meta(88, mean=-0.01))[0]
+    assert not KF.deployable(meta(88, data=KF.KALSHI_FLY_VERSION))[0] and KF.deployable(meta(100, data=KF.KALSHI_FLY_VERSION))[0]
+
+
 def test_a_nan_calibration_mean_never_deploys_the_fly():
     from fly_trader.train import fly_selector
     meta = {"data": fly_selector.FLY_VERSION, "gates_ok": True, "calibration": {"trades": 10 ** 4, "mean": float("nan")}}

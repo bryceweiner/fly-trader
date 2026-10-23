@@ -91,8 +91,12 @@ def oos(ds, rows: np.ndarray, y: np.ndarray, ci: np.ndarray, H, stop, label_: st
 
 
 def fit_final(ds, rows: np.ndarray, ci: np.ndarray, H):
-    """The deployed model of a strategy: a classifier of the side paying, on its candidate rows (at most ds.train_max_rows)."""
-    rows = S.cap_rows(ds, np.flatnonzero(rows), 99)
+    """The deployed model of a strategy: a classifier of the side paying, on its candidate rows (at most ds.train_max_rows).
+    ``rows``: row indices, as train/strategies.final_models passes them (a boolean mask is accepted too). From 2026-10-07
+    to 2026-10-12 this took the indices through np.flatnonzero a second time, which turned them into 0..n−1: every final
+    and holdout model (selectors 188, 220, 249) trained on the corpus's first n rows instead of the strategy's own."""
+    rows = np.asarray(rows)
+    rows = S.cap_rows(ds, np.flatnonzero(rows) if rows.dtype == bool else rows, 99)
     scaler = RobustScaler.fit(ds.X[np.ix_(rows, ci)], seed=99)
     m = HistGradientBoostingClassifier(**S._gbm_params(), random_state=99); m.fit(scaler.transform(ds.X[np.ix_(rows, ci)]), ds.outcome[rows].astype(np.int8))
     return m, scaler

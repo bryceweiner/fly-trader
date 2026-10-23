@@ -206,6 +206,39 @@ def test_book_lists_open_positions_and_the_wealth_line(console):
     assert b["strategy"] == "capitulation" and b["ret"] is None and b["exits_in_min"] == pytest.approx(30 - 12, abs=0.2)     # no hold_s: the model's horizon, else 30
 
 
+def test_sell_now_sells_a_live_position_through_its_chains_mirror(console, monkeypatch):
+    """Sell Now (``overview.sell_now``): refused while the wallet may not sign (a test never signs) and for a position not
+    open in the chain's live book; else the chain's mirror sells it, and the message says what the booked sale brought."""
+    from types import SimpleNamespace
+
+    from fly_trader.agent import live_first
+
+    class Mirror:
+        sold: list = []
+
+        def sell_now(self, conn, position_id):          # the sale, filled and booked at once: +0.01 SOL on 0.2
+            self.sold.append(position_id)
+            conn.execute("UPDATE positions SET status = 'closed', closed_at = now(), realized_sol = 0.01 WHERE id = %s", (position_id,))
+            return 0
+
+        def sale_result(self, did, timeout):
+            return SimpleNamespace(ok=True, error=None)
+
+    pos = [{"book": "live", "mint": MINT_A, "status": "open", "cost_sol": 0.2, "entry_price": 1.0, "opened_at": datetime.now(timezone.utc)}]
+    monkeypatch.setitem(live_first._MIRRORS, "sol", Mirror())
+    with seeded(positions=pos) as (pid,):
+        r = console.act("overview.sell_now", {"chain": "sol", "position_id": pid})
+        assert r.status_code == 409 and "may not sign" in r.json()["error"] and Mirror.sold == []
+        monkeypatch.setattr(live_first, "signing_refused", lambda chain: None)
+        assert console.act("overview.sell_now", {"chain": "sol", "position_id": -1}).status_code == 404
+        monkeypatch.setattr(config, "RH_ENABLED", True)
+        assert console.act("overview.sell_now", {"chain": "rh", "position_id": pid}).status_code == 404       # not in Robinhood Chain's live book
+        d = _ok(console.act("overview.sell_now", {"chain": "sol", "position_id": pid}))
+        assert d["message"] == f"Sold {MINT_A[:6]}…: +0.01 SOL (+5.0%)" and d["booked"] and Mirror.sold == [pid]
+        r = console.act("overview.sell_now", {"chain": "sol", "position_id": pid})
+        assert r.status_code == 409 and "no longer open" in r.json()["error"] and Mirror.sold == [pid]
+
+
 def test_wealth_lines_are_thinned_but_end_at_the_last_mark():
     t0 = datetime(2100, 2, 1, tzinfo=timezone.utc)
     marks = [(-84000 - i, "test_overview_thin", t0 + timedelta(minutes=i), 1.0 + i / 100, 0, 0, 0) for i in range(60)]

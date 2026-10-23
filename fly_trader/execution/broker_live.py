@@ -1,10 +1,11 @@
 """Live execution through Jupiter Swap API v2 with balance-verified fills (plan §9).
 
-Per attempt (one in-flight order per process, guarded by a module lock):
-  assert_signing_allowed() -> pre = snapshot_balances() -> GET /order (taker = bot, excludeRouters=
-  jupiterz) -> assert signatureFeePayer == taker -> orders row (status 'ordered') -> sign only our
-  signer slot -> POST /execute -> orders row updated -> poll getSignatureStatuses every 1 s until
-  confirmed or getBlockHeight() > lastValidBlockHeight (no other timeout) -> post = snapshot ->
+Per attempt (several mints' swaps in flight at once, one per mint: execution/worker.py):
+  assert_signing_allowed() -> pre = snapshot_balances() beside GET /order (taker = bot, excludeRouters=
+  jupiterz) and the signing, taken before anything is sent -> assert signatureFeePayer == taker -> orders row (status
+  'ordered') -> sign only our signer slot -> POST /execute -> orders row updated -> poll getSignatureStatuses every
+  ``CONFIRM_POLL_S`` until confirmed or getBlockHeight() > lastValidBlockHeight (no other timeout) -> post = snapshot
+  beside the swap's own transaction, whose deltas are the fill (another swap may land between the two snapshots) ->
   fill iff the input balance decreased AND the output balance increased (a confirmed sell whose token
   balance fell is a fill even when the SOL delta is <= 0: dust proceeds below fees) -> fills row.
 
@@ -29,6 +30,7 @@ import logging
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from psycopg.types.json import Jsonb
@@ -49,11 +51,14 @@ from . import ledger
 
 log = logging.getLogger(__name__)
 
-_INFLIGHT = threading.Lock()  # one in-flight order at a time (plan §9)
+_INFLIGHT = threading.Lock()  # one token-account close at a time (``close_empty_atas``)
 _UNSETTLED: dict[str, dict] = {}   # token-account closes sent whose wait ended before they landed or expired (``settle_closes``)
 _UNSETTLED_LOCK = threading.Lock()
+_IO = ThreadPoolExecutor(max_workers=8, thread_name_prefix="runner-exec-io")   # a swap's reads beside its order, signing and confirmation
+_SWAPS = {"active": 0, "started": 0}               # swaps in flight now / ever: whether another swap's balances moved between a swap's snapshots
+_SWAPS_LOCK = threading.Lock()
 
-CONFIRM_POLL_S = 1.0
+CONFIRM_POLL_S = 0.4          # one slot
 BLOCKHASH_VALIDITY_BLOCKS = 150  # fallback horizon when /order carries no lastValidBlockHeight
 CLOSE_ATA_BATCH = 10
 BASE_FEE_LAMPORTS = 5_000       # one signature, no priority fee: what the signer's close transaction pays
@@ -178,29 +183,35 @@ class LiveBroker:
             input_mint, output_mint = config.WSOL_MINT, mint
         else:
             input_mint, output_mint = mint, config.WSOL_MINT
-        with _INFLIGHT:
-            slip = int(slippage_bps)
-            attempt = 0
-            while True:
-                attempt += 1
+        slip = int(slippage_bps)
+        attempt = 0
+        while True:
+            attempt += 1
+            with _SWAPS_LOCK:
+                seen = (_SWAPS["active"], _SWAPS["started"]); _SWAPS["active"] += 1; _SWAPS["started"] += 1
+            try:
                 result, retryable = self._attempt(
                     conn, decision_id=decision_id, book=book, side=side, mint=mint, input_mint=input_mint,
                     output_mint=output_mint, amount_in=amount_in, slippage_bps=slip, attempt=attempt,
-                    ref_price=ref_price if side == "buy" else None, decimals=decimals)
-                result.attempts = attempt
-                if result.ok or not retryable or step_bps <= 0 or slip + step_bps > max_slippage_bps:
-                    if retryable and not result.ok:
-                        log.warning("order %s not retried: slippage ladder exhausted at %d bps", result.order_id, slip)
-                    return result
-                slip += int(step_bps)
-                log.warning("retrying %s %s after %s (code %s) with slippage %d bps",
-                            side, mint, result.status, result.code, slip)
+                    ref_price=ref_price if side == "buy" else None, decimals=decimals, seen=seen)
+            finally:
+                with _SWAPS_LOCK:
+                    _SWAPS["active"] -= 1
+            result.attempts = attempt
+            if result.ok or not retryable or step_bps <= 0 or slip + step_bps > max_slippage_bps:
+                if retryable and not result.ok:
+                    log.warning("order %s not retried: slippage ladder exhausted at %d bps", result.order_id, slip)
+                return result
+            slip += int(step_bps)
+            log.warning("retrying %s %s after %s (code %s) with slippage %d bps",
+                        side, mint, result.status, result.code, slip)
 
     # ---- one attempt ----
     def _attempt(self, conn, *, decision_id, book, side, mint, input_mint, output_mint, amount_in,
-                 slippage_bps, attempt, ref_price=None, decimals=None) -> tuple[FillResult, bool]:
+                 slippage_bps, attempt, ref_price=None, decimals=None, seen=(0, 0)) -> tuple[FillResult, bool]:
+        """``seen``: (swaps in flight, swaps started) when this one began (``swap``)."""
         taker = self.pubkey
-        pre = snapshot_balances(self.rpc, taker)
+        pre_f = _IO.submit(snapshot_balances, self.rpc, taker)          # the balances before, read beside the order and the signing
         request = {"inputMint": input_mint, "outputMint": output_mint, "amount": str(amount_in), "taker": taker,
                    "slippageBps": slippage_bps, "excludeRouters": EXCLUDE_ROUTERS}
         base = dict(decision_id=decision_id, book=book, attempt=attempt, side=side, input_mint=input_mint,
@@ -258,6 +269,10 @@ class LiveBroker:
         except SignerUnavailable as e:
             return fail("sign_error", scrub(str(e)), None, order_id=order_id)
         signed_b64, tx_sig = signed["tx"], signed["signature"]
+        try:
+            pre = pre_f.result()                         # taken before anything is sent
+        except Exception as e:
+            return fail("unsent", f"the balances before could not be read: {type(e).__name__}: {scrub(str(e))}", None, order_id=order_id)
 
         # 3. execute
         exec_req = {"requestId": order.get("requestId"), "lastValidBlockHeight": lvbh, "signedTransaction": signed_b64}
@@ -280,20 +295,30 @@ class LiveBroker:
             self._update_order(conn, order_id, execute_request=exec_req, execute_response=ex, signature=signature,
                                status="executed", error_code=code, error=error, latency_ms=ex.get("_latency_ms"))
 
-        # 4. confirm (or expire), 5. verify by balance deltas — retried: a transport error here must not leave a landed swap unrecorded
-        chain_status = st = post = None; last_exc = None
+        # 4. confirm (or expire), 5. verify: the balances after, beside the swap's own transaction — retried: a transport
+        # error here must not leave a landed swap unrecorded
+        chain_status = st = post = tx = None; last_exc = None
         for k in range(4):
             try:
                 if chain_status is None:
                     chain_status, st = await_confirmation(self.rpc, signature, lvbh)
                     self._update_order(conn, order_id, status=chain_status)
-                post = snapshot_balances(self.rpc, taker); break
+                post_f = _IO.submit(snapshot_balances, self.rpc, taker)
+                tx_f = _IO.submit(self._landed, signature) if chain_status == "confirmed" else None
+                post = post_f.result(); tx = tx_f.result() if tx_f is not None else None; break
             except Exception as e:                       # RPC transport / RPC errors
                 last_exc = e; log.warning("confirm/verify attempt %d for %s failed: %s", k + 1, signature, scrub(str(e)))
                 time.sleep(2.0 * (k + 1))
-        if post is None:
-            fill_id = self._insert_fill(conn, order_id, book, signature, None, mint, side, 0, 0, None, None, order.get("platformFee"), "unknown", pre, pre)
-            record_event("error", "broker_live", "fill unknown: could not confirm or verify after retries; entries paused until reconciled (verify-fills)",
+        # another swap, a vault deposit or claim, or a token-account close left unsettled may move the wallet between the
+        # two snapshots: the fill is the swap's own transaction's deltas, so SOL landing meanwhile never becomes part of a
+        # trade's cost or proceeds; with other swaps in flight the snapshots cannot stand in for an unreadable transaction
+        exact = tx_deltas(tx, str(taker), mint) if tx else None
+        with _SWAPS_LOCK:
+            moved = seen[0] > 0 or _SWAPS["started"] - seen[1] > 1
+        if post is None or (chain_status == "confirmed" and exact is None and moved):
+            why = "could not confirm or verify after retries" if post is None else "its transaction could not be read and other swaps moved the wallet meanwhile"
+            fill_id = self._insert_fill(conn, order_id, book, signature, None, mint, side, 0, 0, None, None, order.get("platformFee"), "unknown", pre, post or pre)
+            record_event("error", "broker_live", f"fill unknown: {why}; entries paused until reconciled (verify-fills)",
                          {"order_id": order_id, "signature": signature, "side": side, "mint": mint, "error": scrub(str(last_exc))[:200]})
             try:                                            # a landed but unrecorded swap must not be bought again or leave a stale position
                 with transaction() as c2:
@@ -301,23 +326,15 @@ class LiveBroker:
                     c2.execute("INSERT INTO circuit_events (kind, detail) VALUES ('unknown_fill_pause', %s)", (Jsonb({"order_id": order_id, "signature": signature, "mint": mint, "side": side}),))
             except Exception:
                 log.exception("could not pause entries after an unknown fill")
-            raise RuntimeError(f"confirm/verify failed for {signature}: {type(last_exc).__name__}") from last_exc
+            raise RuntimeError(f"confirm/verify failed for {signature}: {why}") from last_exc
         delta = compute_delta(pre, post)
         lam = int(delta["lamports_delta"])
         tok = int(delta["token_deltas"].get(mint, 0))
-        if (config.VAULT_ENABLED or _UNSETTLED) and chain_status == "confirmed":
-            # the vault fly's wallet also receives deposits and pays claims, and a token-account close left unsettled may
-            # land at any time: take the swap's own deltas from the transaction, so SOL landing between the two snapshots
-            # never becomes part of a trade's cost or proceeds
-            try:
-                exact = tx_deltas(self.rpc.get_transaction(signature), str(taker), mint)
-            except Exception as e:
-                exact = None; log.warning("getTransaction for exact fill deltas failed: %s", type(e).__name__)
-            if exact is not None:
-                if exact != (lam, tok):
-                    log.warning("fill %s: snapshot deltas (%d, %d) differ from the transaction's (%d, %d); using the transaction",
-                                signature[:12], lam, tok, exact[0], exact[1])
-                lam, tok = exact
+        if exact is not None and chain_status == "confirmed":
+            if exact != (lam, tok):
+                log.warning("fill %s: snapshot deltas (%d, %d) differ from the transaction's (%d, %d); using the transaction",
+                            signature[:12], lam, tok, exact[0], exact[1])
+            lam, tok = exact
         # the rent a first buy pays to open the mint's token account (~0.0015 SOL) is a deposit the account's close returns,
         # not the trade: the trade's SOL, its price and the position's cost leave it out (it is kept on the position)
         dep = int(post.deposits.get(mint, 0)) - int(pre.deposits.get(mint, 0))
@@ -338,9 +355,9 @@ class LiveBroker:
                      fill_id, side, mint, tok, lam, price, verified_by)
             return FillResult(True, order_id, fill_id, signature, chain_status, code, error, tok, lam, price, attempt, dep), False
         if jup_status == "Success" or chain_status == "confirmed":
-            tx_info = None
+            tx_info = tx
             try:
-                tx_info = self.rpc.get_transaction(signature)
+                tx_info = tx_info or self.rpc.get_transaction(signature)
             except Exception as e:
                 log.warning("getTransaction failed for %s: %s", signature, type(e).__name__)
             meta = (tx_info or {}).get("meta") or {}
@@ -359,6 +376,18 @@ class LiveBroker:
         return FillResult(False, order_id, None, signature, chain_status, code, error, tok, lam, None, attempt), retryable
 
     # ---- helpers ----
+    def _landed(self, signature: str) -> dict | None:
+        """The confirmed swap's transaction; None when unreadable (a node may not serve it the moment it confirms)."""
+        for k in range(3):
+            try:
+                tx = self.rpc.get_transaction(signature)
+            except Exception as e:
+                tx = None; log.warning("getTransaction for the fill of %s failed: %s", signature[:12], type(e).__name__)
+            if tx:
+                return tx
+            time.sleep(0.3 * (k + 1))
+        return None
+
     def _decimals(self, conn, mint: str, pre: Snapshot, post: Snapshot) -> int | None:
         d = post.decimals.get(mint, pre.decimals.get(mint))
         if d is not None:
@@ -455,8 +484,8 @@ def close_empty_atas(rpc=None, signer=None, url: str | None = None, batch: int =
                      until=None) -> dict:
     """Close every zero-balance token account owned by the bot (rent back to the wallet) and book what each returned
     (``_book_close``). The signer builds and signs the CloseAccount transactions (it re-checks that each account is ours
-    and empty); each is recorded as wallet_events(kind='ata_closed'). A transaction holds the in-flight lock from its
-    signing to its outcome, so no swap's balance snapshots straddle it. ``until``: checked while a close is awaited and
+    and empty); each is recorded as wallet_events(kind='ata_closed'). A transaction holds the close lock from its
+    signing to its outcome; a swap meanwhile takes its fill from its own transaction. ``until``: checked while a close is awaited and
     before each batch; its True starts no other and leaves the one in flight unsettled (``settle_closes`` books it; until
     then swaps take their deltas from their own transactions)."""
     assert_signing_allowed()

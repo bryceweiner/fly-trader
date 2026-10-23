@@ -81,6 +81,23 @@ def test_inspector_token_on_seeded_rows(console, seeded, monkeypatch):
     assert isinstance(d["pathways"]["items"], list) and "note" in d["pathways"]
 
 
+def test_inspector_token_shows_the_scored_minutes_price_and_volume_against_the_five_before(console, seeded):
+    mint = _mint("bar"); t0 = datetime(2026, 10, 2, 12, 0, tzinfo=timezone.utc)
+    with transaction() as conn:
+        conn.execute("INSERT INTO fly_scored (ts, mint, strategy, hold_min, score, frozen_score, line, frozen_line, state, chain, bootstrap_id) "
+                     "VALUES (%s, %s, 'ev', 120, 0.1, 0.1, 0.1, 0.1, 'pending', 'sol', 157)", (t0, mint))
+        seeded.append(("fly_scored", "mint", mint))
+        # the scored minute (t0) and the six before it, t0-3 without trades; the newer bar (t0+1) is not the scored minute
+        for k, (close, buy, sell) in {-6: (0.5e-6, 9.0, 9.0), -5: (1.0e-6, 1.0, 1.0), -4: (1.1e-6, 2.0, 0.0), -2: (1.2e-6, 1.0, 1.0), -1: (1.25e-6, 0.5, 0.5),
+                                      0: (1.3e-6, 4.0, 2.0), 1: (2.0e-6, 50.0, 50.0)}.items():
+            conn.execute("INSERT INTO pump_minutes (mint, ts, close, buy_sol, sell_sol) VALUES (%s, %s, %s, %s, %s)", (mint, t0 + timedelta(minutes=k), close, buy, sell))
+        seeded.append(("pump_minutes", "mint", mint))
+    m = console.topic("inspector.token", chain="sol", mint=mint).json()["minute"]
+    assert datetime.fromisoformat(m["ts"]) == t0 and m["price"] == pytest.approx(1.3e-6) and m["volume"] == pytest.approx(6.0)
+    assert m["price_5m"] == pytest.approx(1.0e-6)                          # the close five minutes before the scored minute
+    assert m["volume_5m"] == pytest.approx((2.0 + 2.0 + 2.0 + 1.0) / 5)    # t0-5 .. t0-1, the quiet minute t0-3 counted as none
+
+
 def test_inspector_token_refuses_bad_params(console):
     assert console.topic("inspector.token", chain="eth", mint="A" * 40).status_code == 400
     assert console.topic("inspector.token", chain="sol", mint="../../etc/passwd").status_code == 400
@@ -90,7 +107,7 @@ def test_inspector_token_refuses_bad_params(console):
 
 def test_inspector_token_unscored_explains_why(console):
     d = console.topic("inspector.token", chain="sol", mint=_mint("none")).json()
-    assert d["series"] == [] and d["total"]["n"] == 0 and d["decisions"] == [] and "has not scored this token" in d["explain"]
+    assert d["series"] == [] and d["total"]["n"] == 0 and d["decisions"] == [] and "has not scored this token" in d["explain"] and d["minute"] is None
 
 
 def test_inspector_market_shape(console, seeded):

@@ -17,9 +17,9 @@ savepoint, so one book's failure never undoes the other's minute.
 Live money first and fast over paper, always (CLAUDE.md, agent/live_first.py). A book that trades live money (``LIVE``:
 the fly) runs its minute in two parts: ``on_minute`` in the minute's live phase (``live_phase``: the features, then the
 fly scores, plans and sends the wallet's orders; committed at once), ``after_minute`` in its paper phase
-(``paper_phase``: its paper trades, learning and bookkeeping, then every other book's minute). The loop runs every
-chain's newest minute's live phase before any chain's paper phase, and the live mirrors' idle bookkeeping between
-minutes. The wallet's scheduled sales go out at each minute boundary from the live clock's own thread
+(``paper_phase``: its paper trades, learning and bookkeeping, then every other book's minute). The loop runs the
+chains' newest minutes' live phases at once, before any chain's paper phase (and a minute written during the paper
+phases has its live phase before the next one), and the live mirrors' idle bookkeeping between minutes. The wallet's scheduled sales go out at each minute boundary from the live clock's own thread
 (``live_first.chain_exits``), started with the runner: a restart never holds them behind the books loading or the warm-up.
 
 Books join when they qualify (checked every ``MODEL_CHECK_S``, mid-minute): the selector while it has a deployable
@@ -27,7 +27,7 @@ model and has not handed its seat to a fly that is trading;
 the fly once its design passed the replay and a deployable bootstrap exists. No entries or exits while the stream is
 stale; missed minutes are replayed through the features without trading; a minute traded more than ``ENTRY_MAX_LAG_S``
 after its end (``Minute.lag_s``) takes no entries (agent/paper_trading.py), only exits. A minute runs as soon as its
-stream has written it (polled every ``POLL_S``).
+stream has written it (the stream's publish wakes the loop, live_first.minute_published; else polled every ``POLL_S``).
 """
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ import math
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
@@ -48,7 +49,7 @@ from ..db.connection import transaction
 from ..market.exit_cost import PUMP_SUPPLY
 from ..market.exit_cost import cost_at_size, cost_label
 from ..market.features import FEATURES, FIDX, TokenMeta, TokenState
-from ..train.corpus_meta import FEATURE_COLS as META_COLS
+from ..train.corpus_meta import FEATURE_COLS as META_COLS, sol_select
 from ..train.decisions import MIN_RESQ_SOL, MIN_VOL_15M_SOL, X_COLS
 from ..train.flow import FlowWindow, MarketWindow
 from ..train.mature import MASKED
@@ -57,15 +58,18 @@ from . import live_first
 
 log = logging.getLogger(__name__)
 WARMUP_MIN = 1440            # training warms each day on the previous day's candles
+V4_WARM_H = 3.0              # a plain v4 memecoin trades only once the engine has fed it this long (the longest feature window):
+                             # it goes live mid-session without the history before (rh/v4_universe.go_live)
 IDLE_EVICT_S = 86400         # training has no history for a mint idle since before the previous day
 STREAM_STALE_S = 180         # no entries or exits when the stream's newest complete minute is older than this
 META_TTL_S = 600
 MODEL_CHECK_S = 600          # how often books reload newer models and new books are admitted
-POLL_S = 0.25                # how often the loop looks for a minute its stream has written
+POLL_S = 0.25                # how often the loop looks for a minute its stream has written (a stream's publish wakes it at once)
+_LIVE_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="runner-live")   # every chain's live phase at once
 
 
 class MintState:
-    __slots__ = ("st", "meta", "hist", "decimals", "pool", "program_label", "graduated_at", "meta_row", "prev_close", "broken", "flow", "fee")
+    __slots__ = ("st", "meta", "hist", "decimals", "pool", "program_label", "graduated_at", "meta_row", "prev_close", "broken", "flow", "fee", "first_seen")
 
     def __init__(self, mint: str, decimals: int, pool: str | None, program_label: str | None, graduated_at: float | None, meta_row: dict | None):
         self.st = TokenState(mint); self.meta = TokenMeta(mint=mint, program_label=program_label or "Pump.fun Amm", graduated_at=graduated_at)
@@ -74,6 +78,7 @@ class MintState:
         self.prev_close: float | None = None; self.broken = False
         self.flow = FlowWindow()                    # wallet flow inputs (train/flow.py, as mature.build_day)
         self.fee: float | None = None               # the last pool fee a minute of this mint reported (Minute.fee)
+        self.first_seen: float | None = None        # end of the first minute this engine fed (warm-up included)
 
 
 @dataclass
@@ -151,9 +156,9 @@ class MinuteEngine:
         hit = self.meta_cache.get(mint)
         if hit is None or time.time() - hit["at"] > META_TTL_S:
             if self.rh:                                  # Robinhood Chain: rh_meta, the same columns (rh/meta.py), plus the quote class
-                r = conn.execute("SELECT graduated_at, supply, quote_class, " + ", ".join(META_COLS) + " FROM rh_meta WHERE mint = %s", (mint,)).fetchone()
+                r = conn.execute("SELECT graduated_at, supply, quote_class, source, " + ", ".join(META_COLS) + " FROM rh_meta WHERE mint = %s", (mint,)).fetchone()
             else:
-                r = conn.execute("SELECT graduated_at, supply, " + ", ".join(META_COLS) + " FROM corpus_meta WHERE mint = %s", (mint,)).fetchone()
+                r = conn.execute("SELECT graduated_at, supply, " + sol_select(META_COLS) + " FROM corpus_meta WHERE mint = %s", (mint,)).fetchone()
             hit = self.meta_cache[mint] = {"row": dict(r) if r else None, "at": time.time()}
         return hit["row"]
 
@@ -207,7 +212,8 @@ class MinuteEngine:
 
     # ---- one minute ----
     def _aggregate(self, conn, m0: datetime, m1: datetime) -> dict[str, dict]:
-        """PumpAPI minutes: every SOL-quoted PumpSwap pump.fun token, the same fields as the archive. Robinhood Chain: the
+        """PumpAPI minutes: every pump.fun token's SOL-quoted PumpSwap or Meteora DLMM pool with the most legs that minute, the
+        same fields as the archive. Robinhood Chain: the
         rh_minutes of graduated Pons pools in ETH (rh/minutes.py), under the same keys."""
         if self.rh:
             rows = conn.execute("SELECT mint, pool_id, open, high, low, close, buy_eth, sell_eth, n_buys, n_sells, n_traders, resq_eth, fee_rate, "
@@ -229,6 +235,8 @@ class MinuteEngine:
         """The full feature vector (``X_COLS``) of a mint for the minute ending ``t_end``, and what trading needs."""
         s = self._state(conn, mint, a["pool"], a["program_label"])
         st, price, resq = s.st, float(a["close"]), a["resq"]
+        if s.first_seen is None:
+            s.first_seen = t_end
         if self.rh:
             s.meta.pool_fee = a.get("fee_rate")          # the Pons hook fee this minute charged (the cost model's fee)
         if a.get("fee_rate") is not None:
@@ -267,11 +275,13 @@ class MinuteEngine:
                 "age_h": (t_end - s.graduated_at) / 3600 if s.graduated_at else None,
                 "mcap": price * s.meta.supply, "fee_rate": a.get("fee_rate"), "decimals": s.decimals, "pool": s.pool, "program_label": s.program_label, "broken": s.broken,
                 "skill_missing": a.get("skill_buy") is None, "curve_known": bool(meta.get("curve_known")), "chain": self.spec.chain,
-                "quote_class": meta.get("quote_class")}
+                "quote_class": meta.get("quote_class"), "source": meta.get("source"), "seen_h": (t_end - s.first_seen) / 3600.0}
         return x, info
 
     def eligible(self, info: dict) -> bool:
         if self.rh:                                      # the same gates in the chain's unit (x K), as training (train/decisions)
+            if info.get("source") == "v4" and (info.get("seen_h") or 0.0) < V4_WARM_H:
+                return False                             # its feature windows are not full yet (V4_WARM_H)
             return not info["broken"] and info["resq"] is not None and info["resq"] >= self.spec.min_resq() and info["logvol_15m"] >= math.log1p(self.spec.min_vol_15m())
         return not info["broken"] and info["resq"] is not None and info["resq"] >= MIN_RESQ_SOL and info["logvol_15m"] >= math.log1p(MIN_VOL_15M_SOL)
 
@@ -333,6 +343,9 @@ class MinuteEngine:
         other chain's paper work runs before these orders (live money first, CLAUDE.md)."""
         m1 = datetime.fromtimestamp(m1_epoch, timezone.utc); m0 = datetime.fromtimestamp(m1_epoch - 60, timezone.utc)
         out: dict = {"minute": m1.isoformat()}
+        live_books = [b for b in self.my_books() if getattr(b, "LIVE", False)]
+        if trade and live_books:
+            live_first.prefetch(self.spec.chain, self.live, m1_epoch)      # the wallet's balance, read beside the features and scores
         with transaction() as conn:
             agg = self._aggregate(conn, m0, m1)
             X, infos, mints, bars = self._minute_rows(conn, agg, m1_epoch)
@@ -341,7 +354,7 @@ class MinuteEngine:
                          fees={m: a.get("fee_rate") for m, a in agg.items()}, fresh=trade and self.stream_fresh(m1_epoch - 60), trade=trade, engine=self,
                          market=self.spec, lag_s=time.time() - m1_epoch)
             out.update(mints_traded=len(agg), eligible=len(mints))
-            for b in [b for b in self.my_books() if getattr(b, "LIVE", False)]:
+            for b in live_books:
                 try:
                     with conn.transaction():                            # a savepoint per book
                         b.on_bars(m1_epoch - 60.0, bars)
@@ -424,38 +437,49 @@ def admit_books(engine: MinuteEngine, live: bool) -> list:
     return new
 
 
+def _live(engine, minute: int, trade: bool):
+    try:
+        return engine.live_phase(float(minute), trade=trade)
+    except Exception:
+        log.exception("%s live minute %s failed", engine.spec.chain, minute); record_event("error", "engine", f"{engine.spec.chain} live minute failed: {minute}")
+        return None
+
+
 def run_ready(engines: list, m1: float) -> list:
     """Every chain's minutes its stream has written up to wall-clock minute ``m1``: older ones whole (catching up: features
-    and the fly's learning only), then each chain's newest -- live money first: every chain's live phase before any
-    chain's paper phase. [(engine, minute, its minute's output or None when it failed)] of the newest minutes."""
-    staged = []
-    for engine in engines:
-        if not engine.my_books() or m1 <= engine.last_minute:
-            continue
-        if (upto := engine.ready_through(m1)) <= engine.last_minute:        # only minutes this chain's stream has written
-            continue
-        for minute in range(int(engine.last_minute) + 60, int(upto), 60):
-            try:
-                engine.run_minute(float(minute), trade=engine.tradeable(minute, m1))
-            except Exception:
-                log.exception("%s minute %s failed", engine.spec.chain, minute); record_event("error", "engine", f"{engine.spec.chain} minute failed: {minute}")
-        staged.append((engine, int(upto)))
-    live = {}
-    for engine, minute in staged:
-        try:
-            live[id(engine)] = engine.live_phase(float(minute), trade=engine.tradeable(minute, m1))
-        except Exception:
-            log.exception("%s live minute %s failed", engine.spec.chain, minute); record_event("error", "engine", f"{engine.spec.chain} live minute failed: {minute}")
-    ran = []
-    for engine, minute in staged:
+    and the fly's learning only), then each chain's newest -- live money first: the chains' live phases at once
+    (``_LIVE_POOL``), every paper phase after them, and before each paper phase the live phase of a minute another
+    chain's stream wrote meanwhile. [(engine, minute, its minute's output or None when it failed)] of the newest minutes."""
+    papers, ran = [], []
+
+    def stage(m1_now: float) -> None:
+        staged = []
+        for engine in engines:
+            if not engine.my_books() or m1_now <= engine.last_minute:
+                continue
+            if (upto := engine.ready_through(m1_now)) <= engine.last_minute:    # only minutes this chain's stream has written
+                continue
+            for minute in range(int(engine.last_minute) + 60, int(upto), 60):
+                try:
+                    engine.run_minute(float(minute), trade=engine.tradeable(minute, m1_now))
+                except Exception:
+                    log.exception("%s minute %s failed", engine.spec.chain, minute); record_event("error", "engine", f"{engine.spec.chain} minute failed: {minute}")
+            engine.last_minute = int(upto)
+            staged.append((engine, int(upto), engine.tradeable(upto, m1_now)))
+        lives = list(_LIVE_POOL.map(lambda s: _live(*s), staged)) if len(staged) > 1 else [_live(*s) for s in staged]
+        papers.extend((engine, minute, lv) for (engine, minute, _), lv in zip(staged, lives))
+
+    stage(m1)
+    while papers:
+        engine, minute, lv = papers.pop(0)
         st = None
-        if id(engine) in live:
+        if lv is not None:
             try:
-                st = engine.paper_phase(*live[id(engine)])
+                st = engine.paper_phase(*lv)
             except Exception:
                 log.exception("%s minute %s failed", engine.spec.chain, minute); record_event("error", "engine", f"{engine.spec.chain} minute failed: {minute}")
-        engine.last_minute = minute
         ran.append((engine, minute, st))
+        stage(math.floor(time.time() / 60) * 60)        # a minute written meanwhile: its live phase before the next paper phase
     return ran
 
 
@@ -509,7 +533,7 @@ def main(stop_event: threading.Event | None = None, live: bool = False) -> None:
                                         for b in engine.my_books()))
             if not ran:                                  # between minutes: bookkeeping that waits for an idle wallet
                 live_first.idle_mirrors()
-            time.sleep(POLL_S)
+            live_first.wait_published(POLL_S)            # back the moment a stream writes a minute
     finally:
         clock.close()
         for b in books:

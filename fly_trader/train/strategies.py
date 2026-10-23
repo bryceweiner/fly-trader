@@ -18,15 +18,18 @@ hold, its own line):
 - ``breakout``: organic buying pressure at a new high (org_imb_5m > 0, buyers_slope > 0, at the 1 h or 3 h high);
   thresholds on organic imbalance, buyer growth and organic volume (order-flow and attention evidence, wash removed).
 A per-strategy classifier of P(net return > 0), trained only on that strategy's out-of-sample candidates (nested
-walk-forward; the primary score is one of its inputs), filters trades (Joubert 2022 meta-labeling). A multiclass
+walk-forward; the primary score is one of its inputs), filters trades (Joubert 2022 meta-labeling): at the strategy's
+own line it chooses only its cut-off, which must beat no cut-off at all. A multiclass
 GBM of the loss tail gives P(return ≤ d) for dump levels d at tail quantiles of the selection half's pick returns
 and vetoes buys (MemeTrans/MELT: rug risk). Hours and market-volume deciles whose selection-half profit factor is below 1
-are blocked. Where several strategies fire on a token-minute, the one with the larger measured Kelly fraction (its
-sizing band) or the higher score wins — whichever rule made more on the selection half.
+are blocked. The book keeps the passed strategies, and the rule between them, that together score best on the selection
+half: a strategy the book does better without is dropped there. Where several of its strategies fire on a token-minute,
+the one with the larger measured Kelly fraction (its sizing band) or the higher score wins.
 """
 from __future__ import annotations
 
 import hashlib
+import itertools
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -188,9 +191,10 @@ def beats_random_removal(ds: DecisionSet, pick_before: np.ndarray, pick_after: n
 
 # ---------------------------------------------------------------- walk-forward primitives
 def _cache_path(ds: DecisionSet, cols: list[str], tag: str) -> "Path":
+    from .mature import AGG_VERSION
     from .selector import DATA_VERSION
-    k = repr((str(ds.days[0]), str(ds.days[-1]), int(len(ds.y)), float(ds.horizon_s), list(cols), tag,
-              DATA_VERSION.get("agg"), DATA_VERSION.get("features"), DATA_VERSION.get("costs"), OBJECTIVE)
+    k = repr((str(ds.days[0]), str(ds.days[-1]), int(len(ds.y)), float(ds.horizon_s), list(cols), tag,          # the corpus build version keys
+              AGG_VERSION, DATA_VERSION.get("features"), DATA_VERSION.get("costs"), OBJECTIVE)                    # the cache, not the model's validity
              + (("label-known-purge",) if getattr(ds, "label_ts", None) is not None else ())
              + ((("data", getattr(ds, "data_version")),) if getattr(ds, "data_version", None) is not None else ())     # e.g. the Kalshi feature version
              + ((("train_max_rows", int(getattr(ds, "train_max_rows"))),) if getattr(ds, "train_max_rows", None) else ()))
@@ -456,32 +460,32 @@ def fit_strategy(ds: DecisionSet, name: str, cols: list[str], uni: np.ndarray, s
 
 # ---------------------------------------------------------------- meta-label, veto, gates
 def fit_meta(ds: DecisionSet, s: StrategyFit, uni: np.ndarray, sel: np.ndarray, day0, stop=None) -> tuple[np.ndarray, float | None, dict]:
-    sp = s.spec or memecoin_spec()
     """Nested: a classifier of P(net return > 0 over the strategy's hold) on its OOS candidates (primary score ≥ 0 and
-    the fitted trigger), walk-forward, the primary score among its inputs; the cut-off (deciles among the selection
-    half's candidates) jointly with the line."""
+    the fitted trigger), walk-forward, the primary score among its inputs; then its cut-off at the strategy's own line
+    (deciles among the selection half's trades), against no cut-off at all. Until 2026-10-19 the line was chosen jointly
+    with the cut-off: on selector #154 that moved ev's line from 0.038 to 0.115, and the filter priced the strategy out of
+    the book instead of filtering it. ``cut`` None: no cut-off cleared the bars, or trading without one did better
+    (``info["unfiltered"]``)."""
+    sp = s.spec or memecoin_spec()
     X, c = ds.X, ds.cols; ci = np.asarray([c.index(x) for x in s.cols]); y_r = sp.label(ds, s.hold_min)
     rows = uni & sp.base_mask(s.name, X, c, s.high) & trigger_mask(s.name, s.thr, X, c, sp) & np.isfinite(s.oos) & (s.oos >= 0) & np.isfinite(y_r)
     log.info("meta-label %s: %d candidate rows of %d, %d inputs, hold %d min", s.name, int(rows.sum()), len(ds.y), len(ci) + 1, s.hold_min)
     feats = lambda idx: np.c_[X[np.ix_(idx, ci)], s.oos[idx]]
     p = wf_classify(ds, rows, feats, (y_r > 0).astype(np.int8), 2, stop)[:, 1]
-    log.info("meta-label %s: classifiers done, %.1f GB resident; choosing the line and cut-off", s.name, _rss_gb())
-    best = None; best_p = None; trials = 0; seen = None
-    lines = [s.line] + quantile_grid(s.oos[sel & rows]); cuts = quantile_grid(p[sel & rows])
-    log.info("meta-label %s: %d lines x %d cut-offs to try", s.name, len(lines), len(cuts))
-    for line in lines:
-        for cut in cuts:
-            trials += 1
-            if trials % 25 == 0:
-                log.info("meta-label %s: trial %d/%d, %.1f GB resident", s.name, trials, len(lines) * len(cuts), _rss_gb())
-            pk = sel & rows & (s.oos >= line) & (p >= cut)
-            sc = score_pick(ds, pk, sp.hold_s(ds, s.hold_min), y_r, day0)
-            if sc.n > 0 and (seen is None or sc.total > seen.total):
-                seen = sc                                     # the most profitable cut-off that actually traded
-            if better(sc, best):
-                best = sc; best_p = (line, cut)
-    return p, (best_p[1] if best_p else None), {"line": best_p[0] if best_p else None, "selection": best.dict() if best else None, "trials": trials,
-                                                "best_seen": seen.dict() if seen else None}
+    log.info("meta-label %s: classifiers done, %.1f GB resident; choosing the cut-off", s.name, _rss_gb())
+    trade = sel & rows & (s.oos >= s.line) & np.isfinite(p)     # its trades where a classifier existed: every trial on the same rows
+    best = None; best_cut = None; trials = 0; seen = None
+    cuts = [None] + quantile_grid(p[trade])                     # no cut-off first: a cut-off must beat it outright
+    log.info("meta-label %s: %d cut-offs to try at its line %.4f", s.name, len(cuts), s.line)
+    for cut in cuts:
+        trials += 1
+        sc = score_pick(ds, trade if cut is None else trade & (p >= cut), sp.hold_s(ds, s.hold_min), y_r, day0)
+        if sc.n > 0 and (seen is None or sc.total > seen.total):
+            seen = sc                                           # the most profitable cut-off that actually traded
+        if better(sc, best):
+            best = sc; best_cut = cut
+    return p, best_cut, {"selection": best.dict() if best else None, "trials": trials, "best_seen": seen.dict() if seen else None,
+                         "unfiltered": best is not None and best_cut is None}
 
 
 def system_pick(ds: DecisionSet, fits: list[StrategyFit], rows: np.ndarray, uni: np.ndarray, combine: str, tables: dict | None = None):
@@ -557,6 +561,15 @@ def _comp(name, passed, reason, sel=None, ev=None, params=None, trials=0, best=N
     log.info("component %s: %s (%s) | selection %s | evaluation %s | best reached %s | %d settings tried",
              name, "kept" if c["passed"] else "dropped", reason, sel, ev, best, c["trials"])
     return c
+
+
+def _dropped(best: Score, with_it: Score) -> str:
+    """Why the book left a strategy out: the chosen book, which lacks it, beat every book that had it on the selection half."""
+    if best.admissible and not with_it.admissible:
+        return f"dropped from the book: without it the book meets {bars(best.gate)} on the selection half, with it never"
+    if best.base_ok and not with_it.base_ok:
+        return "dropped from the book: every book with it missed the bars on the selection half"
+    return f"dropped from the book: the book made {best.total:.1f} on the selection half without it, {with_it.total:.1f} at best with it"
 
 
 def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days_n: int | None = None, spec: "StackSpec | None" = None) -> Stack:
@@ -639,22 +652,45 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
     for f in fits:
         y_r = sp.label(ds, f.hold_min); t = taken_idx(ds.ts, ds.mint, sp.hold_s(ds, f.hold_min), np.flatnonzero(f.pick(ds, sel, uni)))
         tables[f.name] = sizing.build_table(f.oos[t] - f.line, y_r[t])
-    # 3. combination rule
-    best_c = None; combine = "score"
-    for rule in ("kelly", "score"):
-        pk, hd, rt, _ = system_pick(ds, fits, sel, uni, rule, tables)
-        s = score_pick(ds, pk, hd, rt, day0)
-        if better(s, best_c):
-            best_c = s; combine = rule
-    comps.append(_comp("combination", True, f"'{combine}' made more on the selection half", best_c.dict() if best_c else None, None, {"rule": combine}))
-    # 4. meta-label per strategy
+    # 3. the book: which passed strategies it keeps and the rule between them -- every subset under each rule, scored as one
+    # book on the selection half. A strategy the book does better without is dropped here, in the open: until 2026-10-19
+    # only the rule was chosen, logged as having "made more" even when no rule cleared the bars (selector #154), and the
+    # win filter then priced ev out of the book with its line instead.
+    best_c = None; combine = "score"; keep = list(fits); with_it = {}; seen = None; n_books = 0
+    for k in range(len(fits), 0, -1):                              # larger books first: on a tie the book keeps more strategies
+        for sub in itertools.combinations(fits, k):
+            for rule in (("kelly", "score") if k > 1 else ("kelly",)):    # alone, a strategy trades the same rows under either rule
+                n_books += 1
+                s = score_pick(ds, *system_pick(ds, list(sub), sel, uni, rule, tables)[:3], day0)
+                if s.n > 0 and (seen is None or s.total > seen.total):
+                    seen = s
+                for f in sub:                                      # the best book each strategy was part of, for the record
+                    w = with_it.get(f.name)
+                    if w is None or (s.admissible, s.base_ok, s.total) > (w.admissible, w.base_ok, w.total):
+                        with_it[f.name] = s
+                if better(s, best_c):
+                    best_c = s; combine = rule; keep = list(sub)
+    if best_c is None:
+        comps.append(_comp("combination", False, f"no book of the passed strategies cleared the bars on the selection half; all kept under '{combine}'",
+                           params={"rule": combine, "strategies": [f.name for f in fits]}, trials=n_books, best=seen.dict() if seen else None))
+    else:
+        kept = [f.name for f in keep]
+        comps.append(_comp("combination", True, f"{' + '.join(kept)} under '{combine}' made the most on the selection half", best_c.dict(), None,
+                           {"rule": combine, "strategies": kept}, n_books, best=seen.dict() if seen else None))
+        for f in fits:
+            if f.name not in kept:
+                comps.append(_comp(f"combination: {f.name}", False, _dropped(best_c, with_it[f.name]), with_it[f.name].dict(),
+                                   params={"hold_min": f.hold_min, "line": f.line}, best=with_it[f.name].dict()))
+        fits = keep; tables = {n: t for n, t in tables.items() if n in kept}
+    # 4. meta-label per strategy: a filter at the strategy's own line (fit_meta never moves it)
     for f in fits:
         p, cut, info = fit_meta(ds, f, uni, sel, day0, stop)
         if cut is None:
-            comps.append(_comp(f"meta-label: {f.name}", False, "no cut-off cleared the bars on the selection half", trials=info["trials"], best=info.get("best_seen"))); continue
+            comps.append(_comp(f"meta-label: {f.name}", False, "trading without a cut-off did better on the selection half" if info["unfiltered"]
+                               else "no cut-off cleared the bars on the selection half", trials=info["trials"], best=info.get("best_seen"))); continue
         log.info("meta-label %s: scoring the book before the filter (%.1f GB)", f.name, _rss_gb())
         before_s = score_pick(ds, *system_pick(ds, fits, sel, uni, combine, tables)[:3], day0)
-        old = (f.meta_p, f.meta_cut, f.line); f.meta_p, f.meta_cut = p, cut; f.line = info["line"] if info["line"] is not None else f.line
+        old = (f.meta_p, f.meta_cut); f.meta_p, f.meta_cut = p, cut
         log.info("meta-label %s: scoring the book after the filter (%.1f GB)", f.name, _rss_gb())
         after_sel = score_pick(ds, *system_pick(ds, fits, sel, uni, combine, tables)[:3], day0)
         log.info("meta-label %s: evaluation half, unfiltered book (%.1f GB)", f.name, _rss_gb())
@@ -670,7 +706,7 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
                            else "rejected (selection, evaluation or random-removal test)", after_sel.dict(), {**ev_s.dict(), "random_removal": rnd}, {"cut": cut, "line": f.line},
                            info["trials"], best=info.get("best_seen")))
         if not ok:
-            f.meta_p, f.meta_cut, f.line = old
+            f.meta_p, f.meta_cut = old
     # 5. veto
     veto = None
     pk, hd, rt, who = system_pick(ds, fits, tested, uni, combine, tables)
@@ -710,7 +746,7 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
 
 def _without_meta(f: StrategyFit, old) -> StrategyFit:
     import copy
-    g = copy.copy(f); g.meta_p, g.meta_cut, g.line = old
+    g = copy.copy(f); g.meta_p, g.meta_cut = old
     return g
 
 
@@ -834,11 +870,12 @@ def decide_all(models: dict, X: np.ndarray, cols: list[str], t_start, spec: "Sta
     return out
 
 
-def decide(models: dict, X: np.ndarray, cols: list[str], t_start, spec: "StackSpec | None" = None) -> dict:
+def decide(models: dict, X: np.ndarray, cols: list[str], t_start, spec: "StackSpec | None" = None, per: dict | None = None) -> dict:
     """The selector's decision for each row of one minute (``t_start`` = the minute's start): which strategy trades it,
-    its predicted net return, hold, line and sizing table, and whether a filter blocks it (with the reason)."""
+    its predicted net return, hold, line and sizing table, and whether a filter blocks it (with the reason). ``per``: this
+    minute's ``decide_all`` when the caller has it already (one pass over the stack)."""
     sp = spec or memecoin_spec()
-    X = np.atleast_2d(X); n = len(X); per = decide_all(models, X, cols, t_start, sp)
+    X = np.atleast_2d(X); n = len(X); per = decide_all(models, X, cols, t_start, sp) if per is None else per
     best_key = np.full(n, -np.inf); strat = np.full(n, None, dtype=object); score = np.full(n, -1.0); hold = np.zeros(n)
     thr = np.full(n, np.inf); tables = [[] for _ in range(n)]; allow = np.zeros(n, bool); reason = np.full(n, "no strategy fires", dtype=object)
     for name, d in per.items():
