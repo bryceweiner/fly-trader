@@ -3,7 +3,31 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
-## Unreleased
+## 2026-10-23, release 10: A retrained selector trades `ev` again, and live money follows the seat
+
+Published to Hugging Face as signed release 10. It ships selector #560 and fly #561 in place of selector #154 and fly
+#157:
+
+- **Selector #560** is fitted through 2026-10-20 on this release's rules and trades `ev` again besides `capitulation`. On
+  the 18 days 2026-10-03..10-20, out of sample for both, its holdout-blind copy made +9.71 % per trade over 393 trades
+  (62 % winners, profit factor 2.08); #154 made +9.64 % over 392 (58 %, 1.95).
+- **Fly #561** is taught by it. Its own decisions reach the wallet only once it wins its 14-day race (Live money below).
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 10`.
+- **The corpus is rebuilt once on start,** because the Solana universe changed: about 5 hours in a child process at the
+  lowest CPU priority. The rebuild retires no model.
+- **New tables and columns are added on start:** `corpus_meta.grad_quote`; on Robinhood Chain, `rh_v4_keys`,
+  `rh_v4_tokens` and new `rh_pools` and `rh_meta` columns.
+- **Robinhood Chain installs:** run `fly-trader rh-v4-backfill` once, under `nice -n 19` and apart from the console, so
+  v4 pools older than the console's watch are found.
+- **New settings:** `EXEC_THREADS` (default 4), `SOL_FEED` (default `pumpapi`), `STREAM_RELAY_URL`, `STREAM_RELAY_TOKEN`,
+  `STREAM_RELAY_CA_FILE`, `HELIUS_FEED_COMMITMENT`, `REFETCH_PARALLEL`, `REFETCH_MAX_LAG_S` and `REFETCH_SKIP_RECENT_H`.
+- **On an install whose fly already won its race, fly #561 inherits that seat** and trades live without racing first.
+  The next release makes every new fly race.
 
 ### Live money
 
