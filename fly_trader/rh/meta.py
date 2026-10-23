@@ -86,6 +86,47 @@ def outcomes(conn, token: str, graduated_at) -> tuple[float, float] | None:
 COLS = ("mint", "graduated_at", "create_ts", "creator", "quote_asset", "quote_class", "supply", "ttg_min", "dev_sol", "dev_tokens", "dev_share", "mayhem", "rq0",
         "pool_id", "prior_launches", "prior_grads", "prior_known", "prior_rug_share", "prior_moon_share", "bundle_share", "dev_hold_share", "dev_sold_frac",
         "grad_hhi", "curve_known")
+V4_COLS = COLS + ("source",)
+
+
+def _history(conn, creator: str | None, since, g, mint: str) -> dict:
+    """A creator's earlier launches (Pons and plain v4) and graduations with their first-hour outcomes, as ``build``."""
+    if not creator:
+        return {"prior_launches": None, "prior_grads": None, "prior_known": None, "prior_rug_share": None, "prior_moon_share": None}
+    n = conn.execute("SELECT (SELECT count(*) FROM rh_tokens WHERE creator = %(c)s AND launch_ts < %(t)s) + "
+                     "(SELECT count(*) FROM rh_v4_tokens WHERE creator = %(c)s AND first_ts < %(t)s) AS n", {"c": creator, "t": since}).fetchone()["n"]
+    r = conn.execute("""SELECT count(*) AS grads,
+                               count(*) FILTER (WHERE own_dd60 IS NOT NULL AND graduated_at + interval '60 minutes' <= %(g)s) AS known,
+                               avg(CASE WHEN own_dd60 <= -0.9 THEN 1.0 ELSE 0.0 END) FILTER (WHERE own_dd60 IS NOT NULL AND graduated_at + interval '60 minutes' <= %(g)s) AS rug,
+                               avg(CASE WHEN own_max60 >= 1.0 THEN 1.0 ELSE 0.0 END) FILTER (WHERE own_dd60 IS NOT NULL AND graduated_at + interval '60 minutes' <= %(g)s) AS moon
+                        FROM rh_meta WHERE creator = %(c)s AND graduated_at < %(g)s AND mint <> %(m)s""", {"c": creator, "g": g, "m": mint}).fetchone()
+    return {"prior_launches": int(n), "prior_grads": int(r["grads"]), "prior_known": int(r["known"]),
+            "prior_rug_share": float(r["rug"]) if r["rug"] is not None else None, "prior_moon_share": float(r["moon"]) if r["moon"] is not None else None}
+
+
+def build_v4(conn, token: str) -> dict | None:
+    """rh_meta facts of a plain v4 memecoin that passed its contract check (rh/v4_universe.py): its age counts from its
+    first pool's initialization (``graduated_at``: the 6 h floor), its creator is that pool's initializer, and what only a
+    Pons launch records (curve, dev buy, seed reserve, time to graduate) is unknown, as for a Solana coin graduated before
+    the archive. Supply in whole tokens (18 decimals)."""
+    t = conn.execute("SELECT v.*, a.class AS qclass FROM rh_v4_tokens v LEFT JOIN rh_assets a ON a.asset = v.quote_asset WHERE v.token = %s AND v.status = 'ok'",
+                     (token,)).fetchone()
+    if not t or t["first_ts"] is None:
+        return None
+    g = t["first_ts"]
+    return {"mint": token, "graduated_at": g, "create_ts": g, "creator": t["creator"], "quote_asset": t["quote_asset"], "quote_class": t["qclass"] or "eth",
+            "supply": float(t["supply_raw"]) / TOKEN if t["supply_raw"] is not None else None, "ttg_min": None, "dev_sol": None, "dev_tokens": None,
+            "dev_share": None, "mayhem": False, "rq0": None, "pool_id": t["first_pool"], **_history(conn, t["creator"], g, g, token),
+            "bundle_share": None, "dev_hold_share": None, "dev_sold_frac": None, "grad_hhi": None, "curve_known": 0.0, "source": "v4"}
+
+
+def write_v4(conn, token: str) -> bool:
+    """``build_v4`` into rh_meta (idempotent); False when the coin has no accepted row."""
+    row = build_v4(conn, token)
+    if row is None:
+        return False
+    conn.execute(f"INSERT INTO rh_meta ({', '.join(V4_COLS)}) VALUES ({', '.join(['%s'] * len(V4_COLS))}) ON CONFLICT (mint) DO NOTHING", [row.get(k) for k in V4_COLS])
+    return True
 
 
 def run_once(limit: int = 500) -> dict:
@@ -101,8 +142,8 @@ def run_once(limit: int = 500) -> dict:
                 continue
             conn.execute(f"INSERT INTO rh_meta ({', '.join(COLS)}) VALUES ({', '.join(['%s'] * len(COLS))}) ON CONFLICT (mint) DO NOTHING", [row.get(k) for k in COLS])
             n_new += 1
-        due = conn.execute("SELECT m.mint, m.graduated_at FROM rh_meta m WHERE m.own_dd60 IS NULL AND m.graduated_at + interval '61 minutes' <= "
-                           "(SELECT max(ts) FROM rh_minutes) LIMIT %s", (limit,)).fetchall()
+        due = conn.execute("SELECT m.mint, m.graduated_at FROM rh_meta m WHERE m.own_dd60 IS NULL AND m.source = 'pons' AND m.graduated_at + interval '61 minutes' <= "
+                           "(SELECT max(ts) FROM rh_minutes) LIMIT %s", (limit,)).fetchall()      # a plain v4 coin's: rh/v4_universe.backfill_history
         for r in due:
             o = outcomes(conn, r["mint"], r["graduated_at"])
             if o is not None:

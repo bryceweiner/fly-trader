@@ -58,6 +58,8 @@ from . import live_first
 
 log = logging.getLogger(__name__)
 WARMUP_MIN = 1440            # training warms each day on the previous day's candles
+V4_WARM_H = 3.0              # a plain v4 memecoin trades only once the engine has fed it this long (the longest feature window):
+                             # it goes live mid-session without the history before (rh/v4_universe.go_live)
 IDLE_EVICT_S = 86400         # training has no history for a mint idle since before the previous day
 STREAM_STALE_S = 180         # no entries or exits when the stream's newest complete minute is older than this
 META_TTL_S = 600
@@ -67,7 +69,7 @@ _LIVE_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="runner-live")
 
 
 class MintState:
-    __slots__ = ("st", "meta", "hist", "decimals", "pool", "program_label", "graduated_at", "meta_row", "prev_close", "broken", "flow", "fee")
+    __slots__ = ("st", "meta", "hist", "decimals", "pool", "program_label", "graduated_at", "meta_row", "prev_close", "broken", "flow", "fee", "first_seen")
 
     def __init__(self, mint: str, decimals: int, pool: str | None, program_label: str | None, graduated_at: float | None, meta_row: dict | None):
         self.st = TokenState(mint); self.meta = TokenMeta(mint=mint, program_label=program_label or "Pump.fun Amm", graduated_at=graduated_at)
@@ -76,6 +78,7 @@ class MintState:
         self.prev_close: float | None = None; self.broken = False
         self.flow = FlowWindow()                    # wallet flow inputs (train/flow.py, as mature.build_day)
         self.fee: float | None = None               # the last pool fee a minute of this mint reported (Minute.fee)
+        self.first_seen: float | None = None        # end of the first minute this engine fed (warm-up included)
 
 
 @dataclass
@@ -153,7 +156,7 @@ class MinuteEngine:
         hit = self.meta_cache.get(mint)
         if hit is None or time.time() - hit["at"] > META_TTL_S:
             if self.rh:                                  # Robinhood Chain: rh_meta, the same columns (rh/meta.py), plus the quote class
-                r = conn.execute("SELECT graduated_at, supply, quote_class, " + ", ".join(META_COLS) + " FROM rh_meta WHERE mint = %s", (mint,)).fetchone()
+                r = conn.execute("SELECT graduated_at, supply, quote_class, source, " + ", ".join(META_COLS) + " FROM rh_meta WHERE mint = %s", (mint,)).fetchone()
             else:
                 r = conn.execute("SELECT graduated_at, supply, " + sol_select(META_COLS) + " FROM corpus_meta WHERE mint = %s", (mint,)).fetchone()
             hit = self.meta_cache[mint] = {"row": dict(r) if r else None, "at": time.time()}
@@ -232,6 +235,8 @@ class MinuteEngine:
         """The full feature vector (``X_COLS``) of a mint for the minute ending ``t_end``, and what trading needs."""
         s = self._state(conn, mint, a["pool"], a["program_label"])
         st, price, resq = s.st, float(a["close"]), a["resq"]
+        if s.first_seen is None:
+            s.first_seen = t_end
         if self.rh:
             s.meta.pool_fee = a.get("fee_rate")          # the Pons hook fee this minute charged (the cost model's fee)
         if a.get("fee_rate") is not None:
@@ -270,11 +275,13 @@ class MinuteEngine:
                 "age_h": (t_end - s.graduated_at) / 3600 if s.graduated_at else None,
                 "mcap": price * s.meta.supply, "fee_rate": a.get("fee_rate"), "decimals": s.decimals, "pool": s.pool, "program_label": s.program_label, "broken": s.broken,
                 "skill_missing": a.get("skill_buy") is None, "curve_known": bool(meta.get("curve_known")), "chain": self.spec.chain,
-                "quote_class": meta.get("quote_class")}
+                "quote_class": meta.get("quote_class"), "source": meta.get("source"), "seen_h": (t_end - s.first_seen) / 3600.0}
         return x, info
 
     def eligible(self, info: dict) -> bool:
         if self.rh:                                      # the same gates in the chain's unit (x K), as training (train/decisions)
+            if info.get("source") == "v4" and (info.get("seen_h") or 0.0) < V4_WARM_H:
+                return False                             # its feature windows are not full yet (V4_WARM_H)
             return not info["broken"] and info["resq"] is not None and info["resq"] >= self.spec.min_resq() and info["logvol_15m"] >= math.log1p(self.spec.min_vol_15m())
         return not info["broken"] and info["resq"] is not None and info["resq"] >= MIN_RESQ_SOL and info["logvol_15m"] >= math.log1p(MIN_VOL_15M_SOL)
 

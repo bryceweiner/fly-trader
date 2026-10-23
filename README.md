@@ -3,7 +3,7 @@
 **A fruit-fly connectome that trades memecoins on Solana and Robinhood Chain, and Kalshi prediction markets.**
 Website: [fly-trader.app](https://fly-trader.app) · Token: $FLY (coming soon) · X community: coming soon
 
-fly-trader trains the central brain of the [FlyWire](https://flywire.ai) adult *Drosophila* connectome (41,756 neurons, 1.04 M synapses; FAFB v783) to trade memecoins once they graduate: [pump.fun](https://pump.fun) graduates on Solana, in their PumpSwap and Meteora DLMM pools, and Uniswap v4 tokens from Pons on Robinhood Chain. A gradient-boosted selector learns which tokens to buy from 1-minute market data at real trading costs, on both chains' rows together. The fly starts as that selector: it scores every token with the selector's own prediction and buys only what the selector buys. Its mushroom body then learns, from what those trades earn, where the selector is wrong. A second trading type trades [Kalshi](https://kalshi.com) prediction markets with its own fly. Every decision is journaled to Postgres.
+fly-trader trains the central brain of the [FlyWire](https://flywire.ai) adult *Drosophila* connectome (41,756 neurons, 1.04 M synapses; FAFB v783) to trade memecoins once they graduate: [pump.fun](https://pump.fun) graduates on Solana, in their PumpSwap and Meteora DLMM pools, and Uniswap v4 tokens on Robinhood Chain: Pons launches and other v4 memecoins whose contracts pass a check. A gradient-boosted selector learns which tokens to buy from 1-minute market data at real trading costs, on both chains' rows together. The fly starts as that selector: it scores every token with the selector's own prediction and buys only what the selector buys. Its mushroom body then learns, from what those trades earn, where the selector is wrong. A second trading type trades [Kalshi](https://kalshi.com) prediction markets with its own fly. Every decision is journaled to Postgres.
 
 It is an experiment. No performance is claimed. The fly trades a paper book; once it has earned the selector's seat (the handover) and signing is allowed (`LIVE_ENABLED=1` and the live prerequisites), its decisions also trade the bot wallet. Live execution is default-deny.
 
@@ -133,13 +133,14 @@ Every knob is an environment variable read by `fly_trader/config.py`; `.env.exam
 | `RH_ENABLED` | `1` | index Robinhood Chain and paper-trade it (needs `ENVIO_API_TOKEN`) |
 | `ENVIO_API_TOKEN` | — | Envio HyperSync token: Robinhood Chain's logs |
 | `RH_HYPERSYNC_RPM` | `40` | HyperSync queries a minute (the free tier's fair use; Starter: 100) |
+| `RH_V4_ENABLED` | `1` | trade Robinhood Chain's other Uniswap v4 pools once they qualify (`rh-v4-backfill` imports the older pools' keys) |
 | `RH_LIVE_ENABLED` | `0` | signing Robinhood Chain transactions |
 
 ## CLI reference
 
 ```
 init-db  wallet {new,show} [--key-file]  ui [--port] [--host] [--observe]  run  status  health  ready-for-restart  worker {start,stop,status} [name]
-pumpstream  replay-pull  refetch-pool-ids  refetch-archive  discover [--once]  fit-wallet-skill [--days]
+pumpstream  replay-pull  refetch-pool-ids  refetch-archive  rh-v4-backfill [--no-keys --no-history]  discover [--once]  fit-wallet-skill [--days]
 assemble-replay  build-corpus-meta  build-mature  build-corpus-features  backtest-corpus [--max-tokens --days --fees --only --universe]
 train-selector [--days]  train-fly-selector [--days --epochs --device]  fly-replay [--days --device --start-day]
 selector-eval  reset-training [--no-archive]  models convert  apply-release DIR [--bootstrap]

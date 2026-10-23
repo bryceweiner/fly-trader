@@ -29,6 +29,7 @@ LIVE_LAG_BLOCKS = 5_000         # closer than this to the head counts as live
 RPC_CATCHUP_S = 3.0             # between catch-up passes while HyperSync is down (each reads ~2-3 times from the public RPC)
 SLOW_EVERY_S = 60.0             # meta and corpus refresh with each written minute, else at least this often
 _SLOW = {"at": 0.0}
+_V4 = {"minute": None}          # the minute whose v4 slot ran (rh/v4_universe.slot: once a minute)
 _CORPUS: dict = {"proc": None}  # the child building a due corpus day (rh/corpus.run_locked)
 
 
@@ -86,7 +87,12 @@ def one_pass(rpc, skill=None) -> dict:
         px = prices.run_once(max_ranges=BACKFILL_RANGES if behind > LIVE_LAG_BLOCKS else 2, rpc=rpc); lap("prices")
     from . import wallet_skill
     wallet_skill.daily(); lap("skill_tables")                  # today's and tomorrow's tables, before their minutes are written
-    mn = minutes.run_once(src, wallet_skill.load_today() if skill is None else skill); lap("minutes")
+    try:
+        mn = minutes.run_once(src, wallet_skill.load_today() if skill is None else skill); lap("minutes")
+    finally:
+        if pre is not None and config.RH_V4_ENABLED:            # after the minute is written: the other v4 pools' logs, for the slot
+            from . import v4_universe
+            v4_universe.note(pre.logs)
     from . import meta
     mt, cp = {}, {}
     if mn.get("minutes") or time.monotonic() - _SLOW["at"] >= SLOW_EVERY_S:   # after a written minute: passes in between stay short
@@ -122,6 +128,8 @@ def main(stop_event: threading.Event | None = None) -> None:
         except Exception as e:
             log.exception("rh_stream pass failed: %s", str(e)[:200]); _status(error=str(e)[:300])
             stop.wait(10.0); continue
+        if config.RH_V4_ENABLED and out.get("mode") == "live":
+            v4_slot(out)
         stop.wait(_wait_s((out.get("minutes") or {}).get("through")))
     _stop_corpus()
 
@@ -153,6 +161,37 @@ def _stop_corpus() -> None:
             p.wait(timeout=30)
         except subprocess.TimeoutExpired:
             p.kill()
+
+
+def _orders_pending() -> bool:
+    """A live order queued or in flight on either chain (the live mirrors, agent/live_first.py)."""
+    from ..agent import live_first
+    for chain in ("sol", "rh"):
+        m = live_first.mirror_of(chain)
+        q = getattr(m, "ex", None) or getattr(m, "worker", None)
+        try:
+            if q is not None and q.pending():
+                return True
+        except Exception:
+            return True
+    return False
+
+
+def v4_slot(out: dict, now: float | None = None) -> dict:
+    """The other v4 pools' work (rh/v4_universe.slot) once a minute, in this thread between passes: mid-minute
+    (agent/live_first.MID_MINUTE), once the newest minute is written, while HyperSync serves the live logs and no live
+    order is queued or in flight on either chain. It never waits for its window, and reads the RPC only until the
+    window's end. ``out``: the pass just made."""
+    from ..agent import live_first
+    from . import v4_universe
+    t = time.time() if now is None else now; m = int(t // 60)
+    through = int((out.get("minutes") or {}).get("through") or 0)
+    if _V4["minute"] == m or not live_first.mid_minute(t) or through < m * 60 or prefetch.hypersync_down() or _orders_pending():
+        return {}
+    _V4["minute"] = m
+    res = v4_universe.slot(deadline=m * 60 + live_first.MID_MINUTE[1], now=t)
+    _status(v4=res)
+    return res
 
 
 def _wait_s(written_through: int | None, now: float | None = None) -> float:

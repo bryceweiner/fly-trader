@@ -350,6 +350,12 @@ V3_FACTORY = env_str("V3_FACTORY", "0x1f7d7550b1b028f7571e69a784071f0205fd2efa")
 V3_QUOTER_V2 = env_str("V3_QUOTER_V2", "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7")
 RH_WETH = env_str("RH_WETH", "0x0bd7d308f8e1639fab988df18a8011f41eacad73")      # SwapRouter02.WETH9()
 RH_USDG = env_str("RH_USDG", "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168")
+# Robinhood Chain's other Uniswap v4 pools (rh/v4_universe.py): a Pons coin's own pools elsewhere and plain v4 memecoins
+RH_V4_ENABLED = env_bool("RH_V4_ENABLED", True)                     # find, check and index them (0: Pons pools only, as before 2026-10-23)
+RH_V4_QUOTES = tuple(a.strip().lower() for a in env_str("RH_V4_QUOTES", RH_USDG).split(",") if a.strip())   # beside ETH and WETH: a plain memecoin's quote
+RH_V4_HOOKS = tuple(a.strip().lower() for a in env_str("RH_V4_HOOKS", "").split(",") if a.strip())          # hooks allowed besides none (fees outside the Swap event)
+RH_V4_CHECKS_PER_SLOT = env_int("RH_V4_CHECKS_PER_SLOT", 1)          # contract checks a minute (each ~10 reads of the public RPC)
+RH_V4_BACKFILL_RPM = env_float("RH_V4_BACKFILL_RPM", 30)             # fly-trader rh-v4-backfill's own HyperSync pace (the console keeps its share)
 KYBER_API = env_str("KYBER_API", "https://aggregator-api.kyberswap.com/robinhood/api/v1")
 KYBER_ROUTER = env_str("KYBER_ROUTER", "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5")  # MetaAggregationRouterV2: the only router a built Kyber tx may call
 KYBER_CLIENT_ID = env_str("KYBER_CLIENT_ID", "fly-trader")

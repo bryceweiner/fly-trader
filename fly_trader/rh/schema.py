@@ -139,6 +139,36 @@ RH_DDL: list[str] = [
     "ALTER TABLE positions ADD COLUMN IF NOT EXISTS gas_q double precision NOT NULL DEFAULT 0",
     "ALTER TABLE fly_scored ADD COLUMN IF NOT EXISTS chain text NOT NULL DEFAULT 'sol'",
     "ALTER TABLE notional_ledger ADD COLUMN IF NOT EXISTS market text NOT NULL DEFAULT 'sol'",
+    # ---- other Uniswap v4 pools (rh/v4_universe.py, 2026-10-23): a Pons coin's own pools outside its Pons pool ('pons_other')
+    # and plain memecoin pools ('v4'), registered once active past the floors. ``indexed``: live, its swaps indexed like a
+    # Pons pool's (rh/index.apply_v4) from block ``live_from``; ``ready_through``: its history before that, backfilled to
+    # this block (fly-trader rh-v4-backfill); ``lp_fee``: the static LP fee (None: dynamic, read per swap); ``swaps_seen``:
+    # its last half hour's swaps while not live (the contract checks take the busiest coins first)
+    "ALTER TABLE rh_pools ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'pons'",
+    "ALTER TABLE rh_pools ADD COLUMN IF NOT EXISTS indexed boolean NOT NULL DEFAULT false",
+    "ALTER TABLE rh_pools ADD COLUMN IF NOT EXISTS live_from bigint",
+    "ALTER TABLE rh_pools ADD COLUMN IF NOT EXISTS ready_through bigint",
+    "ALTER TABLE rh_pools ADD COLUMN IF NOT EXISTS lp_fee double precision",
+    "ALTER TABLE rh_pools ADD COLUMN IF NOT EXISTS init_tx text",
+    "ALTER TABLE rh_pools ADD COLUMN IF NOT EXISTS swaps_seen int NOT NULL DEFAULT 0",
+    "ALTER TABLE rh_pools ADD COLUMN IF NOT EXISTS last_swap_at timestamptz",
+    "CREATE INDEX IF NOT EXISTS rh_pools_indexed_idx ON rh_pools (indexed) WHERE indexed",
+    # every v4 pool's key from its Initialize (1.07 M pools by 2026-10-23; the Pons hook's are rh_pools'): what a pool
+    # is, once it trades. ``hooks`` NULL: none
+    """CREATE TABLE IF NOT EXISTS rh_v4_keys (
+        pool_id text PRIMARY KEY, currency0 text NOT NULL, currency1 text NOT NULL, fee int, tick_spacing int, hooks text,
+        init_block bigint NOT NULL, init_ts timestamptz, init_tx text, sqrt_price_x96 numeric(78,0), tick int)""",
+    "CREATE INDEX IF NOT EXISTS rh_v4_keys_c0_idx ON rh_v4_keys (currency0)",
+    "CREATE INDEX IF NOT EXISTS rh_v4_keys_c1_idx ON rh_v4_keys (currency1)",
+    # a plain v4 memecoin: its contract check (rh/token_check.py) and the facts its rh_meta row is built from
+    """CREATE TABLE IF NOT EXISTS rh_v4_tokens (
+        token text PRIMARY KEY, symbol text, name text, decimals int, supply_raw numeric(78,0), creator text,
+        first_pool text, first_block bigint, first_ts timestamptz, quote_asset text,
+        status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'ok', 'refused', 'error')), reason text, detail jsonb,
+        attempts int NOT NULL DEFAULT 0, checked_at timestamptz, created_at timestamptz NOT NULL DEFAULT now())""",
+    "CREATE INDEX IF NOT EXISTS rh_v4_tokens_status_idx ON rh_v4_tokens (status)",
+    # where an rh_meta row comes from: a Pons launch ('pons') or a plain v4 memecoin ('v4', graduated_at = its first pool)
+    "ALTER TABLE rh_meta ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'pons'",
     # rails circuit 3 (fly_trader/markets.RH_CIRCUIT); the id CHECK only allowed 1 before the Kalshi migration dropped it,
     # and an install still on the distribution's older ladder may carry it
     "ALTER TABLE circuit_state DROP CONSTRAINT IF EXISTS circuit_state_id_check",

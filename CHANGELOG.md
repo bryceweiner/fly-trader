@@ -87,6 +87,33 @@ ships signed releases built from this development line.
     in its own pool. A coin graduated in another quote has its dev buy and seed reserve in that quote's units, so those two
     inputs read as unknown for it, live and in training. 17 % of graduations on 2026-10-20 were not in SOL.
   - Paper fills charge the minute's pool fee, so a DLMM minute costs that pool's dynamic fee.
+- **Robinhood Chain: a Pons coin's own Uniswap v4 pools elsewhere, and plain v4 memecoins, are traded too.**
+  - The stream already read every PoolManager log and kept only the Pons pools'. In one hour on 2026-10-23, 1,480 v4
+    pools traded 40,960 times; the Pons pools made 3,375 of those swaps. 85 hookless pools pairing a coin with ETH, WETH or
+    USDG cleared the bot's floors, with 17,051 swaps.
+  - A pool is looked at once it trades: its last half hour must clear the RH book's floors (reserve and 15-minute
+    volume, in ETH). Of 1.07 million v4 pools on the chain, only those few hundred a day are registered.
+  - A new pool qualifies when it pairs a coin with ETH, WETH or USDG (`RH_V4_QUOTES`) and has no hook. A graduated Pons
+    coin's other pool may use any priced quote.
+  - Hooked pools stay out unless named in `RH_V4_HOOKS`. In a hookless pool the Swap event's amounts equal the
+    PoolManager's token flows exactly (230 swaps measured). The dynamic-fee hook of ORBIO's and ZZZ's other USDG pools
+    (`0x08e5…a080`) moved up to 6 times more than its Swap events show. The Pons coins' main outside pools are hookless,
+    with fees of 0.8–3 %.
+  - A plain coin's contract is checked first, busiest coins first, one a minute (`RH_V4_CHECKS_PER_SLOT`). It is refused
+    when its owner or an admin role can mint, upgrade, blacklist, pause, set taxes or hooks, or switch trading; when it
+    has a built-in tax; when it is not 18 decimals; and when it is a major, stablecoin or tokenized stock. On 15 known
+    coins the check matched a manual review.
+  - Its creator is the sender of its first pool's initialization, with the same history inputs as a Pons deployer. Its
+    age counts from that pool. What only a Pons launch records reads as unknown.
+  - Nothing of this runs in front of a minute: the stream keeps the pass's logs after the minute is written, and the rest
+    runs mid-minute once that minute is written and no live order waits on either chain. Only the contract checks read
+    the network: the public RPC, once per read, never after 40 s into the minute.
+  - A pool goes live with its coin's meta in one commit, between two passes, so the stream indexes every swap from the
+    next block on. A plain coin trades only after the engine has watched it for 3 hours, the longest feature window.
+  - `fly-trader rh-v4-backfill` (its own process) imports every pool's key since block 0, so pools older than the
+    console's watch can be found. It then backfills each live pool's history before it went live.
+  - A coin with several live pools takes each minute from the one with the most swaps, as on Solana. A non-Pons pool's
+    swaps carry its LP fee. WETH counts as ETH.
 
 ### The selector
 

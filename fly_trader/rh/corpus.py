@@ -55,12 +55,12 @@ def _meta_extra() -> tuple[dict, dict, dict]:
     """(graduations, supplies, TokenMeta extras) for every graduated launch."""
     k = config.RH_ETH_PER_SOL
     with transaction() as conn:
-        g = conn.execute("SELECT mint, graduated_at FROM rh_meta").fetchall()
+        g = conn.execute("SELECT mint, graduated_at, supply FROM rh_meta").fetchall()
         fees = conn.execute("SELECT mint, percentile_cont(0.5) WITHIN GROUP (ORDER BY fee_rate) AS f FROM rh_minutes WHERE fee_rate IS NOT NULL GROUP BY mint").fetchall()
     grads = {r["mint"]: r["graduated_at"] for r in g}
     fee = {r["mint"]: float(r["f"]) for r in fees}
     extra = {m: {"ec_size": 0.1 * k, "pool_fee": fee.get(m, config.RH_HOOK_FEE)} for m in grads}
-    return grads, {m: 1e9 for m in grads}, extra
+    return grads, {r["mint"]: float(r["supply"]) if r["supply"] else 1e9 for r in g}, extra     # a plain v4 memecoin's own supply
 
 
 def build_day(d: date) -> int:

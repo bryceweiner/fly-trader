@@ -7,8 +7,10 @@ Per block range, in order:
 2. those events applied in (block, log index) order → rh_tokens, rh_pools, rh_insiders; a graduation also pulls that
    launch's curve trades from its own curve contract (launch → graduation, address-filtered): only the ~1 % of launches
    that graduate are ever traded, and their curve phase is all the features need (curve facts, time to graduate);
-3. the v4 PoolManager's Initialize / Swap / ModifyLiquidity logs for the Pons pools known by then (topic1 = pool id,
-   200 ids per request), each swap matched to its hook fee by (tx, pool) in log order;
+3. the v4 PoolManager's Initialize / Swap / ModifyLiquidity logs for the Pons pools known by then and the other v4 pools
+   indexed since 2026-10-23 (rh/v4_universe.py: a Pons coin's own pools elsewhere, plain v4 memecoins; topic1 = pool id,
+   200 ids per request), each Pons swap matched to its hook fee by (tx, pool) in log order, another pool's swap priced at
+   the LP fee its Swap event reports;
 4. each swap's trader from the memecoin's own Transfer logs in that transaction (address-filtered, one request per 200
    tokens): the wallet whose token balance rose on a buy (fell on a sell), not the pool manager or a router — the swap
    event itself names the router (measured 2026-09-28: per-swap tx lookups made a 55-day backfill take ~43 days);
@@ -196,11 +198,13 @@ def apply_pons(conn, rpc, events: list[dict]) -> dict:
     return n
 
 
-def apply_v4(conn, rpc, logs: list[dict], fees: list[dict]) -> dict:
-    """v4 logs of Pons pools (+ their hook fees) → rh_swaps / rh_liquidity / rh_pools state."""
+def apply_v4(conn, rpc, logs: list[dict], fees: list[dict], pool_ids: list[str] | None = None) -> dict:
+    """v4 logs of the indexed pools (Pons pools + their hook fees, and the other indexed v4 pools) → rh_swaps / rh_liquidity /
+    rh_pools state. ``pool_ids``: exactly these pools (a live pool's history before its ``live_from``: rh/v4_universe)."""
+    sel = "p.pool_id = ANY(%s)" if pool_ids is not None else "(p.is_pons OR p.indexed)"
     pools = {r["pool_id"]: dict(r) for r in conn.execute(
-        "SELECT p.pool_id, p.token, p.token_is_0, p.quote_asset, p.hook_fee, p.hook_fee_v, a.decimals AS qdec FROM rh_pools p JOIN rh_assets a ON a.asset = p.quote_asset "
-        "WHERE p.is_pons").fetchall()}
+        "SELECT p.pool_id, p.token, p.token_is_0, p.quote_asset, p.hook_fee, p.hook_fee_v, p.is_pons, a.decimals AS qdec FROM rh_pools p JOIN rh_assets a ON a.asset = p.quote_asset "
+        "WHERE " + sel, (list(pool_ids),) if pool_ids is not None else ()).fetchall()}
     fee_q: dict[tuple, list] = {}; observed: dict[str, int] = {}
     for f in fees:
         fee_q.setdefault((f["tx_hash"], f["pool_id"]), []).append(f)
@@ -225,9 +229,10 @@ def apply_v4(conn, rpc, logs: list[dict], fees: list[dict]) -> dict:
         if e is None or e["pool_id"] not in pools:
             continue
         p = pools[e["pool_id"]]
-        if e["event"] == "Initialize":
-            conn.execute("UPDATE rh_pools SET sqrt_price_x96 = %s, tick = %s, fee = %s, tick_spacing = %s, hooks = %s, updated_block = %s WHERE pool_id = %s",
-                         (e["sqrt_price_x96"], e["tick"], e["fee"], e["tick_spacing"], e["hooks"], e["block"], e["pool_id"]))
+        if e["event"] == "Initialize":                                     # (a history backfill never rolls a live pool's state back)
+            conn.execute("UPDATE rh_pools SET sqrt_price_x96 = %s, tick = %s, fee = %s, tick_spacing = %s, hooks = %s, updated_block = %s WHERE pool_id = %s "
+                         "AND (updated_block IS NULL OR updated_block <= %s)",
+                         (e["sqrt_price_x96"], e["tick"], e["fee"], e["tick_spacing"], e["hooks"], e["block"], e["pool_id"], e["block"]))
         elif e["event"] == "ModifyLiquidity":
             conn.execute("INSERT INTO rh_liquidity (block, log_index, tx_hash, ts, pool_id, sender, tick_lower, tick_upper, liquidity_delta, salt) "
                          "VALUES (%s, %s, %s, to_timestamp(%s), %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
@@ -239,9 +244,11 @@ def apply_v4(conn, rpc, logs: list[dict], fees: list[dict]) -> dict:
             side = 1 if tok_amt > 0 else -1                                   # the swapper received tokens: a buy
             fq = fee_q.get((e["tx_hash"], e["pool_id"])) or []
             fee = fq.pop(0) if fq else None
-            price_q = v4.token_price_in_quote(e["sqrt_price_x96"], ti0, PONS_DECIMALS, qdec)
+            price_q = v4.token_price_in_quote(e["sqrt_price_x96"], ti0, PONS_DECIMALS, qdec)       # 18 decimals: rh/token_check admits no other
             fee_frac = None
-            if fee:
+            if not p["is_pons"]:
+                fee_frac = float(e.get("fee") or 0) / 1e6; fee_v = 2                             # the swap's LP fee (hundredths of a bip)
+            elif fee:
                 # the hook takes fee + tax out of the pool's gross output, which is the Swap event's amount of that currency:
                 # the swapper receives (1 − r) of it (live fills receive exactly that), so r = taken / gross. Until 2026-10-17
                 # this stored taken / (gross + taken), 0.0099 for a 1 % fee: those rows have fee_v NULL and readers convert them.
@@ -267,8 +274,8 @@ def apply_v4(conn, rpc, logs: list[dict], fees: list[dict]) -> dict:
             conn.execute(f"UPDATE rh_pools SET hook_fee = (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY {FEE_FRAC}) FROM rh_swaps "
                          "WHERE pool_id = %s AND hook_fee_raw IS NOT NULL AND fee_frac IS NOT NULL), hook_fee_v = 2 WHERE pool_id = %s", (pid, pid))
     for pid, e in last_state.items():
-        conn.execute("UPDATE rh_pools SET sqrt_price_x96 = %s, liquidity = %s, tick = %s, updated_block = %s WHERE pool_id = %s",
-                     (e["sqrt_price_x96"], e["liquidity"], e["tick"], e["block"], pid))
+        conn.execute("UPDATE rh_pools SET sqrt_price_x96 = %s, liquidity = %s, tick = %s, updated_block = %s WHERE pool_id = %s "
+                     "AND (updated_block IS NULL OR updated_block <= %s)", (e["sqrt_price_x96"], e["liquidity"], e["tick"], e["block"], pid, e["block"]))
     return n
 
 
@@ -281,11 +288,11 @@ def step(conn, rpc, lo: int, hi: int) -> dict:
     evs = [e for e in evs if e is not None]
     fill_timestamps(rpc, evs, lo, hi)
     n = apply_pons(conn, rpc, evs)
-    ids = [r["pool_id"] for r in conn.execute("SELECT pool_id FROM rh_pools WHERE is_pons ORDER BY pool_id").fetchall()]
+    ids = [r["pool_id"] for r in conn.execute("SELECT pool_id FROM rh_pools WHERE is_pons OR indexed ORDER BY pool_id").fetchall()]
     need = [r["pool_id"] for r in conn.execute("SELECT pool_id FROM rh_pools WHERE is_pons AND hook_fee IS NULL ORDER BY pool_id").fetchall()]
     fee_topic = [FEE_TOPIC]
     v4_logs, fee_logs = [], []
-    if bulk and hi - lo + 1 <= LIVE_SPAN_BULK:                     # a live range: every PoolManager event, matched to Pons pools here
+    if bulk and hi - lo + 1 <= LIVE_SPAN_BULK:                     # a live range: every PoolManager event, matched to the indexed pools here
         mine = set(ids)                                             # (10k+ pool ids make a ~0.7 MB filter; HyperSync caps bodies at 2 MB)
         v4_logs = [g for g in _get_logs(rpc, [config.V4_POOL_MANAGER], lo, hi, [topics0]) if len(g["topics"]) > 1 and g["topics"][1].lower() in mine]
     else:
