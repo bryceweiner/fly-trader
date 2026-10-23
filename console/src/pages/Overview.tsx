@@ -217,17 +217,17 @@ function BookPanel() {
   ]
   return (
     <div className="row gx-4">
-      <div className="col-12 col-xl-7 d-flex">
+      <div className="col-12 col-xl-5 d-flex">
         <Card title={b.data?.title ?? 'Paper wealth'} icon="wealth" sub={b.data?.sub ?? 'the selector book since it started'} className="flex-fill">
           <Loaded state={b} height={260}>
             {(d) => d.history.length ? <LineChart series={[{ name: 'wealth', data: d.history }]} height={280} yFormat={(v) => `${v.toFixed(2)} ${d.unit}`} /> : <Caption>No marks yet.</Caption>}
           </Loaded>
         </Card>
       </div>
-      <div className="col-12 col-xl-5 d-flex">
+      <div className="col-12 col-xl-7 d-flex">
         <Card title="Open positions" icon="open" className="flex-fill">
           <Loaded state={b}>
-            {(d) => d.positions.length ? <DataTable rows={d.positions} cols={cols(d)} pageSize={10} filename="open-positions" /> : <Caption>None open.</Caption>}
+            {(d) => d.positions.length ? <DataTable rows={d.positions} cols={cols(d)} pageSize={10} filename="open-positions" compact /> : <Caption>None open.</Caption>}
           </Loaded>
         </Card>
       </div>

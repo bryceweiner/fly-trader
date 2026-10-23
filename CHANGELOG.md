@@ -163,6 +163,10 @@ ships signed releases built from this development line.
 - **The fly decision inspector shows the token's price and volume in the minute the fly last scored it.** Each has a
   green or red arrow for its move over the five minutes before: the price against the close five minutes earlier, the
   volume against the five minutes' average. Both are plain decimals, never scientific notation.
+- **The Overview's open positions table fits its card without scrolling sideways, from 1200 px wide up.**
+  - The card takes seven twelfths of the row and the wealth chart five, the other way round from before. The chart
+    still shows its whole history.
+  - The table's headers wrap onto two lines, its cells pad less, and a long token name ends in an ellipsis.
 
 ### Platform
 

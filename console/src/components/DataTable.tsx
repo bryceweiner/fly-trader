@@ -32,9 +32,10 @@ function pages(cur: number, total: number): (number | '…')[] {
   return out
 }
 
-export function DataTable<R extends Record<string, unknown>>({ rows, cols, height = 560, filename = 'table', onRowClick, empty = 'No rows.', search = true, initialSort, pageSize }: {
+/** ``compact`` fits a narrow card: header labels wrap onto two lines and the cells pad less. */
+export function DataTable<R extends Record<string, unknown>>({ rows, cols, height = 560, filename = 'table', onRowClick, empty = 'No rows.', search = true, initialSort, pageSize, compact = false }: {
   rows: R[]; cols: Col<R>[]; height?: number; filename?: string; onRowClick?: (r: R) => void; empty?: ReactNode; search?: boolean
-  initialSort?: { key: string; desc?: boolean }; pageSize?: number
+  initialSort?: { key: string; desc?: boolean }; pageSize?: number; compact?: boolean
 }) {
   const fb = useFeedback()
   const [sort, setSort] = useState<{ key: string; desc: boolean } | null>(initialSort ? { key: initialSort.key, desc: !!initialSort.desc } : null)
@@ -97,7 +98,7 @@ export function DataTable<R extends Record<string, unknown>>({ rows, cols, heigh
         {search && <label className="dt-search">Search:<input className="form-control form-control-sm" value={filter} onChange={(e) => { setFilter(e.target.value); setPage(0) }} /></label>}
       </div>
       <div className="ftable-wrap" style={{ maxHeight: height }}>
-        <table className="ftable">
+        <table className={`ftable ${compact ? 'compact' : ''}`}>
           <thead>
             <tr>
               {cols.map((c) => (
