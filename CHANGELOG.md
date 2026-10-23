@@ -76,6 +76,9 @@ ships signed releases built from this development line.
   - Before, raising one retired every selector and fly and stopped all trading until a retrain and replay, even for data
     already in the corpus. Models, flies and replay verdicts that still carry the old keys stay current.
   - A changed or missing definition still retires a model, as before.
+- **A rebuild of more than three days runs in a child process at the lowest CPU priority.**
+  - Re-featuring the whole archive takes about 5 hours (~100 s a day). It no longer shares the console's interpreter with
+    the live minute pipeline. A day's routine build stays in the console, as before.
 - **The fly's training writes a checkpoint after every epoch, and resumes from it.**
   - Before, a bootstrap (10–20 hours) kept its progress in memory only. A crash or a stop lost every finished epoch,
     and training could not go on past its epoch cap.

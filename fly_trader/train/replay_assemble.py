@@ -162,7 +162,10 @@ def assemble_loop(stop_event: threading.Event | None = None, idle_s: float = 60.
                 log.exception("corpus_meta rebuild failed; mature build waits for the next round")
             else:
                 try:
-                    mature.loop_once()
+                    if len(mature.stale_aggregates()) > mature.BULK_REBUILD_DAYS:
+                        mature.loop_once_apart(stop_event)          # a version change's rebuild: hours of work, kept out of the console
+                    else:
+                        mature.loop_once()
                 except Exception:
                     log.exception("mature universe build failed")
         end = time.time() + idle_s
