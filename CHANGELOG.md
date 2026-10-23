@@ -74,8 +74,6 @@ ships signed releases built from this development line.
   - `build-mature` read the same pools for every day of a rebuild; it now reads them once per round.
   - The Robinhood Chain corpus read every coin's median fee over all of `rh_minutes` (13 s) for every day it built. It now
     reads them once per run, in the middle of a minute, and a run builds up to 31 days.
-  - While both rebuilds ran, the Solana stream wrote its minute at 6.8 / 23.4 s (median / p90) over 19 minutes,
-    against 2.3 / 9.9 in the 2026-10-19 probe (`logs/latency_baseline_20261019/report_new_code.txt`).
 
 ### The universe
 
