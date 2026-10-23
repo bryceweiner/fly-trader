@@ -3,6 +3,18 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## Unreleased
+
+### Live money
+
+- **A new fly never inherits the old fly's seat: it races first.**
+  - A new bootstrap kept the old fly's race and its seat. On an install whose fly had won its race, a release that
+    installed a new fly handed it live money at once (release 10's fly #561 where #157 held the seat).
+  - Now a fly other than the one its chain's saved state was learned under starts its own race at the next minute, and
+    that chain's seat goes back to the selector. A seat recorded for another fly is cleared when the fly starts (an
+    install that ran release 10). A seat set by hand, naming no fly, stays.
+  - An untested fly races `HANDOVER_DAYS` (14) before it trades live (Bryce, 2026-10-23).
+
 ## 2026-10-23, release 10: A retrained selector trades `ev` again, and live money follows the seat
 
 Published to Hugging Face as signed release 10. It ships selector #560 and fly #561 in place of selector #154 and fly

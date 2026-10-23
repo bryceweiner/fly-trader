@@ -227,10 +227,14 @@ class FlyBook:
             self.frozen = [k for k in s.get("frozen") or [] if k in self.names]
             self.race_started_at, self.last_day, self.last_hour, self.rollbacks = s["race_started_at"], s["last_day"], s["last_hour"], s["rollbacks"]
         elif s:
-            self.race_started_at = s.get("race_started_at")        # a new bootstrap keeps racing the same book
+            if s.get("bootstrap_id") == self.boot_id:
+                self.race_started_at = s.get("race_started_at")    # the same bootstrap under the replay's new configuration keeps its race
             with transaction() as conn:
                 conn.execute("UPDATE fly_scored SET state = 'dropped', x = NULL WHERE state = 'pending' AND chain = %s AND bootstrap_id IS DISTINCT FROM %s",
                              (self.chain, self.boot_id))
+            if s.get("bootstrap_id") != self.boot_id:
+                self._new_race(s.get("bootstrap_id"))              # another bootstrap's state: this fly is untested
+        self._own_seat()
         if b is None:                                            # its fill pathways: kept from the state, switched off, or chosen at the first scored minute
             if bool(self.bank.fill.any()) and not config.FLY_FILL_PATHWAY:
                 self.bank.drop_fill(); self._channel_rates()
@@ -299,6 +303,31 @@ class FlyBook:
         except Exception:
             log.exception("teacher decisions failed for this minute (the fly still trades)")
             return {}
+
+    def _new_race(self, old, seat: dict | None = None) -> None:
+        """An untested fly: its own race starts at the next live minute (``race_started_at`` None) and it holds no seat.
+        This chain's handover record is cleared, so the wallet trades the selector's decisions until this fly wins its own
+        race (Bryce, 2026-10-23: an untested fly races ``config.HANDOVER_DAYS`` before it trades live). Until then a new
+        bootstrap kept racing the same book and kept the old fly's seat: an install whose fly had won its race handed a
+        new fly live money at once (release 10's fly #561 on an install where #157 held the seat)."""
+        self.race_started_at = None; self.has_seat = False
+        with transaction() as conn:
+            seat = handover.state(conn, self.chain) if seat is None else seat
+            if seat is not None:
+                handover.clear(conn, self.chain)
+        record_event("warning" if seat else "info", "fly", f"fly bootstrap #{self.boot_id} starts its own race on {self.market.name}"
+                     + (f"; the seat fly #{seat.get('bootstrap', old)} won is cleared and the selector trades live until this fly wins" if seat else ""),
+                     {"from": old, "to": self.boot_id, "chain": self.chain, "cleared_seat": seat})
+
+    def _own_seat(self) -> None:
+        """A seat recorded for another bootstrap is not this fly's: it is cleared and this fly races from the start (an
+        install that ran release 10, whose new fly kept the old one's seat and race, or a lost state file). A seat that
+        names no bootstrap (set by hand) stays."""
+        with transaction() as conn:
+            seat = handover.state(conn, self.chain)
+        won = (seat or {}).get("bootstrap")
+        if seat is not None and won is not None and int(won) != int(self.boot_id):
+            self._new_race(won, seat)
 
     def _read_state(self) -> dict | None:
         if not self.state_path.exists():

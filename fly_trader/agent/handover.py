@@ -27,6 +27,11 @@ def state(conn, chain: str | None = "sol") -> dict | None:
     return v or None
 
 
+def clear(conn, chain: str | None = "sol") -> None:
+    """The chain's seat goes back to the selector: its fly has not won its own race (agent/fly_session.FlyBook._new_race)."""
+    conn.execute("DELETE FROM ui_settings WHERE key = %s", (_key(chain),))
+
+
 def record(conn, detail: dict, chain: str | None = "sol") -> None:
     conn.execute("INSERT INTO ui_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
                  (_key(chain), json.dumps(detail, default=str)))
