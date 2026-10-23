@@ -68,7 +68,7 @@ def main(out: Path) -> None:
     if not verdict:
         raise SystemExit("no replay verdict stored: the fly session refuses to trade without one (fly-trader fly-replay)")
     v = verdict["value"] if isinstance(verdict["value"], dict) else json.loads(verdict["value"])
-    if not v.get("passed") or v.get("data") != fly_selector.verdict_version():
+    if not v.get("passed") or not selector.defs_match(v.get("data"), fly_selector.verdict_version()):     # as the fly session and apply-release judge it
         raise SystemExit("the stored replay verdict did not pass on the current definitions: run fly-trader fly-replay again")
 
     models = out / "models"; (models / "policies").mkdir(parents=True, exist_ok=True); (models / "selectors").mkdir(exist_ok=True); (models / "connectome").mkdir(exist_ok=True)

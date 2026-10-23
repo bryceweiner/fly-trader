@@ -215,6 +215,9 @@ Published to Hugging Face as signed release 10. It ships selector #560 and fly #
 
 ### Tools
 
+- **`tools/make_seed.py` judges the stored replay verdict as the fly session and `apply-release` do,** with the corpus
+  build versions set aside (`selector.defs_match`). It compared the verdict's definitions exactly, so the corpus rebuild
+  that retires no model still blocked a release.
 - **`tools/latency_probe.py` and `tools/latency_report.py` measure the minute pipeline from outside the console.**
   - They sample, four times a second, when the stream publishes each minute, what SQL the console is running, when each
     book's status lands, the console's CPU and every live order. The report turns that into per-minute timelines.
