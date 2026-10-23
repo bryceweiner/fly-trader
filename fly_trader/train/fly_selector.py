@@ -28,6 +28,13 @@ are calibrated (``train/fly_calibrate.py``) on its scores for the seven days bef
 then — never the selector's line. Reports: the MBONs' share of the score variance, MBON saturation, the slope and rank
 correlation of the fly's scores against the teacher's. Snapshots: ``data/brain/policies/fly_<ts>.pt`` + ``brain_snapshots``
 kind 'fly_selector'.
+
+Matched mode (opt-in, 2026-10-23; train/matched_pair.py runs it): the teacher is a given stack -- the selector's
+holdout-blind fit, to be scored on the holdout, or its full fit, to be deployed -- and the fly learns on exactly the rows
+that stack was fit on (``matched_teacher``, ``bootstrap_matched``): no calibration week and no purge day of its own. Its
+lines are matched to the teacher's own trade count on those rows, which needs no label, so the holdout stays unseen by
+both. Its evidence is the out-of-sample report on the holdout (``oos_report``), then the live race; ``deployable``
+reads that report instead of a calibration week. The default bootstrap above is unchanged.
 """
 from __future__ import annotations
 
@@ -55,7 +62,7 @@ from ..db.connection import transaction
 from . import fly_calibrate, model_io
 from . import progress as prog
 from . import selector
-from .decisions import HOLD_MIN, DecisionSet, build, rank_corr, taken_idx
+from .decisions import HOLD_MIN, DecisionSet, build, day_ords, rank_corr, taken_idx
 from .scaling import RobustScaler
 
 log = logging.getLogger(__name__)
@@ -452,19 +459,23 @@ def _write_checkpoint(path, obj: dict) -> None:
 
 def train_fly(ds: DecisionSet, rows: np.ndarray, teacher, epochs: int = EPOCHS, batch: int = BATCH, stop: threading.Event | None = None,
               seed: int = 0, graph=None, device=None, net_kwargs: dict | None = None, model_cls=None, target_clip: tuple = (-1.0, 1.0),
-              horizon_min: int | None = None, checkpoint=None) -> tuple[FlyModel | None, dict]:
+              horizon_min: int | None = None, checkpoint=None, label_known: bool = False) -> tuple[FlyModel | None, dict]:
     """Distil ``teacher`` (a StackTeacher, or anything with ``score`` and ``scaler``) into a FlyNet over the training rows
     ``rows`` (mask): one head per strategy, each learning its strategy's targets on that strategy's candidates.
     ``net_kwargs`` (``aff_rows``, ``scale``), ``model_cls`` and ``target_clip`` let another trading type (kalshi/fly.py) run
     its own fly through this loop; the memecoin defaults are unchanged. ``checkpoint``: a file written after every epoch
     (weights, optimiser, history, the best epoch so far, the random state): a run that dies resumes after its last
     finished epoch, and a finished one goes on past the cap it ran under when ``epochs`` is raised. A file written for
-    other training data is set aside, never resumed."""
+    other training data is set aside, never resumed. ``label_known`` (matched mode): a strategy learns only on rows whose
+    label over its hold exists, the rows its teacher's own fit used (strategies.final_models)."""
     brain_device.seed_all(seed); rng = np.random.default_rng(seed); dev = torch.device(device) if device else _device()
     n_s = len(teacher.strategies) if isinstance(teacher, StackTeacher) else 1
     net = FlyNet(graph if graph is not None else _graph(), obs_dim=len(ds.cols), device=dev, n_strategies=n_s, **(net_kwargs or {}))
     model_cls = model_cls or FlyModel
     idx = np.flatnonzero(rows); T, W = _teacher_targets(teacher, ds, idx, target_clip)
+    if label_known and isinstance(teacher, StackTeacher):
+        for j, k in enumerate(teacher.strategies):
+            T[~np.isfinite(_hold_label(ds, int(teacher.rules[k]["hold_min"]))[idx]), j] = np.nan
     keep = np.isfinite(T).any(1); idx, T, W = idx[keep], T[keep], W[keep]
     if not len(idx):
         return None, {"stopped": False, "reason": "no teacher candidates"}
@@ -722,6 +733,171 @@ def bootstrap(ds: DecisionSet, S: date, epochs: int = EPOCHS, stop: threading.Ev
     return fly, info
 
 
+# ---------------------------------------------------------------- matched mode (opt-in): train/matched_pair.py
+MATCHED = "matched"
+MATCH_CHUNK = 1_000_000      # training rows scored at once for the line match: one chunk's copy of the corpus stays small
+
+
+def _hold_label(ds: DecisionSet, hold_min: int) -> np.ndarray:
+    """The net return over ``hold_min`` (the label the fly's line calibration reads: the hold's own, else the set's)."""
+    return ds.fwd_h.get(hold_min, ds.fwd_pess)
+
+
+def scaler_on(ds: DecisionSet, rows: np.ndarray, seed: int = 7) -> RobustScaler:
+    """``RobustScaler.fit(ds.X[rows], seed)`` without copying every row first: the fit keeps a ``FIT_SAMPLE`` sample, drawn
+    here the same way, so the result is identical (``deployed_teacher``'s copy of the training rows was ~10 GB)."""
+    from .scaling import FIT_SAMPLE
+    rows = np.asarray(rows)
+    if len(rows) > FIT_SAMPLE:
+        rows = rows[np.random.default_rng(seed).choice(len(rows), FIT_SAMPLE, replace=False)]
+    return RobustScaler.fit(ds.X[rows], seed=seed)
+
+
+def matched_teacher(ds: DecisionSet, models: dict, exclude_days: list | None = None, note: str | None = None) -> tuple[StackTeacher, np.ndarray, str]:
+    """The teacher of a matched fly: the stack ``models`` itself (strategies.final_models: the holdout-blind fit with
+    ``exclude_days``, or the full fit), never the registry's deployed selector or a separate refit, with the rows that
+    stack was fit on (``strategies.fit_keep``) and its input scaler fitted on them. (teacher, fit rows, note)."""
+    from . import strategies
+    st = models.get("strategies") or {}
+    if not st:
+        raise ValueError("a matched fly needs a teacher stack with at least one strategy")
+    missing = sorted({c for v in st.values() for c in v["cols"]} - set(ds.cols))
+    if missing:
+        raise ValueError(f"the teacher stack wants columns the corpus lacks: {', '.join(missing[:4])}")
+    fit = strategies.fit_keep(ds, exclude_days)
+    if not fit.any():
+        raise ValueError("the teacher stack's fit days hold no row of this set")
+    days = sorted(set(ds.day[fit].tolist()))
+    names = ", ".join(f"{k} (line {v['line']:.4f}, {v['hold_min']} min)" for k, v in st.items())
+    seen = f", blind to {min(exclude_days)}..{max(exclude_days)}" if exclude_days else ""
+    note = note or f"matched stack: {names}; fit on {days[0]}..{days[-1]}{seen}"
+    return StackTeacher(models, scaler_on(ds, np.flatnonzero(fit)), list(ds.cols)), fit, note
+
+
+def _match_lines(ds: DecisionSet, fly: FlyModel, teacher: StackTeacher, rows: np.ndarray) -> tuple[dict, int]:
+    """Each strategy's line on each chain, set by the match rule (``fly_calibrate.match_line``) over the training rows
+    ``rows``: the lowest line at which the fly's own scores take no more trades there than its teacher's decisions do (one
+    position per token over the hold). The count needs no label; the in-sample stats at the chosen line are recorded."""
+    idx = np.flatnonzero(rows); NS = len(fly.strategies)
+    holds = [int(fly.rules[k]["hold_min"]) for k in fly.strategies]; ys = [_hold_label(ds, h) for h in holds]
+    trig = np.zeros((len(idx), NS), bool)
+    for i in range(0, len(idx), MATCH_CHUNK):
+        trig[i:i + MATCH_CHUNK] = fly.triggers(ds.X[idx[i:i + MATCH_CHUNK]], ds.cols)
+    ok = trig & np.column_stack([np.isfinite(y[idx]) for y in ys])          # the rows each strategy learned on
+    cand = ok.any(1); wi = idx[cand]; ok = ok[cand]
+    V = np.empty((len(wi), NS)); A = np.zeros((len(wi), NS), bool); t0 = time.time()
+    for i in range(0, len(wi), MATCH_CHUNK):
+        sl = wi[i:i + MATCH_CHUNK]
+        V[i:i + MATCH_CHUNK] = fly.score_all(ds.X[sl]); A[i:i + MATCH_CHUNK] = teacher_allowed(teacher, ds.X[sl], ds.ts[sl], fly.strategies)
+        prog.update("fly: scoring its training rows for the line match", min(i + MATCH_CHUNK, len(wi)), len(wi),
+                    eta_s=(len(wi) - i - len(sl)) * (time.time() - t0) / max(i + len(sl), 1))
+    ch = ds.chains()[wi]; per = {}
+    for chain in sorted(set(ch.tolist()), key=lambda c: c != "sol"):        # Solana first: another chain without rows keeps its lines
+        for j, name in enumerate(fly.strategies):
+            H = holds[j]; known = ok[:, j] & (ch == chain); ci = wi[known]
+            target = len(taken_idx(ds.ts[ci], ds.mint[ci], H * 60.0, np.flatnonzero(A[known, j])))
+            cal = fly_calibrate.calibrate(ds.ts[ci], ds.mint[ci], H * 60.0, V[known, j], ys[j][ci], rule="match", target_trades=target,
+                                          prev_line=fly.lines.get(name) if chain != "sol" else None)
+            fly.set_line(name, chain, cal.line, cal.sizing)
+            per[name if chain == "sol" else f"{name}@{chain}"] = {"line": cal.line, "trades": cal.trades, "mean": cal.mean, "total": cal.total, "hold_min": H,
+                                                                "rule": "match", "teacher_trades": target, "chain": chain, "rows": int(len(ci))}
+    return per, int(len(wi))
+
+
+def bootstrap_matched(ds: DecisionSet, teacher: StackTeacher, fit: np.ndarray, epochs: int = EPOCHS, stop: threading.Event | None = None, seed: int = 0,
+                      graph=None, device=None, teacher_note: str | None = None, checkpoint=None, match_days: int | None = None) -> tuple[FlyModel | None, dict]:
+    """A matched fly (``matched_teacher``): taught by ``teacher`` on exactly ``fit`` -- the rows that stack was fit on --
+    under the universe filter, each strategy only where its label existed (``train_fly(label_known=True)``), with no
+    calibration week and no purge day of its own. Its lines are matched to the teacher's trade count on the same rows
+    (``_match_lines``; ``match_days``: on the last N of those days only, since scoring every training candidate costs
+    about one forward pass over them). It trades from the day after its last training day (``S``). Its evidence is set
+    by the caller (``oos_report``: ``info['oos']``), which ``deployable`` reads; nothing here looks at a later day."""
+    uni = selector.in_universe(ds.X, ds.cols); train = np.asarray(fit, bool) & uni
+    if not train.any():
+        raise RuntimeError("the teacher's fit rows hold no tradable minute")
+    od = day_ords(ds)[train]; first, last = date.fromordinal(int(od.min())), date.fromordinal(int(od.max())); S = last + timedelta(days=1)
+    fly, fit_info = train_fly(ds, train, teacher, epochs=epochs, stop=stop, seed=seed, graph=graph, device=device, checkpoint=checkpoint, label_known=True)
+    if fly is None:
+        return None, {"stopped": True, **fit_info}
+    prog.update("fly: matching its buy lines to its teacher's trades on its training days", 0, 1, force=True)
+    m_first = first if match_days is None else max(first, last - timedelta(days=int(match_days) - 1))
+    m_rows = train if match_days is None else train & (day_ords(ds) >= m_first.toordinal())
+    per, scored = _match_lines(ds, fly, teacher, m_rows)
+    ti = np.flatnonzero(train)
+    di = ti if len(ti) <= DIAG_ROWS else np.sort(np.random.default_rng(seed).choice(ti, DIAG_ROWS, replace=False))
+    t_sc = teacher.targets(ds.X[di], ds.ts[di])[0][:, 0] if len(di) else np.zeros(0)
+    ok_t = np.isfinite(t_sc); di, t_sc = di[ok_t], t_sc[ok_t]
+    diag = diagnose(fly, ds.X[di], t_sc) if len(di) else {"mbon_share": 0.0, "mbon_saturated": 1.0, "kc_active": 0.0, "rows": 0}
+    ok, why = gate_check(diag)
+    fly.teacher = teacher          # not saved: the replay's match rule reads the teacher's own decisions over its rows
+    info = {"mode": MATCHED, "S": str(S), "train_days": [str(first), str(last)], "train_through": str(last), "calibration_days": None,
+            "line": fly.threshold, "sizing": fly.sizing, "lines": fly.lines, "chain_lines": fly.chain_lines,
+            "line_fit": {"rule": "match", "days": [str(m_first), str(last)], "rows": scored, "per_strategy": per}, "calibration": None,
+            "strategies": fly.strategies, "rules": fly.rules, "diagnostics": diag, "gates_ok": ok, "gate_failures": why, "fit": fit_info,
+            "teacher": teacher_note or "a matched stack", "teacher_line": teacher.threshold, "teacher_stack": None}
+    log.info("matched fly through %s: strategies %s, lines %s (matched on %d rows) | MBON share %.1f%% saturated %.0f%% | gates %s", last, fly.strategies,
+             {k: round(v, 4) for k, v in fly.lines.items()}, scored, diag["mbon_share"] * 100, diag["mbon_saturated"] * 100, "ok" if ok else "; ".join(why))
+    return fly, info
+
+
+def _book(ds: DecisionSet, picks: np.ndarray, strat: np.ndarray, holds: dict, day0, pool: np.ndarray, trig: dict) -> dict:
+    """One book's trades on the holdout (``strategies.score_holdout``'s rules: each pick on its strategy's hold and net
+    label, one position per token across the book's strategies), combined and per strategy, each with its random picks:
+    the combined book's among ``pool`` on the set's own hold (as score_holdout), a strategy's among its triggered rows of
+    ``pool`` on its own hold. ``picks``: row indices; ``strat``: each pick's strategy."""
+    from . import strategies
+    from .decisions import random_trades, summarize
+    n_all = len(ds.y); hold = np.zeros(n_all); ret = np.full(n_all, np.nan, np.float32); who = np.full(n_all, None, dtype=object)
+    for name, H in holds.items():
+        r = picks[strat == name]
+        if len(r):
+            hold[r] = H * 60.0; ret[r] = _hold_label(ds, H)[r]; who[r] = name
+    tr = taken_idx(ds.ts, ds.mint, hold, picks) if len(picks) else np.zeros(0, int)
+    out = {"all": {**strategies.score_trades(ds, tr, ret, day0).dict(), "random_mean": summarize(random_trades(ds, pool, max(1, len(tr)))).get("mean")}}
+    for name, H in holds.items():
+        ts_ = tr[who[tr] == name]
+        rnd = summarize(random_trades(ds, pool & trig[name], max(1, len(ts_)), hold_s=H * 60.0, returns=_hold_label(ds, H)))
+        out[name] = {**strategies.score_trades(ds, ts_, ret, day0).dict(), "random_mean": rnd.get("mean"), "hold_min": H}
+    return out
+
+
+def oos_report(ds: DecisionSet, models: dict, fly: FlyModel, days: list) -> dict:
+    """The selector's and the fly's picks on ``days`` -- the stack's holdout, which neither the blind stack nor the fly
+    matched to it was fit on -- per chain and per strategy, with the selector's own costs and hold rules (``_book``).
+    ``selector``: the stack's decisions as it trades them (strategies.decide: triggers, lines, win filters, gates, dump
+    veto). ``fly``: the fly's own decisions (``fly_decide``: its scores against its matched lines, on its teacher's
+    triggers). With FLY_SCORE=teacher and FLY_TEACHER_GATE the live fly trades exactly the selector's picks until its
+    learning vetoes some, so at bootstrap its live book is the selector's; what it then learns is the replay's to show.
+    Trades, win rate, profit factor, mean and total net return per trade at fixed size, and the random baseline."""
+    from . import strategies
+    if not days:
+        return {}
+    days = sorted(days)
+    pool_all = np.isin(day_ords(ds), [d.toordinal() for d in days]) & selector.in_universe(ds.X, ds.cols)
+    rows = np.flatnonzero(pool_all); names = list((models.get("strategies") or {}))
+    holds = {k: int(v["hold_min"]) for k, v in models["strategies"].items()}
+    s_str = np.full(len(rows), None, dtype=object); s_ok = np.zeros(len(rows), bool); f_str = np.full(len(rows), None, dtype=object)
+    tr_rows = {k: np.zeros(len(ds.y), bool) for k in names}
+    for i in range(0, len(rows), MATCH_CHUNK):
+        sl = rows[i:i + MATCH_CHUNK]; X = ds.X[sl]
+        d = strategies.decide(models, X, ds.cols, ds.ts[sl]); s_str[i:i + MATCH_CHUNK] = d["strategy"]; s_ok[i:i + MATCH_CHUNK] = d["allow"]
+        f_str[i:i + MATCH_CHUNK] = fly_decide(fly, X, ds.cols)["strategy"]
+        tg = fly.triggers(X, ds.cols)
+        for j, k in enumerate(fly.strategies):
+            if k in tr_rows:
+                tr_rows[k][sl] = tg[:, j]
+    ch = ds.chains(); out = {"days": [str(days[0]), str(days[-1])], "rows": int(len(rows)), "strategies": holds,
+                             "note": "fly = its own scores against its matched lines; at bootstrap the live fly (teacher score, teacher gate) trades the selector's picks",
+                             "chains": {}}
+    for chain in ["all"] + sorted(set(ch[rows].tolist()), key=lambda c: c != "sol"):
+        cm = np.ones(len(rows), bool) if chain == "all" else ch[rows] == chain
+        pool = pool_all if chain == "all" else pool_all & (ch == chain)
+        s_pick = cm & s_ok; f_pick = cm & np.array([x is not None for x in f_str], bool)
+        out["chains"][chain] = {"selector": _book(ds, rows[s_pick], s_str[s_pick], holds, days[0], pool, tr_rows),
+                                "fly": _book(ds, rows[f_pick], f_str[f_pick], {k: h for k, h in holds.items() if k in fly.strategies}, days[0], pool, tr_rows)}
+    return out
+
+
 def verdict_version() -> dict:
     """What a replay verdict holds for: the bootstrap's definitions (``FLY_VERSION``) and how the fly scores a row
     (config.FLY_SCORE; "own" is what FLY_VERSION alone meant until 2026-10-11, so its verdicts stay valid for it)."""
@@ -798,7 +974,8 @@ def latest_current(conn, kind: str = "fly_selector", version: dict | None = None
 
 def deployable(meta: dict | None, version: dict | None = None) -> tuple[bool, str]:
     """A bootstrap may race for the seat: current definitions, healthy network (``GATES``) and its own line made money on
-    its calibration week over at least the race's own minimum of trades (``config.HANDOVER_MIN_TRADES``). The wallet
+    its calibration week over at least the race's own minimum of trades (``config.HANDOVER_MIN_TRADES``); a matched fly
+    (``bootstrap_matched``) instead on its out-of-sample report (``info['oos']['evidence']``), over the same minimum. The wallet
     trades the selector's decisions until the fly wins its race (agent/fly_session.py), so a calibration week need not
     prove more than the race will: a quiet week (2026-10-15..21) gave a new fly 88 trades, under the 100 asked before.
     Another trading type (``version``: Kalshi) keeps ``selector.MIN_LINE_TRADES``."""
@@ -806,6 +983,13 @@ def deployable(meta: dict | None, version: dict | None = None) -> tuple[bool, st
         return False, "trained on other definitions"
     if not meta.get("gates_ok"):
         return False, "; ".join(meta.get("gate_failures") or ["network gates failed"])
+    if meta.get("mode") == MATCHED:              # a matched fly's evidence: its own picks on the holdout (oos_report), then the race
+        ev = (meta.get("oos") or {}).get("evidence") or {}; n = int(ev.get("trades") or 0); m = ev.get("mean")
+        if n < config.HANDOVER_MIN_TRADES:
+            return False, f"too few out-of-sample trades ({n})"
+        if not (isinstance(m, (int, float)) and math.isfinite(m) and m > 0):
+            return False, f"its out-of-sample picks lost money ({(m or 0) * 100:+.2f}% per trade)"
+        return True, f"its own picks made {m * 100:+.2f}% per trade over {n} out-of-sample trades"
     cal = meta.get("calibration") or {}
     if (cal.get("trades") or 0) < (config.HANDOVER_MIN_TRADES if version in (None, FLY_VERSION) else selector.MIN_LINE_TRADES):
         return False, f"too few calibration trades ({cal.get('trades') or 0})"

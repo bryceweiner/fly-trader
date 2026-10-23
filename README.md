@@ -143,6 +143,7 @@ init-db  wallet {new,show} [--key-file]  ui [--port] [--host] [--observe]  run  
 pumpstream  replay-pull  refetch-pool-ids  refetch-archive  rh-v4-backfill [--no-keys --no-history]  discover [--once]  fit-wallet-skill [--days]
 assemble-replay  build-corpus-meta  build-mature  build-corpus-features  backtest-corpus [--max-tokens --days --fees --only --universe]
 train-selector [--days]  train-fly-selector [--days --epochs --device]  fly-replay [--days --device --start-day]
+matched-pair OUT --last-day YYYY-MM-DD [--epochs --match-days --replay]
 selector-eval  reset-training [--no-archive]  models convert  apply-release DIR [--bootstrap]
 build-connectome [--annotations]  swap-smoke [--sol]  verify-fills  close-empty-atas
 pause-entries  resume-entries  reset-circuit [--kill]

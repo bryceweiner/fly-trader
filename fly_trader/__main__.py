@@ -128,6 +128,13 @@ def _cmd_build_corpus_features(args):
     corpus_features.main()
 
 
+def _cmd_matched_pair(args):
+    from .train import matched_pair
+    out = matched_pair.cli(args)
+    print(json.dumps(out, default=str, indent=1))
+    return 1 if out.get("stopped") else 0
+
+
 def _cmd_rh_build_corpus(args):
     from .logging_setup import setup
     from .rh import corpus
@@ -363,6 +370,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_bm = sub.add_parser("build-mature", help="one corpus build round (the console's replay worker runs it as a child process)")
     p_bm.add_argument("--meta", action="store_true", help="rebuild corpus_meta first (the replay worker's round)")
     p_bm.set_defaults(fn=_cmd_build_mature)
+    p_mp = sub.add_parser("matched-pair", help="train a selector and a fly on exactly the same pinned corpus into a scratch folder and score both on the "
+                                               "holdout (no registry rows; run apart from the console, under nice)")
+    p_mp.add_argument("out", help="the scratch folder (a rerun resumes it)")
+    p_mp.add_argument("--last-day", required=True, help="the corpus's last day, pinned (YYYY-MM-DD)")
+    p_mp.add_argument("--epochs", type=int, default=None, help="each fly's epoch cap (default fly_selector.EPOCHS; early stopping decides below it)")
+    p_mp.add_argument("--match-days", type=int, default=None, help="match the fly's lines on its last N training days only (default: all of them)")
+    p_mp.add_argument("--replay", action="store_true", help="also replay the blind fly's learning over the holdout days")
+    p_mp.set_defaults(fn=_cmd_matched_pair)
     p_rc = sub.add_parser("rh-build-corpus", help="build the due Robinhood Chain corpus days (the stream starts it as a child process)")
     p_rc.add_argument("--days", type=int, default=31, help="days at most per run (each run reads every minute's fee once)")
     p_rc.set_defaults(fn=_cmd_rh_build_corpus)

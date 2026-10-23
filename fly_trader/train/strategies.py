@@ -794,6 +794,15 @@ def score_holdout(ds: DecisionSet, models: dict, days: list, spec: "StackSpec | 
 
 
 # ---------------------------------------------------------------- deployment: final models and live decisions
+def fit_keep(ds: DecisionSet, exclude_days: list | None = None) -> np.ndarray:
+    """The rows ``final_models`` may fit on: every row, or with ``exclude_days`` none of those days' rows and only rows
+    whose label was known before the first of them (``known_before``). A fly matched to these models trains on exactly
+    these rows (train/fly_selector.matched_teacher)."""
+    if not exclude_days:
+        return np.ones(len(ds.y), bool)
+    return ~np.isin(day_ords(ds), [d.toordinal() for d in exclude_days]) & known_before(ds, _day_start(min(exclude_days)))
+
+
 def final_models(ds: DecisionSet, stack: Stack, exclude_days: list | None = None, spec: "StackSpec | None" = None) -> dict:
     """Every accepted component refit on all days (the walk-forward only chose their settings): per strategy its GBM over
     its candidates and hold, its win classifier on all its out-of-sample candidates; the veto on all candidate trades.
@@ -801,7 +810,7 @@ def final_models(ds: DecisionSet, stack: Stack, exclude_days: list | None = None
     refits on everything; only the holdout measurement excludes, or it would be scoring itself in sample."""
     sp = spec or memecoin_spec()
     uni = sp.in_universe(ds.X, ds.cols); out = {"strategies": {}, "veto": None, "combine": stack.combine, "spec": sp.name}
-    keep = (~np.isin(day_ords(ds), [d.toordinal() for d in exclude_days]) & known_before(ds, _day_start(min(exclude_days)))) if exclude_days else np.ones(len(ds.y), bool)
+    keep = fit_keep(ds, exclude_days)
     for f in stack.fits:
         ci = np.asarray([ds.cols.index(x) for x in f.cols]); y = sp.label(ds, f.hold_min)
         loose = np.zeros(len(ds.y), bool)

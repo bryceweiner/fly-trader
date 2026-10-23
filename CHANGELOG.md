@@ -21,6 +21,27 @@ ships signed releases built from this development line.
   - A routine day's build (~80 s) no longer runs beside the live minute pipeline either, and neither does corpus_meta's
     rebuild, which the child now runs before its builds: 36-82 s every 30 minutes until now.
 
+### Training
+
+- **A selector and a fly can be trained as a matched pair on exactly the same data (opt-in: `fly-trader matched-pair`).**
+  - Until now they never saw the same days. The fly held out its own calibration week and a purge day, and learned from
+    the deployed selector's holdout-blind refit: release 10's selector #560 was fit through 10-20, its blind refit
+    through 09-29, and fly #561 through 10-13.
+  - In matched mode the fly's teacher is the stack itself: its holdout-blind fit, to be scored on the holdout, or its full
+    fit, to be deployed. The fly learns on exactly that fit's days and rows (each strategy only where its own label
+    existed), with no calibration week or purge day of its own.
+  - Its lines are matched to the teacher's own trade count on those same rows. The count needs no outcome, so the 21
+    held-out days stay unseen by both. `--match-days N` matches on the last N training days only: scoring every training
+    candidate costs about one pass of the network over them.
+  - The command pins the corpus's last day and writes only to its scratch folder: the stack with its full and blind fits,
+    the blind fly, an out-of-sample report, optionally the blind fly's learning replayed over the holdout (`--replay`),
+    then the full fly. No registry row is written, and a rerun resumes. The report covers both books per strategy and per
+    chain: trades, win rate, mean and total net return, and random picks, with the selector's own costs and hold rules.
+  - A matched fly may race on its own out-of-sample picks (at least `HANDOVER_MIN_TRADES` trades, a positive mean)
+    instead of a calibration week. At bootstrap the live fly (teacher score, teacher gate) trades the selector's own picks.
+  - The default bootstrap, every model definition and the live fly and selector are unchanged.
+  - `decisions.build` can pin its last day, and frees its per-day frames before the sort: a ~52 GB peak instead of ~78.
+
 ## 2026-10-23, release 10: A retrained selector trades `ev` again, and live money follows the seat
 
 Published to Hugging Face as signed release 10. It ships selector #560 and fly #561 in place of selector #154 and fly
