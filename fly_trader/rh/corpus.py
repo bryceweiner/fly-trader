@@ -9,9 +9,13 @@
 4. ``rh/wallet_skill.build_wallet_day(D − 1)`` once D's aggregate and part exist.
 
 A day is built once complete (the minutes cursor past its end); a part records ``fly_chain = rh`` and ``fly_rh_agg``.
+The stream builds no day itself: once one is due it starts ``fly-trader rh-build-corpus`` (``run_locked``) as a child
+process at the lowest CPU priority. A day took ~30 s in the stream's thread at 00:00 UTC on 2026-10-23, in front of the
+next minute's write, and the other v4 pools (rh/v4_universe.py) add several times the swaps.
 """
 from __future__ import annotations
 
+import fcntl
 import logging
 from datetime import date, datetime, timedelta, timezone
 
@@ -97,3 +101,29 @@ def run_once(max_days: int = 3) -> dict:
             out[d.isoformat()] = {"minutes": n_agg, "rows": n_part}; done += 1
         d += timedelta(days=1)
     return {"days": done, "built": out}
+
+
+def due(days: int = 3) -> bool:
+    """Whether one of the last ``days`` complete days lacks its corpus files (``run_once`` would build it)."""
+    last = complete_through()
+    if last is None:
+        return False
+    first = date.fromisoformat(config.RH_START_DAY)
+    for i in range(days):
+        d = last - timedelta(days=i)
+        if d < first:
+            break
+        if not (MATURE_DIR / f"{d.isoformat()}.parquet").exists() or not part_current(FEAT_DIR / d.isoformat() / "part.parquet"):
+            return True
+    return False
+
+
+def run_locked(max_days: int = 3) -> dict:
+    """``run_once`` under a file lock, one builder at a time across processes (``fly-trader rh-build-corpus``)."""
+    MATURE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(MATURE_DIR / ".rh_build.lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"days": 0, "busy": True}
+        return run_once(max_days)

@@ -62,6 +62,11 @@ ships signed releases built from this development line.
     prices that day): about 130,000 swaps and 2.1–2.5 s by 23:59, in front of that minute's live entries.
   - It now reads only each coin's last 200 prices that day: 0.03–0.07 s at 23:59. On 18 real ranges (single minutes at
     23:59, noon and now, 240 minutes, across midnight, a whole day, and four quote assets) the rows are identical.
+- **The Robinhood Chain corpus is built in a child process, never in the stream's thread.**
+  - At 00:00 UTC the stream built the previous day's training files itself: about 30 s on 2026-10-23, after that minute's
+    write and before the next one's. The other v4 pools (The universe) add several times the swaps.
+  - The stream now only looks at the files and starts `fly-trader rh-build-corpus` at the lowest CPU priority, one at a
+    time.
 
 ### The universe
 

@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -26,6 +29,7 @@ LIVE_LAG_BLOCKS = 5_000         # closer than this to the head counts as live
 RPC_CATCHUP_S = 3.0             # between catch-up passes while HyperSync is down (each reads ~2-3 times from the public RPC)
 SLOW_EVERY_S = 60.0             # meta and corpus refresh with each written minute, else at least this often
 _SLOW = {"at": 0.0}
+_CORPUS: dict = {"proc": None}  # the child building a due corpus day (rh/corpus.run_locked)
 
 
 def _status(**kv) -> None:
@@ -83,12 +87,12 @@ def one_pass(rpc, skill=None) -> dict:
     from . import wallet_skill
     wallet_skill.daily(); lap("skill_tables")                  # today's and tomorrow's tables, before their minutes are written
     mn = minutes.run_once(src, wallet_skill.load_today() if skill is None else skill); lap("minutes")
-    from . import corpus, meta
+    from . import meta
     mt, cp = {}, {}
     if mn.get("minutes") or time.monotonic() - _SLOW["at"] >= SLOW_EVERY_S:   # after a written minute: passes in between stay short
         _SLOW["at"] = time.monotonic()
         mt = meta.run_once(); lap("meta")
-        cp = corpus.run_once(max_days=1) if behind <= LIVE_LAG_BLOCKS * 20 else {}      # the training corpus follows once near the head
+        cp = corpus_apart() if behind <= LIVE_LAG_BLOCKS * 20 else {}               # the training corpus follows once near the head
         lap("corpus")
     out = {"head": head, "index_through": ix.get("through"), "behind_blocks": head - (ix.get("through") or 0), "index": ix.get("counts"), "prices": px,
            "minutes": mn, "meta": mt, "corpus": cp, "mode": "backfill" if behind > LIVE_LAG_BLOCKS else "live", "timings_s": tm,
@@ -119,6 +123,36 @@ def main(stop_event: threading.Event | None = None) -> None:
             log.exception("rh_stream pass failed: %s", str(e)[:200]); _status(error=str(e)[:300])
             stop.wait(10.0); continue
         stop.wait(_wait_s((out.get("minutes") or {}).get("through")))
+    _stop_corpus()
+
+
+def corpus_apart() -> dict:
+    """A due corpus day is built by a child process at the lowest CPU priority (``fly-trader rh-build-corpus``), never in
+    this thread (rh/corpus.py). One child at a time; this only looks at the files and starts it."""
+    from . import corpus
+    p = _CORPUS["proc"]
+    if p is not None and p.poll() is None:
+        return {"building": p.pid}
+    if p is not None:
+        _CORPUS["proc"] = None
+        if p.returncode:
+            log.warning("rh corpus child %d exited %d (its log: rh_corpus.log)", p.pid, p.returncode)
+    if not corpus.due():
+        return {}
+    nice = ["/usr/bin/nice", "-n", "19"] if os.path.exists("/usr/bin/nice") else []      # not preexec_fn: unsafe in a threaded process
+    p = _CORPUS["proc"] = subprocess.Popen([*nice, sys.executable, "-m", "fly_trader", "rh-build-corpus"], stdout=subprocess.DEVNULL)
+    log.info("rh corpus: a day is due, built by child process %d at the lowest CPU priority", p.pid)
+    return {"started": p.pid}
+
+
+def _stop_corpus() -> None:
+    p = _CORPUS["proc"]
+    if p is not None and p.poll() is None:
+        p.terminate()                                            # every file is written atomically: an ended child loses only its day
+        try:
+            p.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            p.kill()
 
 
 def _wait_s(written_through: int | None, now: float | None = None) -> float:
