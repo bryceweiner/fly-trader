@@ -70,12 +70,17 @@ def build_wallet_day(d: date, out_dir: Path | None = None) -> int:
     if inp is None:
         return 0
     trades, aggs, parts = inp
+    from ..db.connection import transaction
+    from .corpus_meta import pumpfun_graduates
+    with transaction() as conn:
+        grads = pumpfun_graduates(conn)
     con = duckdb.connect()
+    con.register("grads", pa.table({"mint": pa.array(grads, pa.string())}))
     cols = [c[0] for c in con.execute("SELECT * FROM read_parquet(?, union_by_name = true) LIMIT 0", [trades]).description]
     quote_filter = "AND (quote_mint IS NULL OR quote_mint = 'So11111111111111111111111111111111111111112')" if "quote_mint" in cols else ""
     # the universe's legs (mature.aggregate_table): pump.fun's coins, SOL-quoted (a leg in another quote is not a SOL amount)
     con.execute(f"""CREATE TEMP TABLE legs AS SELECT mint, trader, ts, side, sol, price FROM read_parquet(?, union_by_name = true)
-                    WHERE pool = 'pump-amm' AND mint LIKE '%pump' AND price > 0 AND sol > 0
+                    WHERE pool = 'pump-amm' AND (mint LIKE '%pump' OR mint IN (SELECT mint FROM grads)) AND price > 0 AND sol > 0
                       AND trader IS NOT NULL {quote_filter}""", [trades])
     con.execute("CREATE TEMP TABLE closes AS SELECT mint, ts AS mts, close FROM read_parquet(?) ORDER BY mint, mts", [aggs])
     con.execute("CREATE TEMP TABLE ec AS SELECT mint, ts AS mts, exit_cost_0p1 AS ec FROM read_parquet(?)", [parts])
@@ -181,18 +186,18 @@ def daily() -> int:
     return n
 
 
-def _lookups() -> tuple[list[str], dict]:
-    """The blocked pools and token insiders, read once: a fit aggregates 149 days per candidate, and reconnecting for each
-    one cost thousands of connections and lost a 20-hour run to a connection timeout."""
+def _lookups() -> tuple[list[str], dict, list[str]]:
+    """The blocked pools, token insiders and pump.fun graduates without the suffix, read once: a fit aggregates 149 days per
+    candidate, and reconnecting for each one cost thousands of connections and lost a 20-hour run to a connection timeout."""
     from ..db.connection import transaction
-    from .corpus_meta import blocked_pool_ids
+    from .corpus_meta import blocked_pool_ids, pumpfun_graduates
     with transaction() as conn:
-        blocked = blocked_pool_ids(conn)
+        blocked = blocked_pool_ids(conn); grads = pumpfun_graduates(conn)
         ins: dict = {}
         for r in conn.execute("SELECT mint, wallet FROM token_insiders").fetchall():
             ins.setdefault(r["mint"], []).append(r["wallet"])
-    log.info("wallet skill: %d blocked pools, insiders for %d tokens (read once)", len(blocked), len(ins))
-    return blocked, ins
+    log.info("wallet skill: %d blocked pools, insiders for %d tokens, %d graduates without the suffix (read once)", len(blocked), len(ins), len(grads))
+    return blocked, ins, grads
 
 
 def _day_skill(d: date, h: int, L: int, day_dir: Path | None = None, lookups=None):
@@ -201,8 +206,8 @@ def _day_skill(d: date, h: int, L: int, day_dir: Path | None = None, lookups=Non
     files = mature._hour_files(d)
     if not files or mature._lacks_pool_id(files):
         return None
-    blocked, insiders = lookups if lookups is not None else (None, None)
-    tab = mature.aggregate_table(files, skill_table(d, h, L, day_dir), blocked=blocked, insiders=insiders)
+    blocked, insiders, grads = lookups if lookups is not None else (None, None, None)
+    tab = mature.aggregate_table(files, skill_table(d, h, L, day_dir), blocked=blocked, insiders=insiders, grads=grads)
     sb = np.zeros((tab.num_rows, flow.N_SKILL))
     col = tab["skill_buy"].combine_chunks()
     if col.null_count < len(col):

@@ -131,7 +131,7 @@ def _ms(ts: int) -> float:
     return (ts + TS_OFFSET_S) * 1000.0
 
 
-def build(sig: str, slot: int, evs: list[tuple[str, bytes]], pools: dict, payer: str | None = None) -> tuple[list[dict], set]:
+def build(sig: str, slot: int, evs: list[tuple[str, bytes]], pools: dict, payer: str | None = None, pumpfun=None) -> tuple[list[dict], set]:
     """PumpAPI-shaped events of one transaction, and the PumpSwap pools whose mints are not known yet (then nothing is
     built: the caller resolves them and builds again)."""
     trades, curve, creates, cpools = [], [], [], []
@@ -178,7 +178,7 @@ def build(sig: str, slot: int, evs: list[tuple[str, bytes]], pools: dict, payer:
         base, quote = pools[pool]
         last = legs[-1]; sgn = 1 if last["side"] == "buy" else -1
         post_q, post_b = last["pqr"] + sgn * last["q"], last["pbr"] - sgn * last["base"]
-        dec = 6 if base.endswith("pump") else None       # only pump.fun coins (6 decimals) are priced: the minutes keep no other
+        dec = 6 if (pumpfun(base) if pumpfun is not None else base.endswith("pump")) else None   # only pump.fun coins (6 decimals) are priced: the minutes keep no other
         out.append({"action": legs[0]["side"], "pool": "pump-amm", "mint": base, "quoteMint": quote, "poolId": pool, "timestamp": _ms(legs[0]["ts"]),
                     "price": ((post_q + last["vq"]) / 1e9) / (post_b / 10 ** dec) if dec is not None and post_b > 0 else None,
                     "quoteInPool": post_q / 1e9, "quoteAmount": legs[0]["q"] / 1e9, "txSigner": legs[0]["user"], "poolFeeRate": last["fee_bps"] / 1e4,
@@ -251,8 +251,9 @@ class HeliusFeed:
     source = "helius"
     grace_s = 0.5                # its stamps are its blocks' seconds (+TS_OFFSET_S) in slot order: a minute is whole at the next second's first event
 
-    def __init__(self, emit, rpc=None):
-        self.emit, self.pools = emit, Pools()
+    def __init__(self, emit, rpc=None, pumpfun=None):
+        """``pumpfun``: mint → is a pump.fun coin (pumpstream.Aggregator.pumpfun: the suffix, or a graduate without it)."""
+        self.emit, self.pools, self.pumpfun = emit, Pools(), pumpfun
         self._rpc = rpc
         self.delivered: dict[str, float] = {}                   # signature -> when it went out
         self.wm = 0.0; self.last_amm = 0.0; self.connected: dict[str, bool] = {AMM: False, PUMP: False}
@@ -277,7 +278,7 @@ class HeliusFeed:
         """Build and emit, once per transaction; False (kept back) while a pool's mints are unknown."""
         if sig in self.delivered:
             return True
-        out, unknown = build(sig, slot, evs, self.pools.map, payer)
+        out, unknown = build(sig, slot, evs, self.pools.map, payer, self.pumpfun)
         if unknown:
             return False
         now = time.time(); self.delivered[sig] = now

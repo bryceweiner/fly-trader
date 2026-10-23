@@ -47,7 +47,7 @@ def test_stream_loads_blocked_set(db_conn):
                     "ON CONFLICT DO NOTHING"); db_conn.commit()
     try:
         agg = pumpstream.Aggregator(); pumpstream._load_blocked(agg)
-        assert "LOAD_T1" in agg.blocked and "LOAD_T2" not in agg.blocked     # a non-pump mint never reaches the pool check
+        assert "LOAD_T1" in agg.blocked and "LOAD_T2" not in agg.blocked     # a mint that is not pump.fun's never reaches the pool check
         agg.ingest(_leg("Lpump", 1_800_000_001_000, 1.0, "LOAD_T1"))
         assert agg.stats["dropped_custom_pool"] == 1 and not agg.minutes
     finally:
@@ -71,7 +71,7 @@ def test_aggregate_day_excludes_custom_pools(db_conn, tmp_path, monkeypatch):
         assert mature.aggregate_day(d) == 3
         out = pq.read_table(tmp_path / "mature" / f"{d.isoformat()}.parquet").to_pandas()
         assert set(out["mint"]) == {"Xpump"} and (out["close"] == 1.0).all() and len(out) == 3
-        assert mature.part_version(tmp_path / "mature" / f"{d.isoformat()}.parquet") == mature.AGG_VERSION == 4
+        assert mature.part_version(tmp_path / "mature" / f"{d.isoformat()}.parquet") == mature.AGG_VERSION == 5
     finally:
         db_conn.execute("DELETE FROM pump_pools WHERE pool_id = 'AGG_BAD'"); db_conn.execute("DELETE FROM mature_days WHERE day = %s", (d,)); db_conn.commit()
 
@@ -95,6 +95,51 @@ def test_archive_backfill_idempotent(db_conn, tmp_path, monkeypatch):
         assert "BF_C1" in corpus_meta.blocked_pool_ids(db_conn)
     finally:
         db_conn.execute("DELETE FROM ui_settings WHERE key = 'pump_pools_backfill'"); db_conn.execute("DELETE FROM pump_pools WHERE pool_id LIKE 'BF_%'"); db_conn.commit()
+
+
+def test_stream_keeps_pumpfun_graduates_without_the_suffix(monkeypatch):
+    """A pump.fun graduate whose mint lacks the "pump" suffix is a universe coin once its migration is seen; any other
+    mint without the suffix is not."""
+    agg = pumpstream.Aggregator(); m = 1_800_000_000
+    monkeypatch.setattr(agg, "write_creates", lambda: 0); monkeypatch.setattr(agg, "_graduation", lambda e: None)
+    agg.ingest({"action": "migrate", "pool": "pump-amm", "mint": "GradNoSuffix", "timestamp": (m + 1) * 1000, "poolId": "GRAD_POOL", "signature": "g1"})
+    assert agg.pumpfun("GradNoSuffix") and agg.pumpfun("Apump") and not agg.pumpfun("OtherNoSuffix")
+    for mint, pid in (("GradNoSuffix", "GRAD_POOL"), ("OtherNoSuffix", "OTHER_POOL")):
+        agg.ingest(_leg(mint, (m + 5) * 1000, 1.0, pid))
+    assert set(agg.minutes[m]) == {"GradNoSuffix"}
+
+
+def test_stream_loads_graduates_without_the_suffix(db_conn):
+    db_conn.execute("INSERT INTO corpus_meta (mint, graduated_at) VALUES ('GradLoadNoSuffix', now()) ON CONFLICT DO NOTHING")
+    db_conn.execute("INSERT INTO pump_pools (pool_id, mint, created_by, source) VALUES ('LOAD_G1', 'GradLoadNoSuffix', 'custom', 'archive') ON CONFLICT DO NOTHING")
+    db_conn.commit()
+    try:
+        agg = pumpstream.Aggregator(); pumpstream._load_blocked(agg)
+        assert "GradLoadNoSuffix" in agg.grads and "LOAD_G1" in agg.blocked    # its custom pools are blocked like any universe coin's
+        agg.ingest(_leg("GradLoadNoSuffix", 1_800_000_001_000, 1.0, "LOAD_G1"))
+        assert agg.stats["dropped_custom_pool"] == 1 and not agg.minutes
+    finally:
+        db_conn.execute("DELETE FROM pump_pools WHERE pool_id = 'LOAD_G1'"); db_conn.execute("DELETE FROM corpus_meta WHERE mint = 'GradLoadNoSuffix'")
+        db_conn.commit()
+
+
+def test_aggregate_day_includes_pumpfun_graduates_without_the_suffix(db_conn, tmp_path, monkeypatch):
+    d = date(2031, 1, 3); t0 = datetime(2031, 1, 3, tzinfo=timezone.utc).timestamp()
+    rows = [(mint, t0 + 60 * k + 1, pid) for k in range(3) for mint, pid in (("Xpump", "P_X"), ("GradAggNoSuffix", "P_G"), ("OtherAggNoSuffix", "P_O"))]
+    tab = pa.table({"ts": pa.array([datetime.fromtimestamp(r[1], timezone.utc) for r in rows], pa.timestamp("ms", tz="UTC")), "slot": pa.array(range(len(rows)), pa.int64()),
+                    "pool": ["pump-amm"] * len(rows), "mint": [r[0] for r in rows], "trader": ["t"] * len(rows), "side": pa.array([1] * len(rows), pa.int8()),
+                    "sol": [1.0] * len(rows), "price": [1.0] * len(rows), "quote_in_pool": [80.0] * len(rows), "quote_mint": [WSOL] * len(rows),
+                    "pool_id": [r[2] for r in rows]})
+    (tmp_path / "replay" / d.isoformat()).mkdir(parents=True)
+    pq.write_table(tab, tmp_path / "replay" / d.isoformat() / "00_trades.parquet")
+    monkeypatch.setattr(config, "REPLAY_DIR", tmp_path / "replay"); monkeypatch.setattr(mature, "MATURE_DIR", tmp_path / "mature")
+    db_conn.execute("INSERT INTO corpus_meta (mint, graduated_at) VALUES ('GradAggNoSuffix', now()) ON CONFLICT DO NOTHING"); db_conn.commit()
+    try:
+        assert mature.aggregate_day(d) == 6
+        out = pq.read_table(tmp_path / "mature" / f"{d.isoformat()}.parquet").to_pandas()
+        assert set(out["mint"]) == {"Xpump", "GradAggNoSuffix"}               # a mint pump.fun never graduated stays out
+    finally:
+        db_conn.execute("DELETE FROM corpus_meta WHERE mint = 'GradAggNoSuffix'"); db_conn.execute("DELETE FROM mature_days WHERE day = %s", (d,)); db_conn.commit()
 
 
 def test_corpus_versions_never_retire_a_model():

@@ -7,7 +7,8 @@ identical to the replay archive. From Asia it falls behind and reconnects about 
 ``SOL_FEED=helius`` (ingest/helius_feed.py: the same events decoded from Helius). Each transaction is taken once from
 whichever feed brought it first (``Aggregator.ingest_from``), and the backup's clock counts only while the primary is down.
 This worker keeps only what the selector needs: PumpSwap (``pump-amm``, SOL-quoted)
-buys and sells of pump.fun-origin mints, aggregated per (mint, minute) into the same fields ``train/mature.py``
+buys and sells of pump.fun-origin mints (a ``pump`` mint, or a pump.fun graduate without the suffix: one whose migration
+the stream saw or ``corpus_meta`` holds, reloaded every 5 minutes), aggregated per (mint, minute) into the same fields ``train/mature.py``
 derives from the archive, with the same filters: legs in a pool created directly rather than by a pump.fun migration
 (``createPool`` with ``poolCreatedBy`` other than ``pump``; the owner can pull its unburned liquidity) are dropped — such pools
 go to ``pump_pools`` as they are created, and the blocked set is reloaded from that table (archive backfill included) at
@@ -47,7 +48,7 @@ from .. import config
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..logging_setup import setup
-from ..train.corpus_meta import CURVE_COLS, blocked_pool_ids, creator_history, curve_facts
+from ..train.corpus_meta import CURVE_COLS, blocked_pool_ids, creator_history, curve_facts, pumpfun_graduates
 from ..train.flow import minute_wallet_cols
 
 log = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ class Aggregator:
         self.curve: dict[str, dict] = {}                                   # mint → bonding-curve wallets since its create (corpus_meta.curve_facts)
         self.pending_creates: list[tuple[str, dict]] = []                 # creates not yet written to pump_events
         self.blocked: set[str] = set()                                     # pool ids of directly created (custom) PumpSwap pools
+        self.grads: set[str] = set()                                       # pump.fun graduates whose mint lacks the "pump" suffix
         self.pending_pools: list[tuple] = []                               # custom pools not yet written to pump_pools
         self.flushed_through: datetime | None = None                       # start of the newest complete minute written
         self.insiders: dict[str, frozenset] = {}                           # mint → creator/bundle/early wallets (token_insiders)
@@ -140,6 +142,10 @@ class Aggregator:
         pools = self.minutes.get(minute, {}).get(mint)
         return max(pools.values(), key=lambda r: (r.nb + r.ns, r.buy + r.sell)) if pools else None
 
+    def pumpfun(self, mint) -> bool:
+        """A pump.fun coin: the ``pump`` suffix, or a graduate without it (its migration seen here or in ``corpus_meta``)."""
+        return bool(mint) and (str(mint).endswith("pump") or mint in self.grads)
+
     def ingest(self, e: dict, source: str = "pumpapi") -> None:
         self.stats["events"] += 1
         a = e.get("action"); pool = e.get("pool"); mint = e.get("mint"); ts = e.get("timestamp")
@@ -155,7 +161,7 @@ class Aggregator:
             self._curve(e)
             return
         if a in ("buy", "sell"):
-            if pool != "pump-amm" or e.get("quoteMint") != WSOL or not str(mint).endswith("pump"):
+            if pool != "pump-amm" or e.get("quoteMint") != WSOL or not self.pumpfun(mint):
                 return
             if e.get("poolId") in self.blocked:
                 self.stats["dropped_custom_pool"] += 1
@@ -217,6 +223,8 @@ class Aggregator:
                 self.curve = {k: v for k, v in self.curve.items() if v["ts"] >= cutoff}
         elif a == "migrate" and pool == "pump-amm":
             self.stats["migrates"] += 1
+            if not str(mint).endswith("pump"):
+                self.grads.add(mint)                # a pump.fun graduate without the suffix: its PumpSwap legs are universe legs
             self.write_creates()                    # the creator's own earlier creates must be visible to the history query
             self._graduation(e)
 
@@ -469,10 +477,12 @@ def load_skill(agg: Aggregator, now: float | None = None) -> None:
 
 
 def _load_blocked(agg: Aggregator) -> None:
-    """Union the custom pools in ``pump_pools`` (stream rows and the archive backfill) into the blocked set."""
+    """Union the custom pools in ``pump_pools`` (stream rows and the archive backfill) into the blocked set, and the pump.fun
+    graduates without the ``pump`` suffix (``corpus_meta``: the archive's and the stream's migrations) into ``grads``."""
     try:
         with transaction() as conn:
             agg.block(blocked_pool_ids(conn))
+            agg.grads.update(pumpfun_graduates(conn))
     except Exception:
         log.exception("custom pool load failed; retried in 5 min")
 
@@ -567,7 +577,7 @@ async def _run(stop: threading.Event | None, agg: Aggregator) -> None:
             agg.ingest_from(e, source)
     if config.SOL_FEED == "helius":
         from .helius_feed import HeliusFeed
-        agg.feed = HeliusFeed(emit)
+        agg.feed = HeliusFeed(emit, pumpfun=agg.pumpfun)
         jobs.append(agg.feed.run(stop))
     elif config.SOL_FEED == "relay":                    # PumpAPI's events from our relay near its source (stream_relay/)
         from .relay_feed import RelayFeed

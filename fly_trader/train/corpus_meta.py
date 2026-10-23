@@ -19,6 +19,10 @@ the stream fills ``own_dd60``/``own_max60`` from its own minutes at that time, t
 the assembled candle files. Runs inside the ``replay`` worker after each assembly round and as
 ``fly-trader build-corpus-meta``. It first copies the archive's directly created PumpSwap pools into ``pump_pools``
 (``backfill_pump_pools``), which the stream and ``train/mature.py`` exclude from the universe (``blocked_pool_ids``).
+
+The universe's coins are pump.fun's: a mint ending in ``pump`` or one this table holds (a pump.fun migration recorded it).
+Since 2026-10-23 the second half counts too: 4-22 % of daily graduations carry a mint without the suffix, with the same
+launchpad, creator history, burned pool liquidity and token rules as the rest (``pumpfun_graduates``).
 """
 from __future__ import annotations
 
@@ -300,9 +304,17 @@ def backfill_pump_pools() -> int:
 
 
 def blocked_pool_ids(conn) -> list[str]:
-    """Blocked pools that can carry universe legs. The stream and ``train/mature.py`` both keep only pump.fun-origin mints
-    (suffix ``pump``) before this check, so pools of other mints never match either way."""
-    return [r["pool_id"] for r in conn.execute("SELECT pool_id FROM pump_pools WHERE mint IS NULL OR right(mint, 4) = 'pump'").fetchall()]
+    """Blocked pools that can carry universe legs: those of pump.fun's coins (a ``pump`` mint or a graduate in this table).
+    The stream and ``train/mature.py`` keep only those coins before this check, so pools of other mints never match either
+    way (and the set stays ~10 % of ``pump_pools``)."""
+    return [r["pool_id"] for r in conn.execute("""SELECT p.pool_id FROM pump_pools p WHERE p.mint IS NULL OR right(p.mint, 4) = 'pump'
+                                                  OR EXISTS (SELECT 1 FROM corpus_meta c WHERE c.mint = p.mint)""").fetchall()]
+
+
+def pumpfun_graduates(conn) -> list[str]:
+    """pump.fun graduates whose mint does not end in ``pump`` (a migration recorded them here): universe coins as much as
+    the suffixed ones, which the stream and the archive aggregation recognise by the suffix alone."""
+    return [r["mint"] for r in conn.execute("SELECT mint FROM corpus_meta WHERE right(mint, 4) <> 'pump'").fetchall()]
 
 
 def creator_history(conn, creator: str | None, create_ts, graduated_at) -> dict:

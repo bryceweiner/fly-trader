@@ -58,6 +58,16 @@ ships signed releases built from this development line.
     the fly's paper book, which is what the race compares with the selector's. Once the fly holds the seat, its vetoes
     bind the wallet too. A pick the selector itself blocks never goes live. Both chains.
 
+### The universe
+
+- **Solana: pump.fun graduates whose mint does not end in "pump" are traded too.**
+  - They are 4–22 % of a day's graduations (40–60 a day this week), with the same launchpad, creator history, burned pool
+    liquidity and token rules as the rest. A mint-suffix test dropped them in the stream, the corpus and the wallet skill.
+  - A coin now counts as pump.fun's when its mint ends in "pump" or a pump.fun migration recorded it: the stream adds a
+    graduate the moment it sees the migration and reloads `corpus_meta`'s every 5 minutes. Their custom pools stay blocked.
+  - On 2026-10-21 they add 1,582 mints to the day's 10,754 and 5.5 % of its volume. No existing row changes.
+  - The corpus is rebuilt to include them (aggregation version 5). The current selector and fly keep trading through it.
+
 ### The selector
 
 - **A strategy's win filter chooses only its cut-off, at the strategy's own line, and must beat having no filter.**
