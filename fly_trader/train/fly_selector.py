@@ -750,7 +750,8 @@ def teacher_scores_of(per: dict, names: list[str], n: int) -> np.ndarray:
 
 
 def is_current(meta: dict | None, version: dict | None = None) -> bool:
-    return bool(meta) and meta.get("data") == (version or FLY_VERSION)
+    """Trained on exactly the current definitions, the retired corpus build versions set aside (``selector.defs_match``)."""
+    return bool(meta) and selector.defs_match(meta.get("data"), version or FLY_VERSION)
 
 
 def save(fly: FlyModel, metrics: dict, run_id: str | None = None, kind: str = "fly_selector", subdir: str = "policies", version: dict | None = None,

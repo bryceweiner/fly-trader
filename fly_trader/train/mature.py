@@ -19,7 +19,9 @@ mask as absent), Jupiter stats stay masked. Age and price-vs-graduation come fro
 graduation is inside the archive (``corpus_meta.graduated_at``, the source live uses too); older tokens carry NaN age.
 Output: ``data/corpus/features_mature/<day>/part.parquet``. Both outputs carry a version in their Parquet metadata
 (``AGG_VERSION``, ``market.features.FEATURE_VERSION``); ``loop_once`` rebuilds any file from another version and moves
-the old one to ``data/corpus/_mature_stale/``. Feature parts also record how many of their mints had a known graduation
+the old one to ``data/corpus/_mature_stale/``. ``AGG_VERSION`` only says when the files are rebuilt: it is not a model
+definition (``train/selector.DATA_VERSION``), so a rebuild never retires a model.
+Feature parts also record how many of their mints had a known graduation
 (``fly_known``); a part is rebuilt once ``corpus_meta`` dates more of them (older days are backfilled after newer ones).
 """
 from __future__ import annotations

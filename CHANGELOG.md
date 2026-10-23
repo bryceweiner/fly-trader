@@ -70,6 +70,12 @@ ships signed releases built from this development line.
 
 ### Training
 
+- **A corpus rebuild never retires a model.**
+  - The corpus build versions (`mature.AGG_VERSION`, `rh/corpus.RH_AGG_VERSION`) say when the corpus files are rebuilt,
+    not what a model's inputs, labels or costs mean. They are no longer part of a model's definitions.
+  - Before, raising one retired every selector and fly and stopped all trading until a retrain and replay, even for data
+    already in the corpus. Models, flies and replay verdicts that still carry the old keys stay current.
+  - A changed or missing definition still retires a model, as before.
 - **The fly's training writes a checkpoint after every epoch, and resumes from it.**
   - Before, a bootstrap (10–20 hours) kept its progress in memory only. A crash or a stop lost every finished epoch,
     and training could not go on past its epoch cap.

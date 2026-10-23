@@ -95,3 +95,19 @@ def test_archive_backfill_idempotent(db_conn, tmp_path, monkeypatch):
         assert "BF_C1" in corpus_meta.blocked_pool_ids(db_conn)
     finally:
         db_conn.execute("DELETE FROM ui_settings WHERE key = 'pump_pools_backfill'"); db_conn.execute("DELETE FROM pump_pools WHERE pool_id LIKE 'BF_%'"); db_conn.commit()
+
+
+def test_corpus_versions_never_retire_a_model():
+    """The corpus build versions say when the files are rebuilt, not what a model means: a selector, fly or replay verdict
+    that still carries them (every one trained before 2026-10-23 does) stays current, so a rebuild retires nothing; a
+    changed, missing or extra definition still does (fly #251's ``distil`` must not make it the live fly)."""
+    from fly_trader.train import fly_replay, fly_selector, selector
+    assert "agg" not in selector.DATA_VERSION and "rh_agg" not in selector.DATA_VERSION
+    old = {**selector.DATA_VERSION, "agg": 4, "rh_agg": 1}
+    assert selector.is_current({"data": old}) and not selector.is_current({"data": {**old, "features": -1}})
+    assert fly_selector.is_current({"data": {**fly_selector.FLY_VERSION, "agg": 4, "rh_agg": 1}})
+    assert not fly_selector.is_current({"data": {k: v for k, v in fly_selector.FLY_VERSION.items() if k != "fly"}})
+    assert not fly_selector.is_current({"data": {**fly_selector.FLY_VERSION, "agg": 4, "distil": "x"}})     # any other extra key still retires a fly
+    row = {"value": {"data": {**fly_selector.verdict_version(), "agg": 4, "rh_agg": 1}, "chains": {"rh": {"passed": True}}}}
+    merged = fly_replay.merge_chains(row, {"data": fly_selector.verdict_version(), "chains": {"sol": {"passed": True}}, "S": "x"}, ("sol",))
+    assert set(merged["chains"]) == {"rh", "sol"} and merged["passed"]       # the stored verdict's other chain is kept

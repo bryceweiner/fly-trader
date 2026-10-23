@@ -429,7 +429,7 @@ def merge_chains(row, out: dict, only_chains: tuple) -> dict:
     """The stored verdict with ``out``'s verdicts for ``only_chains`` put in; the other chains keep theirs (each with the
     replay start it was judged from). A stored verdict on other definitions is replaced whole."""
     old = (row["value"] if isinstance(row["value"], dict) else json.loads(row["value"])) if row else None
-    if not old or old.get("data") != out.get("data") or "chains" not in old:
+    if not old or not isinstance(out.get("data"), dict) or not selector.defs_match(old.get("data"), out["data"]) or "chains" not in old:
         return out
     chains = dict(old["chains"])
     for c in only_chains:
@@ -581,7 +581,7 @@ def verdict() -> dict | None:
     with transaction() as conn:
         r = conn.execute("SELECT value FROM ui_settings WHERE key = %s", (KEY,)).fetchone()
     v = (r["value"] if isinstance(r["value"], dict) else json.loads(r["value"] or "{}")) if r else None
-    return v if v and v.get("data") == fly_selector.verdict_version() else None
+    return v if v and selector.defs_match(v.get("data"), fly_selector.verdict_version()) else None
 
 
 def main(days: int | None = None, start_day: int = START_DAY, stop_event: threading.Event | None = None, only_chains: tuple | None = None) -> dict:
