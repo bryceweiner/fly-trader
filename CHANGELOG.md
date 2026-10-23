@@ -128,6 +128,7 @@ ships signed releases built from this development line.
     to the console, and rebuilds each finished day itself. About 4,500 hours, roughly 2.7 TB of downloads; run it under
     `nice -n 19` only after the console runs this code. Progress: `ui_settings['replay_refetch_status']`.
   - A day is rebuilt whenever one of its hour files is newer than its aggregate.
+- **The stream relay forwards pump.fun graduates without the "pump" suffix and every SOL-quoted DLMM trade.**
 - **A stream relay is ready, but switched off.**
   - `stream_relay/` holds PumpAPI's stream on a server near its source. It forwards only the events and fields the
     minutes use: about 33 KB/s at the busiest minute, instead of the whole stream.

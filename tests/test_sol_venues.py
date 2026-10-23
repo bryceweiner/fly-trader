@@ -1,8 +1,10 @@
 """Meteora DLMM pools of pump.fun coins make their minutes too (2026-10-23), and the archive keeps every venue's SOL legs:
-the hour files, the refetch that rewrites older hours, the stream and a graduation's quote asset."""
+the hour files, the refetch that rewrites older hours, the stream, a graduation's quote asset and the relay."""
+import importlib.util
 import os
 import time
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import orjson
 import pyarrow as pa
@@ -15,6 +17,7 @@ from fly_trader.train import corpus_meta, mature
 
 WSOL = pumpstream.WSOL
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _trade(pool, mint, quote, ts_ms, pid, action="buy", q=1.0, price=1e-5, by=None):
@@ -106,3 +109,13 @@ def test_aggregate_day_lets_a_dlmm_pool_make_the_minute(db_conn, tmp_path, monke
         assert mature.agg_stale(agg)
     finally:
         db_conn.execute("DELETE FROM mature_days WHERE day = %s", (d,)); db_conn.commit()
+
+
+def test_relay_forwards_graduates_without_the_suffix_and_dlmm_legs():
+    spec = importlib.util.spec_from_file_location("stream_relay_relay_v", ROOT / "stream_relay" / "relay.py")
+    relay = importlib.util.module_from_spec(spec); spec.loader.exec_module(relay)
+    assert relay.keep(_trade("pump-amm", "GradNoSuffix", WSOL, 1, "P", by="pump"))                      # a migration's pool
+    assert not relay.keep(_trade("pump-amm", "Other", WSOL, 1, "P", by="custom"))
+    assert relay.keep(_trade("pump-amm", "Xpump", WSOL, 1, "P", by="custom"))                            # suffixed: as before (blocked downstream)
+    assert relay.keep(_trade("meteora-dlmm", "Anything", WSOL, 1, "D")) and not relay.keep(_trade("meteora-dlmm", "Anything", USDC, 1, "D"))
+    assert not relay.keep(_trade("orca-whirlpool", "Xpump", WSOL, 1, "O"))

@@ -6,8 +6,10 @@ From Asia, PumpAPI's stream (Frankfurt) falls behind and reconnects about once a
 (2026-10-19): the long hop cannot carry the whole firehose. This relay holds the firehose where it is fast and sends
 only what fly-trader's aggregator (fly_trader/ingest/pumpstream.py) reads:
 
-- the events: PumpSwap buys and sells of pump.fun coins quoted in SOL, bonding-curve buys and sells, creates,
-  migrations and pool creations (``keep``) -- everything else (transfers, other venues, other quotes) is dropped;
+- the events: SOL-quoted buys and sells of pump.fun coins in PumpSwap (a "pump" mint, or any mint in a pool pump.fun's
+  migration created: ``poolCreatedBy`` "pump") and every SOL-quoted Meteora DLMM buy and sell (the aggregator keeps
+  pump.fun coins' only), bonding-curve buys and sells, creates, migrations and pool creations (``keep``) -- everything
+  else (transfers, other venues, other quotes) is dropped;
 - the fields: only those the aggregator reads (``FIELDS``, ``LEG_FIELDS``; tests/test_stream_relay.py checks them
   against pumpstream.py), unchanged.
 
@@ -58,12 +60,15 @@ log = logging.getLogger("stream_relay")
 
 
 def keep(e: dict) -> bool:
-    """The events the aggregator uses (pumpstream.Aggregator.ingest): PumpSwap trades of pump.fun coins in SOL,
-    pool creations and migrations; bonding-curve trades and creates."""
+    """The events the aggregator uses (pumpstream.Aggregator.ingest): SOL-quoted PumpSwap trades of pump.fun coins (a
+    "pump" mint, or a graduate without the suffix in its migration's pool), SOL-quoted Meteora DLMM trades, pool
+    creations and migrations; bonding-curve trades and creates."""
     a, pool = e.get("action"), e.get("pool")
+    if pool == "meteora-dlmm":
+        return a in ("buy", "sell") and e.get("quoteMint") == WSOL
     if pool == "pump-amm":
         if a in ("buy", "sell"):
-            return e.get("quoteMint") == WSOL and str(e.get("mint") or "").endswith("pump")
+            return e.get("quoteMint") == WSOL and (str(e.get("mint") or "").endswith("pump") or e.get("poolCreatedBy") == "pump")
         return a in ("migrate", "createPool")
     return pool == "pump" and a in ("buy", "sell", "create")
 
