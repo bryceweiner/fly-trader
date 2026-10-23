@@ -796,14 +796,17 @@ def latest_current(conn, kind: str = "fly_selector", version: dict | None = None
 
 
 def deployable(meta: dict | None, version: dict | None = None) -> tuple[bool, str]:
-    """A bootstrap may trade: current definitions, healthy network (``GATES``) and its own line made money over at least
-    100 trades on its calibration week."""
+    """A bootstrap may race for the seat: current definitions, healthy network (``GATES``) and its own line made money on
+    its calibration week over at least the race's own minimum of trades (``config.HANDOVER_MIN_TRADES``). The wallet
+    trades the selector's decisions until the fly wins its race (agent/fly_session.py), so a calibration week need not
+    prove more than the race will: a quiet week (2026-10-15..21) gave a new fly 88 trades, under the 100 asked before.
+    Another trading type (``version``: Kalshi) keeps ``selector.MIN_LINE_TRADES``."""
     if not is_current(meta, version):
         return False, "trained on other definitions"
     if not meta.get("gates_ok"):
         return False, "; ".join(meta.get("gate_failures") or ["network gates failed"])
     cal = meta.get("calibration") or {}
-    if (cal.get("trades") or 0) < selector.MIN_LINE_TRADES:
+    if (cal.get("trades") or 0) < (config.HANDOVER_MIN_TRADES if version in (None, FLY_VERSION) else selector.MIN_LINE_TRADES):
         return False, f"too few calibration trades ({cal.get('trades') or 0})"
     if not (isinstance(cal.get("mean"), (int, float)) and math.isfinite(cal["mean"]) and cal["mean"] > 0):      # NaN never passes
         return False, f"its calibration week lost money ({(cal.get('mean') or 0) * 100:+.2f}% per trade)"

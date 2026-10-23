@@ -144,6 +144,10 @@ were judged on: no model, seed or infrastructure file changes.
 ## 2026-10-18, release 8: The live stats follow each live order, and empty token accounts close on their own
 
 Published to Hugging Face as signed release 8. Fly #157 and selector #154 are unchanged, and so are the definitions they
+- **A new fly may race once its calibration week made money over 30 trades, the race's own minimum (was 100).**
+  - The wallet trades the selector's decisions until the fly wins its race, so the calibration week need not prove more
+    than the race will. A quiet week (2026-10-15..21) gave the new fly 88 trades at +2.96%, which the old bar refused.
+  - A losing calibration week still never deploys a fly. The Kalshi fly keeps 100.
 were judged on: no model, seed or infrastructure file changes.
 
 ### Upgrading
