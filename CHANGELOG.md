@@ -57,6 +57,11 @@ ships signed releases built from this development line.
   - Now, until the handover, a pick the fly's learning vetoes still goes live as the selector decided it. It stays out of
     the fly's paper book, which is what the race compares with the selector's. Once the fly holds the seat, its vetoes
     bind the wallet too. A pick the selector itself blocks never goes live. Both chains.
+- **A Robinhood Chain minute is written in milliseconds at any hour, not up to 2.5 s late in the UTC day.**
+  - Writing each minute re-read every swap since 00:00 UTC to warm the price filter (the median of a coin's previous 200
+    prices that day): about 130,000 swaps and 2.1–2.5 s by 23:59, in front of that minute's live entries.
+  - It now reads only each coin's last 200 prices that day: 0.03–0.07 s at 23:59. On 18 real ranges (single minutes at
+    23:59, noon and now, 240 minutes, across midnight, a whole day, and four quote assets) the rows are identical.
 
 ### The universe
 

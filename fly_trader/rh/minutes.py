@@ -10,7 +10,9 @@ The same rules as the Solana stream (ingest/pumpstream.Aggregator) and the archi
 - fee_rate = the volume-weighted Pons hook fee + tax fraction (the analogue of pump_minutes.fee_rate, the pool fee charged);
 - the wallet columns (buyers, wash, top seller, insider sells, buys per skill decile) by train/flow.minute_wallet_cols.
 
-Minutes are recomputed from the swaps, never accumulated, so a live pass and a backfill write identical rows.
+Minutes are recomputed from the swaps, never accumulated, so a live pass and a backfill write identical rows. Only the
+median needs swaps before the first minute: each mint's last ``REF_LEGS`` prices that day are read for it (until 2026-10-23
+every swap since 00:00 UTC was re-read for each live minute: ~2.3 s per minute by 23:59, in front of the RH live entries).
 """
 from __future__ import annotations
 
@@ -53,14 +55,23 @@ def aggregate(conn, t0: int, t1: int, skill: dict | None = None, quote_asset: st
         "p.quote_asset, a.decimals AS qdec, a.class AS cls "
         "FROM rh_swaps s JOIN rh_pools p ON p.pool_id = s.pool_id JOIN rh_assets a ON a.asset = p.quote_asset "
         "WHERE s.ts >= to_timestamp(%s) AND s.ts < to_timestamp(%s) AND (%s::text IS NULL OR p.quote_asset = %s) ORDER BY s.ts, s.block, s.log_index",
-        (day0, t1, quote_asset, quote_asset)).fetchall()
+        (t0, t1, quote_asset, quote_asset)).fetchall()
     insiders: dict[str, frozenset] = {}
     base_cache: dict[tuple, tuple] = {}
-    ref: dict[str, deque] = {}; ref_day = None
+    ref: dict[str, deque] = {}; ref_day = day0 // 86400
+    first_day = sorted({s["token"] for s in swaps if s["ts"].timestamp() < day0 + 86400})
+    if first_day and t0 > day0:                                    # the median's state at t0: each mint's last prices that day
+        for h in conn.execute(
+                "SELECT u.token, h.price_q FROM unnest(%s::text[]) AS u(token) CROSS JOIN LATERAL ("
+                "SELECT s.price_q, s.ts, s.block, s.log_index FROM rh_swaps s JOIN rh_pools p ON p.pool_id = s.pool_id JOIN rh_assets a ON a.asset = p.quote_asset "
+                "WHERE s.token = u.token AND s.ts >= to_timestamp(%s) AND s.ts < to_timestamp(%s) AND s.price_q > 0 AND (%s::text IS NULL OR p.quote_asset = %s) "
+                "ORDER BY s.ts DESC, s.block DESC, s.log_index DESC LIMIT %s) h ORDER BY u.token, h.ts, h.block, h.log_index",
+                (first_day, day0, t0, quote_asset, quote_asset, REF_LEGS)).fetchall():
+            ref.setdefault(h["token"], deque(maxlen=REF_LEGS)).append(float(h["price_q"]))
     rows: dict[tuple, _Row] = {}
     for s in swaps:
         ts = s["ts"].timestamp(); day = int(ts // 86400)
-        if ref_day is None or day != ref_day:
+        if day != ref_day:
             ref = {}; ref_day = day
         p = float(s["price_q"] or 0.0)
         if p <= 0:
@@ -68,8 +79,8 @@ def aggregate(conn, t0: int, t1: int, skill: dict | None = None, quote_asset: st
         dq = ref.setdefault(s["token"], deque(maxlen=REF_LEGS))
         ok = not dq or (statistics.median(dq) / PRICE_BAND <= p <= statistics.median(dq) * PRICE_BAND)
         dq.append(p)
-        if not ok or ts < t0:
-            continue                                               # before t0: only the median's history
+        if not ok:
+            continue
         m = int(ts // 60) * 60
         key_b = (s["quote_asset"], m)
         if key_b not in base_cache:
