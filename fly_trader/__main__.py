@@ -362,7 +362,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("build-corpus-meta").set_defaults(fn=_cmd_build_corpus_meta)
     sub.add_parser("build-mature").set_defaults(fn=_cmd_build_mature)
     p_rc = sub.add_parser("rh-build-corpus", help="build the due Robinhood Chain corpus days (the stream starts it as a child process)")
-    p_rc.add_argument("--days", type=int, default=3, help="days at most per run")
+    p_rc.add_argument("--days", type=int, default=31, help="days at most per run (each run reads every minute's fee once)")
     p_rc.set_defaults(fn=_cmd_rh_build_corpus)
     p_v4 = sub.add_parser("rh-v4-backfill", help="import every Robinhood Chain v4 pool key, then backfill the live v4 pools' history (run apart from the console, under nice)")
     p_v4.add_argument("--no-keys", action="store_true", help="skip the pool-key import")

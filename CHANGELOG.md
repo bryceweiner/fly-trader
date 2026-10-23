@@ -67,6 +67,15 @@ ships signed releases built from this development line.
     write and before the next one's. The other v4 pools (The universe) add several times the swaps.
   - The stream now only looks at the files and starts `fly-trader rh-build-corpus` at the lowest CPU priority, one at a
     time.
+- **Two reads the latency probe caught after the 04:40 UTC restart are cheap now, and off the live path.**
+  - The Solana stream reloads the blocked custom pools every 5 minutes on the loop that flushes its minutes. Since the
+    suffix-less graduates, that read probed `corpus_meta` once per pool row: up to 3.5 s. It now joins the two tables
+    (the same 32,308 pools, 1.9 s → 65 ms on a copy) and runs on a thread.
+  - `build-mature` read the same pools for every day of a rebuild; it now reads them once per round.
+  - The Robinhood Chain corpus read every coin's median fee over all of `rh_minutes` (13 s) for every day it built. It now
+    reads them once per run, in the middle of a minute, and a run builds up to 31 days.
+  - While both rebuilds ran (04:47–05:05 UTC), the Solana stream wrote its minute at 6.8 / 23.4 s (median / p90),
+    against 2.3 / 9.9 in the 2026-10-19 probe (`logs/latency_baseline_20261019/report_new_code.txt`).
 
 ### The universe
 

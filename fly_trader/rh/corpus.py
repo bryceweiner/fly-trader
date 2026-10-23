@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import fcntl
 import logging
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import pyarrow as pa
@@ -52,7 +53,8 @@ def aggregate(d: date) -> int:
 
 
 def _meta_extra() -> tuple[dict, dict, dict]:
-    """(graduations, supplies, TokenMeta extras) for every graduated launch."""
+    """(graduations, supplies, TokenMeta extras) for every graduated launch. Its fee medians read all of rh_minutes (13 s on
+    2026-10-23): ``run_once`` reads it once a run, in the middle of a minute (``_quiet``)."""
     k = config.RH_ETH_PER_SOL
     with transaction() as conn:
         g = conn.execute("SELECT mint, graduated_at, supply FROM rh_meta").fetchall()
@@ -63,8 +65,17 @@ def _meta_extra() -> tuple[dict, dict, dict]:
     return grads, {r["mint"]: float(r["supply"]) if r["supply"] else 1e9 for r in g}, extra     # a plain v4 memecoin's own supply
 
 
-def build_day(d: date) -> int:
-    grads, supplies, extra = _meta_extra()
+def _quiet() -> None:
+    """Wait for the middle of a minute (agent/live_first.MID_MINUTE) before a long read of the database: the live
+    pipeline's reads run in the first seconds after a minute's end."""
+    from ..agent import live_first
+    while not live_first.mid_minute():
+        time.sleep(1.0)
+
+
+def build_day(d: date, meta: tuple | None = None) -> int:
+    """Day ``d``'s feature rows; ``meta``: ``_meta_extra()``'s result, read here when not given."""
+    grads, supplies, extra = meta if meta is not None else _meta_extra()
     return mature.build_day(d, grads=grads, supplies=supplies, src_dir=MATURE_DIR, out_dir=FEAT_DIR, program_label=PONS_LABEL, meta_extra=extra,
                             extra_md={"fly_chain": "rh", "fly_rh_agg": RH_AGG_VERSION})
 
@@ -90,13 +101,15 @@ def run_once(max_days: int = 3) -> dict:
     last = complete_through()
     if last is None:
         return {"days": 0}
-    d = date.fromisoformat(config.RH_START_DAY); done = 0; out = {}
+    d = date.fromisoformat(config.RH_START_DAY); done = 0; out = {}; meta = None
     while d <= last and done < max_days:
         part = FEAT_DIR / d.isoformat() / "part.parquet"; agg = MATURE_DIR / f"{d.isoformat()}.parquet"
         if not agg.exists() or not part_current(part):
             wallet_skill.write_table(d)
             n_agg = aggregate(d)
-            n_part = build_day(d) if n_agg else 0
+            if n_agg and meta is None:
+                _quiet(); meta = _meta_extra()        # once a run, not once a day
+            n_part = build_day(d, meta) if n_agg else 0
             wallet_skill.build_wallet_day(d - timedelta(days=1))
             out[d.isoformat()] = {"minutes": n_agg, "rows": n_part}; done += 1
         d += timedelta(days=1)

@@ -541,7 +541,7 @@ async def _housekeeping(stop: threading.Event | None, agg: Aggregator, io: dict)
     """The minutes' flush on its own clock (``FLUSH_CHECK_S``: a feed's reconnect never holds a minute back), the
     engine woken the moment one is written (agent/live_first.minute_published), then the status and the periodic loads."""
     last_pools = time.time(); last_ins = 0.0; last_status = last_outcomes = 0.0; last_archive = time.time() - 3000
-    bg: dict[str, asyncio.Task | None] = {"archive": None, "outcomes": None}
+    bg: dict[str, asyncio.Task | None] = {"archive": None, "outcomes": None, "blocked": None}
     while not (stop is not None and stop.is_set()):
         await asyncio.sleep(FLUSH_CHECK_S)
         now = time.time()
@@ -565,7 +565,9 @@ async def _housekeeping(stop: threading.Event | None, agg: Aggregator, io: dict)
                     live_first.minute_published()
             agg.expire_claims(now)
             if now - last_pools >= 300:
-                _load_blocked(agg); last_pools = now
+                if bg["blocked"] is None or bg["blocked"].done():      # on a thread: the minutes' flush never waits for the read
+                    bg["blocked"] = asyncio.create_task(asyncio.to_thread(_load_blocked, agg))
+                last_pools = now
                 try:
                     load_skill(agg, now)
                 except Exception:

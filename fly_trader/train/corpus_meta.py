@@ -338,9 +338,12 @@ def backfill_pump_pools() -> int:
 def blocked_pool_ids(conn) -> list[str]:
     """Blocked pools that can carry universe legs: those of pump.fun's coins (a ``pump`` mint or a graduate in this table).
     The stream and ``train/mature.py`` keep only those coins before this check, so pools of other mints never match either
-    way (and the set stays ~10 % of ``pump_pools``)."""
-    return [r["pool_id"] for r in conn.execute("""SELECT p.pool_id FROM pump_pools p WHERE p.mint IS NULL OR right(p.mint, 4) = 'pump'
-                                                  OR EXISTS (SELECT 1 FROM corpus_meta c WHERE c.mint = p.mint)""").fetchall()]
+    way (and the set stays ~10 % of ``pump_pools``). Read as two halves joined on the indexes: one ``corpus_meta`` probe per
+    pool row took 3.5 s (2026-10-23)."""
+    return [r["pool_id"] for r in conn.execute("""SELECT pool_id FROM pump_pools WHERE mint IS NULL OR right(mint, 4) = 'pump'
+                                                  UNION ALL
+                                                  SELECT p.pool_id FROM pump_pools p JOIN corpus_meta c ON c.mint = p.mint
+                                                  WHERE right(p.mint, 4) <> 'pump'""").fetchall()]
 
 
 def pumpfun_graduates(conn) -> list[str]:

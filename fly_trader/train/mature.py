@@ -285,7 +285,8 @@ def aggregate_table(files: list[str], skill, blocked: list[str] | None = None, i
     return tab
 
 
-def aggregate_day(d: date) -> int:
+def aggregate_day(d: date, blocked: list[str] | None = None, grads: list[str] | None = None) -> int:
+    """Aggregate day ``d`` (``aggregate_table``); ``blocked`` and ``grads`` as there, read here when not given."""
     t0 = time.time(); files = _hour_files(d)
     if not files:
         return 0
@@ -294,7 +295,7 @@ def aggregate_day(d: date) -> int:
         return 0
     MATURE_DIR.mkdir(parents=True, exist_ok=True)
     skill = skill_table_for(d)
-    tab = aggregate_table(files, skill)
+    tab = aggregate_table(files, skill, blocked=blocked, grads=grads)
     write_part(tab, MATURE_DIR / f"{d.isoformat()}.parquet", AGG_VERSION, {"fly_skill": _skill_version() if skill is not None else "none"})
     n_mints = len(pa.compute.unique(tab["mint"]))
     with transaction() as conn:
@@ -472,8 +473,12 @@ def _loop_once() -> int:
                 _retire(MATURE_FEAT_DIR / dd.isoformat() / "part.parquet", f"feat_{dd}")
             with transaction() as conn:
                 conn.execute("DELETE FROM mature_days WHERE day = %s", (d,))
-    for d in days_ready():
-        aggregate_day(d); n += 1
+    days = days_ready()
+    if days:
+        with transaction() as conn:                 # the custom pools and suffix-less graduates once a round, not once a day
+            blocked, pf = blocked_pool_ids(conn), pumpfun_graduates(conn)
+        for d in days:
+            aggregate_day(d, blocked=blocked, grads=pf); n += 1
     grads = _graduations()          # corpus_meta.rebuild reads the day's events before every round, so its graduations are known
     for f in sorted(MATURE_DIR.glob("*.parquet"), reverse=True):
         d = date.fromisoformat(f.stem)
