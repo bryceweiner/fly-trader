@@ -176,7 +176,7 @@ class FlyBook:
             self.boot_id = b.boot_id; self.fly = b.fly; self.connectome_name = b.connectome_name; self.capture_ok = False
             self.fly_lock = b.fly_lock                       # the chains' live phases run at once: one model, one at a time
             self.teacher_models = b.teacher_models; self.idx = b.idx; self.names = b.names; self.holds = b.holds; self.H = b.H
-            self.teacher_live, self.teacher_groups = b.teacher_live, b.teacher_groups
+            self.teacher_live, self.teacher_groups, self.gate_sid = b.teacher_live, b.teacher_groups, b.gate_sid
             self.cfg = b.cfg; self.alpha = b.alpha; self.half_life = b.half_life; self.bank = b.bank
             net = self.fly.net
         else:
@@ -191,6 +191,7 @@ class FlyBook:
             self.idx = np.asarray([X_COLS.index(c) for c in self.fly.cols], dtype=int)
             self.names = list(self.fly.strategies); self.holds = {k: float(self.fly.rules[k]["hold_min"]) * 60.0 for k in self.names}
             self.H = max(self.holds.values())
+            self._follow_deployed(initial=True)                  # the gate: the selector the selector book trades
             per = self.verdict.get("per_strategy") or {self.names[0]: {"alpha": self.verdict.get("alpha", 0.0), "half_life_days": self.verdict.get("half_life_days")}}
             self.cfg = {k: (float((per.get(k) or {}).get("alpha") or 0.0), (per.get(k) or {}).get("half_life_days")) for k in self.names}
             self.alpha = self.cfg[self.names[0]][0]; self.half_life = float(self.cfg[self.names[0]][1]) if self.cfg[self.names[0]][1] is not None else math.inf
@@ -266,6 +267,45 @@ class FlyBook:
 
     teacher_live: dict | None = None
     teacher_groups: set = set()
+    gate_sid: int | None = None              # the selector snapshot the gate (teacher_live) is
+
+    def _follow_deployed(self, initial: bool = False) -> bool:
+        """The gate (``teacher_live``: the selector decision every buy of this book needs, the wallet's included) is the
+        selector the selector book trades -- its pin, else the newest deployable snapshot -- not only the one that taught this
+        fly. Live money follows the seat, and until this fly wins its race the wallet trades that selector's decisions;
+        weekly refits deploy when they win (Bryce, 2026-10-24), so the gate moves with them. The fly's network, its learned
+        correction and its race stay; its bootstrap teacher still sets the match rule's budget (``teacher_models``). The
+        current gate stays when the deployed selector cannot be loaded or wants an input this engine lacks."""
+        from .selector_session import pinned_snapshot
+        pin = pinned_snapshot()
+        with transaction() as conn:
+            r = (conn.execute("SELECT id, path FROM brain_snapshots WHERE id = %s", (pin,)).fetchone() if pin is not None
+                 else selector.latest_current(conn))
+        if not r or self.gate_sid == int(r["id"]):
+            return False
+        try:
+            m = selector.load_snapshot(int(r["id"]))
+        except Exception:
+            log.exception("fly #%s: deployed selector #%s could not be loaded; the gate stays on #%s", self.boot_id, r["id"], self.gate_sid)
+            return False
+        live = getattr(m, "stack", None)
+        if not live or not live.get("strategies") or any(c not in X_COLS for v in live["strategies"].values() for c in v["cols"]):
+            log.warning("fly #%s: selector #%s has no usable strategy stack; the gate stays on #%s", self.boot_id, r["id"], self.gate_sid)
+            return False
+        old = self.gate_sid
+        self.teacher_live = live; self.teacher_groups = set((getattr(m, "metrics", None) or {}).get("groups") or []); self.gate_sid = int(r["id"])
+        unknown = sorted(set(live["strategies"]) - set(self.names))
+        if unknown:
+            log.warning("fly #%s: selector #%s trades %s, which this fly has no network for: those picks are not traded", self.boot_id, self.gate_sid, unknown)
+        moved = {k: (self.holds[k] / 60.0, float(v["hold_min"])) for k, v in live["strategies"].items()
+                 if k in self.holds and v.get("hold_min") is not None and float(v["hold_min"]) * 60.0 != self.holds[k]}
+        if moved:                                        # the wallet holds the selector's time (_gated); the fly's labels keep its own
+            log.warning("fly #%s: selector #%s holds other times than this fly learned (fly min, selector min): %s", self.boot_id, self.gate_sid, moved)
+        if not initial:
+            record_event("info", "fly", f"the fly's gate follows selector #{self.gate_sid}", {"from": old, "to": self.gate_sid, "chain": self.chain,
+                                                                                             "unknown_strategies": unknown, "holds_moved": moved})
+        log.info("fly #%s: the gate is selector #%s (was #%s)", self.boot_id, self.gate_sid, old)
+        return True
 
     def _teacher_models(self, boot: dict) -> dict | None:
         """The stack that taught this fly (its snapshot's ``teacher_snapshot``: the holdout-blind copy when that is what
@@ -287,7 +327,7 @@ class FlyBook:
         live = getattr(m, "stack", None)                         # the gate: the teacher's full stack, as its selector book trades it
         if live and live.get("strategies") and all(c in X_COLS for v in live["strategies"].values() for c in v["cols"]):
             self.teacher_live = live
-            self.teacher_groups = set((getattr(m, "metrics", None) or {}).get("groups") or [])
+            self.teacher_groups = set((getattr(m, "metrics", None) or {}).get("groups") or []); self.gate_sid = int(sid)
         if not models or not models.get("strategies") or any(c not in X_COLS for v in models["strategies"].values() for c in v["cols"]):
             log.warning("fly #%s: teacher #%s has no usable strategy stack", self.boot_id, sid)
             return None
@@ -419,16 +459,20 @@ class FlyBook:
         """A newer deployable bootstrap (a re-bootstrap) replaces this one at once: D = 0, pending tags dropped, the book carries on.
         Another chain's book follows its brain (the Solana book reloads first)."""
         if self.brain is not None:
+            gate = self.brain.gate_sid != self.gate_sid
+            if gate:                                     # the Solana book's gate moved: this chain's follows it
+                self.teacher_live, self.teacher_groups, self.gate_sid = self.brain.teacher_live, self.brain.teacher_groups, self.brain.gate_sid
             if self.brain.boot_id == self.boot_id:
-                return False
+                return gate
             self._write_state(); self._load_bootstrap(None)
             return True
+        gate = self._follow_deployed()                   # a new deployed selector: the gate follows it, the fly stays
         from ..train import fly_replay
         with transaction() as conn:
             boot = fly_selector.latest_deployable(conn)
         v = fly_replay.verdict()
         if boot is None or v is None or not v.get("passed") or int(boot["id"]) == self.boot_id:
-            return False
+            return gate
         old = self.boot_id; self.verdict = v
         self._write_state()
         self._load_bootstrap(boot)
@@ -853,7 +897,8 @@ class FlyBook:
             # the selector's own score, line and sizing table for the row: a gated fly buy is sized exactly as the selector
             # sizes it (agent/sizing.size_position; FLY_SIZING=kelly: the same Kelly band, fraction and caps; flat: flat),
             # its correctness bands at the selector's own P(clean) margin included
-            strat[i] = s_; score[i] = float(td["score"][i]); thr[i] = float(td["threshold"][i]); hold[i] = self.holds[s_]; tables[i] = td["tables"][i]
+            strat[i] = s_; score[i] = float(td["score"][i]); thr[i] = float(td["threshold"][i]); tables[i] = td["tables"][i]
+            hold[i] = float(td["hold_s"][i]) if td.get("hold_s") is not None and td["hold_s"][i] > 0 else self.holds[s_]    # the selector's own hold
             size_margin[i] = float(t_m[i]) if t_m is not None else np.nan; pclean[i] = float(t_c[i]) if t_c is not None else np.nan
             if not td["allow"][i]:
                 reason[i] = f"selector: {td['reason'][i]}"

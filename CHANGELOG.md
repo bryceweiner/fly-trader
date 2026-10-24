@@ -44,6 +44,17 @@ ships signed releases built from this development line.
   - Robinhood Chain keeps its EV bands (neutral in the study); its rows still carry their P(clean).
   - The live mirrors size the wallet's buys, and its retries, at the same margin; the fly's gated buys are sized as the
     selector sizes them. A model without a correctness model (#560) trades exactly as before.
+- **The fly's gate follows the deployed selector, not only the one that taught it.**
+  - Every fly buy, the wallet's included, needs the selector's decision on the row. That decision came from the selector
+    that taught the fly, so a newer selector traded only its own paper book until a fly trained on it was deployed.
+  - Now the gate is the selector the selector book trades: its pin, else the newest deployable snapshot. The fly picks it
+    up at its reload check, mid-minute, never in front of a minute's orders. Other chains' books follow the Solana book.
+  - Weekly refits that win deploy themselves (Bryce, 2026-10-24), so the wallet trades a winning selector from its
+    deploy, not from its matched fly's, which trains for about ten hours more.
+  - A gated buy holds for the selector's own hold time. The fly's network, its learned correction, its race and its
+    labels stay as they were.
+  - A selector that fails to load, or wants an input live lacks, leaves the gate where it was. Strategies the fly has no
+    network for, and holds that differ from the fly's, are logged.
 
 ### The selector
 
