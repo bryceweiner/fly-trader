@@ -797,8 +797,11 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
         if not ok:
             f.meta_p, f.meta_cut = old
     # 4b. correctness per strategy (memecoins): P(clean) on all its candidates. On CLEAN_CHAINS its Kelly bands replace the
-    # EV margin's -- built on the selection half's trades at the strategy's own line, the lowest band forced to Kelly 0 --
-    # and that lowest band is a filter, judged as the win filter is (selection, evaluation, random removal).
+    # EV margin's: built on the selection half's trades at the strategy's own line, each band with its measured Kelly (a band
+    # with no edge gets 0), a pick below the first band with an edge blocked. Kept when, on the strategy's evaluation-half
+    # trades on those chains, its bands grow the bankroll faster than the EV margin's on the same trades (Kelly growth per
+    # trade, the measure sizing is for) and the book still passes there (Bryce, 2026-10-24: option a). Forcing the lowest
+    # band to Kelly 0, the first design, cut 787 selection-half trades that had made +6.06 % each.
     if sp.name == "memecoin":
         on = np.isin(ds.chains(), CLEAN_CHAINS)
         for f in fits:
@@ -810,26 +813,31 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
             if len(t) < 2 * sizing.MIN_BAND_TRADES:
                 comps.append(_comp(f"correctness: {f.name}", False, f"{len(t)} selection-half trades on {'+'.join(CLEAN_CHAINS)}: too few for two bands")); continue
             p0 = float(np.min(p[t])); table = sizing.build_table(p[t] - p0, y_r[t])
-            if len(table) < 2:
-                comps.append(_comp(f"correctness: {f.name}", False, "its trades make a single band: nothing to size or gate by")); continue
-            table[0] = {**table[0], "kelly": 0.0, "gate": True}           # the lowest band never trades: the gate
-            clean = {"p0": p0, "cut": p0 + float(table[1]["lo"]), "table": table, "chains": list(CLEAN_CHAINS), "ret": CLEAN_RET, "dd": CLEAN_DD}
-            before_s = score_pick(ds, *system_pick(ds, fits, sel, uni, combine, tables)[:3], day0)
-            pk0, hd0, rt0, _ = system_pick(ds, fits, ev, uni, combine, tables)
+            first = next((b for b in table if b["kelly"] > 0), None)
+            if len(table) < 2 or first is None:
+                comps.append(_comp(f"correctness: {f.name}", False, "its trades make a single band, or no band has an edge: nothing to size by")); continue
+            clean = {"p0": p0, "cut": p0 + float(first["lo"]), "table": table, "chains": list(CLEAN_CHAINS), "ret": CLEAN_RET, "dd": CLEAN_DD}
+            # the same evaluation-half trades (as the strategy trades them before any correctness), each at its EV band's Kelly,
+            # then at its correctness band's (0 below the cut, or without a P(clean))
+            te0 = taken_idx(ds.ts, ds.mint, hold, np.flatnonzero(f.pick(ds, ev, uni) & on))
+            k_ev = _band_kelly(tables.get(f.name) or [], f.oos[te0] - f.line)
+            pc = p[te0]; k_c = np.where(np.isfinite(pc) & (pc >= clean["cut"]), _band_kelly(table, pc - p0), 0.0)
+            g_ev, g_c = _kelly_growth(k_ev, y_r[te0]), _kelly_growth(k_c, y_r[te0])
+            growth = {"ev_bands": g_ev, "correctness_bands": g_c, "n_ev": int(len(te0)), "n_correctness": int(len(te0)),
+                      "below_cut": int((np.isfinite(pc) & (pc < clean["cut"])).sum()), "no_pclean": int((~np.isfinite(pc)).sum())}
             f.clean_p, f.clean_on, f.clean = p, on, clean
-            after_sel = score_pick(ds, *system_pick(ds, fits, sel, uni, combine, tables)[:3], day0)
+            sel_s = score_pick(ds, *system_pick(ds, fits, sel, uni, combine, tables)[:3], day0)
             pk1, hd1, rt1, _ = system_pick(ds, fits, ev, uni, combine, tables)
-            ev_s = _on_eval(score_pick(ds, pk1, hd1, rt1, day0))
-            rnd_ok, rnd = beats_random_removal(ds, pk0, pk1, hd1, rt1, day0, hold_before=hd0, returns_before=rt0)
-            # the record: Kelly growth per trade of the strategy's evaluation-half trades on those chains, EV bands vs correctness bands
-            te = taken_idx(ds.ts, ds.mint, hold, np.flatnonzero(f.pick(ds, ev, uni) & on & np.isfinite(p)))
-            f.clean = None; te0 = taken_idx(ds.ts, ds.mint, hold, np.flatnonzero(f.pick(ds, ev, uni) & on)); f.clean = clean
-            growth = {"ev_bands": _kelly_growth(_band_kelly(tables.get(f.name) or [], f.oos[te0] - f.line), y_r[te0]), "n_ev": int(len(te0)),
-                      "correctness_bands": _kelly_growth(_band_kelly(table, p[te] - p0), y_r[te]), "n_correctness": int(len(te))}
-            ok = better(after_sel, before_s) and passes(ev_s, fallback=not after_sel.admissible) and rnd_ok
-            comps.append(_comp(f"correctness: {f.name}", ok, "its lowest band improves the book on the selection half, passes on the evaluation half and beats random "
-                               "removal; its bands size the strategy" if ok else "rejected (selection, evaluation or random-removal test): EV bands kept",
-                               after_sel.dict(), {**ev_s.dict(), "random_removal": rnd, "growth_per_trade": growth},
+            ev_s = _on_eval(score_pick(ds, pk1, hd1, rt1, day0))                    # the book with its cut, on the evaluation half
+            ok = (g_ev is not None and g_c is not None and g_c > g_ev and len(te0) >= EVAL_MIN_TRADES
+                  and passes(ev_s, fallback=not ev_s.admissible))
+            bp = lambda g: "-" if g is None else f"{1e4 * g:+.1f}"                   # noqa: E731
+            comps.append(_comp(f"correctness: {f.name}", ok,
+                               (f"its bands grow the evaluation half's bankroll faster than the EV margin's ({bp(g_c)} vs {bp(g_ev)} bp a trade over "
+                                f"{len(te0)} trades); they size the strategy" if ok else
+                                f"its bands do not beat the EV margin's on the evaluation half ({bp(g_c)} vs {bp(g_ev)} bp a trade) or the book fails there: "
+                                "EV bands kept"),
+                               sel_s.dict(), {**ev_s.dict(), "growth_per_trade": growth},
                                {"p0": p0, "cut": clean["cut"], "table": table, "chains": list(CLEAN_CHAINS)}))
             if not ok:
                 f.clean_p, f.clean_on, f.clean = None, None, None
@@ -995,7 +1003,7 @@ def decide_all(models: dict, X: np.ndarray, cols: list[str], t_start, spec: "Sta
             pc[idx] = pr[:, cls.index(1)] if 1 in cls else 0.0
             on = rows_on_chains(X, cols, cl["chains"])
             low = ok & on & (pc < cl["cut"]) & (why == "")
-            why[low] = [f"correctness {v * 100:.0f} % below {cl['cut'] * 100:.0f} % (its lowest band, Kelly 0)" for v in pc[low]]
+            why[low] = [f"correctness {v * 100:.0f} % below {cl['cut'] * 100:.0f} % (no band with an edge below it)" for v in pc[low]]
         gated = ok & np.isin(hour, m.get("hours", [])) & (why == "")
         why[gated] = [f"hour {h} UTC gated" for h in hour[gated]]
         if m.get("regimes") and "mkt_vol_1h" in cols:

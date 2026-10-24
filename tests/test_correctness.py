@@ -145,8 +145,8 @@ def test_the_book_sizes_at_the_correctness_margin_and_records_the_correctness(db
 
 def test_the_stack_keeps_correctness_where_it_ranks_inside_the_ev_picks(monkeypatch):
     """Planted: inside the EV signal's picks a third of the trades lose, invisible to the EV inputs. A P(clean) that knows
-    them (stubbed here: the component's judgement is the subject) makes its lowest band the gate; the component is kept,
-    its table's lowest band is Kelly 0, its cut is p0 + the next band's start, and the final model carries it."""
+    them (stubbed here: the component's judgement is the subject) grows the evaluation half's bankroll faster than the EV
+    margin: kept, its losing band measured at Kelly 0, its cut at the first band with an edge, and the final model carries it."""
     monkeypatch.setattr(S, "STRATEGIES", {"ev": {**S.STRATEGIES["ev"], "holds": (240,)}})
     monkeypatch.setattr(S, "GROUPS", {})
     monkeypatch.setattr(S, "LEGACY_COLS", ["imb_5m", "ret_1m", "age_known", "log_age_h"])
@@ -165,7 +165,8 @@ def test_the_stack_keeps_correctness_where_it_ranks_inside_the_ev_picks(monkeypa
     assert c["passed"], c["reason"]
     f = next(x for x in st.fits if x.name == "ev")
     tab = f.clean["table"]
-    assert tab[0]["kelly"] == 0.0 and tab[0].get("gate") and f.clean["cut"] == pytest.approx(f.clean["p0"] + tab[1]["lo"])
+    assert tab[0]["kelly"] == 0.0 and f.clean["cut"] == pytest.approx(f.clean["p0"] + tab[1]["lo"])        # measured: the losing band has no edge
+    g = c["evaluation"]["growth_per_trade"]; assert g["correctness_bands"] > g["ev_bands"]
     assert f.clean["chains"] == ["sol"] and c["evaluation"]["growth_per_trade"]["n_correctness"] > 0
     m = S.final_models(ds, st)["strategies"]["ev"]["clean"]
     assert m is not None and {"model", "scaler", "p0", "cut", "table", "chains"} <= set(m) and m["table"][0]["kelly"] == 0.0

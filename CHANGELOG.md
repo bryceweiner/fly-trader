@@ -39,7 +39,8 @@ ships signed releases built from this development line.
     (the 2026-10-23 study). P(clean) ranked the same picks at +0.14 to +0.24 on Solana.
   - A row that clears its strategy's line is sized by the band of its P(clean) above the bands' floor (``p0``, the lowest
     P(clean) among the selection half's trades), with the same Kelly per band, `KELLY_FRACTION` and caps as before.
-  - The lowest band is Kelly 0: a pick in it is blocked ("correctness N % below M % (its lowest band, Kelly 0)").
+  - Each band keeps its measured Kelly, and a band with no edge gets 0. A pick below the first band with an edge is blocked
+    ("correctness N % below M % (no band with an edge below it)").
   - Robinhood Chain keeps its EV bands (neutral in the study); its rows still carry their P(clean).
   - The live mirrors size the wallet's buys, and its retries, at the same margin; the fly's gated buys are sized as the
     selector sizes them. A model without a correctness model (#560) trades exactly as before.
@@ -50,10 +51,13 @@ ships signed releases built from this development line.
   - Clean: net ≥ +5 % over the strategy's hold, and no checkpoint of the hold grid up to it below -15 %.
   - Walk-forward on every candidate of the strategy (its base mask and fitted trigger in the universe, whatever its EV
     score), from the strategy's own inputs; cached like the strategies' walk-forwards.
-  - Its Kelly bands are built on the selection half's trades at the strategy's line, and its lowest band is the gate. It
-    is kept only when that gate improves the book on the selection half, passes on the evaluation half and beats
-    random removal; else the strategy keeps its EV bands. Its record holds Kelly growth per trade on the evaluation half,
-    EV bands against correctness bands.
+  - Its Kelly bands are built on the selection half's trades at the strategy's line, each with its measured Kelly. It is
+    kept when its bands grow the bankroll faster than the EV margin's bands on the strategy's evaluation-half trades
+    (Kelly growth per trade on the same trades), and the book still passes there. Otherwise the strategy keeps its EV
+    bands.
+  - The first design forced the lowest band to Kelly 0 and judged that gate by its fixed-size total. In the 2026-10-24
+    retrain that band's 787 selection-half trades had made +6.06 % each, so the gate failed, and with it the sizing,
+    which grew the evaluation half +30.6 bp a trade against +17.1 bp with EV bands.
   - Memecoins only; Kalshi's stack is unchanged.
 - **The random-removal test clips each trade to -100 % … +300 %.** Unclipped, one Robinhood Chain moonshot (+226,678 %)
   decided it: #560's capitulation win filter lost, filtered 377 against random 2,524.
