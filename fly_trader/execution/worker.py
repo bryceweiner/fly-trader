@@ -120,7 +120,7 @@ class ExecutionWorker:
         self.busy = SharedLock()                       # held (shared) from each swap to its booking
         self.stop_flag = False
         self.on_done = None                            # called with each result once booked (the mirror's live stats: agent/fly_live.py)
-        self.emptied: set[str] = set()                 # mints whose sale left their token account empty: closed by the mirror, mid-minute
+        self.emptied: set[str] = set()                 # mints whose token account a sale (or a multi-hop route) left empty: closed by the mirror, mid-minute
         n = max(1, int(threads if threads is not None else config.EXEC_THREADS))
         self.threads = [threading.Thread(target=self._loop, name="runner-exec" + (f"-{i}" if i else ""), daemon=True) for i in range(n)]   # routed to the runner's log
         self.thread = self.threads[0]
@@ -223,6 +223,9 @@ class ExecutionWorker:
                         rails.record_failure(conn, fr.error or fr.status or "swap failed")
                     return ExecResult(req, False, error=fr.error or fr.status, retryable=req.side == "buy" and fr.fill_id is None)
                 rails.record_success(conn)
+                if any(v > 0 for v in fr.hops.values()):       # a multi-hop route left its intermediate tokens' accounts empty
+                    with self.lock:
+                        self.emptied.update(m for m, v in fr.hops.items() if v > 0)
                 ts = datetime.now(timezone.utc)
                 if req.side == "buy":
                     cost = -fr.lamports_delta / config.LAMPORTS_PER_SOL

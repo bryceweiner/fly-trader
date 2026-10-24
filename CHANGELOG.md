@@ -7,6 +7,19 @@ ships signed releases built from this development line.
 
 ### Live money
 
+- **Buys that Jupiter routes through another token are signed again.**
+  - Since 2026-10-23 16:29 Jupiter routes some buys through an intermediate token, for example SOL → USDC → token or
+    SOL → PUMP → token.
+  - Such a transaction opens the wallet's own account for the intermediate token, about 0.0015 SOL of rent per hop.
+  - The signer left that account out of its simulation, so the rent counted as spending beyond the order. It refused
+    every such buy as overspending ("the swap spends X lamports, more than the Y ordered").
+  - The wallet missed 4 of the fly's picks this way, 3 of them on 10-24 (out of 12 picks that day). The best of them
+    closed +56 % on paper.
+  - Now the accounts the transaction's ATA instructions open for the wallet are in the simulation. Their rent stays the
+    wallet's. Only token accounts the wallet owns count.
+  - Re-simulated, the refused 10-23 and 10-24 routes pass; with the change switched off they are refused to the lamport.
+  - The rent is not the trade's either. The fill, its price and the position's cost leave it out, as they leave out the
+    traded token's account rent, and the mirror closes the empty account mid-minute to get it back.
 - **A new fly never inherits the old fly's seat: it races first.**
   - A new bootstrap kept the old fly's race and its seat. On an install whose fly had won its race, a release that
     installed a new fly handed it live money at once (release 10's fly #561 where #157 held the seat).

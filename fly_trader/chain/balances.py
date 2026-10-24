@@ -73,3 +73,19 @@ def tx_deltas(tx: dict, owner: str, mint: str) -> tuple[int, int] | None:
         return lam, tok(post, mint) - tok(pre, mint)
     except (KeyError, TypeError, ValueError, StopIteration):
         return None
+
+
+def tx_hop_deposits(tx: dict, owner: str, mint: str) -> dict[str, int] | None:
+    """{mint: lamports} the transaction moved into ``owner``'s token accounts of mints other than ``mint`` and wrapped SOL
+    (< 0: out of them): the rent of the accounts a multi-hop route opens for its intermediate tokens, left empty for the
+    wallet's close to return. Read from the transaction, so another swap landing meanwhile is not in it. None if unreadable."""
+    try:
+        meta = tx["meta"]; pre, post = meta["preBalances"], meta["postBalances"]
+        idx = {int(r["accountIndex"]): r["mint"] for r in (meta.get("preTokenBalances") or []) + (meta.get("postTokenBalances") or [])
+               if r.get("owner") == owner and r.get("mint") not in (mint, config.WSOL_MINT)}
+        out: dict[str, int] = {}
+        for i, m in idx.items():
+            out[m] = out.get(m, 0) + int(post[i]) - int(pre[i])
+        return {m: v for m, v in out.items() if v}
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None

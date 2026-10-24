@@ -233,6 +233,30 @@ def test_sign_swap_signs_a_good_buy_and_refuses_diverted_output():
         signer(rpc).sign_swap(swap_tx(), str(NATIVE_MINT), str(MEME), 50_000_000, 900_000)
 
 
+def test_a_multi_hop_buys_account_for_its_intermediate_token_is_the_wallets_not_spent():
+    """A route through an intermediate token (SOL -> USDC -> the token) opens the wallet's account for it with an ATA
+    instruction: its rent stays the wallet's (their close returns it), so the buy does not overspend (such buys were
+    refused 2026-10-23..24). The same rent without the account opened in the transaction, or in an account there that is
+    not the wallet's, is spent."""
+    usdc = Keypair.from_seed(bytes([15]) * 32).pubkey(); hop = policy.ata(ME, usdc); rent = 1_488_440
+    open_hop = Instruction(policy.ATA, bytes([1]), [AccountMeta(ME, True, True), AccountMeta(hop, False, True), AccountMeta(ME, False, False),
+                                                    AccountMeta(usdc, False, False), AccountMeta(policy.SYSTEM, False, False), AccountMeta(TOKEN, False, False)])
+
+    def chain(owner):
+        rpc = FakeRpc(); wallet(rpc); after_buy(rpc)
+        rpc.post[ME] = {**rpc.post[ME], "lamports": rpc.post[ME]["lamports"] - rent}
+        rpc.post[hop] = {"lamports": rent, "owner": TOKEN, "data": token_data(usdc, owner, 0)}
+        return rpc
+    tx = VersionedTransaction.from_bytes(base64.b64decode(swap_tx([open_hop])))
+    assert policy.check_swap_static(tx, ME, lambda k: [], 5_000_000).opens == [hop]
+    out = signer(chain(ME)).sign_swap(swap_tx([open_hop]), str(NATIVE_MINT), str(MEME), 50_000_000, 900_000)
+    assert out["simulated"] == {"sol": -50_005_000, "token": 1_000_000}
+    with pytest.raises(PolicyError, match="spends"):
+        signer(chain(ME)).sign_swap(swap_tx(), str(NATIVE_MINT), str(MEME), 50_000_000, 900_000)
+    with pytest.raises(PolicyError, match="spends"):
+        signer(chain(OTHER)).sign_swap(swap_tx([open_hop]), str(NATIVE_MINT), str(MEME), 50_000_000, 900_000)
+
+
 def test_buy_caps_rate_and_panic():
     rpc = FakeRpc(); wallet(rpc); after_buy(rpc)
     s = signer(rpc, max_buy_lamports=10_000_000)

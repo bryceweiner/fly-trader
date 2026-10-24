@@ -31,11 +31,11 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from psycopg.types.json import Jsonb
 from .. import config
-from ..chain.balances import tx_deltas, Snapshot, compute_delta, snapshot_balances
+from ..chain.balances import tx_deltas, tx_hop_deposits, Snapshot, compute_delta, snapshot_balances
 from ..chain.cluster_guard import assert_signing_allowed
 from ..chain.jupiter_swap import JupiterError, JupiterSwap
 from ..db.connection import transaction
@@ -86,6 +86,7 @@ class FillResult:
     price_sol: float | None
     attempts: int
     deposit_lamports: int = 0         # SOL the swap put into the mint's token account (its rent, a first buy) or took back out (< 0)
+    hops: dict = field(default_factory=dict)   # {mint: lamports} it put into the token accounts a multi-hop route opened for its intermediate tokens
 
 
 def _int_or_none(v) -> int | None:
@@ -338,7 +339,17 @@ class LiveBroker:
         # the rent a first buy pays to open the mint's token account (~0.0015 SOL) is a deposit the account's close returns,
         # not the trade: the trade's SOL, its price and the position's cost leave it out (it is kept on the position)
         dep = int(post.deposits.get(mint, 0)) - int(pre.deposits.get(mint, 0))
-        lam += dep
+        # nor is the rent of the token accounts a multi-hop route opens for its intermediate tokens (~0.0015 SOL each): they
+        # are left empty and the mirror's close returns it (execution/worker.py ``emptied``). Read from the swap's own
+        # transaction; from the snapshots only when no other swap could have opened accounts between them
+        if exact is not None and chain_status == "confirmed":
+            hops = tx_hop_deposits(tx, str(taker), mint) or {}
+        elif not moved:
+            hops = {m: int(post.deposits.get(m, 0)) - int(pre.deposits.get(m, 0)) for m in set(pre.deposits) | set(post.deposits) if m != mint}
+            hops = {m: v for m, v in hops.items() if v}
+        else:
+            hops = {}
+        lam += dep + sum(hops.values())
         # a confirmed sell that moved the tokens is a fill even at lam <= 0 (a rugged token's dust proceeds < fees)
         verified = (lam < 0 and tok > 0) if side == "buy" else (tok < 0 and (lam > 0 or chain_status == "confirmed"))
         jup_status = (ex or {}).get("status")
@@ -353,7 +364,7 @@ class LiveBroker:
                                         order.get("platformFee"), verified_by, pre, post)
             log.info("fill %s: %s %s token_delta=%d lamports_delta=%d price_sol=%s (%s)",
                      fill_id, side, mint, tok, lam, price, verified_by)
-            return FillResult(True, order_id, fill_id, signature, chain_status, code, error, tok, lam, price, attempt, dep), False
+            return FillResult(True, order_id, fill_id, signature, chain_status, code, error, tok, lam, price, attempt, dep, hops), False
         if jup_status == "Success" or chain_status == "confirmed":
             tx_info = tx
             try:

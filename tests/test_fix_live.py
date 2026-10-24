@@ -276,6 +276,24 @@ def test_a_first_buys_token_account_rent_is_a_deposit_its_close_returns(circuit1
             conn.execute("DELETE FROM positions WHERE mint = %s", (mint,))
 
 
+def test_a_multi_hop_buy_has_the_mirror_close_its_intermediate_token_accounts(circuit1):
+    """The accounts a multi-hop route opened for its intermediate tokens and left empty are the mirror's to close
+    mid-minute, as a sale's are: their rent comes back. It is neither the position's cost nor its deposit."""
+    mint, hop = f"M{uuid.uuid4().hex[:10]}", f"H{uuid.uuid4().hex[:10]}"
+    buy = FillResult(True, None, None, "sig", "confirmed", 0, None, 1_000_000, -200_000_000, 2e-7, 1, 0, {hop: 1_488_440})
+    fb = _ScriptBroker([buy]); w = ExecutionWorker(fb)
+    try:
+        assert w.submit(_req(mint, "buy", 200_000_000))
+        r = w.results.get(timeout=10)
+        with transaction() as conn:
+            p = _pos(conn, r.position_id)
+        assert r.ok and w.emptied == {hop} and p["cost_sol"] == pytest.approx(0.2) and p["deposit_sol"] is None
+    finally:
+        w.stop()
+        with transaction() as conn:
+            conn.execute("DELETE FROM positions WHERE mint = %s", (mint,))
+
+
 def test_a_buy_queues_behind_the_sale_of_its_mint_which_keeps_its_token_account(circuit1):
     """Paper sold the token and bought it back in one minute: the live buy waits behind the sale, runs once the sale has
     closed the position, and the token account stays for it."""

@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
-from fly_trader.chain.balances import Snapshot, compute_delta, snapshot_balances
+from fly_trader import config
+from fly_trader.chain.balances import Snapshot, compute_delta, snapshot_balances, tx_hop_deposits
 
 TS = datetime(2026, 9, 12, tzinfo=timezone.utc)
 
@@ -41,3 +42,17 @@ def test_the_rent_held_by_each_mints_token_accounts_is_a_deposit_wrapped_sol_is_
     snap = snapshot_balances(Rpc(), "owner")
     assert snap.deposits == {"M": 2_039_280} and snap.to_json()["deposits"] == {"M": 2_039_280}
 
+
+def test_a_transactions_hop_deposits_are_the_rent_it_put_into_the_owners_accounts_of_other_tokens():
+    """The rent a multi-hop route put into the owner's accounts for its intermediate tokens, from the transaction: not
+    the traded mint's account, not wrapped SOL, not another wallet's accounts."""
+    def bal(i, mint, owner, amount="0"):
+        return {"accountIndex": i, "mint": mint, "owner": owner, "uiTokenAmount": {"amount": amount}}
+    tx = {"transaction": {"message": {"accountKeys": [{"pubkey": "ME"}, {"pubkey": "a1"}, {"pubkey": "a2"}, {"pubkey": "a3"}, {"pubkey": "a4"}]}},
+          "meta": {"preBalances": [10**9, 0, 0, 2_039_280, 0], "postBalances": [10**9 - 53_000_000, 1_513_840, 1_488_440, 2_039_280, 2_039_280],
+                   "preTokenBalances": [bal(3, "USDC", "SOMEONE", "9")],
+                   "postTokenBalances": [bal(1, "TOKEN", "ME", "700"), bal(2, "USDC", "ME"), bal(3, "USDC", "SOMEONE", "9"),
+                                         bal(4, config.WSOL_MINT, "ME")]}}
+    assert tx_hop_deposits(tx, "ME", "TOKEN") == {"USDC": 1_488_440}
+    assert tx_hop_deposits(tx, "ME", "USDC") == {"TOKEN": 1_513_840}
+    assert tx_hop_deposits({"meta": {}}, "ME", "TOKEN") is None

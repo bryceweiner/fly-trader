@@ -114,9 +114,11 @@ class Signer:
         return list(AddressLookupTable.deserialize(acc["data"]).addresses)
 
     def _snapshot(self, accounts: list[dict | None], addrs: list[Pubkey]) -> policy.Snapshot:
+        """The trading wallet's lamports and the token accounts among ``addrs`` that are its own (their authority)."""
+        me = self.trading.pubkey()
         tokens = {}
         for a, acc in zip(addrs[1:], accounts[1:]):
-            if acc and acc["owner"] in (TOKEN, TOKEN_2022) and len(acc["data"]) >= 72:
+            if acc and acc["owner"] in (TOKEN, TOKEN_2022) and len(acc["data"]) >= 72 and policy.token_owner(acc["data"]) == me:
                 tokens[a] = (policy.token_mint(acc["data"]), policy.token_amount(acc["data"]), acc["lamports"])
         return policy.Snapshot(lamports=accounts[0]["lamports"] if accounts[0] else 0, tokens=tokens)
 
@@ -142,8 +144,9 @@ class Signer:
                 raise PolicyError("daily buy volume cap reached", code="cap")
         vt = VersionedTransaction.from_bytes(base64.b64decode(tx))
         chk = policy.check_swap_static(vt, me, self._resolve_alt, self.cfg.max_priority_lamports)
-        # every token account the trading wallet owns, plus the two this swap may open (the reads side by side: a live
-        # order waits on this signature)
+        # every token account the trading wallet owns, plus those this swap opens for it: the in and out tokens' and a
+        # multi-hop route's for its intermediate tokens, whose rent stays the wallet's (their close returns it) and is not
+        # spent (the reads side by side: a live order waits on this signature)
         tok = out_m if buy else in_m
         f_mints = _IO.submit(self.rpc.accounts, [in_m, out_m])
         f_spl, f_t22 = _IO.submit(self.rpc.token_accounts, me, TOKEN), _IO.submit(self.rpc.token_accounts, me, TOKEN_2022)
@@ -151,8 +154,7 @@ class Signer:
         mint_acc = f_mints.result()
         progs = {m: (a["owner"] if a else TOKEN) for m, a in zip((in_m, out_m), mint_acc)}
         addrs = [me] + f_spl.result() + f_t22.result()
-        for m in (in_m, out_m):
-            a = policy.ata(me, m, progs[m])
+        for a in [policy.ata(me, m, progs[m]) for m in (in_m, out_m)] + chk.opens:
             if a not in addrs:
                 addrs.append(a)
         f_pre = _IO.submit(self.rpc.accounts, addrs)
