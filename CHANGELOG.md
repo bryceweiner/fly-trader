@@ -5,6 +5,21 @@ ships signed releases built from this development line.
 
 ## Unreleased
 
+Since 2026-10-25 00:07 (UTC+8), selector #595 has traded this development install in place of #560. Fly #561 stays until
+the matched fly trained beside #595 is ready:
+
+- **Selector #595** comes from the first matched retrain (`fly-trader matched-pair`, Training below) and is fitted through
+  2026-10-22. It trades `capitulation` alone with 240-minute holds, and on Solana its correctness bands size it.
+- **Out of sample:** on the 21 days 2026-10-02..10-22 its holdout-blind copy made +6.65 % per trade over 485 trades (55 %
+  winners, profit factor 1.61; random picks -4.06 %). On Solana that was 215 trades at +4.96 %; on Robinhood Chain, 270
+  at +7.99 %.
+- **Over 10-18..10-22,** replayed with the live engine's real outages, stale minutes and entry failures, the blind copy
+  made +1.69 SOL and +0.031 ETH. The same replay gives #154, which traded live then, +0.39 SOL and +0.0099 ETH. Live
+  itself made +0.25 SOL and +0.0095 ETH.
+- **It stakes more per trade:** its Solana buys in that replay averaged 0.42 SOL against #154's 0.14.
+- **The wallet trades its decisions from the deploy,** because fly #561's gate now follows the deployed selector (Live
+  money below).
+
 ### Live money
 
 - **Buys that Jupiter routes through another token are signed again.**
