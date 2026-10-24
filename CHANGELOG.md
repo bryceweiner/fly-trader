@@ -44,6 +44,9 @@ ships signed releases built from this development line.
   - Memecoins only; Kalshi's stack is unchanged.
 - **The random-removal test clips each trade to -100 % … +300 %.** Unclipped, one Robinhood Chain moonshot (+226,678 %)
   decided it: #560's capitulation win filter lost, filtered 377 against random 2,524.
+- **An evaluation half confirms a component on 30 trades, the race's own minimum, not 100.** The selection half keeps
+  100, and the profit-factor bar is unchanged. Held to 100, the wallet-skill inputs were dropped at 87 evaluation trades
+  and a profit factor of 1.98, after 472 selection trades at 1.51. Kalshi's significance gate keeps its own minimum.
 
 ### The console
 

@@ -32,7 +32,7 @@ import hashlib
 import itertools
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -130,12 +130,14 @@ class Score:
     weeks_pos: int = 0
     sign_ok: bool = False
     gate: str = "memecoin"           # "significance": the bars are a positive mean and the weekly sign test (see OBJECTIVE)
+    min_n: int | None = None         # the trade minimum (None: selector.MIN_LINE_TRADES); an evaluation half's is EVAL_MIN_TRADES (_on_eval)
 
     @property
     def base_ok(self) -> bool:
+        need = _min_trades() if self.min_n is None else self.min_n
         if self.gate == "significance":
-            return self.n >= _min_trades() and self.mean is not None and self.mean > 0 and self.sign_ok
-        return self.n >= _min_trades() and self.pf is not None and self.pf >= PF_MIN
+            return self.n >= need and self.mean is not None and self.mean > 0 and self.sign_ok
+        return self.n >= need and self.pf is not None and self.pf >= PF_MIN
 
     @property
     def admissible(self) -> bool:
@@ -146,6 +148,18 @@ class Score:
     def dict(self) -> dict:
         return {"n": self.n, "win": self.win, "pf": self.pf, "total": self.total, "mean": self.mean, "weeks": self.weeks, "weeks_pos": self.weeks_pos,
                 "sign_ok": self.sign_ok, "admissible": self.admissible, "base_ok": self.base_ok, "gate": self.gate}
+
+
+# The evaluation half confirms what the selection half found, on about half its days: it needs the race's own minimum of
+# trades (config.HANDOVER_MIN_TRADES), with the same profit-factor bar. Held to the selection half's MIN_LINE_TRADES it
+# dropped the wallet-skill inputs at 87 evaluation trades and PF 1.98 after 472 at PF 1.51 (2026-10-24, Bryce: "excluding
+# it is shooting ourselves in the foot"). Kalshi's significance gate keeps its own minimum.
+EVAL_MIN_TRADES = 30
+
+
+def _on_eval(s: "Score") -> "Score":
+    """``s`` judged as an evaluation half: the trade minimum is ``EVAL_MIN_TRADES`` (memecoins)."""
+    return s if s.gate == "significance" else replace(s, min_n=EVAL_MIN_TRADES)
 
 
 def bars(gate: str) -> str:
@@ -693,7 +707,7 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
             continue
         sel_s = _score_of(f) or Score()
         if better(sel_s, _score_of(best)):
-            evs = score_pick(ds, f.pick(ds, ev, uni), sp.hold_s(ds, f.hold_min), sp.label(ds, f.hold_min), day0)
+            evs = _on_eval(score_pick(ds, f.pick(ds, ev, uni), sp.hold_s(ds, f.hold_min), sp.label(ds, f.hold_min), day0))
             ok = passes(evs, fallback=not sel_s.admissible)
             comps.append(_comp(f"inputs: {'+'.join(add)}", ok, "improves the ev strategy on the selection half" + ("" if ok else ", fails on the evaluation half"),
                                f.selection, evs.dict(), {"groups": add}, f.trials, best=f.best_seen))
@@ -711,7 +725,7 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
             comps.append(_comp(f"strategy: {name}", False, (f.reason if f else "no candidates") or "no admissible setting", trials=f.trials if f else 0,
                                best=f.best_seen if f else None)); continue
         y_r = sp.label(ds, f.hold_min)
-        evs = score_pick(ds, f.pick(ds, ev, uni), sp.hold_s(ds, f.hold_min), y_r, day0)
+        evs = _on_eval(score_pick(ds, f.pick(ds, ev, uni), sp.hold_s(ds, f.hold_min), y_r, day0))
         sel_adm = f.selection.get("admissible")
         f.evaluation = evs.dict(); f.passed = passes(evs, fallback=not sel_adm)
         f.reason = (f"meets {bars(evs.gate)} on both halves" if sel_adm and evs.admissible else
@@ -773,7 +787,7 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
         log.info("meta-label %s: evaluation half, filtered book (%.1f GB)", f.name, _rss_gb())
         pk1, hd1, rt1, _ = system_pick(ds, fits, ev, uni, combine, tables)
         log.info("meta-label %s: scoring the evaluation half (%.1f GB)", f.name, _rss_gb())
-        ev_s = score_pick(ds, pk1, hd1, rt1, day0)
+        ev_s = _on_eval(score_pick(ds, pk1, hd1, rt1, day0))
         log.info("meta-label %s: random-removal test (%.1f GB)", f.name, _rss_gb())
         rnd_ok, rnd = beats_random_removal(ds, pk0, pk1, hd1, rt1, day0, hold_before=hd0, returns_before=rt0)
         ok = better(after_sel, before_s) and passes(ev_s, fallback=not after_sel.admissible) and rnd_ok
@@ -805,7 +819,7 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
             f.clean_p, f.clean_on, f.clean = p, on, clean
             after_sel = score_pick(ds, *system_pick(ds, fits, sel, uni, combine, tables)[:3], day0)
             pk1, hd1, rt1, _ = system_pick(ds, fits, ev, uni, combine, tables)
-            ev_s = score_pick(ds, pk1, hd1, rt1, day0)
+            ev_s = _on_eval(score_pick(ds, pk1, hd1, rt1, day0))
             rnd_ok, rnd = beats_random_removal(ds, pk0, pk1, hd1, rt1, day0, hold_before=hd0, returns_before=rt0)
             # the record: Kelly growth per trade of the strategy's evaluation-half trades on those chains, EV bands vs correctness bands
             te = taken_idx(ds.ts, ds.mint, hold, np.flatnonzero(f.pick(ds, ev, uni) & on & np.isfinite(p)))
@@ -826,7 +840,7 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
     if v is not None and v.get("cut") is not None:
         before_sel = score_pick(ds, pk & sel, hd, rt, day0); after_sel = score_pick(ds, pk & sel & ~(v["p"] >= v["cut"]), hd, rt, day0)
         ev_before = pk & ev; ev_after = ev_before & ~(v["p"] >= v["cut"])
-        ev_s = score_pick(ds, ev_after, hd, rt, day0); rnd_ok, rnd = beats_random_removal(ds, ev_before, ev_after, hd, rt, day0)
+        ev_s = _on_eval(score_pick(ds, ev_after, hd, rt, day0)); rnd_ok, rnd = beats_random_removal(ds, ev_before, ev_after, hd, rt, day0)
         ok = better(after_sel, before_sel) and passes(ev_s, fallback=not after_sel.admissible) and rnd_ok
         comps.append(_comp("dump veto", ok, "improves the book on the selection half, passes on the evaluation half and beats random removal" if ok else "rejected",
                            after_sel.dict(), {**ev_s.dict(), "random_removal": rnd}, {"dump": v["dump"], "cut": v["cut"]}, v["trials"], best=v.get("best_seen")))
@@ -842,7 +856,7 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
     keep = ~(veto["p"] >= veto["cut"]) if veto else np.ones(len(ds.y), bool)
     # the whole book
     pk, hd, rt, _ = system_pick(ds, fits, tested, uni, combine, tables); pk &= keep
-    s_sel = score_pick(ds, pk & sel, hd, rt, day0); s_ev = score_pick(ds, pk & ev, hd, rt, day0)
+    s_sel = score_pick(ds, pk & sel, hd, rt, day0); s_ev = _on_eval(score_pick(ds, pk & ev, hd, rt, day0))
     tr_ev = taken_idx(ds.ts, ds.mint, hd, np.flatnonzero(pk & ev))
     from .decisions import random_trades, summarize
     rnd = summarize(random_trades(ds, ev & uni, max(1, len(tr_ev)), hold_s=sp.random_hold(ds) if sp.random_hold else None,
