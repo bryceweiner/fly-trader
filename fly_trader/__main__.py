@@ -377,6 +377,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_mp.add_argument("--epochs", type=int, default=None, help="each fly's epoch cap (default fly_selector.EPOCHS; early stopping decides below it)")
     p_mp.add_argument("--match-days", type=int, default=None, help="match the fly's lines on its last N training days only (default: all of them)")
     p_mp.add_argument("--replay", action="store_true", help="also replay the blind fly's learning over the holdout days")
+    p_mp.add_argument("--no-blind-fly", action="store_true", help="skip the test fly: the report scores the selector's book alone, and the full fly's "
+                                                                   "evidence is the blind selector's holdout picks (it trades them at bootstrap)")
     p_mp.set_defaults(fn=_cmd_matched_pair)
     p_rc = sub.add_parser("rh-build-corpus", help="build the due Robinhood Chain corpus days (the stream starts it as a child process)")
     p_rc.add_argument("--days", type=int, default=31, help="days at most per run (each run reads every minute's fee once)")

@@ -153,7 +153,7 @@ def report_text(rep: dict) -> str:
         lines.append("")
     for chain, books in rep["chains"].items():
         lines.append(f"== {chain}")
-        for who in ("selector", "fly"):
+        for who in (w for w in ("selector", "fly") if w in books):
             b = books[who]
             lines.append(f"  {who:<9} all            {_fmt(b['all'])}")
             for k, v in b.items():
@@ -161,12 +161,16 @@ def report_text(rep: dict) -> str:
                     lines.append(f"  {'':<9} {k:<14} {_fmt(v)}")
         lines.append("")
     ev = rep.get("evidence") or {}; m = ev.get("mean")
-    lines.append(f"Evidence (the fly's own picks, every chain): {ev.get('trades')} trades, mean " + ("-" if m is None else f"{m * 100:+.2f}%"))
+    lines.append(f"Evidence ({ev.get('book') or 'the fly'}): {ev.get('trades')} trades, mean " + ("-" if m is None else f"{m * 100:+.2f}%"))
     return "\n".join(lines) + "\n"
 
 
-def main(out, last_day, epochs: int | None = None, match_days: int | None = None, replay: bool = False, stop: threading.Event | None = None) -> dict:
-    """Stages 1-5 of the module docstring into ``out`` on the set ending ``last_day``; the summary (also summary.json)."""
+def main(out, last_day, epochs: int | None = None, match_days: int | None = None, replay: bool = False, stop: threading.Event | None = None,
+         blind_fly: bool = True) -> dict:
+    """Stages 1-5 of the module docstring into ``out`` on the set ending ``last_day``; the summary (also summary.json).
+    ``blind_fly`` False (Bryce, 2026-10-24: "skip the test fly"): no stage 2 and no replay. The report scores the selector's
+    book alone, and the full fly's evidence is that book: at bootstrap the live fly trades exactly the selector's picks,
+    and its learning is judged by its live race, not by its network's own picks."""
     from . import decisions as D, fly_selector as FS, strategies as S
     from ..brain import device as brain_device
     out = Path(out); out.mkdir(parents=True, exist_ok=True); _quiet_progress()
@@ -180,17 +184,21 @@ def main(out, last_day, epochs: int | None = None, match_days: int | None = None
     if sel is None:
         return {**summary, "stopped": "selector"}
     summary["selector"] = {"holdout_days": sel.blind["holdout_days"], "holdout": sel.metrics.get("holdout"), "deployable": sel.metrics.get("deployable")}
-    fly_b, info_b, _ = _fly(ds, out, "fly_blind", sel.blind["models"], hold, epochs, match_days, stop)
-    if fly_b is None:
-        return {**summary, "stopped": "fly_blind"}
+    fly_b, info_b = None, None
+    if blind_fly:
+        fly_b, info_b, _ = _fly(ds, out, "fly_blind", sel.blind["models"], hold, epochs, match_days, stop)
+        if fly_b is None:
+            return {**summary, "stopped": "fly_blind"}
     oos_path = out / "oos.json"
     if oos_path.exists():
         rep = json.loads(oos_path.read_text())
     else:
         rep = FS.oos_report(ds, sel.blind["models"], fly_b, hold)
         rep["correctness"] = [c for c in (sel.metrics.get("components") or []) if str(c.get("name", "")).startswith("correctness:")]
-        own = rep["chains"]["all"]["fly"]["all"]
-        rep["evidence"] = {"book": "the blind fly's own picks, every chain", "days": rep["days"], "trades": own.get("n"), "mean": own.get("mean"),
+        own = rep["chains"]["all"]["fly" if fly_b is not None else "selector"]["all"]
+        rep["evidence"] = {"book": "the blind fly's own picks, every chain" if fly_b is not None else
+                           "the selector's own picks, every chain (no test fly; the live fly trades them at bootstrap)",
+                           "days": rep["days"], "trades": own.get("n"), "mean": own.get("mean"),
                            "total": own.get("total"), "win": own.get("win"), "random_mean": own.get("random_mean")}
         stack_rec = (sel.metrics.get("holdout") or {})
         mine = rep["chains"]["all"]["selector"]["all"]
@@ -198,12 +206,13 @@ def main(out, last_day, epochs: int | None = None, match_days: int | None = None
             log.warning("the report's selector book (%s, %s) differs from the stack's own holdout record (%s, %s)", mine.get("n"), mine.get("mean"),
                         stack_rec.get("n"), stack_rec.get("mean"))
         _write_json(oos_path, rep); (out / "oos.txt").write_text(report_text(rep))
-        info_b = {**info_b, "oos": {"days": rep["days"], "evidence": rep["evidence"]},
-                  "calibration": {"trades": rep["evidence"]["trades"], "mean": rep["evidence"]["mean"], "total": rep["evidence"]["total"], "source": "out of sample"}}
-        _write_json(out / "fly_blind" / "note.json", {**info_b, "data": FS.FLY_VERSION})
+        if fly_b is not None:
+            info_b = {**info_b, "oos": {"days": rep["days"], "evidence": rep["evidence"]},
+                      "calibration": {"trades": rep["evidence"]["trades"], "mean": rep["evidence"]["mean"], "total": rep["evidence"]["total"], "source": "out of sample"}}
+            _write_json(out / "fly_blind" / "note.json", {**info_b, "data": FS.FLY_VERSION})
     log.info("out of sample:\n%s", report_text(rep))
-    summary["oos"] = {"evidence": rep["evidence"], "selector": rep["chains"]["all"]["selector"]["all"], "fly": rep["chains"]["all"]["fly"]["all"]}
-    if replay and not (out / "replay.json").exists() and not (stop is not None and stop.is_set()):
+    summary["oos"] = {"evidence": rep["evidence"], "selector": rep["chains"]["all"]["selector"]["all"], "fly": (rep["chains"]["all"].get("fly") or {}).get("all")}
+    if replay and fly_b is not None and not (out / "replay.json").exists() and not (stop is not None and stop.is_set()):
         from . import fly_replay as FR
         FR.TRADES_DIR = out / "replay"
         res = FR.run(ds=ds, fly=fly_b, boot=info_b, start_day=ds.days.index(hold[0]), stop=stop, save_verdict=False, dump_trades=True)
@@ -218,9 +227,11 @@ def main(out, last_day, epochs: int | None = None, match_days: int | None = None
     if fly_f is None:
         return {**summary, "stopped": "fly_full"}
     if not (info_f.get("oos") or {}).get("evidence"):
-        info_f = {**info_f, "oos": {"days": rep["days"], "evidence": rep["evidence"], "source": "the blind pair on the holdout days (fly_blind)"},
+        src = "the blind pair on the holdout days (fly_blind)" if fly_b is not None or (out / "fly_blind" / "fly.pt").exists() else \
+            "the blind selector's own picks on the holdout days (no test fly)"
+        info_f = {**info_f, "oos": {"days": rep["days"], "evidence": rep["evidence"], "source": src},
                   "calibration": {"trades": rep["evidence"]["trades"], "mean": rep["evidence"]["mean"], "total": rep["evidence"]["total"],
-                                  "source": "out of sample (the blind pair)"}}
+                                  "source": f"out of sample ({src})"}}
         _save_fly(fly_f, info_f, out / "fly_full" / "fly.pt"); _write_json(out / "fly_full" / "note.json", {**info_f, "data": FS.FLY_VERSION})
     ok, why = FS.deployable({**info_f, "data": FS.FLY_VERSION})
     summary["fly_full"] = {"lines": info_f.get("lines"), "chain_lines": info_f.get("chain_lines"), "gates_ok": info_f.get("gates_ok"), "deployable": ok, "why": why}
@@ -238,4 +249,4 @@ def cli(args) -> dict:
         h.setFormatter(fmt); root.addHandler(h)
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    return main(out, args.last_day, epochs=args.epochs, match_days=args.match_days, replay=args.replay, stop=stop)
+    return main(out, args.last_day, epochs=args.epochs, match_days=args.match_days, replay=args.replay, stop=stop, blind_fly=not args.no_blind_fly)

@@ -75,6 +75,9 @@ ships signed releases built from this development line.
   - `decisions.build` can pin its last day, and frees its per-day frames before the sort: a ~52 GB peak instead of ~78.
   - The report adds the selector book's Kelly growth per trade at its own bands, and each strategy's correctness verdict
     with its bands.
+  - `--no-blind-fly` skips the test fly, about 19 hours of training. The report then scores the selector's book alone,
+    and the full fly's evidence is the blind selector's holdout picks: at bootstrap the live fly trades exactly those, and
+    its learning is judged by its live race.
 
 ## 2026-10-23, release 10: A retrained selector trades `ev` again, and live money follows the seat
 

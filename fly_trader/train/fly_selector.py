@@ -869,14 +869,16 @@ def _book(ds: DecisionSet, picks: np.ndarray, strat: np.ndarray, holds: dict, da
     return out
 
 
-def oos_report(ds: DecisionSet, models: dict, fly: FlyModel, days: list) -> dict:
+def oos_report(ds: DecisionSet, models: dict, fly: FlyModel | None, days: list) -> dict:
     """The selector's and the fly's picks on ``days`` -- the stack's holdout, which neither the blind stack nor the fly
     matched to it was fit on -- per chain and per strategy, with the selector's own costs and hold rules (``_book``).
     ``selector``: the stack's decisions as it trades them (strategies.decide: triggers, lines, win filters, gates, dump
     veto). ``fly``: the fly's own decisions (``fly_decide``: its scores against its matched lines, on its teacher's
     triggers). With FLY_SCORE=teacher and FLY_TEACHER_GATE the live fly trades exactly the selector's picks until its
     learning vetoes some, so at bootstrap its live book is the selector's; what it then learns is the replay's to show.
-    Trades, win rate, profit factor, mean and total net return per trade at fixed size, and the random baseline."""
+    Trades, win rate, profit factor, mean and total net return per trade at fixed size, and the random baseline.
+    ``fly`` None (``matched-pair --no-blind-fly``): the selector's book alone, each strategy's random picks among the
+    selector's own triggered rows."""
     from . import strategies
     if not days:
         return {}
@@ -888,24 +890,31 @@ def oos_report(ds: DecisionSet, models: dict, fly: FlyModel, days: list) -> dict
     tr_rows = {k: np.zeros(len(ds.y), bool) for k in names}; s_frac = np.zeros(len(ds.y))      # the selector's band Kelly per row, as it sizes it
     for i in range(0, len(rows), MATCH_CHUNK):
         sl = rows[i:i + MATCH_CHUNK]; X = ds.X[sl]
-        d = strategies.decide(models, X, ds.cols, ds.ts[sl]); s_str[i:i + MATCH_CHUNK] = d["strategy"]; s_ok[i:i + MATCH_CHUNK] = d["allow"]
+        per = strategies.decide_all(models, X, ds.cols, ds.ts[sl])
+        d = strategies.decide(models, X, ds.cols, ds.ts[sl], per=per); s_str[i:i + MATCH_CHUNK] = d["strategy"]; s_ok[i:i + MATCH_CHUNK] = d["allow"]
         for j in np.flatnonzero(d["allow"]):
             mg = d["size_margin"][j] if np.isfinite(d["size_margin"][j]) else d["score"][j] - d["threshold"][j]
             s_frac[sl[j]] = (sizing.band_for(d["tables"][j] or [], mg) or {}).get("kelly") or 0.0
+        if fly is None:
+            for k in names:
+                tr_rows[k][sl] = per[k]["trig"]
+            continue
         f_str[i:i + MATCH_CHUNK] = fly_decide(fly, X, ds.cols)["strategy"]
         tg = fly.triggers(X, ds.cols)
         for j, k in enumerate(fly.strategies):
             if k in tr_rows:
                 tr_rows[k][sl] = tg[:, j]
     ch = ds.chains(); out = {"days": [str(days[0]), str(days[-1])], "rows": int(len(rows)), "strategies": holds,
-                             "note": "fly = its own scores against its matched lines; at bootstrap the live fly (teacher score, teacher gate) trades the selector's picks",
+                             "note": ("the selector's book alone (no test fly): at bootstrap the live fly (teacher score, teacher gate) trades its picks" if fly is None else
+                                      "fly = its own scores against its matched lines; at bootstrap the live fly (teacher score, teacher gate) trades the selector's picks"),
                              "chains": {}}
     for chain in ["all"] + sorted(set(ch[rows].tolist()), key=lambda c: c != "sol"):
         cm = np.ones(len(rows), bool) if chain == "all" else ch[rows] == chain
         pool = pool_all if chain == "all" else pool_all & (ch == chain)
         s_pick = cm & s_ok; f_pick = cm & np.array([x is not None for x in f_str], bool)
-        out["chains"][chain] = {"selector": _book(ds, rows[s_pick], s_str[s_pick], holds, days[0], pool, tr_rows, fracs=s_frac),
-                                "fly": _book(ds, rows[f_pick], f_str[f_pick], {k: h for k, h in holds.items() if k in fly.strategies}, days[0], pool, tr_rows)}
+        out["chains"][chain] = {"selector": _book(ds, rows[s_pick], s_str[s_pick], holds, days[0], pool, tr_rows, fracs=s_frac)}
+        if fly is not None:
+            out["chains"][chain]["fly"] = _book(ds, rows[f_pick], f_str[f_pick], {k: h for k, h in holds.items() if k in fly.strategies}, days[0], pool, tr_rows)
     return out
 
 

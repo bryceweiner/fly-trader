@@ -75,6 +75,8 @@ def test_the_oos_report_scores_both_books_on_the_holdout_with_the_selectors_rule
     fl = rep["chains"]["all"]["fly"]
     assert set(fl) == {"all", *HOLDS} and sum(fl[k]["n"] for k in HOLDS) == fl["all"]["n"]
     assert rep["days"] == [str(hold[0]), str(hold[-1])] and set(rep["chains"]) == {"all", "sol"}
+    alone = fly_selector.oos_report(ds, models, None, hold)                       # matched-pair --no-blind-fly
+    assert set(alone["chains"]["all"]) == {"selector"} and alone["chains"]["all"]["selector"]["all"]["n"] == sel["all"]["n"]
 
 
 def test_a_matched_fly_races_on_its_out_of_sample_evidence(monkeypatch):
