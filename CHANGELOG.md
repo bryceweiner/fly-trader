@@ -126,7 +126,7 @@ the matched fly trained beside #595 is ready:
 ### Install
 
 - **One command installs the Docker distribution: `./install.sh`** (Linux, macOS, Windows under WSL 2). It asks for the
-  two API keys and offers an NVIDIA GPU when Docker can reach one. It then builds and starts the containers, waits until
+  two API keys, checks each with its provider, and offers an NVIDIA GPU when Docker can reach one. It then builds and starts the containers, waits until
   the trader is healthy, creates the bot wallet, restarts the trader so it loads the key, and opens the dashboard. A
   rerun keeps the keys, the wallet and the data. On WSL it refuses a folder on a Windows drive.
 - **Windows has its own guide, [INSTALL.md](INSTALL.md):** WSL 2, Docker Desktop and its memory, then `install.sh`, the
