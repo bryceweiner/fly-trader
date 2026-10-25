@@ -3,6 +3,143 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## Unreleased
+
+Since 2026-10-25 00:07 (UTC+8), selector #595 has traded this development install in place of #560. Fly #561 stays until
+the matched fly trained beside #595 is ready:
+
+- **Selector #595** comes from the first matched retrain (`fly-trader matched-pair`, Training below) and is fitted through
+  2026-10-22. It trades `capitulation` alone with 240-minute holds, and on Solana its correctness bands size it.
+- **Out of sample:** on the 21 days 2026-10-02..10-22 its holdout-blind copy made +6.65 % per trade over 485 trades (55 %
+  winners, profit factor 1.61; random picks -4.06 %). On Solana that was 215 trades at +4.96 %; on Robinhood Chain, 270
+  at +7.99 %.
+- **Over 10-18..10-22,** replayed with the live engine's real outages, stale minutes and entry failures, the blind copy
+  made +1.69 SOL and +0.031 ETH. The same replay gives #154, which traded live then, +0.39 SOL and +0.0099 ETH. Live
+  itself made +0.25 SOL and +0.0095 ETH.
+- **It stakes more per trade:** its Solana buys in that replay averaged 0.42 SOL against #154's 0.14.
+- **The wallet trades its decisions from the deploy,** because fly #561's gate now follows the deployed selector (Live
+  money below).
+
+### Live money
+
+- **Buys that Jupiter routes through another token are signed again.**
+  - Since 2026-10-23 16:29 Jupiter routes some buys through an intermediate token, for example SOL → USDC → token or
+    SOL → PUMP → token.
+  - Such a transaction opens the wallet's own account for the intermediate token, about 0.0015 SOL of rent per hop.
+  - The signer left that account out of its simulation, so the rent counted as spending beyond the order. It refused
+    every such buy as overspending ("the swap spends X lamports, more than the Y ordered").
+  - The wallet missed 4 of the fly's picks this way, 3 of them on 10-24 (out of 12 picks that day). The best of them
+    closed +56 % on paper.
+  - Now the accounts the transaction's ATA instructions open for the wallet are in the simulation. Their rent stays the
+    wallet's. Only token accounts the wallet owns count.
+  - Re-simulated, the refused 10-23 and 10-24 routes pass; with the change switched off they are refused to the lamport.
+  - The rent is not the trade's either. The fill, its price and the position's cost leave it out, as they leave out the
+    traded token's account rent, and the mirror closes the empty account mid-minute to get it back.
+- **A new fly never inherits the old fly's seat: it races first.**
+  - A new bootstrap kept the old fly's race and its seat. On an install whose fly had won its race, a release that
+    installed a new fly handed it live money at once (release 10's fly #561 where #157 held the seat).
+  - Now a fly other than the one its chain's saved state was learned under starts its own race at the next minute, and
+    that chain's seat goes back to the selector. A seat recorded for another fly is cleared when the fly starts (an
+    install that ran release 10). A seat set by hand, naming no fly, stays.
+  - An untested fly races `HANDOVER_DAYS` (14) before it trades live (Bryce, 2026-10-23).
+- **Every corpus build runs in a child process at the lowest CPU priority, not only big rebuilds.**
+  - Only more than three stale aggregates went to the child. A restart that killed one after its aggregates but before
+    its features left 20 days to re-feature in the console's own interpreter: ~80 s a day, 16 GB and a whole core, for
+    half an hour (2026-10-23).
+  - A routine day's build (~80 s) no longer runs beside the live minute pipeline either, and neither does corpus_meta's
+    rebuild, which the child now runs before its builds: 36-82 s every 30 minutes until now.
+- **On Solana a strategy with a correctness model sizes by it: the EV line screens, P(clean) sets the Kelly band.**
+  - Inside the EV line's picks the EV margin carried no information: its rank correlation with the outcome was +0.00 /
+    +0.08 / +0.01 on the selection, evaluation and holdout periods, and #560's margin bands were flat to inverted
+    (the 2026-10-23 study). P(clean) ranked the same picks at +0.14 to +0.24 on Solana.
+  - A row that clears its strategy's line is sized by the band of its P(clean) above the bands' floor (``p0``, the lowest
+    P(clean) among the selection half's trades), with the same Kelly per band, `KELLY_FRACTION` and caps as before.
+  - Each band keeps its measured Kelly, and a band with no edge gets 0. A pick below the first band with an edge is blocked
+    ("correctness N % below M % (no band with an edge below it)").
+  - Robinhood Chain keeps its EV bands (neutral in the study); its rows still carry their P(clean).
+  - The live mirrors size the wallet's buys, and its retries, at the same margin; the fly's gated buys are sized as the
+    selector sizes them. A model without a correctness model (#560) trades exactly as before.
+- **The fly's gate follows the deployed selector, not only the one that taught it.**
+  - Every fly buy, the wallet's included, needs the selector's decision on the row. That decision came from the selector
+    that taught the fly, so a newer selector traded only its own paper book until a fly trained on it was deployed.
+  - Now the gate is the selector the selector book trades: its pin, else the newest deployable snapshot. The fly picks it
+    up at its reload check, mid-minute, never in front of a minute's orders. Other chains' books follow the Solana book.
+  - Weekly refits that win deploy themselves (Bryce, 2026-10-24), so the wallet trades a winning selector from its
+    deploy, not from its matched fly's, which trains for about ten hours more.
+  - A gated buy holds for the selector's own hold time. The fly's network, its learned correction, its race and its
+    labels stay as they were.
+  - A selector that fails to load, or wants an input live lacks, leaves the gate where it was. Strategies the fly has no
+    network for, and holds that differ from the fly's, are logged.
+
+### The selector
+
+- **A per-strategy correctness model: P(clean), trained on all of the strategy's candidates.**
+  - Clean: net ≥ +5 % over the strategy's hold, and no checkpoint of the hold grid up to it below -15 %.
+  - Walk-forward on every candidate of the strategy (its base mask and fitted trigger in the universe, whatever its EV
+    score), from the strategy's own inputs; cached like the strategies' walk-forwards.
+  - Its Kelly bands are built on the selection half's trades at the strategy's line, each with its measured Kelly. It is
+    kept when its bands grow the bankroll faster than the EV margin's bands on the strategy's evaluation-half trades
+    (Kelly growth per trade on the same trades), and the book still passes there. Otherwise the strategy keeps its EV
+    bands.
+  - The first design forced the lowest band to Kelly 0 and judged that gate by its fixed-size total. In the 2026-10-24
+    retrain that band's 787 selection-half trades had made +6.06 % each, so the gate failed, and with it the sizing,
+    which grew the evaluation half +30.6 bp a trade against +17.1 bp with EV bands.
+  - Memecoins only; Kalshi's stack is unchanged.
+- **The random-removal test clips each trade to -100 % … +300 %.** Unclipped, one Robinhood Chain moonshot (+226,678 %)
+  decided it: #560's capitulation win filter lost, filtered 377 against random 2,524.
+- **An evaluation half confirms a component on 30 trades, the race's own minimum, not 100.** The selection half keeps
+  100, and the profit-factor bar is unchanged. Held to 100, the wallet-skill inputs were dropped at 87 evaluation trades
+  and a profit factor of 1.98, after 472 selection trades at 1.51. Kalshi's significance gate keeps its own minimum.
+
+### The console
+
+- **Correctness %: every decision records its strategy's P(clean)** (`correctness` in the decision's detail), shown in the
+  decision inspector and the Overview's open positions.
+
+### Training
+
+- **A selector and a fly can be trained as a matched pair on exactly the same data (opt-in: `fly-trader matched-pair`).**
+  - Until now they never saw the same days. The fly held out its own calibration week and a purge day, and learned from
+    the deployed selector's holdout-blind refit: release 10's selector #560 was fit through 10-20, its blind refit
+    through 09-29, and fly #561 through 10-13.
+  - In matched mode the fly's teacher is the stack itself: its holdout-blind fit, to be scored on the holdout, or its full
+    fit, to be deployed. The fly learns on exactly that fit's days and rows (each strategy only where its own label
+    existed), with no calibration week or purge day of its own.
+  - Its lines are matched to the teacher's own trade count on those same rows. The count needs no outcome, so the 21
+    held-out days stay unseen by both. `--match-days N` matches on the last N training days only: scoring every training
+    candidate costs about one pass of the network over them.
+  - The command pins the corpus's last day and writes only to its scratch folder: the stack with its full and blind fits,
+    the blind fly, an out-of-sample report, optionally the blind fly's learning replayed over the holdout (`--replay`),
+    then the full fly. No registry row is written, and a rerun resumes. The report covers both books per strategy and per
+    chain: trades, win rate, mean and total net return, and random picks, with the selector's own costs and hold rules.
+  - A matched fly may race on its own out-of-sample picks (at least `HANDOVER_MIN_TRADES` trades, a positive mean)
+    instead of a calibration week. At bootstrap the live fly (teacher score, teacher gate) trades the selector's own picks.
+  - The default bootstrap, every model definition and the live fly and selector are unchanged.
+  - `decisions.build` can pin its last day, and frees its per-day frames before the sort: a ~52 GB peak instead of ~78.
+  - The report adds the selector book's Kelly growth per trade at its own bands, and each strategy's correctness verdict
+    with its bands.
+  - `--no-blind-fly` skips the test fly, about 19 hours of training. The report then scores the selector's book alone,
+    and the full fly's evidence is the blind selector's holdout picks: at bootstrap the live fly trades exactly those, and
+    its learning is judged by its live race. Its first run died after saving the full fly, before attaching that evidence
+    (it read the freed test-fly variable); the evidence's source now comes from the report itself.
+
+### Install
+
+- **One command installs the Docker distribution: `./install.sh`** (Linux, macOS, Windows under WSL 2). It asks for the
+  two API keys and offers an NVIDIA GPU when Docker can reach one. It then builds and starts the containers, waits until
+  the trader is healthy, creates the bot wallet, restarts the trader so it loads the key, and opens the dashboard. A
+  rerun keeps the keys, the wallet and the data. On WSL it refuses a folder on a Windows drive.
+- **Windows has its own guide, [INSTALL.md](INSTALL.md):** WSL 2, Docker Desktop and its memory, then `install.sh`, the
+  `.env` backup (not into OneDrive), sleep and sign-in after restarts, the NVIDIA GPU through Docker Desktop (the Windows
+  driver only), and the dashboard from another device.
+- **The dashboard can be opened from other devices on your network** (opt-in): `CONSOLE_PUBLISH=0.0.0.0` publishes it
+  beyond 127.0.0.1, and `CONSOLE_ALLOWED_HOSTS` names the addresses the browser may use. It still has no login.
+- **Line endings are LF on every OS** (`.gitattributes`): a Git for Windows clone gave `docker/*.sh` CRLF endings, and the
+  container did not start.
+- **The docs apply a changed setting with `docker compose up -d --force-recreate fly`.** `docker compose restart` keeps
+  the values `.env` had when the container was created, because the process environment wins over `.env`. So "edit
+  `.env`, then restart" changed nothing for any setting already in the file.
+
 ## 2026-10-23, release 10: A retrained selector trades `ev` again, and live money follows the seat
 
 Published to Hugging Face as signed release 10. It ships selector #560 and fly #561 in place of selector #154 and fly

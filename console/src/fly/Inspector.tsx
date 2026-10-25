@@ -19,7 +19,7 @@ type Stat = {
   label_all?: number | null; mean_correction: number | null; first: string | null; last: string | null
 }
 type Decision = { id: number; ts: string; kind: string; side?: string | null; m_hat: number | null; size_sol: number | null; rail: string | null; reason: string | null
-  book: string | null; strategy?: string | null; threshold?: number | null; action: string; actor: string }
+  book: string | null; strategy?: string | null; threshold?: number | null; correctness?: number | null; action: string; actor: string }
 type Position = { id: number; book: string; status: string; opened_at: string; closed_at: string | null; strategy: string | null; hold_s: number | null; cost_sol: number
   entry_price: number | null; last_mark_price: number | null; exit_price: number | null; realized_sol: number | null; fees_sol: number; forced_exit_kind: string | null
   return: number | null; held_min: number | null }
@@ -163,7 +163,8 @@ function DecisionTable({ rows, unit, kalshi }: { rows: Decision[]; unit: string;
     ...(kalshi ? [{ key: 'side', label: 'side', render: (r: Decision) => String(r.side ?? '').toUpperCase() } as Col<Decision>]
       : [{ key: 'strategy', label: 'strategy' } as Col<Decision>]),
     { key: 'm_hat', label: kalshi ? 'edge' : 'score', num: true, render: (r) => f4(r.m_hat) },
-    ...(kalshi ? [] : [{ key: 'threshold', label: 'line', num: true, render: (r: Decision) => f4(r.threshold ?? null) } as Col<Decision>]),
+    ...(kalshi ? [] : [{ key: 'threshold', label: 'line', num: true, render: (r: Decision) => f4(r.threshold ?? null) } as Col<Decision>,
+      { key: 'correctness', label: 'correctness', num: true, render: (r: Decision) => (r.correctness == null ? '—' : pct(r.correctness, 0, false)) } as Col<Decision>]),
     { key: 'size_sol', label: kalshi ? 'dollars' : `size (${unit})`, num: true, render: (r) => (kalshi ? usd(r.size_sol) : num(r.size_sol, unit === 'SOL' ? 4 : 6)) },
     { key: 'why', label: 'why', value: (r) => (r.rail ? `${r.rail}: ` : '') + (r.reason ?? ''),
       render: (r) => { const w = (r.rail ? `${r.rail}: ` : '') + (r.reason ?? ''); return <span title={w}>{w}</span> } },

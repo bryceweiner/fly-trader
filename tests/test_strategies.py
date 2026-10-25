@@ -71,7 +71,9 @@ def test_stack_finds_the_planted_edge_and_decides_like_it(monkeypatch):
     X = ds.X[:200]; d = S.decide(models, X, ds.cols, float(ds.ts[0]))
     good = X[:, ds.cols.index("imb_5m")] > 1.2
     assert (d["strategy"][good] == "ev").mean() > 0.8 and (d["strategy"][~good] == None).mean() > 0.8   # noqa: E711
-    assert set(np.unique(d["reason"])) <= {"trade", "no strategy fires", "win filter (meta-label)"} | {r for r in d["reason"] if "veto" in r or "gated" in r}
+    assert set(np.unique(d["reason"])) <= ({"trade", "no strategy fires", "win filter (meta-label)"}
+                                           | {r for r in d["reason"] if "veto" in r or "gated" in r or r.startswith("correctness")})
+    assert any(n.startswith("correctness: ") for n in names)          # the correctness component is judged (kept or not)
 
 
 def test_a_fit_that_clears_nothing_records_what_it_reached(monkeypatch):
@@ -172,3 +174,16 @@ def test_the_holdout_is_never_fitted_on_and_is_scored_once(monkeypatch):
     monkeypatch.undo()
     h = S.score_holdout(ds, S.final_models(ds, st, exclude_days=st.holdout_days), st.holdout_days)
     assert h["n"] > 0 and h["days"] == [str(ds.days[-10]), str(ds.days[-1])] and h.get("random_mean") is not None
+
+
+def test_the_evaluation_half_confirms_on_the_races_minimum():
+    """The evaluation half confirms on about half the selection half's days: 87 trades at PF 1.98 pass on the race's own
+    minimum (EVAL_MIN_TRADES), while the selection half keeps MIN_LINE_TRADES; Kalshi's significance gate keeps its own."""
+    s = S.Score(n=87, win=0.5, pf=1.98, total=6.9, mean=0.079)
+    assert not s.base_ok                                              # the selection bar: MIN_LINE_TRADES
+    e = S._on_eval(s)
+    assert e.base_ok and S.passes(e, fallback=True) and e.min_n == S.EVAL_MIN_TRADES
+    assert not S._on_eval(S.Score(n=29, win=0.5, pf=2.0, total=1.0, mean=0.03)).base_ok
+    assert not S._on_eval(S.Score(n=87, win=0.5, pf=1.24, total=1.0, mean=0.01)).base_ok     # the profit-factor bar still holds
+    k = S.Score(n=87, mean=0.05, sign_ok=True, gate="significance")
+    assert S._on_eval(k) is k

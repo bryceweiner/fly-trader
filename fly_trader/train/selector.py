@@ -145,7 +145,8 @@ class SelectorModel:
             return strategies.decide(st, X, cols, t_start)
         idx = [cols.index(c) for c in self.cols]; sc = self.score(np.atleast_2d(X)[:, idx]); n = len(sc)
         return {"strategy": np.full(n, "ev", dtype=object), "score": sc, "hold_s": np.full(n, self.horizon_min * 60.0), "threshold": np.full(n, self.threshold),
-                "tables": [self.sizing] * n, "allow": np.ones(n, bool), "reason": np.full(n, "trade", dtype=object)}
+                "tables": [self.sizing] * n, "allow": np.ones(n, bool), "reason": np.full(n, "trade", dtype=object),
+                "pclean": np.full(n, np.nan), "size_margin": np.full(n, np.nan)}
 
     def universe(self, X: np.ndarray) -> np.ndarray:
         return in_universe(X, self.cols)

@@ -5,7 +5,8 @@
    the only roles it may have; the priority fee is capped. Program ids are always static keys in a v0 message, so a
    lookup table can hide an account but never a program.
 2. Simulated: the signer simulates the transaction itself (its own RPC) and compares the trading wallet's SOL and every
-   token account it owns before and after. A buy may spend at most the ordered SOL (+ rent and fees) and must deliver
+   token account it owns before and after (those the transaction opens for it included: a multi-hop route's token
+   accounts for its intermediate tokens hold their rent for the wallet). A buy may spend at most the ordered SOL (+ fees) and must deliver
    the bought token to the trading wallet; a sell may spend at most the ordered tokens and must return SOL to it; no
    other holding may shrink. So a route that pays someone else, drains another holding or overspends is refused
    whatever the brain claimed.
@@ -15,7 +16,7 @@ Pure functions only: the RPC calls live in core.py, which passes their results i
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from solders.message import MessageV0
 from solders.pubkey import Pubkey
@@ -69,6 +70,7 @@ class SwapCheck:
     fee_payer: Pubkey
     priority_lamports: int
     creates_atas: int
+    opens: list[Pubkey] = field(default_factory=list)   # the token accounts its ATA instructions open for the trading wallet
 
 
 def check_swap_static(tx: VersionedTransaction, trading: Pubkey, resolve_alt, max_priority_lamports: int) -> SwapCheck:
@@ -85,7 +87,7 @@ def check_swap_static(tx: VersionedTransaction, trading: Pubkey, resolve_alt, ma
         raise PolicyError("the trading wallet is not a required signer")
     keys = account_keys(msg, resolve_alt) if hasattr(msg, "address_table_lookups") else static
     wsol = ata(trading, NATIVE_MINT)
-    cu_limit, cu_price, creates = 200_000, 0, 0
+    cu_limit, cu_price, creates, opens = 200_000, 0, 0, []
     for ix in msg.instructions:
         prog = static[ix.program_id_index]
         if prog not in SWAP_PROGRAMS:
@@ -116,11 +118,13 @@ def check_swap_static(tx: VersionedTransaction, trading: Pubkey, resolve_alt, ma
             if tag not in (None, 0, 1) or len(acc) < 3 or acc[2] != trading:   # Create / CreateIdempotent for our wallet
                 raise PolicyError("an associated-token-account instruction for another wallet")
             creates += 1
+            if acc[1] not in opens:                          # (payer, the account, wallet, mint, ...)
+                opens.append(acc[1])
         # JUPITER_V6: the route itself; what it does to our balances is checked by simulation
     prio = cu_limit * cu_price // 1_000_000
     if prio > max_priority_lamports:
         raise PolicyError(f"priority fee {prio} lamports is above the cap {max_priority_lamports}")
-    return SwapCheck(signer_index=idx, fee_payer=static[0], priority_lamports=prio, creates_atas=creates)
+    return SwapCheck(signer_index=idx, fee_payer=static[0], priority_lamports=prio, creates_atas=creates, opens=opens)
 
 
 def token_amount(data: bytes | None) -> int:
@@ -132,6 +136,11 @@ def token_amount(data: bytes | None) -> int:
 
 def token_mint(data: bytes) -> Pubkey:
     return Pubkey.from_bytes(bytes(data[0:32]))
+
+
+def token_owner(data: bytes) -> Pubkey:
+    """The wallet a token account belongs to (its authority)."""
+    return Pubkey.from_bytes(bytes(data[32:64]))
 
 
 @dataclass

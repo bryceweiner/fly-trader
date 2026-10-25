@@ -55,7 +55,8 @@ type Minute = {
 }
 type RaceBook = { book: string; title: string; pnl: number | null; n: number; daily: number[] }
 type Race = { hidden: boolean; unit: string; handover?: boolean; success?: string | null; caption?: string | null; metrics?: RaceBook[]; series?: Series[]; days?: string[] }
-type Position = { id: number; mint: string; token: string; strategy: string; held_min: number; exits_in_min: number; cost: number; ret: number | null }
+type Position = { id: number; mint: string; token: string; strategy: string; held_min: number; exits_in_min: number; cost: number; ret: number | null
+  correctness?: number | null }
 type Book = { unit: string; history: [string, number][]; positions: Position[]; live?: boolean; book?: string; title?: string; sub?: string; observer?: boolean
   sell?: { from_pct: number; to_pct: number } }
 
@@ -210,6 +211,7 @@ function BookPanel() {
     ...(d.live && d.sell ? [sellCol(d)] : []),
     { key: 'token', label: 'token', render: (r) => <TokenButton chain={chain} mint={r.mint} token={r.token} /> },
     { key: 'strategy', label: 'strategy' },
+    { key: 'correctness', label: 'correctness', num: true, render: (r) => (r.correctness == null ? '—' : pct(r.correctness, 0, false)) },
     { key: 'held_min', label: 'held (min)', num: true, render: (r) => num(r.held_min, 0) },
     { key: 'exits_in_min', label: 'exits in (min)', num: true, render: (r) => num(r.exits_in_min, 0) },
     { key: 'cost', label: `cost (${d.unit})`, num: true, render: (r) => g(r.cost, 4) },

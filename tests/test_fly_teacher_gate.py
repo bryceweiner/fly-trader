@@ -144,3 +144,59 @@ def test_a_release_keeps_the_fly_pointing_at_its_teacher():
     assert remap_teacher(note, {154: 1, 157: 2}) == {"teacher_snapshot": 1, "lines": {"ev": 0.16}}   # the shipped selector's id here
     assert remap_teacher({"teacher_snapshot": 1}, {154: 1, 157: 2}) is None                          # already remapped (a re-applied release)
     assert remap_teacher({"lines": {}}, {154: 1}) is None and remap_teacher({"teacher_snapshot": 154}, {154: 154}) is None
+
+
+def test_the_gate_follows_the_deployed_selector(monkeypatch):
+    """The wallet trades the seat's decision, so the gate is the selector its book trades (its pin, else the newest
+    deployable), not only the one that taught the fly: a refit that wins deploys (Bryce, 2026-10-24) and the gate moves with
+    it, the fly's network and race unchanged. A selector that cannot load or wants an input live lacks leaves the gate where
+    it is; another chain's book follows the Solana book's."""
+    from contextlib import contextmanager
+    from fly_trader.agent import selector_session
+    from fly_trader.train.decisions import X_COLS
+
+    def stack(cols, hold=240):
+        return {"strategies": {"capitulation": {"cols": cols, "hold_min": hold, "line": 0.07}}}
+    snaps = {562: SimpleNamespace(stack=stack([X_COLS[0]]), metrics={"groups": ["skill"]}), 563: SimpleNamespace(stack=stack(["no such input"]), metrics={}),
+             154: SimpleNamespace(stack=stack([X_COLS[1]], hold=120), metrics={})}
+    deployed, pin, events = {"id": 562}, [None], []
+
+    class Conn:
+        def execute(self, sql, args):
+            return SimpleNamespace(fetchone=lambda: {"id": args[0], "path": f"s{args[0]}"})
+
+    @contextmanager
+    def tx():
+        yield Conn()
+
+    def load(sid):
+        if sid == 999:
+            raise OSError("the file is gone")
+        return snaps[sid]
+    monkeypatch.setattr(fly_session, "transaction", tx); monkeypatch.setattr(selector_session, "pinned_snapshot", lambda: pin[0])
+    monkeypatch.setattr(fly_session.selector, "latest_current", lambda conn: {"id": deployed["id"], "path": "s"})
+    monkeypatch.setattr(fly_session.selector, "load_snapshot", load); monkeypatch.setattr(fly_session, "record_event", lambda *a: events.append(a))
+    me = SimpleNamespace(boot_id=561, chain="sol", names=["capitulation"], holds={"capitulation": 14400.0}, gate_sid=560, teacher_live={"strategies": {}}, teacher_groups=set())
+    follow = lambda: fly_session.FlyBook._follow_deployed(me)
+    assert follow() and me.gate_sid == 562 and me.teacher_live is snaps[562].stack and me.teacher_groups == {"skill"}
+    assert events[-1][2] == "the fly's gate follows selector #562" and events[-1][3]["from"] == 560 and not events[-1][3]["holds_moved"]
+    assert not follow() and len(events) == 1                          # nothing new deployed: nothing loads
+    deployed["id"] = 563
+    assert not follow() and me.gate_sid == 562                        # it wants an input live lacks: the gate stays
+    deployed["id"] = 999
+    assert not follow() and me.gate_sid == 562                        # it cannot load: the gate stays
+    pin[0] = 154
+    assert follow() and me.gate_sid == 154 and events[-1][3]["holds_moved"] == {"capitulation": (240.0, 120.0)}   # the pin wins
+    rh = SimpleNamespace(brain=me, boot_id=561, gate_sid=562, teacher_live=snaps[562].stack, teacher_groups={"skill"})
+    assert fly_session.FlyBook.maybe_reload(rh) and rh.gate_sid == 154 and rh.teacher_live is snaps[154].stack and rh.teacher_groups == set()
+    assert not fly_session.FlyBook.maybe_reload(rh)                   # in step with its brain
+
+
+def test_a_gated_buy_holds_for_the_selectors_time():
+    """The wallet holds a gated buy as long as the selector that decided it holds it, even when the fly learned that
+    strategy at another hold (a newer deployed selector)."""
+    td = {"strategy": np.array(["capitulation", "capitulation"], dtype=object), "score": np.array([0.10, 0.10]), "allow": np.array([True, True]),
+          "reason": np.array(["trade", "trade"], dtype=object), "threshold": np.full(2, 0.069), "tables": [[], []], "hold_s": np.array([7200.0, 0.0])}
+    me = SimpleNamespace(names=["capitulation"], holds={"capitulation": 14400.0})
+    d = fly_session.FlyBook._gated(me, SimpleNamespace(mints=["m0", "m1"]), np.full((2, 1), 0.1), np.full((2, 1), 0.1), td)
+    assert d["hold_s"].tolist() == [7200.0, 14400.0] and d["allow"].all()   # the selector's hold; none given: the fly's own

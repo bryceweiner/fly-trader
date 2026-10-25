@@ -29,6 +29,8 @@ BUY_LAMPORTS = 10_000_000
 BUY_TOKENS = 1_000_000
 BUY_FEES = 7_000
 RENT = 1_513_840            # a Token-2022 account's rent, as a first buy of a pump.fun mint pays it (2026-10-18)
+HOP = str(Pubkey.new_unique())
+HOP_RENT = 1_488_440        # the rent of the wallet's USDC account a route SOL -> USDC -> the token opens (2026-10-23)
 
 
 class FakeRpc:
@@ -103,6 +105,12 @@ class FakeJup:
         if outcome == "success_first_buy":                  # the swap also opens the mint's token account: its rent leaves the wallet
             self.rpc.lamports -= BUY_LAMPORTS + BUY_FEES + RENT
             self.rpc.tokens[MINT] = self.rpc.tokens.get(MINT, 0) + BUY_TOKENS; self.rpc.rent[MINT] = RENT
+            self.rpc.landed.add(sig)
+            return {"status": "Success", "signature": sig, "slot": "5", "code": 0, "totalInputAmount": str(BUY_LAMPORTS),
+                    "totalOutputAmount": str(BUY_TOKENS), "_latency_ms": 900}
+        if outcome == "success_multihop_buy":               # routed through an intermediate token: the wallet's account for it opened, left empty
+            self.rpc.lamports -= BUY_LAMPORTS + BUY_FEES + HOP_RENT
+            self.rpc.tokens[MINT] = self.rpc.tokens.get(MINT, 0) + BUY_TOKENS; self.rpc.tokens[HOP] = 0; self.rpc.rent[HOP] = HOP_RENT
             self.rpc.landed.add(sig)
             return {"status": "Success", "signature": sig, "slot": "5", "code": 0, "totalInputAmount": str(BUY_LAMPORTS),
                     "totalOutputAmount": str(BUY_TOKENS), "_latency_ms": 900}
@@ -221,6 +229,24 @@ def test_a_first_buy_keeps_its_token_accounts_rent_apart_from_the_trade(db_conn,
     f = _fills(db_conn, [res.order_id])[0]
     assert f["sol_delta_lamports"] == -(BUY_LAMPORTS + BUY_FEES) and f["fee_lamports"] == BUY_FEES
     assert f["post_snapshot"]["deposits"][MINT] == RENT and MINT not in f["pre_snapshot"]["deposits"]
+
+
+def test_a_multi_hop_buys_intermediate_token_account_rent_is_not_the_trade(db_conn, gate_open, monkeypatch):
+    """A route through an intermediate token opens the wallet's account for it (~0.0015 SOL of rent each) and leaves it
+    empty: the rent is not the trade (the mirror's close returns it). The fill's SOL, price and fee are the swap's own, and
+    the rent is reported by mint for that close; from the snapshots when nothing else moved, else from the transaction."""
+    broker, rpc, jup = _broker(["success_multihop_buy"])
+    res = _swap(broker, db_conn, random.randrange(1 << 40))
+    assert res.ok and res.lamports_delta == -(BUY_LAMPORTS + BUY_FEES) and res.hops == {HOP: HOP_RENT} and res.deposit_lamports == 0
+    assert res.price_sol == pytest.approx(((BUY_LAMPORTS + BUY_FEES) / 1e9) / (BUY_TOKENS / 1e6))
+    f = _fills(db_conn, [res.order_id])[0]
+    assert f["sol_delta_lamports"] == -(BUY_LAMPORTS + BUY_FEES) and f["fee_lamports"] == BUY_FEES
+    monkeypatch.setattr(broker_live, "tx_deltas", lambda tx, owner, mint: (-(BUY_LAMPORTS + BUY_FEES + HOP_RENT), BUY_TOKENS))
+    monkeypatch.setattr(broker_live, "tx_hop_deposits", lambda tx, owner, mint: {HOP: HOP_RENT})
+    monkeypatch.setitem(broker_live._SWAPS, "active", 1)                              # another swap in flight: the snapshots are not this one's
+    broker, rpc, jup = _broker(["success_multihop_buy"])
+    res = _swap(broker, db_conn, random.randrange(1 << 40))
+    assert res.ok and res.lamports_delta == -(BUY_LAMPORTS + BUY_FEES) and res.hops == {HOP: HOP_RENT}
 
 
 def test_verified_sell(db_conn, gate_open):

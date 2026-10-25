@@ -32,7 +32,7 @@ from ..market.exit_cost import exit_cost_fraction
 
 def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str, mints: list, infos: list, scores, threshold,
                 table: list | None, horizon_s: float, block: str | None = None, holds=None, strategies=None, allow=None, reasons=None,
-                tables: list | None = None, flat: bool = False, live_allow=None) -> dict:
+                tables: list | None = None, flat: bool = False, live_allow=None, size_margins=None, correctness=None) -> dict:
     """The minute's beat, exits and entries, decided and quoted but not booked: every entry and blocked pick is already a
     ``decisions`` row (the live mirror buys under the entry's id); ``book_minute`` books the rest.
 
@@ -47,7 +47,11 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
     ``rebuy``: each token the book keeps through the minute and has a row of, this minute's verdict on buying it again --
     its score and line, and where it would (allowed, not blocked; the book's own cash aside) its sizing table and paper's
     fill price at this minute's price for what the book paid (``ref_price``), else why not (``why``). A live mirror tries
-    a failed entry again only on such a buy, at that price (agent/fly_live.py, rh/live.py)."""
+    a failed entry again only on such a buy, at that price (agent/fly_live.py, rh/live.py).
+
+    ``size_margins`` / ``correctness`` (train/strategies.decide's ``size_margin`` / ``pclean``, per row): where the
+    strategy's correctness sizes a row, its band is read at that margin instead of score − line; every decision, entry and
+    rebuy carries both (``size_margin``, ``correctness``: the console's correctness %), so a live mirror sizes it the same."""
     conn, m1 = ctx.conn, ctx.m1
     beat = conn.execute("INSERT INTO beats (run_id, ts, beat_no, n_slots_active, notes) VALUES (%s,%s,%s,%s,%s) RETURNING id",
                         (run_id, m1, beat_no, len(mints), json.dumps({"minute": m1.isoformat(), "mints_traded": len(ctx.agg), "book": book}))).fetchone()["id"]
@@ -82,30 +86,34 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
             continue
         picks.append((m, float(sc)))
         tab_k = tables[k] if tables is not None else table
-        size, why = sizing.size_position(float(sc), thr_k, tab_k or [], bankroll, cash, i["resq"], flat=flat, market=market)
+        mg = None if size_margins is None else float(size_margins[k]); mg = mg if mg is not None and np.isfinite(mg) else None
+        pc = None if correctness is None else float(correctness[k]); pc = pc if pc is not None and np.isfinite(pc) else None
+        cx = {key: v for key, v in (("correctness", pc), ("size_margin", mg)) if v is not None}      # only where correctness sizes or scores the row
+        size, why = sizing.size_position(float(sc), thr_k, tab_k or [], bankroll, cash, i["resq"], flat=flat, market=market, margin=mg)
         denied = allow is not None and not bool(allow[k])
         if m in open_mints or blocked or denied or size <= 0:
             rail = blocked or ("held" if m in open_mints else (str(reasons[k]) if denied and reasons is not None else "filtered") if denied else "sizing")
             conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, m_hat, size_sol, forced, rail, reason, detail) VALUES (%s,%s,%s,%s,%s,'blocked',%s,%s,false,%s,%s,%s)",
                          (beat, run_id, m1, m, i["pool"], float(sc), size, rail, why if rail == "sizing" else f"{kind} pick not taken",
-                          json.dumps({"book": book, "score": float(sc), "threshold": thr_k, "sizing": why,
+                          json.dumps({"book": book, "score": float(sc), "threshold": thr_k, "sizing": why, **cx,
                                       "strategy": None if strategies is None else strategies[k]})))
             if m in paid:                # it keeps the token: would this minute buy it again, and paper's fill now for what it paid
                 q = None if blocked or denied else broker.quote_buy(size_sol=paid[m], price=i["price"], res_quote_sol=i["resq"], mcap_sol=i["mcap"], decimals=i["decimals"],
                                                                        program_label=ctx.cost_label(m, i["program_label"]), pool_fee=ctx.fee(m))
-                rebuy[m] = {"score": float(sc), "threshold": thr_k, **({"table": tab_k, "ref_price": paid[m] / (q.token_delta / 10 ** int(i["decimals"]))} if q is not None and q.ok
-                                                                     else {"why": blocked or (q.reason if q is not None else str(reasons[k]) if reasons is not None else "filtered")})}
+                rebuy[m] = {"score": float(sc), "threshold": thr_k, **cx,
+                            **({"table": tab_k, "ref_price": paid[m] / (q.token_delta / 10 ** int(i["decimals"]))} if q is not None and q.ok
+                               else {"why": blocked or (q.reason if q is not None else str(reasons[k]) if reasons is not None else "filtered")})}
             if denied and live_allow is not None and bool(live_allow[k]) and not blocked and m not in open_mints and size > 0:
                 hold_k = float(holds[k]) if holds is not None else None      # the wallet's buy alone: this book stays as it is
                 did = conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, m_hat, size_sol, forced, reason, book_targets, detail) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,false,%s,%s,%s) RETURNING id",
                                    (beat, run_id, m1, m, i["pool"], f"{kind}_enter", float(sc), size, f"live only ({rail} binds {book}): {strat_k + ': ' if strat_k else ''}score {sc:.3f} ≥ {thr_k:.3f}; {why}", None,
                                     json.dumps({"book": book, "live_only": True, "score": float(sc), "threshold": thr_k, "size_sol": size, "sizing": why, "resq": i["resq"], "age_h": i["age_h"],
-                                                "price": i["price"], "strategy": strat_k, "hold_s": hold_k}))).fetchone()["id"]
+                                                "price": i["price"], "strategy": strat_k, "hold_s": hold_k, **cx}))).fetchone()["id"]
                 q = broker.quote_buy(size_sol=size, price=i["price"], res_quote_sol=i["resq"], mcap_sol=i["mcap"], decimals=i["decimals"],
                                      program_label=ctx.cost_label(m, i["program_label"]), pool_fee=ctx.fee(m))
                 if q.ok:
                     entries.append({"mint": m, "decision_id": did, "score": float(sc), "size_sol": size, "info": i, "threshold": thr_k, "table": tab_k, "hold_s": hold_k,
-                                    "strategy": strat_k, "live_only": True, "ref_price": size / (q.token_delta / 10 ** int(i["decimals"]))})
+                                    "strategy": strat_k, "live_only": True, **cx, "ref_price": size / (q.token_delta / 10 ** int(i["decimals"]))})
                 else:
                     conn.execute("UPDATE decisions SET rail = %s, reason = %s WHERE id = %s", ("paper_fill", q.reason, did))
             continue
@@ -113,14 +121,14 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
         did = conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, m_hat, size_sol, forced, reason, book_targets, detail) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,false,%s,%s,%s) RETURNING id",
                            (beat, run_id, m1, m, i["pool"], f"{kind}_enter", float(sc), size, f"{strat_k + ': ' if strat_k else ''}score {sc:.3f} ≥ {thr_k:.3f}; {why}", [book],
                             json.dumps({"book": book, "score": float(sc), "threshold": thr_k, "size_sol": size, "sizing": why, "resq": i["resq"], "age_h": i["age_h"], "price": i["price"],
-                                        "strategy": strat_k, "hold_s": hold_k}))).fetchone()["id"]
+                                        "strategy": strat_k, "hold_s": hold_k, **cx}))).fetchone()["id"]
         args = dict(size_sol=size, price=i["price"], res_quote_sol=i["resq"], mcap_sol=i["mcap"], decimals=i["decimals"],
                     program_label=ctx.cost_label(m, i["program_label"]), pool_fee=ctx.fee(m))
         q = broker.quote_buy(**args)
         if q.ok:
             n_enter += 1; open_mints.add(m); cash -= size; buys.append((did, m, i, args, hold_k, strat_k))
             entries.append({"mint": m, "decision_id": did, "score": float(sc), "size_sol": size, "info": i, "threshold": thr_k, "table": tab_k, "hold_s": hold_k, "strategy": strat_k,
-                            "ref_price": size / (q.token_delta / 10 ** int(i["decimals"]))})
+                            **cx, "ref_price": size / (q.token_delta / 10 ** int(i["decimals"]))})
         else:
             conn.execute("UPDATE decisions SET rail = %s, reason = %s WHERE id = %s", ("paper_fill", q.reason, did))
     return {"book": book, "run_id": run_id, "kind": kind, "broker": broker, "beat_id": beat, "exits": exits, "buys": buys, "entries": entries,

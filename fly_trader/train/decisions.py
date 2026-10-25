@@ -135,14 +135,20 @@ def _roots(feature_dir) -> list[tuple]:
     return out
 
 
-def build(days: int | None = 45, horizon_min: int = HOLD_MIN, fee: float | None = None, label_thr: float = 0.03, feature_dir=None, holds=None) -> DecisionSet:
-    """``holds``: extra holds (minutes) whose labels are computed in the same pass (``DecisionSet.fwd_h``)."""
+def build(days: int | None = 45, horizon_min: int = HOLD_MIN, fee: float | None = None, label_thr: float = 0.03, feature_dir=None, holds=None,
+          last_day=None) -> DecisionSet:
+    """``holds``: extra holds (minutes) whose labels are computed in the same pass (``DecisionSet.fwd_h``). ``last_day``
+    (a date or 'YYYY-MM-DD'): the corpus ends there, as if no later day had been built (a pinned set: a run that resumes
+    rebuilds the very rows it began with; train/matched_pair.py)."""
     need = ["mint", "ts", "open", "close", "resq", "age_h", "traders_15m", "traders_1h", "n_trades_1m"] + FEATURES + FLOW_COLS + SKILL_COLS + MARKET_COLS
     optional = set(FLOW_COLS + SKILL_COLS + MARKET_COLS)      # parts that predate the wallet-flow columns (tests' synthetic parts) read as 0
     roots = _roots(feature_dir); per_root = []
     for root, chain, current in roots:
         files = sorted(glob.glob(str(root / "*" / "part.parquet")))
         per_root.append((files, chain, current))
+    if last_day is not None:
+        cut = str(last_day)
+        per_root = [([f for f in files if f.split("/")[-2] <= cut], c, cur) for files, c, cur in per_root]
     if days:                                                  # the last ``days`` calendar days (+1 of warm-up) of the newest corpus
         last = max((f.split("/")[-2] for files, _, _ in per_root for f in files), default=None)
         if last is not None:
@@ -158,7 +164,8 @@ def build(days: int | None = 45, horizon_min: int = HOLD_MIN, fee: float | None 
         for f in files:
             fr = pq.read_table(f, columns=[c for c in need if c not in optional or c in pq.read_schema(f).names]).to_pandas()
             fr["_chain"] = chain; frames.append(fr)
-    df = pd.concat(frames, ignore_index=True).sort_values(["mint", "ts"]).reset_index(drop=True)
+    df = pd.concat(frames, ignore_index=True); del frames         # the per-day frames go before the sort's copy (~52 GB peak, not ~78)
+    df = df.sort_values(["mint", "ts"]).reset_index(drop=True)
     kk = np.where(df["_chain"].to_numpy() == "rh", config.RH_ETH_PER_SOL, 1.0)      # ETH per SOL on RH rows: fixed-unit thresholds
     for c in optional:
         if c not in df:
