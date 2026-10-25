@@ -88,7 +88,8 @@ file system, and `install.sh` refuses to run from a Windows drive. To see the fo
 It:
 
 1. checks that Docker answers and that the folder is on Linux's file system;
-2. creates `.env` and asks for your Helius and Jupiter API keys (paste each and press Enter);
+2. creates `.env` and asks for your Helius and Jupiter API keys (paste each and press Enter). It checks each key with
+   its provider and asks again if one is refused;
 3. offers the NVIDIA GPU when the PC has one and Docker can reach it;
 4. builds the image and starts the database and the trader. The first build takes several minutes. On its first start
    the trader downloads the wallet-skill table (~300 MB, checked against its pinned sha256) and installs the models;
@@ -126,7 +127,8 @@ only on a network you trust, such as your home network. Never forward it through
 
 1. Find the PC's address: in PowerShell, `ipconfig`, then **IPv4 Address** under the Wi-Fi or Ethernet adapter, for
    example `192.168.1.20`.
-2. Add two lines to `.env` (`nano .env`; save with **Ctrl+O**, **Enter**, quit with **Ctrl+X**):
+2. Set these two lines in `.env` (`nano .env`; save with **Ctrl+O**, **Enter**, quit with **Ctrl+X**). A `.env` made
+   before October 25, 2026 has no `CONSOLE_PUBLISH` line: add it.
 
    ```
    CONSOLE_PUBLISH=0.0.0.0
