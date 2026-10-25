@@ -1,5 +1,6 @@
-# fly-trader, fire-and-forget: one Postgres, one trading container. The console is published on 127.0.0.1 only --
-# it can start and stop the workers and clear the kill switch, so it must never face the internet.
+# fly-trader, fire-and-forget: one Postgres, one trading container. The console is published on 127.0.0.1 unless
+# CONSOLE_PUBLISH in .env widens it to your network -- it has no login, can start and stop the workers and clear the kill
+# switch, so it must never face the internet.
 services:
   db:
     image: postgres:17
@@ -36,7 +37,8 @@ services:
       - ./logs:/app/logs
       - ./.env:/app/.env        # `fly-trader wallet new` writes the bot key here
     ports:
-      - "127.0.0.1:8501:8501"
+      # CONSOLE_PUBLISH=0.0.0.0 in .env: every device on your network (then CONSOLE_ALLOWED_HOSTS names the address)
+      - "${CONSOLE_PUBLISH:-127.0.0.1}:8501:8501"
     depends_on:
       db:
         condition: service_healthy

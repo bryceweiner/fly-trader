@@ -38,7 +38,7 @@ connectome they run on. The training pipeline lives on [`master`](https://github
 
 ## Requirements
 
-- Docker (Desktop on macOS/Windows, or Engine + Compose v2 on Linux). ~2 GB of disk for the image and database
+- Docker (Desktop on macOS/Windows, or Engine + Compose v2 on Linux; on Windows follow [INSTALL.md](INSTALL.md)). ~2 GB of disk for the image and database
   (Robinhood Chain, if you turn it on, adds ~30 GB for its full history; see below).
 - A [Helius](https://dashboard.helius.dev) API key (free tier is enough) and a [Jupiter](https://portal.jup.ag) API key.
   Optional: a second Solana RPC from another provider as `SIGNER_RPC_URL`, so the checks above do not rely on Helius
@@ -56,6 +56,11 @@ connectome they run on. The training pipeline lives on [`master`](https://github
 > to index its history. Without a token, leave Robinhood Chain off: Solana trades either way.
 
 ## Start trading
+
+**In one command:** after step 1, `./install.sh` does steps 2 to 4 and opens the console. It asks for the two API keys
+(and checks them), offers an NVIDIA GPU when Docker can reach one, builds and starts the trader, waits until it is
+healthy, creates the bot wallet and restarts the trader so it loads the key. Then back up `.env` and fund the wallet
+(step 5; no restart needed). On Windows, [INSTALL.md](INSTALL.md) sets up WSL 2 and Docker Desktop first.
 
 1. Download this branch and open a terminal in it:
    ```bash
@@ -97,8 +102,10 @@ scores anything); then it trades paper until 20 trades have closed; then it trad
 | Stop everything | `docker compose down` — **open positions stay open in the wallet**; start again and it sells them on schedule, or sell them yourself |
 | See the logs | `docker compose logs -f fly` |
 | Start again from nothing | `docker compose down -v` (deletes the database) and `sudo rm -rf data/` (the container writes it as root; it also holds the signer's ledger) |
+| Open the console from another device | In `.env`, `CONSOLE_PUBLISH=0.0.0.0` and `CONSOLE_ALLOWED_HOSTS=` the address you will type (this machine's network address or name), then `docker compose up -d --force-recreate fly`. Only on a network you trust |
 
-The console listens on `127.0.0.1` only. Do not expose it: it can start and stop the engine and clear the rails.
+The console has no login: it can start and stop the engine and clear the rails. It listens on `127.0.0.1` only unless
+you set `CONSOLE_PUBLISH`. Never expose it to the internet.
 
 ## What is in the box
 
@@ -119,7 +126,8 @@ factor 1.13) against −5.27 % for random picks of the same tokens. That is a ba
 
 ## Tuning
 
-Edit `.env`, then `docker compose restart fly`. The ones that matter:
+Edit `.env`, then `docker compose up -d --force-recreate fly`. A plain `docker compose restart fly` keeps the values the
+container was created with, so it does not apply a change. The ones that matter:
 
 | Variable | Shipped | Meaning |
 |---|---|---|
@@ -154,7 +162,7 @@ The same engine also trades Robinhood Chain: tokens launched on Pons that gradua
   models trade Solana alone.
 - **Live** needs `RH_LIVE_ENABLED=1`, `RH_BOT_PRIVATE_KEY` (in `.env` only, never in the image) and the address it
   derives to as `RH_BOT_ADDRESS`, plus a funded wallet (ETH on Robinhood Chain, chain 4663). Then
-  `docker compose restart fly`. As on Solana, the fly trades the wallet only after it has won the RH paper race.
+  `docker compose up -d --force-recreate fly`. As on Solana, the fly trades the wallet only after it has won the RH paper race.
 - `RH_ENABLED=0` turns all of it off.
 
 RH training data does not ship: an install that turns RH on builds its own from the stream, as Solana does.
