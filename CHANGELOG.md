@@ -120,7 +120,8 @@ the matched fly trained beside #595 is ready:
     with its bands.
   - `--no-blind-fly` skips the test fly, about 19 hours of training. The report then scores the selector's book alone,
     and the full fly's evidence is the blind selector's holdout picks: at bootstrap the live fly trades exactly those, and
-    its learning is judged by its live race.
+    its learning is judged by its live race. Its first run died after saving the full fly, before attaching that evidence
+    (it read the freed test-fly variable); the evidence's source now comes from the report itself.
 
 ## 2026-10-23, release 10: A retrained selector trades `ev` again, and live money follows the seat
 

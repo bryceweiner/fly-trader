@@ -227,8 +227,8 @@ def main(out, last_day, epochs: int | None = None, match_days: int | None = None
     if fly_f is None:
         return {**summary, "stopped": "fly_full"}
     if not (info_f.get("oos") or {}).get("evidence"):
-        src = "the blind pair on the holdout days (fly_blind)" if fly_b is not None or (out / "fly_blind" / "fly.pt").exists() else \
-            "the blind selector's own picks on the holdout days (no test fly)"
+        src = "the blind pair on the holdout days (fly_blind)" if rep["chains"]["all"].get("fly") else \
+            "the blind selector's own picks on the holdout days (no test fly)"         # the book the report's evidence is
         info_f = {**info_f, "oos": {"days": rep["days"], "evidence": rep["evidence"], "source": src},
                   "calibration": {"trades": rep["evidence"]["trades"], "mean": rep["evidence"]["mean"], "total": rep["evidence"]["total"],
                                   "source": f"out of sample ({src})"}}

@@ -95,3 +95,32 @@ def test_a_pinned_set_ends_on_its_last_day(tmp_path, db_conn):
     one = _part(tmp_path / "one"); two = _part(tmp_path / "two"); shutil.copytree(two / "2026-09-01", two / "2026-09-02")
     a = decisions.build(days=None, feature_dir=one, holds=H); b = decisions.build(days=None, feature_dir=two, holds=H, last_day="2026-09-01")
     assert b.days == a.days and len(b.y) == len(a.y) and np.array_equal(a.X, b.X, equal_nan=True)
+
+
+def test_without_the_test_fly_the_full_fly_races_on_the_selectors_holdout_picks(tmp_path, monkeypatch):
+    """--no-blind-fly (2026-10-24): no test fly is trained, and the full fly's out-of-sample evidence is the blind
+    selector's own holdout picks. 2026-10-25: the last step read the freed test-fly variable, so the run died after saving
+    the full fly, which then had no evidence to race on."""
+    from datetime import date
+    from types import SimpleNamespace
+    from fly_trader.train import matched_pair
+    last = date(2026, 10, 22); book = {"n": 40, "mean": 0.05, "total": 2.0, "win": 0.6, "random_mean": -0.04}
+    sel = SimpleNamespace(blind={"holdout_days": ["2026-10-22", "2026-10-22"], "models": "blind"}, stack="full",
+                          metrics={"holdout": {"n": 40, "mean": 0.05}, "deployable": True, "components": []})
+    trained, saved = [], []
+
+    def fly(ds, out, sub, models, exclude_days, epochs, match_days, stop):
+        (out / sub).mkdir(exist_ok=True); trained.append((sub, models))
+        return SimpleNamespace(), {"mode": fly_selector.MATCHED, "gates_ok": True, "lines": {"capitulation": 0.1}}, None
+    monkeypatch.setattr(matched_pair, "_quiet_progress", lambda: None); monkeypatch.setattr(config, "HANDOVER_MIN_TRADES", 30)
+    monkeypatch.setattr(decisions, "build", lambda **k: SimpleNamespace(days=[date(2026, 10, 21), last], y=np.zeros(3)))
+    monkeypatch.setattr(matched_pair, "_selector", lambda ds, out, stop: (sel, [last]))
+    monkeypatch.setattr(fly_selector, "oos_report", lambda ds, models, fly, hold: {"days": ["2026-10-22", "2026-10-22"], "rows": 3,
+                                                                                    "chains": {"all": {"selector": {"all": book}}}})
+    monkeypatch.setattr(matched_pair, "report_text", lambda rep: "report"); monkeypatch.setattr(matched_pair, "_fly", fly)
+    monkeypatch.setattr(matched_pair, "_save_fly", lambda f, info, path: saved.append(info))
+    out = matched_pair.main(tmp_path, "2026-10-22", epochs=1, blind_fly=False)
+    assert trained == [("fly_full", "full")]                                             # the full fly only, taught by the full stack
+    assert saved[-1]["oos"]["source"] == "the blind selector's own picks on the holdout days (no test fly)"
+    assert saved[-1]["oos"]["evidence"]["trades"] == 40 and saved[-1]["calibration"]["trades"] == 40
+    assert out["fly_full"]["deployable"] and (tmp_path / "summary.json").exists()
