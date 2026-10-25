@@ -1,5 +1,7 @@
 """The self-updater: a new head that is neither the installed revision nor a failed one is an update; revisions and
 failures are remembered on the data volume; nothing else about the install is a backup's business."""
+import hashlib
+import json
 from pathlib import Path
 
 from fly_trader.ops import autoupdate as au
@@ -36,12 +38,74 @@ def test_backup_and_restore_leave_the_installs_state_alone(tmp_path, monkeypatch
 
 
 class FakeFU:
-    def __init__(self, seq):
-        self.seq = seq
+    def __init__(self, seq, raw=b"{}"):
+        self.seq, self.raw = seq, raw
 
     def fetch(self, c, sha):
         assert c["principals"] == ["bryce", "bryce-recovery"] and c["namespace"] == "fly-trader-release"
-        return {"seq": self.seq}, Path(c["root"]), b"{}", "bryce"
+        return {"seq": self.seq}, Path(c["root"]), self.raw, "bryce"
+
+
+def _recorded(app, monkeypatch, manifest=b"{}", seq=3):
+    """An install whose data volume records release ``seq`` (manifest bytes ``manifest``) at revision a*40."""
+    monkeypatch.setattr(au, "APP", app); monkeypatch.setattr(au, "RELEASE_FILE", app / "data" / "hf_release.json")
+    monkeypatch.setattr(au, "REV_FILE", app / "data" / "hf_revision"); monkeypatch.setattr(au, "BAD_FILE", app / "data" / "hf_bad_revisions")
+    monkeypatch.setattr(au, "STAGE", app / "data" / "updates")
+    (app / "data").mkdir(parents=True, exist_ok=True)
+    au.RELEASE_FILE.write_text(json.dumps({"seq": seq, "manifest_sha256": hashlib.sha256(manifest).hexdigest()}))
+    au.record("a" * 40)
+
+
+def test_a_recreated_container_lags_the_recorded_release(tmp_path, monkeypatch):
+    monkeypatch.setattr(au, "APP", tmp_path); monkeypatch.setattr(au, "RELEASE_FILE", tmp_path / "data" / "hf_release.json")
+    assert not au.tree_lags()                                              # nothing recorded: a fresh install updates as before
+    _recorded(tmp_path, monkeypatch)
+    assert au.tree_lags() and au.current() is None                         # the image's checkout has no release.json
+    (tmp_path / "release.json").write_bytes(b'{"seq": 2}')
+    assert au.tree_lags()                                                  # an older release's tree
+    (tmp_path / "release.json").write_bytes(b"{}")
+    assert not au.tree_lags() and au.current() == "a" * 40                 # the recorded release itself
+
+
+def test_only_the_recorded_release_comes_again_and_only_onto_a_lagging_tree(tmp_path, monkeypatch):
+    import pytest
+    _recorded(tmp_path, monkeypatch)
+    (tmp_path / "release").mkdir(); (tmp_path / "release" / "allowed_signers").write_text('bryce namespaces="fly-trader-release" ssh-ed25519 AAAA\n')
+    monkeypatch.setattr(au, "_FU", FakeFU(3))
+    assert au.fetch_verified("a" * 40)[0]["seq"] == 3                     # the image's tree: release 3 again
+    monkeypatch.setattr(au, "_FU", FakeFU(3, b'{"other": 1}'))
+    with pytest.raises(au.Refused, match="not newer"):                     # another manifest under the same number
+        au.fetch_verified("b" * 40)
+    monkeypatch.setattr(au, "_FU", FakeFU(2))
+    with pytest.raises(au.Refused, match="not newer"):                     # an older release stays refused
+        au.fetch_verified("c" * 40)
+    (tmp_path / "release.json").write_bytes(b"{}")
+    monkeypatch.setattr(au, "_FU", FakeFU(3))
+    with pytest.raises(au.Refused, match="not newer"):                     # the tree is release 3: nothing to put back
+        au.fetch_verified("a" * 40)
+
+
+def test_boot_installs_the_recorded_release_before_the_console_starts(tmp_path, monkeypatch):
+    _recorded(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(au, "head_sha", lambda repo=au.REPO: "a" * 40)
+    monkeypatch.setattr(au, "bootstrap", lambda: calls.append("bootstrap"))
+    monkeypatch.setattr(au, "start_console", lambda: calls.append("start") or "console on the image")
+    monkeypatch.setattr(au, "update", lambda sha, proc: calls.append(("update", sha, proc)) or "console on the release")
+    assert au.boot() == "console on the release" and calls == [("update", "a" * 40, None)]
+    calls.clear()
+    monkeypatch.setattr(au, "update", lambda sha, proc: calls.append(("update", sha, proc)))     # the fetch failed: the image's tree starts
+    assert au.boot() == "console on the image" and calls == [("update", "a" * 40, None), "bootstrap", "start"]
+    calls.clear(); (tmp_path / "release.json").write_bytes(b"{}")
+    assert au.boot() == "console on the image" and calls == ["bootstrap", "start"]                # the tree is current
+
+
+def test_the_installed_release_keeps_its_verified_copy_alone(tmp_path):
+    r = tmp_path / "releases"
+    for n in ("2", "3", "4.part"):
+        (r / n).mkdir(parents=True); (r / n / "f").write_text(n)
+    au.keep_only(r / "3")
+    assert [p.name for p in r.iterdir()] == ["3"] and (r / "3" / "f").read_text() == "3"
 
 
 def test_updates_need_release_keys_and_a_newer_signed_release(tmp_path, monkeypatch):

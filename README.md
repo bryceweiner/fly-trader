@@ -111,8 +111,8 @@ you set `CONSOLE_PUBLISH`. Never expose it to the internet.
 
 | Path | What |
 |---|---|
-| `models/policies/fly_*.pt` | the fly (#107 on the training machine; a fresh install gives it its own id): taught by selector #100, one strategy (`capitulation`), 240-minute hold, its own buy line. Loaded weights-only: the file cannot run code |
-| `models/selectors/selector_*.skops` | the selector that taught it (#100), kept so the console can show the paper selector alongside. Saved with skops, not pickle |
+| `models/policies/fly_*.pt` | the fly (#604 on the training machine; a fresh install gives it its own id): taught by selector #595 on exactly the same data (a matched pair), one strategy (`capitulation`), 240-minute hold, its line matched to the selector's trade count. Loaded weights-only: the file cannot run code |
+| `models/selectors/selector_*.skops` | the selector that taught it (#595), kept so the console can show the paper selector alongside. Saved with skops, not pickle |
 | `models/connectome/` | the FlyWire FAFB v783 central brain as the fly runs on it (14 MB), with its calibrated scale |
 | `models/wallet_skill/` | the fitted wallet-skill inputs: `config.json` (the horizon and lookback the model was trained with), the name of the newest per-day table (`TABLE`) and its sha256 (`TABLE.sha256`). The table itself (~300 MB) is on Hugging Face; the container downloads it once and uses it only if the hash matches |
 | `seed/release_seed.json` (`seed/seed.sql` is the fallback) | the database rows that admit the fly to trade: the model records (by file hash), the passed replay verdict, autostart |
@@ -121,8 +121,9 @@ you set `CONSOLE_PUBLISH`. Never expose it to the internet.
 | `docker-compose.yml`, `Dockerfile`, `docker/` | one Postgres, one engine + console (the Dockerfile's default stage; its `signer` stage is for the vault server) |
 | `deploy/` | the hosted $FLY vault server: a separate signer container, host hardening, the signed-release updater ([docs/vault/RUNBOOK.md](docs/vault/RUNBOOK.md)) |
 
-The replay verdict shipped here: over the 29 evaluation days it made +1.52 % per trade after real costs (profit
-factor 1.13) against −5.27 % for random picks of the same tokens. That is a backtest on one corpus, not a forecast.
+Out of sample, on the 21 days 2026-10-02..10-22 that neither model trained on, the selector's holdout-blind copy made
++6.65 % per trade after real costs over 485 trades (55 % winners, profit factor 1.61) against −4.06 % for random picks.
+That is a backtest on one corpus, not a forecast.
 
 ## Tuning
 

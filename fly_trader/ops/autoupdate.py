@@ -10,6 +10,10 @@ Face for the head commit of the repo this install came from; when it has moved:
    ``uv.lock`` (``uv sync --frozen``), rerun the bootstrap steps and start the console again; if it is not answering
    within ``HEALTH_WAIT_S`` the previous tree is put back and that revision is never tried again
 
+A recreated container starts from its image's checkout, not from the release the updater installed into the old one: at
+boot, a tree that is not the release the data volume records gets that release installed again (from the verified copy
+kept on the data volume) before the console starts.
+
 An unsigned or wrongly signed commit is logged once and never installed. With no release keys in
 ``release/allowed_signers`` the updater installs nothing. ``docker/entrypoint.sh`` runs this as pid 1 when
 AUTO_UPDATE=1; the console is its child and is restarted if it dies. The vault server never runs it (AUTO_UPDATE=0
@@ -96,6 +100,28 @@ def installed_release() -> dict:
         return {"seq": 0}
 
 
+def tree_release() -> str | None:
+    """sha256 of the signed manifest this tree was installed from (install_tree copies ``release.json`` into it); None for
+    a tree no update installed, such as the image's own checkout."""
+    try:
+        return hashlib.sha256((APP / "release.json").read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def tree_lags() -> bool:
+    """The data volume records a signed release this tree is not. A recreated container (``up --force-recreate``, or
+    ``down`` then ``up``) starts from its image, the checkout it was built from, while the release the updater installed
+    lived in the old container; the revision on the data volume would call that tree current forever."""
+    want = installed_release().get("manifest_sha256")
+    return bool(want) and tree_release() != want
+
+
+def current() -> str | None:
+    """The revision this tree runs, for deciding on an update: none when it lags the recorded release."""
+    return None if tree_lags() else installed()
+
+
 def wants_update(head: str | None, current: str | None, skip: set[str]) -> bool:
     """A new head that is not the installed one and has not already failed."""
     return bool(head) and head != current and head not in skip
@@ -135,8 +161,11 @@ def fetch_verified(sha: str) -> tuple[dict, Path, bytes, str]:
         m, d, raw, who = fu.fetch(c, sha)                      # signature, manifest, paths, sizes, sha256
     except SystemExit as e:                                   # fly_update reports refusals as SystemExit
         raise Refused(str(e)) from None
-    have = int(installed_release().get("seq") or 0)
-    if int(m["seq"]) <= have:
+    rec = installed_release()
+    have = int(rec.get("seq") or 0)
+    # the one release that may come again is the recorded one, byte for byte, onto a tree that lags it: not a rollback
+    again = int(m["seq"]) == have and hashlib.sha256(raw).hexdigest() == rec.get("manifest_sha256") and tree_lags()
+    if int(m["seq"]) <= have and not again:
         raise Refused(f"release {m['seq']} is not newer than the installed {have}")
     return m, d, raw, who
 
@@ -199,6 +228,14 @@ def restore() -> None:
         (shutil.copytree if p.is_dir() else shutil.copy2)(p, APP / p.name)
 
 
+def keep_only(d: Path) -> None:
+    """The installed release's verified copy stays on the data volume, older ones go: a recreated container reinstalls
+    from it (fly_update.fetch re-verifies a matching copy and reuses it, so only the small signed manifest is fetched)."""
+    for p in d.parent.iterdir():
+        if p != d:
+            shutil.rmtree(p, ignore_errors=True)
+
+
 def install_tree(d: Path) -> None:
     """Replace the code, models and seed with exactly the verified release (the install's state is kept)."""
     for p in _code_files():
@@ -228,7 +265,7 @@ def update(sha: str, proc: subprocess.Popen | None) -> subprocess.Popen | None:
         if healthy():
             record(sha)
             RELEASE_FILE.write_text(json.dumps({"seq": int(m["seq"]), "manifest_sha256": hashlib.sha256(raw).hexdigest()}) + "\n")
-            shutil.rmtree(d, ignore_errors=True)
+            keep_only(d)
             log.info("updated to release %s", m["seq"]); return p
         log.error("the new console did not answer within %.0fs", HEALTH_WAIT_S); stop_console(p)
     except Exception:
@@ -238,11 +275,25 @@ def update(sha: str, proc: subprocess.Popen | None) -> subprocess.Popen | None:
     return start_console()
 
 
-def main() -> None:
+def boot() -> subprocess.Popen:
+    """Bootstrap and start the console. A tree that lags the recorded release gets that release (or a newer signed one)
+    installed first, so the console starts once, on the release, not on the image's checkout."""
+    if tree_lags():
+        log.warning("this tree is not release %s, which the data volume records (a recreated container): installing it again",
+                    installed_release().get("seq"))
+        head = head_sha()
+        if wants_update(head, None, bad()):
+            p = update(head, None)
+            if p is not None:
+                return p
     bootstrap()
+    return start_console()
+
+
+def main() -> None:
+    proc = boot()
     if signers() is None:
         log.warning("release/allowed_signers holds no release key: automatic updates are off until it does")
-    proc = start_console()
     stopping = {"now": False}
 
     def _term(signum, frame):
@@ -256,7 +307,7 @@ def main() -> None:
         if time.time() - last < INTERVAL_S:
             continue
         last = time.time(); head = head_sha()
-        if wants_update(head, installed(), bad()):
+        if wants_update(head, current(), bad()):
             proc = update(head, proc)
     stop_console(proc)
 
