@@ -5,10 +5,9 @@
 > [the distribution README](https://github.com/bryceweiner/fly-trader/blob/distribution/README.md) first: it says what
 > the trader does and what its rails are.
 
-You end up with two containers in Docker Desktop, the database and the trader, and the console at
-<http://localhost:8501>. Every command after step 2 runs in an **Ubuntu terminal** (WSL 2), not in PowerShell. That is
-Docker's recommended setup on Windows: the trader's data folder is much faster on Linux's file system, and the
-container's start scripts need the Linux line endings that a Windows checkout would change.
+You end up with two containers in Docker Desktop, the database and the trader, and the dashboard at
+<http://localhost:8501>. Steps 1 and 2 install WSL 2 and Docker Desktop. After that, every command runs in an
+**Ubuntu terminal**, not in PowerShell, and one script (`install.sh`) does the rest.
 
 ## What you need
 
@@ -50,13 +49,6 @@ Keep **Use WSL 2 instead of Hyper-V** ticked during the install. Start Docker De
 - **Resources → WSL integration**: turn on **Ubuntu**, then **Apply & restart**.
 - **General**: keep **Start Docker Desktop when you sign in** on, so the trader comes back after a reboot.
 
-Open Ubuntu and check that both commands print a version:
-
-```bash
-docker version
-docker compose version
-```
-
 **Memory (only if the PC has less than 32 GB).** WSL 2 gives Docker half the PC's memory by default. To give it more,
 in PowerShell open the WSL settings file:
 
@@ -75,7 +67,7 @@ Then run `wsl --shutdown` in PowerShell and start Docker Desktop again.
 
 ## 3. Download fly-trader
 
-In **Ubuntu**:
+Open **Ubuntu** from the Start menu:
 
 ```bash
 cd ~
@@ -83,67 +75,72 @@ git clone -b distribution https://github.com/bryceweiner/fly-trader.git
 cd fly-trader
 ```
 
-Keep it in your Ubuntu home folder (`~`). Do not clone it under `/mnt/c/...`, and do not clone it with Git for Windows:
-the first makes the trader's data folder slow, and the second converts line endings so the container does not start.
-To see the folder in File Explorer, run `explorer.exe .`.
+Keep it in your Ubuntu home folder (`~`), not under `/mnt/c/...`: the trader's data folder is much faster on Linux's
+file system, and `install.sh` refuses to run from a Windows drive. To see the folder in File Explorer, run
+`explorer.exe .`.
 
-## 4. Add your API keys
-
-```bash
-cp .env.example .env
-nano .env
-```
-
-Paste your keys after `HELIUS_API_KEY=` and `JUPITER_API_KEY=`, with no quotes and no spaces. Save with **Ctrl+O**,
-**Enter**, and quit with **Ctrl+X**.
-
-- Do not add a `BOT_PRIVATE_KEY=` line yourself; step 6 writes it.
-- `LIVE_ENABLED=1` is the shipped setting: once the wallet is funded and 20 paper trades have closed, the trader trades
-  the wallet. Set `LIVE_ENABLED=0` to run paper only.
-- Keep each value bare: Docker keeps a `# comment` after a value as part of the value.
-
-## 5. Start it
+## 4. Run the installer
 
 ```bash
-docker compose up -d --build
+./install.sh
 ```
 
-With an NVIDIA GPU, use the command in [NVIDIA GPU](#nvidia-gpu-optional) instead.
+It:
 
-The first start takes several minutes. It builds the image, creates the database, downloads the wallet-skill table
-(~300 MB, checked against its pinned sha256), installs the models and starts the market feed and the trading engine.
-To watch it, run `docker compose logs -f fly`. **Ctrl+C** stops the log, not the trader. It is ready when
-`docker compose ps` shows `fly` as `healthy`.
+1. checks that Docker answers and that the folder is on Linux's file system;
+2. creates `.env` and asks for your Helius and Jupiter API keys (paste each and press Enter);
+3. offers the NVIDIA GPU when the PC has one and Docker can reach it;
+4. builds the image and starts the database and the trader. The first build takes several minutes. On its first start
+   the trader downloads the wallet-skill table (~300 MB, checked against its pinned sha256) and installs the models;
+5. waits until the trader reports healthy;
+6. creates the bot wallet, writes its key into `.env`, restarts the trader so it loads the key, and prints the
+   wallet's address;
+7. opens the dashboard in your Windows browser.
 
-## 6. Create the bot wallet
+It is safe to run again: it keeps the keys, the wallet and the data it finds.
 
-```bash
-docker compose exec fly fly-trader wallet new
-```
+## 5. Back up `.env`
 
-It prints the wallet's public key and writes the secret key into `.env`.
-
-**Back up `.env` now. It is the only copy of that key.** Run `explorer.exe .` and copy `.env` to a USB drive, or put
-its `BOT_PRIVATE_KEY` line in a password manager. Do not copy it into a OneDrive folder (Desktop, Documents and Pictures
+**`.env` holds the only copy of the wallet's key.** Run `explorer.exe .` and copy `.env` to a USB drive, or put its
+`BOT_PRIVATE_KEY` line in a password manager. Do not copy it into a OneDrive folder (Desktop, Documents and Pictures
 often are one): that uploads the key to the cloud.
 
-## 7. Fund it
+## 6. Fund the wallet
 
-Send **0.5 SOL** to the printed address, then restart the trader so it picks up the key:
-
-```bash
-docker compose restart fly
-```
-
-## 8. Open the console
-
-Open <http://localhost:8501> in any Windows browser and watch the **Overview** page.
+Send **0.5 SOL** to the address the installer printed (`docker compose exec fly fly-trader wallet show` prints it
+again).
 
 From here it runs on its own. The first ~24 hours are a warm-up (it needs a day of candles before it scores anything).
-Then it trades paper until 20 trades have closed, and then it trades the wallet.
+Then it trades paper until 20 trades have closed, and then it trades the wallet. To run paper only, set
+`LIVE_ENABLED=0` in `.env` and apply it (see [Change a setting](#day-to-day)).
 
-The console listens on `127.0.0.1` only. Do not expose it (no port forwarding, no tunnels to the internet): it can start
-and stop the engine and clear the rails.
+## The dashboard
+
+Open <http://localhost:8501> in any Windows browser, or click the `8501:8501` port of the `fly` container in Docker
+Desktop. Watch the **Overview** page.
+
+### From another device on your network
+
+The dashboard has no login: whoever can open it can stop the engine and clear the rails. Open it to other devices
+only on a network you trust, such as your home network. Never forward it through your router to the internet.
+
+1. Find the PC's address: in PowerShell, `ipconfig`, then **IPv4 Address** under the Wi-Fi or Ethernet adapter, for
+   example `192.168.1.20`.
+2. Add two lines to `.env` (`nano .env`; save with **Ctrl+O**, **Enter**, quit with **Ctrl+X**):
+
+   ```
+   CONSOLE_PUBLISH=0.0.0.0
+   CONSOLE_ALLOWED_HOSTS=192.168.1.20
+   ```
+
+   `CONSOLE_ALLOWED_HOSTS` lists every name you will type in the browser, comma-separated: add the PC's name or a
+   Tailscale name the same way.
+3. Apply it: `docker compose up -d --force-recreate fly`.
+4. If Windows Firewall asks whether **Docker Desktop Backend** may accept connections, allow it on **Private** networks
+   (and mark your home network as Private: Settings → Network & internet → your network → Private).
+
+Then open `http://192.168.1.20:8501` on the other device. Ask your router to keep giving the PC that address (a DHCP
+reservation), or the address will change.
 
 ## Keep it running
 
@@ -158,11 +155,11 @@ Run these in Ubuntu, from the install folder (`cd ~/fly-trader`):
 
 | Want to | Do |
 |---|---|
-| See what it is doing | <http://localhost:8501>: **Overview**, **Trades**, **Safety & wallet**, **Processes** |
-| See the logs | `docker compose logs -f fly` |
+| See what it is doing | The dashboard: **Overview**, **Trades**, **Safety & wallet**, **Processes** |
+| See the logs | `docker compose logs -f fly` (**Ctrl+C** stops the log, not the trader) |
 | Pause new entries | Safety & wallet → **Pause entries**, or `docker compose exec fly fly-trader pause-entries` |
-| Change a setting | `nano .env`, then `docker compose restart fly` |
-| Stop everything | `docker compose down`. **Open positions stay open in the wallet**; start again and it sells them on schedule |
+| Change a setting | `nano .env`, then `docker compose up -d --force-recreate fly`. A plain `docker compose restart` keeps the old values |
+| Stop everything | `docker compose down`. **Open positions stay open in the wallet**; start again (`docker compose up -d`) and it sells them on schedule |
 | Update by hand | `git pull && docker compose up -d --build` (signed releases also install themselves within the hour; `AUTO_UPDATE=0` in `.env` turns that off) |
 | Start again from nothing | `docker compose down -v && sudo rm -rf data/` deletes the database, the fly's learned state and the signer's ledger; `.env` (your key) stays |
 
@@ -174,29 +171,25 @@ works as written in the Ubuntu terminal.
 
 The CPU image trades fine; a GPU makes the once-a-minute scoring and the fly's learning a little faster.
 
-1. Install the current NVIDIA driver for Windows (Game Ready or Studio, 560 or newer). That is all: Docker Desktop
-   passes the GPU through WSL 2. Install no NVIDIA driver inside Ubuntu, and no NVIDIA Container Toolkit.
-2. In PowerShell: `wsl --update`, then restart Docker Desktop.
-3. In step 5, start with the CUDA override instead:
+Install the current NVIDIA driver for Windows (Game Ready or Studio, 560 or newer), run `wsl --update` in PowerShell
+and restart Docker Desktop. That is all: Docker Desktop passes the GPU through WSL 2. Install no NVIDIA driver inside
+Ubuntu, and no NVIDIA Container Toolkit.
 
-   ```bash
-   docker compose -f docker-compose.yml -f docker-compose.cuda.yml up -d --build
-   ```
+`install.sh` then offers the GPU and, if you accept, adds this line to `.env`, so every `docker compose` command builds
+and starts the CUDA image:
 
-   Any later `docker compose up` needs the same two `-f` files. To make the plain commands use them, add this line to `.env`:
+```
+COMPOSE_FILE=docker-compose.yml:docker-compose.cuda.yml
+```
 
-   ```
-   COMPOSE_FILE=docker-compose.yml:docker-compose.cuda.yml
-   ```
-
-Check which device the fly is on:
+To switch an existing install, add that line yourself and run `docker compose up -d --build`. To go back to the CPU,
+delete it and run the same command. To see which device the fly is on:
 
 ```bash
 docker compose logs fly | grep "fly-trader: device"
 ```
 
-`cuda:0 (NVIDIA …)` means the GPU. `cpu (… threads)` means the container did not get it. The console's Model &
-training page shows the same.
+`cuda:0 (NVIDIA …)` means the GPU, `cpu (… threads)` the CPU. The dashboard's Model & training page shows the same.
 
 **AMD GPUs** are not reachable from Docker Desktop on Windows: `docker-compose.rocm.yml` needs Linux's `/dev/kfd`, so do
 not use it here. The CPU image runs instead.
@@ -206,8 +199,9 @@ not use it here. The CPU image runs instead.
 | You see | Do |
 |---|---|
 | `0x80370102` while installing WSL | Virtualization is off: turn on Intel VT-x / AMD SVM in the UEFI/BIOS |
-| `docker: command not found`, or "could not be found in this WSL 2 distro" | Start Docker Desktop; Settings → Resources → WSL integration → **Ubuntu** on → Apply & restart |
-| `exec /app/docker/entrypoint.sh: no such file or directory`, or `set: Illegal option -` in the logs | Windows line endings: the folder was cloned by Git for Windows or under `/mnt/c`. Move `.env` somewhere safe, delete the folder, clone again in Ubuntu (step 3), put `.env` back, `docker compose up -d --build` |
-| Everything is slow | The folder is under `/mnt/c`. `docker compose down`, clone again into `~` (step 3), copy `.env` and `data/` across (`sudo cp -a /mnt/c/…/fly-trader/data ~/fly-trader/`), start again. The database is kept |
-| `could not select device driver "nvidia"` | Update the NVIDIA driver, run `wsl --update`, restart Docker Desktop; or start without the CUDA override |
-| The console does not open | `docker compose ps`: `fly` must be `Up` (the first start takes minutes); `docker compose logs -f fly` says why |
+| `docker: command not found`, "could not be found in this WSL 2 distro", or install.sh says Docker does not answer | Start Docker Desktop; Settings → Resources → WSL integration → **Ubuntu** on → Apply & restart |
+| install.sh says the folder is on a Windows drive | Clone again inside Ubuntu (step 3). If the old folder already ran, `docker compose down` there first and copy its `.env` and `data/` across (`sudo cp -a /mnt/c/…/fly-trader/data ~/fly-trader/`); the database is kept |
+| `exec /app/docker/entrypoint.sh: no such file or directory`, or `set: Illegal option -` in the logs | Windows line endings, from a copy made before October 25, 2026 or by a tool that converts them. Keep `.env`, clone again (step 3), `docker compose up -d --build` |
+| `could not select device driver "nvidia"` | Update the NVIDIA driver, run `wsl --update`, restart Docker Desktop; or delete the `COMPOSE_FILE` line from `.env` to run on the CPU |
+| The dashboard does not open | `docker compose ps`: `fly` must be `Up` (the first start takes minutes); `docker compose logs -f fly` says why |
+| The dashboard says `host '…' is not allowed` | Add the name you typed to `CONSOLE_ALLOWED_HOSTS` in `.env`, then `docker compose up -d --force-recreate fly` |

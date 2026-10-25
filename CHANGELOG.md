@@ -123,6 +123,23 @@ the matched fly trained beside #595 is ready:
     its learning is judged by its live race. Its first run died after saving the full fly, before attaching that evidence
     (it read the freed test-fly variable); the evidence's source now comes from the report itself.
 
+### Install
+
+- **One command installs the Docker distribution: `./install.sh`** (Linux, macOS, Windows under WSL 2). It asks for the
+  two API keys and offers an NVIDIA GPU when Docker can reach one. It then builds and starts the containers, waits until
+  the trader is healthy, creates the bot wallet, restarts the trader so it loads the key, and opens the dashboard. A
+  rerun keeps the keys, the wallet and the data. On WSL it refuses a folder on a Windows drive.
+- **Windows has its own guide, [INSTALL.md](INSTALL.md):** WSL 2, Docker Desktop and its memory, then `install.sh`, the
+  `.env` backup (not into OneDrive), sleep and sign-in after restarts, the NVIDIA GPU through Docker Desktop (the Windows
+  driver only), and the dashboard from another device.
+- **The dashboard can be opened from other devices on your network** (opt-in): `CONSOLE_PUBLISH=0.0.0.0` publishes it
+  beyond 127.0.0.1, and `CONSOLE_ALLOWED_HOSTS` names the addresses the browser may use. It still has no login.
+- **Line endings are LF on every OS** (`.gitattributes`): a Git for Windows clone gave `docker/*.sh` CRLF endings, and the
+  container did not start.
+- **The docs apply a changed setting with `docker compose up -d --force-recreate fly`.** `docker compose restart` keeps
+  the values `.env` had when the container was created, because the process environment wins over `.env`. So "edit
+  `.env`, then restart" changed nothing for any setting already in the file.
+
 ## 2026-10-23, release 10: A retrained selector trades `ev` again, and live money follows the seat
 
 Published to Hugging Face as signed release 10. It ships selector #560 and fly #561 in place of selector #154 and fly
