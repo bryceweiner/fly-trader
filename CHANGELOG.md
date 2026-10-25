@@ -3,11 +3,16 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
-## Unreleased
+## 2026-10-25, release 11: The matched pair, selector #595 and fly #604, and a one-command install
 
-Since 2026-10-25 00:07 (UTC+8), selector #595 has traded this development install in place of #560. Fly #561 stays until
-the matched fly trained beside #595 is ready:
+Release 11 ships selector #595 and fly #604 in place of release 10's #560 and #561. The two were trained as a matched pair,
+on exactly the same data. #595 has traded the development install since 2026-10-25 00:07 (UTC+8):
 
+- **Fly #604** was trained beside #595, on the same days and rows (2026-04-19..10-22), and is taught by #595's full fit.
+  - Its line is matched to #595's own trade count: 322 Solana trades over the last 30 training days.
+  - It ranks tokens as its teacher does (rank correlation 0.96).
+  - Its evidence is the blind selector's own holdout picks (485 trades, +6.65 %). At bootstrap it trades exactly the
+    selector's picks, and its live race judges its learning.
 - **Selector #595** comes from the first matched retrain (`fly-trader matched-pair`, Training below) and is fitted through
   2026-10-22. It trades `capitulation` alone with 240-minute holds, and on Solana its correctness bands size it.
 - **Out of sample:** on the 21 days 2026-10-02..10-22 its holdout-blind copy made +6.65 % per trade over 485 trades (55 %
@@ -129,6 +134,16 @@ the matched fly trained beside #595 is ready:
   two API keys, checks each with its provider, and offers an NVIDIA GPU when Docker can reach one. It then builds and starts the containers, waits until
   the trader is healthy, creates the bot wallet, restarts the trader so it loads the key, and opens the dashboard. A
   rerun keeps the keys, the wallet and the data. On WSL it refuses a folder on a Windows drive.
+- **A recreated container runs its installed release again, not the checkout its image was built from.**
+  - The updater installs each release into the container, but records it on the data volume.
+  - After `docker compose up --force-recreate`, or `down` then `up`, the container ran the code its image was built from.
+    The updater still called that current and never installed the release again.
+  - At boot it now compares the tree's signed `release.json` with the recorded manifest. When they differ, it installs
+    the recorded release, or a newer one, before the console starts.
+  - The installed release's verified copy stays on the data volume, so this fetches only the small signed manifest from
+    Hugging Face.
+  - Only that exact manifest may come again under the same release number; anything older is still refused.
+  - With `AUTO_UPDATE=1`, a container rebuilt from a newer `git pull` also runs the latest signed release.
 - **Windows has its own guide, [INSTALL.md](INSTALL.md):** WSL 2, Docker Desktop and its memory, then `install.sh`, the
   `.env` backup (not into OneDrive), sleep and sign-in after restarts, the NVIDIA GPU through Docker Desktop (the Windows
   driver only), and the dashboard from another device.
