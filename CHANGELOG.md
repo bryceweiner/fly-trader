@@ -3,6 +3,42 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## 2026-10-26, release 12: `ev` trades beside `capitulation` again: selector #640 and fly #641
+
+Release 12 ships selector #640 and fly #641 in place of release 11's #595 and #604. It is again a matched pair, trained on
+the same days and rows (2026-04-19..10-22). The pair has traded the development install since 2026-10-26 19:25 (UTC+8):
+
+- **Selector #640** trades `ev` and `capitulation`, both with 240-minute holds. On Solana its correctness bands size both.
+  - #595 had dropped `ev`, because its book was chosen on the oldest half of the walk-forward (The selector, below).
+- **Out of sample:** on the 21 days 2026-10-02..10-22 its holdout-blind copy made +7.69 % per trade over 704 trades (59 %
+  winners, profit factor 1.78; random picks -3.41 %). #595 made +6.65 % over 485 trades on the same days: 54.1 in
+  total against 32.2.
+  - On Solana it made 353 trades at +7.90 % (#595: 215 at +4.96 %), on Robinhood Chain 351 at +7.48 % (#595: 270 at
+    +7.99 %).
+- **Fly #641** is taught by #640's full fit on exactly its fit rows. It ranks the rows as its teacher does (rank
+  correlation 0.89), and its lines are matched to #640's own trade count.
+  - Its evidence is the blind selector's own holdout picks (704 trades, +7.69 %).
+  - Like every new fly, it races 14 days before it can take the seat. Until then the wallet trades #640's decisions.
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 12`. The only code change is in training (below); live trading runs as in release 11.
+
+### The selector
+
+- **The book is chosen on the walk-forward's last four weeks, not on its oldest half (memecoins).**
+  - Each strategy must still pass both halves on its own. Which of the passing strategies trade together, and under which
+    rule, is now decided on the walk-forward's last `RECENT_BOOK_DAYS` (28), because that choice moves with the market
+    (Bryce, 2026-10-25).
+  - On the 10-22 corpus the selection half (May–July) kept capitulation alone, and selector #595 traded it alone. ev
+    passed on its own (+4.4 % and +5.0 % a trade on the two halves), but with one position per token it buys a token
+    first and blocks capitulation's later entry: 1,331 of capitulation's trades, worth +136, on the selection half.
+  - From mid-September the pair made as much as capitulation alone or more. On the 21 held-out days, from blind refits,
+    the pair made 54.9 over 725 trades (+7.6 % a trade) against capitulation's 32.2 over 485 (+6.65 %).
+  - Kalshi still chooses its book on the selection half.
+
 ## 2026-10-25, release 11: The matched pair, selector #595 and fly #604, and a one-command install
 
 Release 11 ships selector #595 and fly #604 in place of release 10's #560 and #561. The two were trained as a matched pair,
