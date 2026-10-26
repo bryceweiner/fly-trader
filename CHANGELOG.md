@@ -3,6 +3,21 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## Unreleased
+
+### The selector
+
+- **The book is chosen on the walk-forward's last four weeks, not on its oldest half (memecoins).**
+  - Each strategy must still pass both halves on its own. Which of the passing strategies trade together, and under which
+    rule, is now decided on the walk-forward's last `RECENT_BOOK_DAYS` (28), because that choice moves with the market
+    (Bryce, 2026-10-25).
+  - On the 10-22 corpus the selection half (May–July) kept capitulation alone, and selector #595 traded it alone. ev
+    passed on its own (+4.4 % and +5.0 % a trade on the two halves), but with one position per token it buys a token
+    first and blocks capitulation's later entry: 1,331 of capitulation's trades, worth +136, on the selection half.
+  - From mid-September the pair made as much as capitulation alone or more. On the 21 held-out days, from blind refits,
+    the pair made 54.9 over 725 trades (+7.6 % a trade) against capitulation's 32.2 over 485 (+6.65 %).
+  - Kalshi still chooses its book on the selection half.
+
 ## 2026-10-25, release 11: The matched pair, selector #595 and fly #604, and a one-command install
 
 Release 11 ships selector #595 and fly #604 in place of release 10's #560 and #561. The two were trained as a matched pair,

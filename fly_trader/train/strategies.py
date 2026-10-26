@@ -88,6 +88,7 @@ PREDICT_CHUNK = 2_000_000       # rows scored at once out of sample: the block's
 # scored on them exactly once, for the record — never to decide anything, or they would stop being a holdout. At the
 # book's observed rate (~48 trades a day) that is ~1,000 trades, an order of magnitude above MIN_LINE_TRADES.
 HOLDOUT_DAYS = 21
+RECENT_BOOK_DAYS = 28        # memecoins: the book (which passed strategies, which rule) is chosen on the walk-forward's last four weeks
 CACHE_DIR = config.CORPUS_DIR / "stack_cache"
 # Correctness (2026-10-24, the ideal-asset study): inside the EV line's picks the EV margin carries no information (rank
 # correlation with the outcome +0.00 / +0.08 / +0.01 on selection / evaluation / holdout), while a classifier of a "clean"
@@ -652,13 +653,13 @@ def _comp(name, passed, reason, sel=None, ev=None, params=None, trials=0, best=N
     return c
 
 
-def _dropped(best: Score, with_it: Score) -> str:
-    """Why the book left a strategy out: the chosen book, which lacks it, beat every book that had it on the selection half."""
+def _dropped(best: Score, with_it: Score, where: str = "the selection half") -> str:
+    """Why the book left a strategy out: the chosen book, which lacks it, beat every book that had it on ``where``."""
     if best.admissible and not with_it.admissible:
-        return f"dropped from the book: without it the book meets {bars(best.gate)} on the selection half, with it never"
+        return f"dropped from the book: without it the book meets {bars(best.gate)} on {where}, with it never"
     if best.base_ok and not with_it.base_ok:
-        return "dropped from the book: every book with it missed the bars on the selection half"
-    return f"dropped from the book: the book made {best.total:.1f} on the selection half without it, {with_it.total:.1f} at best with it"
+        return f"dropped from the book: every book with it missed the bars on {where}"
+    return f"dropped from the book: the book made {best.total:.1f} on {where} without it, {with_it.total:.1f} at best with it"
 
 
 def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days_n: int | None = None, spec: "StackSpec | None" = None) -> Stack:
@@ -742,15 +743,23 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
         y_r = sp.label(ds, f.hold_min); t = taken_idx(ds.ts, ds.mint, sp.hold_s(ds, f.hold_min), np.flatnonzero(f.pick(ds, sel, uni)))
         tables[f.name] = sizing.build_table(f.oos[t] - f.line, y_r[t])
     # 3. the book: which passed strategies it keeps and the rule between them -- every subset under each rule, scored as one
-    # book on the selection half. A strategy the book does better without is dropped here, in the open: until 2026-10-19
-    # only the rule was chosen, logged as having "made more" even when no rule cleared the bars (selector #154), and the
-    # win filter then priced ev out of the book with its line instead.
+    # book. A strategy the book does better without is dropped here, in the open: until 2026-10-19 only the rule was chosen,
+    # logged as having "made more" even when no rule cleared the bars (selector #154), and the win filter then priced ev out
+    # of the book with its line instead. Memecoins choose the book on the walk-forward's last ``RECENT_BOOK_DAYS`` (Bryce,
+    # 2026-10-25): every strategy in it has passed both halves on its own, and which of them earn a place beside each other
+    # moves with the market. On the selection half (2026-05..07) the 10-22 stack kept capitulation alone, though from
+    # mid-September ev + capitulation made as much or more, and on the 21 held-out days 54.9 against 32.2.
+    if sp.name == "memecoin":
+        b0 = tdays[-1] - timedelta(days=RECENT_BOOK_DAYS - 1)
+        book_rows, book_where = tested & (od >= b0.toordinal()), f"the walk-forward's last {RECENT_BOOK_DAYS} days ({b0}..{tdays[-1]})"
+    else:
+        book_rows, book_where = sel, "the selection half"
     best_c = None; combine = "score"; keep = list(fits); with_it = {}; seen = None; n_books = 0
     for k in range(len(fits), 0, -1):                              # larger books first: on a tie the book keeps more strategies
         for sub in itertools.combinations(fits, k):
             for rule in (("kelly", "score") if k > 1 else ("kelly",)):    # alone, a strategy trades the same rows under either rule
                 n_books += 1
-                s = score_pick(ds, *system_pick(ds, list(sub), sel, uni, rule, tables)[:3], day0)
+                s = score_pick(ds, *system_pick(ds, list(sub), book_rows, uni, rule, tables)[:3], day0)
                 if s.n > 0 and (seen is None or s.total > seen.total):
                     seen = s
                 for f in sub:                                      # the best book each strategy was part of, for the record
@@ -760,15 +769,15 @@ def fit_stack(ds: DecisionSet, stop: threading.Event | None = None, holdout_days
                 if better(s, best_c):
                     best_c = s; combine = rule; keep = list(sub)
     if best_c is None:
-        comps.append(_comp("combination", False, f"no book of the passed strategies cleared the bars on the selection half; all kept under '{combine}'",
+        comps.append(_comp("combination", False, f"no book of the passed strategies cleared the bars on {book_where}; all kept under '{combine}'",
                            params={"rule": combine, "strategies": [f.name for f in fits]}, trials=n_books, best=seen.dict() if seen else None))
     else:
         kept = [f.name for f in keep]
-        comps.append(_comp("combination", True, f"{' + '.join(kept)} under '{combine}' made the most on the selection half", best_c.dict(), None,
+        comps.append(_comp("combination", True, f"{' + '.join(kept)} under '{combine}' made the most on {book_where}", best_c.dict(), None,
                            {"rule": combine, "strategies": kept}, n_books, best=seen.dict() if seen else None))
         for f in fits:
             if f.name not in kept:
-                comps.append(_comp(f"combination: {f.name}", False, _dropped(best_c, with_it[f.name]), with_it[f.name].dict(),
+                comps.append(_comp(f"combination: {f.name}", False, _dropped(best_c, with_it[f.name], book_where), with_it[f.name].dict(),
                                    params={"hold_min": f.hold_min, "line": f.line}, best=with_it[f.name].dict()))
         fits = keep; tables = {n: t for n, t in tables.items() if n in kept}
     # 4. meta-label per strategy: a filter at the strategy's own line (fit_meta never moves it)
