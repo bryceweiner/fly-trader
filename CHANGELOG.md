@@ -3,7 +3,18 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
-## Unreleased
+## 2026-10-28, release 13: Coins whose creator bought most of the supply are traded briefly and small, serial ruggers' never
+
+Release 13 changes which coins the models may trade and how much a risky one gets. The models are unchanged: selector #640
+and fly #641, as in release 12. The rules have traded the development install since 2026-10-28 02:21 (UTC+8).
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 13`. The change reaches live trading: which coins are bought, and the size of some buys.
+
+### Trading
 
 - **Coins whose creator bought most of the supply at launch are traded only briefly and small, and a serial rugger's
   coins not at all.** On 2026-10-27 the live book lost 0.37 SOL on USDP. Its creator bought 79 % of the supply in the
