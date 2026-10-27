@@ -3,7 +3,9 @@
 Strategy: the model predicts the net return of buying a token now and selling ``HOLD_MIN`` minutes later, after the
 real fees and price impact; it trains on every eligible minute. It trades only tokens at least ``MIN_AGE_H`` hours
 past graduation (or graduated before the archive began) — random entries into younger tokens lose 4–28 % per trade at
-real costs. ``in_universe`` is the one definition of that universe for training, backtest and the live engine.
+real costs; never a serial rugger's coin, and a coin whose creator bought most of the supply at launch only while the
+position is sold before the coin is 12 h old. ``in_universe`` is the one definition of that universe for training,
+backtest and the live engine.
 
 Trading configuration, shared verbatim with the fly (``train/fly_selector.py``): features robust-scaled
 (``train/scaling.py``); buy when the predicted net return clears the buy line; the line is the one (of
@@ -69,17 +71,45 @@ DATA_VERSION = {"features": FEATURE_VERSION, "costs": "real-fees-sized-1", "sele
                 "cols": hashlib.sha1(",".join(X_COLS).encode()).hexdigest()[:8], "skill": _skill_version(), "meta": "rug-1", **_rh_version()}
 WARMUP_DAYS, BLOCK_DAYS = 21, 7      # walk-forward: the first 21 days only train; every later day is tested, refit every 7 days
 MIN_AGE_H = 6.0                      # trade only tokens at least this long past graduation (unknown age = graduated before the archive); fitted, see decisions.HOLD_MIN
-MIN_EV = 0.01                        # the buy line of a model before its walk-forward chose one
+# Creator rules (2026-10-28, after the USDP rug: its creator bought 79 % of the supply in the launch transaction, which
+# graduated it the same second; it was drained 13.7 h later, 97 minutes after the live book bought it). Of the coins
+# whose creator bought ≥ half the supply at launch and that still stood 6 h after graduation, 82 % later fell 90 % within
+# an hour, median 24 h after graduation (other graduates: 24 %); data/scratch/rug_20261028.
+# A creator-heavy coin (launch buy above CREATOR_HEAVY_SHARE of the supply) is traded only while every position can be
+# sold before CREATOR_HEAVY_SELL_BY_H past graduation, the longest hold any strategy may fit (LONGEST_HOLD_H,
+# train/strategies.HOLDS_MIN) included, and at most config.CREATOR_HEAVY_CAP_SOL a buy (agent/sizing.size_position).
+# A serial rugger -- at least one earlier graduation with a known outcome, and at least SERIAL_RUG_SHARE of them fell
+# 90 % within an hour of graduating -- is never traded: of 16 rug signals fixed before the test, the only one whose
+# exclusion raised selector #640's out-of-sample growth in the selection half, the evaluation half and the holdout.
+CREATOR_HEAVY_SHARE = 0.7
+CREATOR_HEAVY_SELL_BY_H = 12.0
+LONGEST_HOLD_H = 4.0
+SERIAL_RUG_SHARE = 0.5
+UNIVERSE_VERSION = "creator-1"      # keys the walk-forward caches (train/strategies._cache_path): a changed universe refits them
+MIN_EV = 0.01                       # the buy line of a model before its walk-forward chose one
 LINE_CANDIDATES = (0.0, 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03)
 MIN_LINE_TRADES = 100
 GBM_PARAMS = dict(max_iter=200, learning_rate=0.06, max_leaf_nodes=63, min_samples_leaf=300, l2_regularization=1.0)
 IC_SAMPLE = 200_000
 
 
+def creator_heavy(dev_share) -> bool:
+    """The creator's own launch buy was more than ``CREATOR_HEAVY_SHARE`` of the supply (unknown: no)."""
+    return dev_share is not None and np.isfinite(float(dev_share)) and float(dev_share) > CREATOR_HEAVY_SHARE
+
+
 def in_universe(X: np.ndarray, cols: list[str]) -> np.ndarray:
-    """Rows the models may trade: age unknown (graduated before the archive) or at least ``MIN_AGE_H`` hours old."""
+    """Rows the models may trade: age unknown (graduated before the archive) or at least ``MIN_AGE_H`` hours old; never
+    a serial rugger's coin; a creator-heavy coin only while a ``LONGEST_HOLD_H`` hold still ends before
+    ``CREATOR_HEAVY_SELL_BY_H`` (its age must be known). Inputs a caller's columns lack leave their rule out."""
     X = np.atleast_2d(X); c = {n: i for i, n in enumerate(cols)}
-    return (X[:, c["age_known"]] == 0) | (np.expm1(X[:, c["log_age_h"]]) >= MIN_AGE_H)
+    known = X[:, c["age_known"]] != 0; age = np.expm1(X[:, c["log_age_h"]])
+    ok = ~known | (age >= MIN_AGE_H)
+    if "prior_known" in c and "prior_rug_share" in c:
+        ok &= ~((X[:, c["prior_known"]] >= 1) & (X[:, c["prior_rug_share"]] >= SERIAL_RUG_SHARE))
+    if "dev_share" in c:
+        ok &= ~(X[:, c["dev_share"]] > CREATOR_HEAVY_SHARE) | (known & (age <= CREATOR_HEAVY_SELL_BY_H - LONGEST_HOLD_H))
+    return ok
 
 
 RETIRED_KEYS = ("agg", "rh_agg")     # the corpus build versions, dropped from the definitions 2026-10-23

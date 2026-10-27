@@ -233,7 +233,8 @@ class LiveMirror:
                 e = {**e, **{k: v[k] for k in ("score", "threshold", "table", "ref_price", "size_margin", "correctness") if k in v}}   # its score and price now, not its decision's
                 rail = blocked or ("stale minute" if stale else None) or ("held" if e["mint"] in held_mints else None) or (None if "ref_price" in v else "no longer a buy")
                 size, why = (0.0, "") if rail else sizing.size_position(e["score"], e.get("threshold", line), e.get("table") or table or [], bankroll, cash,
-                                                                        ctx.resqs.get(e["mint"]) or e["info"]["resq"], flat=config.FLY_SIZING == "flat", margin=e.get("size_margin"))
+                                                                        ctx.resqs.get(e["mint"]) or e["info"]["resq"], flat=config.FLY_SIZING == "flat", margin=e.get("size_margin"),
+                                                                        creator_heavy=bool(e["info"].get("creator_heavy")))
                 if rail or size <= 0:
                     why = v["why"] if rail == "no longer a buy" else rail or why
                     skipped.append((e["mint"], why)); self._blocked(conn, ctx, run_id, beat_id, e, rail or "sizing", f"retry not sent: {why}", size, retry=True); continue
@@ -244,7 +245,8 @@ class LiveMirror:
                 if e["mint"] in held_mints:
                     skipped.append((e["mint"], "held")); self._blocked(conn, ctx, run_id, beat_id, e, "held", "the wallet holds this token or has an order of it queued"); continue
                 size, why = sizing.size_position(e["score"], e.get("threshold", line), e.get("table") or table or [], bankroll, cash, e["info"]["resq"],
-                                                 flat=config.FLY_SIZING == "flat", margin=e.get("size_margin"))
+                                                 flat=config.FLY_SIZING == "flat", margin=e.get("size_margin"),
+                                                 creator_heavy=bool(e["info"].get("creator_heavy")))
                 if blocked or size <= 0:
                     skipped.append((e["mint"], blocked or why)); self._blocked(conn, ctx, run_id, beat_id, e, blocked or "sizing", why, size); continue
                 if self._buy(e, size):

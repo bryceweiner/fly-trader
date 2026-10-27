@@ -9,7 +9,8 @@ fly, ``config.FLY_SIZING``): ``MAX_POSITION_FRACTION`` of it on every buy that c
 capped at ``MAX_POSITION_FRACTION`` of the deployable bankroll, the free cash above the reserve, and the label size
 (``market/exit_cost.label_size``: ``LABEL_SIZE_SOL`` or ``MAX_POOL_SHARE`` of the pool) -- the size every edge was
 measured at, so the book behaves the same with 5 SOL or 500: a bigger bankroll buys no bigger than the backtest did,
-it only runs out of cash later. Below ``MIN_POSITION_SOL`` the buy is skipped. A model without a table (trained
+it only runs out of cash later. A coin whose creator bought most of its supply at launch stakes at most
+``CREATOR_HEAVY_CAP_SOL`` (they rug often; train/selector.py). Below ``MIN_POSITION_SOL`` the buy is skipped. A model without a table (trained
 before sizing) trades the fixed ``MAX_POSITION_SOL``, under the same caps.
 """
 from __future__ import annotations
@@ -61,12 +62,14 @@ def band_for(table: list[dict], margin: float) -> dict | None:
 
 
 def size_position(score: float, threshold: float, table: list[dict] | None, bankroll_sol: float, cash_sol: float,
-                  res_quote_sol: float | None, flat: bool = False, market=None, margin: float | None = None) -> tuple[float, str]:
+                  res_quote_sol: float | None, flat: bool = False, market=None, margin: float | None = None,
+                  creator_heavy: bool = False) -> tuple[float, str]:
     """(size in the book's unit, why). Size 0 means skip the buy. ``flat``: ``MAX_POSITION_FRACTION`` of the deployable
     bankroll on every buy that cleared the line (the fly); otherwise the Kelly band of ``table``. ``market``
     (fly_trader/markets; default Solana): the gas reserve, minimum position and label size of the book's own market.
     ``margin``: where the strategy's correctness sizes the row (train/strategies.decide's ``size_margin``), the margin its
-    correctness bands are read at, P(clean) − the bands' p0, instead of score − threshold."""
+    correctness bands are read at, P(clean) − the bands' p0, instead of score − threshold. ``creator_heavy``: the coin's
+    creator bought most of its supply at launch (train/selector.creator_heavy) -- at most ``CREATOR_HEAVY_CAP_SOL``."""
     rh = market is not None and market.chain != "sol"
     reserve = market.gas_reserve() if rh else config.GAS_RESERVE_SOL; free = cash_sol - reserve
     min_pos = market.min_position() if rh else config.MIN_POSITION_SOL
@@ -84,6 +87,8 @@ def size_position(score: float, threshold: float, table: list[dict] | None, bank
         why = (f"correctness band from +{b['lo']:.3f}" if by_c else f"band from +{b['lo']:.3f} over the line") + f": Kelly {b['kelly']:.2f} × {config.KELLY_FRACTION:g} of {deployable:.2f} SOL"
     # the label size is the largest buy any backtest measured: past it the edge is an extrapolation that impact eats
     caps = {"bankroll cap": config.MAX_POSITION_FRACTION * deployable, "free cash": free, "label size": label_size(res_quote_sol, market if rh else None)}
+    if creator_heavy:
+        caps["creator-heavy cap"] = config.CREATOR_HEAVY_CAP_SOL * (market.k() if rh else 1.0)
     limit = min(caps, key=caps.get)
     if caps[limit] < size:
         size = caps[limit]; why += f", capped by {limit}"
