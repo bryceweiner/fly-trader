@@ -21,6 +21,7 @@ def _ds(days=42, per_day=600, seed=0):
     rng = np.random.default_rng(seed); n = days * per_day
     X = np.zeros((n, len(X_COLS)), np.float32); c = {k: i for i, k in enumerate(X_COLS)}
     X[:, c["age_known"]] = 0.0
+    X[:, c["meta_known"]] = 1.0; X[:, c["curve_known"]] = 1.0          # launch and curve seen: creator facts known (selector.in_universe)
     sig = rng.normal(size=n).astype(np.float32); X[:, c["imb_5m"]] = sig
     X[:, c["ret_1m"]] = rng.normal(0, 0.02, n); X[:, c["mkt_vol_1h"]] = rng.normal(5, 1, n)
     d0 = datetime(2026, 7, 1, tzinfo=timezone.utc); k = np.arange(n)

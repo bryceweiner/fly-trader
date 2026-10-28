@@ -29,7 +29,9 @@ def _set(fh: dict, n: int, mints=None, day_rows: int = 100) -> DecisionSet:
     ts = np.array([(d0 + timedelta(days=int(i // day_rows), minutes=int(i % day_rows) * 3)).timestamp() for i in k])
     day = np.array([(d0 + timedelta(days=int(i // day_rows))).date() for i in k], dtype=object)
     r = fh[240]
-    return DecisionSet(X=np.zeros((n, len(X_COLS)), np.float32), y=(r > 0).astype(np.int8), fwd=r, fwd_pess=r, day=day, ts=ts,
+    X = np.zeros((n, len(X_COLS)), np.float32)
+    X[:, X_COLS.index("meta_known")] = 1.0; X[:, X_COLS.index("curve_known")] = 1.0     # creator facts known (selector.in_universe)
+    return DecisionSet(X=X, y=(r > 0).astype(np.int8), fwd=r, fwd_pess=r, day=day, ts=ts,
                        mint=np.array(mints if mints is not None else [f"m{i}" for i in k]), cols=list(X_COLS), horizon_s=14400.0, fwd_h=fh)
 
 

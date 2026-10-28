@@ -77,20 +77,22 @@ def test_a_coin_whose_creator_owned_most_of_the_supply_never_enters_the_universe
     s = _engine()
     g = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
     with db_conn.cursor() as cur:
-        cur.execute("DELETE FROM corpus_meta WHERE mint IN ('Hvpump', 'Hdpump', 'Ltpump')")
-        cur.execute("""INSERT INTO corpus_meta (mint, graduated_at, ttg_min, dev_sol, dev_share, dev_hold_share) VALUES ('Hvpump', %s, 0.0, 85.0, 0.7931, 0.7931),
-                       ('Hdpump', %s, 20.0, 5.0, 0.2, 0.74), ('Ltpump', %s, 30.0, 1.0, 0.05, 0.05)""", (g, g, g))
+        cur.execute("DELETE FROM corpus_meta WHERE mint IN ('Hvpump', 'Hdpump', 'Bdpump', 'Unpump', 'Ltpump')")
+        cur.execute("""INSERT INTO corpus_meta (mint, graduated_at, ttg_min, dev_sol, dev_share, dev_hold_share, bundle_share, curve_known) VALUES
+                       ('Hvpump', %s, 0.0, 85.0, 0.7931, 0.7931, 0.0, true), ('Hdpump', %s, 20.0, 5.0, 0.2, 0.74, 0.0, true),
+                       ('Bdpump', %s, 20.0, 5.0, 0.1, 0.1, 0.65, true), ('Unpump', %s, 20.0, 1.0, 0.05, NULL, NULL, NULL),
+                       ('Ltpump', %s, 30.0, 1.0, 0.05, 0.05, 0.1, true)""", (g, g, g, g, g))
     db_conn.commit()
     a = {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "buy": 6.0, "sell": 0.0, "nb": 2, "ns": 0, "n_traders": 2, "resq": 60.0, "pool": "P", "program_label": "Pump.fun Amm"}
     seen = {}
-    for mint in ("Hvpump", "Hdpump", "Ltpump"):
+    for mint in ("Hvpump", "Hdpump", "Bdpump", "Unpump", "Ltpump"):
         for h in (7.0, 9.0):
             x, info = s._features(db_conn, mint, a, g.timestamp() + h * 3600)
             seen[(mint, h)] = (info["creator_heavy"], bool(in_universe(x[None], X_COLS)[0]))
-    assert seen == {("Hvpump", 7.0): (True, False), ("Hvpump", 9.0): (True, False), ("Hdpump", 7.0): (False, False), ("Hdpump", 9.0): (False, False),
-                    ("Ltpump", 7.0): (False, True), ("Ltpump", 9.0): (False, True)}
+    assert seen == {**{(m, h): (m == "Hvpump", False) for m in ("Hvpump", "Hdpump", "Bdpump", "Unpump") for h in (7.0, 9.0)},
+                   ("Ltpump", 7.0): (False, True), ("Ltpump", 9.0): (False, True)}         # launch buy, holding, launch block, unknown curve
     with db_conn.cursor() as cur:
-        cur.execute("DELETE FROM corpus_meta WHERE mint IN ('Hvpump', 'Hdpump', 'Ltpump')")
+        cur.execute("DELETE FROM corpus_meta WHERE mint IN ('Hvpump', 'Hdpump', 'Bdpump', 'Unpump', 'Ltpump')")
     db_conn.commit()
 
 
@@ -180,6 +182,9 @@ def test_books_share_one_feature_pass_and_trade_in_their_own_savepoints(db_conn,
     m0 = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
     with db_conn.cursor() as cur:
         cur.execute("DELETE FROM pump_minutes WHERE mint = 'Wpump'"); cur.execute("DELETE FROM events WHERE source = 'engine_test'")
+        cur.execute("DELETE FROM corpus_meta WHERE mint = 'Wpump'")                 # a coin whose creator facts are known (selector.in_universe)
+        cur.execute("INSERT INTO corpus_meta (mint, graduated_at, ttg_min, dev_share, dev_hold_share, bundle_share, curve_known) VALUES ('Wpump', %s, 30.0, 0.05, 0.05, 0.1, true)",
+                    (m0 - timedelta(days=1),))
         cur.execute("INSERT INTO pump_minutes (mint, ts, pool_id, open, high, low, close, buy_sol, sell_sol, n_buys, n_sells, n_traders, resq_sol) VALUES "
                     "('Wpump', %s, 'POOL', 1.0, 1.2, 0.9, 1.1, 6.0, 2.0, 3, 1, 4, 55.0)", (m0,))
     db_conn.commit()
@@ -196,6 +201,7 @@ def test_books_share_one_feature_pass_and_trade_in_their_own_savepoints(db_conn,
     with transaction() as conn:
         left = [r["message"] for r in conn.execute("SELECT message FROM events WHERE source = 'engine_test'").fetchall()]
         conn.execute("DELETE FROM events WHERE source = 'engine_test'"); conn.execute("DELETE FROM pump_minutes WHERE mint = 'Wpump'")
+        conn.execute("DELETE FROM corpus_meta WHERE mint = 'Wpump'")
     assert left == ["good"]                                                        # the failing book's writes were rolled back alone
 
 
