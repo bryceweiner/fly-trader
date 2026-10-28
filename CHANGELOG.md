@@ -3,6 +3,26 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## Unreleased
+
+- **A coin bought far below its high is sold once it doubles, instead of being held the full hold.** On 2026-10-28 the
+  live book bought Darla 85 % below the high it had reached after graduation. It rose 146 % within the hour, then faded
+  to +69 % while held.
+  - **The rule:** a buy of a coin trading at least 50 % below its highest minute close since graduation gets a
+    take-profit line at twice its entry price. The position is sold at the first minute that closes at or above the
+    line; otherwise it is held its hold as before. Its token is not bought again until that hold would have ended.
+  - **Why:** on selector #640's out-of-sample book, held to the same 240 minutes, the rule made more than holding in every
+    period: on Solana 10 %, 31 % and 34 % more in the selection, evaluation and holdout periods, with every month from
+    June on ahead and May behind; on Robinhood Chain 23 % and 9 % more in the evaluation and holdout periods.
+  - **What did not pass:** the same take-profit at +50 %, a trailing sale 20 % below the peak after +50 %, and an exit
+    model trained on every held minute.
+  - **Where:** every paper and live book on both chains (`TAKE_PROFIT_X`, `TAKE_PROFIT_DIP`, `TAKE_PROFIT_CHAINS`). A live
+    take-profit sale goes out the moment the engine reads the minute's closes, before the minute's features and the fly's
+    scores (agent/live_first.chain_take_profits). The line is stored on the entry decision, so a live position carries
+    its paper entry's line. Sales show as `take_profit` exits.
+  - **Known limit:** the Solana stream keeps 7 days of minutes, so a coin older than that is judged on its high since
+    then.
+
 ## 2026-10-28, release 13: Coins whose creator bought most of the supply are traded briefly and small, serial ruggers' never
 
 Release 13 changes which coins the models may trade and how much a risky one gets. The models are unchanged: selector #640

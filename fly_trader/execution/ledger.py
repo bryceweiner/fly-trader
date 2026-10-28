@@ -20,12 +20,14 @@ log = logging.getLogger(__name__)
 
 def open_positions(conn, book: str) -> list[dict]:
     """Open positions of ``book`` with what trading them needs; ``decision_ts`` is the entry decision's minute (its ``ts``,
-    the minute end a paper position opens at): a live position's hold runs from it, not from its fill 10–20 s later."""
+    the minute end a paper position opens at): a live position's hold runs from it, not from its fill 10–20 s later.
+    ``take_profit_x``: the entry decision's take-profit line, a multiple of the entry price (None: held its hold), which a
+    live position shares with its paper entry (agent/paper_trading.take_profit_x)."""
     rows = conn.execute(
         """SELECT p.*, COALESCE(t.decimals, CASE WHEN p.chain = 'rh' THEN 18 END) AS decimals, t.graduated_at,
                   COALESCE(wp.program_label, CASE WHEN p.chain = 'rh' THEN 'Pons v4' END) AS program_label,
                   COALESCE(p.hold_s, (d.detail->>'hold_s')::float) AS hold_s, COALESCE(p.strategy, d.detail->>'strategy') AS strategy,
-                  d.ts AS decision_ts
+                  d.ts AS decision_ts, (d.detail->>'take_profit_x')::float AS take_profit_x
            FROM positions p LEFT JOIN tokens t ON t.mint = p.mint
            LEFT JOIN watch_pools wp ON wp.pool = p.pool
            LEFT JOIN decisions d ON d.id = p.entry_decision_id

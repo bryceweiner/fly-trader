@@ -97,6 +97,14 @@ CIRCUIT_COOLDOWN_S = env_float("CIRCUIT_COOLDOWN_S", 900.0)
 MAX_ENTRY_CHASE = env_float("MAX_ENTRY_CHASE", 0.03)
 ENTRY_RETRY_MIN = env_float("ENTRY_RETRY_MIN", 2.0)               # a failed live entry is retried this many minutes after its decision while paper holds it
 ENTRY_MAX_LAG_S = env_float("ENTRY_MAX_LAG_S", 90.0)              # no entries (paper and live) on a minute that ended longer ago: the price moved on
+# Take-profit (agent/paper_trading.take_profit_x): a buy of a coin trading at least TAKE_PROFIT_DIP below its high since
+# graduation is sold once a minute closes at TAKE_PROFIT_X times its entry price -- paper and live alike, on the chains in
+# TAKE_PROFIT_CHAINS -- and its token is not bought again before its hold would have ended. On #640's out-of-sample books
+# (2026-10-28, data/scratch/correctness_20261028/exit_study.py, exit_check.py) it made 10 / 31 / 34 % more than holding
+# on Solana in the selection, evaluation and holdout periods, and 23 / 9 % more on RH (evaluation, holdout).
+TAKE_PROFIT_X = env_float("TAKE_PROFIT_X", 2.0)                    # 0: no take-profit on new buys
+TAKE_PROFIT_DIP = env_float("TAKE_PROFIT_DIP", 0.5)
+TAKE_PROFIT_CHAINS = env_list("TAKE_PROFIT_CHAINS", ["sol", "rh"])
 EXECUTABILITY_MAX_IMPACT = env_float("EXECUTABILITY_MAX_IMPACT", 0.30)
 SLIPPAGE_ENTRY_BPS = env_int("SLIPPAGE_ENTRY_BPS", 150)
 SLIPPAGE_EXIT_BPS = env_int("SLIPPAGE_EXIT_BPS", 300)
