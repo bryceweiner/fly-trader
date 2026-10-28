@@ -8,6 +8,9 @@ agent/live_first.py):
   not): positions held their hold — from their entry decision's minute, as paper counts it — are sold (exit slippage,
   the forced ladder once ``OVERDUE_S`` late); with circuit 3's kill switch on and ``KILL_SWITCH_LIQUIDATE`` every other
   open position is sold at the forced slippage;
+- take-profits (``take_profits``: the moment the engine reads a minute, before its features and the fly's scores,
+  agent/live_first.chain_take_profits): a position whose minute closed at its take-profit line (set at its entry,
+  agent/paper_trading.take_profit_x) is sold at the exit slippage, as a 'take_profit' exit;
 - entries (``minute``: the moment the fly has decided, before any paper trade, learning or bookkeeping): the executor
   drained (one intent at a time; each booked by rh/accounting.py from measured balance deltas); this minute's paper RH
   entries, sized from the wallet (native ETH + open positions at cost as the bankroll, native − committed buys as cash,
@@ -40,6 +43,7 @@ import numpy as np
 
 from .. import config
 from ..agent import live_first, rails, sizing
+from ..agent.paper_trading import at_take_profit
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..execution import ledger
@@ -176,6 +180,24 @@ class RhLiveMirror:
         if n_liq:
             record_event("error", "rh_live", f"kill switch: liquidating {n_liq} open live RH position(s)", {"positions": n_liq})
         return {"exited": n_exit, "liquidated": n_liq}
+
+    def take_profits(self, conn, *, m1: datetime, prices: dict, run_id: str | None, beat_id: int | None = None) -> int:
+        """The positions whose minute ``m1`` closed at their take-profit line (``prices``: the minute's closes in ETH), sold
+        at the exit slippage as 'take_profit' exits; how many went out. A position due by its hold is the clock's to sell,
+        one in flight the executor's."""
+        n = 0
+        with self.exit_lock:
+            inflight = self.ex.pending()
+            for p in ledger.open_positions(conn, BOOK):
+                px = prices.get(p["mint"])
+                if p["mint"].lower() in inflight or not at_take_profit(p, px):
+                    continue
+                held, H = self._held(p, m1)
+                if held >= H:
+                    continue
+                did = self._decision(conn, m1, run_id, beat_id, p, f"took profit: {px / float(p['entry_price']) - 1:+.0%} over its entry (its ×{float(p['take_profit_x']):g} line)", False)
+                n += self._sell(conn, p, did, config.SLIPPAGE_EXIT_BPS, "take_profit")
+        return n
 
     def sell_now(self, conn, position_id: int) -> int:
         """The operator's Sell Now (the console's open positions, agent/live_first.sell_now): one open position of this book

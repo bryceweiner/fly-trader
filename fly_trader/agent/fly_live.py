@@ -7,6 +7,10 @@ The paper book ``paper_fly`` keeps running as the mirror. Only after the handove
   minute, as paper counts it, not from the fill 10–20 s later — are sold (exit slippage, the forced ladder once
   ``OVERDUE_S`` late), retried every minute; while the kill switch is on with ``KILL_SWITCH_LIQUIDATE`` (or a vault
   panic) every other open position is sold at the forced slippage, retried until the book is flat;
+- take-profits (``take_profits``: the moment the engine reads a minute, before its features and the fly's scores,
+  agent/live_first.chain_take_profits): a position whose minute closed at its take-profit line (set at its entry on a
+  coin bought far below its high, agent/paper_trading.take_profit_x) is sold at the exit slippage, as a 'take_profit'
+  exit, tried again each minute that closes at the line;
 - entries (``minute``: the moment the fly has decided, before any paper trade, learning or bookkeeping of the minute):
   the execution worker's results are drained (execution/worker.py books live positions from balance-verified fills);
   every paper entry of this minute is mirrored with the same score, line and certainty bands, sized from the wallet
@@ -50,6 +54,7 @@ from ..execution import ledger
 from ..execution.worker import ExecRequest
 from ..market.exit_cost import exit_cost_fraction
 from . import live_first, rails, sizing
+from .paper_trading import at_take_profit
 
 log = logging.getLogger(__name__)
 BOOK, MIRROR = "live", "paper_fly"
@@ -167,6 +172,24 @@ class LiveMirror:
         if n_liq:
             record_event("error", "fly_live", f"kill switch: liquidating {n_liq} open live position(s)", {"positions": n_liq})
         return {"exited": n_exit, "liquidated": n_liq}
+
+    def take_profits(self, conn, *, m1: datetime, prices: dict, run_id: str | None, beat_id: int | None = None) -> int:
+        """The positions whose minute ``m1`` closed at their take-profit line (``prices``: the minute's closes), sold at the
+        exit slippage as 'take_profit' exits; how many went out. A position due by its hold is the clock's to sell, one in
+        flight the worker's."""
+        n = 0
+        with self.exit_lock:
+            inflight = self.worker.pending()
+            for p in ledger.open_positions(conn, BOOK):
+                px = prices.get(p["mint"])
+                if p["mint"] in inflight or not at_take_profit(p, px):
+                    continue
+                held, H = self._held(p, m1)
+                if held >= H:
+                    continue
+                did = self._decision(conn, m1, run_id, beat_id, p, f"took profit: {px / float(p['entry_price']) - 1:+.0%} over its entry (its ×{float(p['take_profit_x']):g} line)", False)
+                n += self._sell(p, did, config.SLIPPAGE_EXIT_BPS, "take_profit")
+        return n
 
     def sell_now(self, conn, position_id: int) -> int:
         """The operator's Sell Now (the console's open positions, agent/live_first.sell_now): one open position of this book

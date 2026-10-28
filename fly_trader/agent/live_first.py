@@ -4,6 +4,8 @@
   (``runner-live-clock``), every chain's side by side, started with the runner -- before its books load and the engine
   warms up, so a restart never holds a sale back -- and at once for the minute it starts in (a restart may have
   straddled a boundary).
+- ``chain_take_profits``: a live position's take-profit sale depends on its minute's close alone, so it goes out the
+  moment the engine reads the minute, before the minute's features and the fly's scores (agent/minute_engine.live_phase).
 - Anything that can run beside a live order does: the engine wakes the moment a stream writes a minute
   (``minute_published``), each chain's wallet balance is read while its minute's features and scores are computed
   (``prefetch``), and the chains' live phases run at once (agent/minute_engine.run_ready).
@@ -148,6 +150,21 @@ def chain_exits(chain: str, m1_epoch: float, live: bool, run_id: str | None = No
         if not trades_live(conn, chain, live):
             return None
         return mirror(chain).exits(conn, m1=datetime.fromtimestamp(m1_epoch, timezone.utc), run_id=run_id)
+
+
+def chain_take_profits(chain: str, m1_epoch: float, prices: dict, live: bool, run_id: str | None = None) -> int:
+    """The chain's live sales of positions whose minute closed at their take-profit line (``prices``: the minute's closes;
+    its mirror's ``take_profits``), in a transaction of their own while its wallet trades; how many went out. The line is
+    each position's own, set at its entry (agent/paper_trading.take_profit_x): a position bought without one is held."""
+    if not live or signing_refused(chain):
+        return 0
+    m = mirror_of(chain)
+    if m is None:
+        return 0
+    with transaction() as conn:
+        if not trades_live(conn, chain, live):
+            return 0
+        return m.take_profits(conn, m1=datetime.fromtimestamp(m1_epoch, timezone.utc), prices=prices, run_id=run_id)
 
 
 SELL_NOW_WAIT_S = 90.0        # how long the operator's Sell Now waits for its sale to be booked (an RH sale can take a minute)
