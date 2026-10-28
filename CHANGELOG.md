@@ -3,7 +3,19 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
-## Unreleased
+## 2026-10-29, release 15: A coin whose creator owns most of its supply is never traded
+
+Release 15 changes which coins the models may trade. The models are unchanged: selector #640 and fly #641, as in releases
+12 to 14. The rule has run on the development install since 2026-10-29 01:02 (UTC+8).
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 15`. The change reaches live trading: which coins are bought.
+- **Positions open when the release installs are held as before:** the rule decides buys only.
+
+### Trading
 
 - **A coin whose creator owns most of its supply is never traded.** On the night of 2026-10-28 the live book lost about
   0.2 SOL on two coins named XTO, bought at 21:29 and 23:46 (UTC+8). Each was launched by a wallet that bought the whole
