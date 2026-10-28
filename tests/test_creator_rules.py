@@ -1,6 +1,6 @@
-"""The creator rules of the memecoin universe (train/selector.py, 2026-10-28): a serial rugger's coin is never traded; a
-coin whose creator bought most of its supply at launch only while its position is sold before the coin is 12 h old, and
-at most CREATOR_HEAVY_CAP_SOL a buy (agent/sizing.py)."""
+"""The creator rules of the memecoin universe (train/selector.py, 2026-10-28/29): a serial rugger's coin is never traded,
+nor a coin whose creator owned most of its supply (its launch buy, or its holding at graduation); a creator-heavy buy
+that reached sizing would stake at most CREATOR_HEAVY_CAP_SOL (agent/sizing.py)."""
 import math
 
 import numpy as np
@@ -9,15 +9,16 @@ import pytest
 from fly_trader import config
 from fly_trader.agent import sizing
 from fly_trader.markets import RH
-from fly_trader.train import selector, strategies
+from fly_trader.train import selector
 from fly_trader.train.decisions import X_COLS
 
 
-def _row(age_h=None, dev_share=0.0, prior_known=0.0, prior_rug_share=0.0):
+def _row(age_h=None, dev_share=0.0, prior_known=0.0, prior_rug_share=0.0, dev_hold_share=0.0):
     x = np.zeros(len(X_COLS), np.float32)
     if age_h is not None:
         x[X_COLS.index("age_known")] = 1.0; x[X_COLS.index("log_age_h")] = math.log1p(age_h)
     x[X_COLS.index("dev_share")] = dev_share; x[X_COLS.index("prior_known")] = prior_known; x[X_COLS.index("prior_rug_share")] = prior_rug_share
+    x[X_COLS.index("dev_hold_share")] = dev_hold_share
     return x
 
 
@@ -25,15 +26,14 @@ def _uni(**kw):
     return bool(selector.in_universe(_row(**kw)[None], X_COLS)[0])
 
 
-def test_a_creator_heavy_coin_trades_only_while_its_hold_ends_before_12_h():
+def test_a_coin_whose_creator_owned_most_of_the_supply_is_never_traded():
     assert _uni(age_h=9.0, dev_share=0.3)                                   # an ordinary coin: any age past 6 h
-    assert not _uni(age_h=5.0, dev_share=0.79)                              # the 6 h minimum still holds
-    assert _uni(age_h=7.0, dev_share=0.79) and _uni(age_h=8.0, dev_share=0.79)
-    assert not _uni(age_h=8.5, dev_share=0.79) and not _uni(age_h=20.0, dev_share=0.79)
-    assert not _uni(age_h=None, dev_share=0.79)                             # an unknown age can't be shown to be young
-    assert _uni(age_h=9.0, dev_share=0.7)                                   # more than 70 %, not 70 % itself
-    assert selector.LONGEST_HOLD_H * 60 >= max(strategies.HOLDS_MIN)        # every hold a strategy may fit ends in time
-    assert selector.CREATOR_HEAVY_SELL_BY_H - selector.LONGEST_HOLD_H >= selector.MIN_AGE_H
+    assert not _uni(age_h=5.0, dev_share=0.3)                               # the 6 h minimum still holds
+    for h in (6.0, 7.5, 8.0, 20.0, None):                                   # XTO: 79 % at launch, bought at 6 and 7.5 h
+        assert not _uni(age_h=h, dev_share=0.7931)
+    assert not _uni(age_h=9.0, dev_share=0.3, dev_hold_share=0.75)          # bought the rest on the curve
+    assert not _uni(age_h=9.0, dev_share=0.79, dev_hold_share=0.0)          # sold on the curve: its launch buy still counts
+    assert _uni(age_h=9.0, dev_share=0.7) and _uni(age_h=9.0, dev_hold_share=0.7)   # more than 70 %, not 70 % itself
 
 
 def test_a_serial_ruggers_coin_is_never_traded():
