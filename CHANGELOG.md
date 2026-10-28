@@ -3,7 +3,20 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
-## Unreleased
+## 2026-10-28, release 14: A coin bought far below its high is sold once it doubles
+
+Release 14 changes when some positions are sold. The models are unchanged: selector #640 and fly #641, as in releases 12
+and 13. The rule has run on the development install since 2026-10-28 18:31 (UTC+8); it has not sold a position there yet.
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 14`. The change reaches live trading: some positions are sold before their hold ends.
+- **Positions open when the release installs keep their full hold:** a position gets its take-profit line when it is
+  bought.
+
+### Trading
 
 - **A coin bought far below its high is sold once it doubles, instead of being held the full hold.** On 2026-10-28 the
   live book bought Darla 85 % below the high it had reached after graduation. It rose 146 % within the hour, then faded
@@ -20,8 +33,8 @@ ships signed releases built from this development line.
     take-profit sale goes out the moment the engine reads the minute's closes, before the minute's features and the fly's
     scores (agent/live_first.chain_take_profits). The line is stored on the entry decision, so a live position carries
     its paper entry's line. Sales show as `take_profit` exits.
-  - **Known limit:** the Solana stream keeps 7 days of minutes, so a coin older than that is judged on its high since
-    then.
+  - **Known limit:** the high is the highest close the install has recorded. The Solana stream keeps 7 days of minutes,
+    so a coin older than that, or older than the install, is judged on its high since then.
 
 ## 2026-10-28, release 13: Coins whose creator bought most of the supply are traded briefly and small, serial ruggers' never
 
