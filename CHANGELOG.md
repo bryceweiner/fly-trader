@@ -3,6 +3,18 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## Unreleased
+
+- **A buy of a creator-heavy coin stakes at most 2 % of the bankroll, not a fixed 0.1 SOL.** A creator-heavy coin is one
+  whose creator bought more than 70 % of its supply at launch. The fixed cap was set for a 5 SOL bankroll, so an install
+  with less staked the same 0.1 SOL on these coins.
+  - **The cap:** 0.1 SOL of a 5 SOL bankroll, 0.01 SOL of a 0.5 SOL one. Below a 1 SOL bankroll it is under the 0.02 SOL
+    minimum buy, so no such buy is made. On Robinhood Chain it is 2 % of the ETH bankroll.
+  - **No trade changes today:** since release 15 these coins are never traded, so no buy reaches the cap. It applies if
+    one ever does.
+  - **Setting:** `CREATOR_HEAVY_CAP_FRACTION` (default 0.02) replaces `CREATOR_HEAVY_CAP_SOL`. An old
+    `CREATOR_HEAVY_CAP_SOL` setting is ignored.
+
 ## 2026-10-29, release 16: The launch block's wallets count as the creator's, and a coin with no creator facts is never traded
 
 Release 16 changes which coins the models may trade. The models are unchanged: selector #640 and fly #641, as in releases

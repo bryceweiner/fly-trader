@@ -1,7 +1,7 @@
 """The creator rules of the memecoin universe (train/selector.py, 2026-10-28/29): a serial rugger's coin is never traded,
 nor a coin whose creator owned most of its supply (its launch buy, or its holding at graduation with the launch block's
 wallets), nor one whose launch or curve is unknown; a creator-heavy buy that reached sizing would stake at most
-CREATOR_HEAVY_CAP_SOL (agent/sizing.py)."""
+CREATOR_HEAVY_CAP_FRACTION of the bankroll (agent/sizing.py)."""
 import math
 
 import numpy as np
@@ -70,16 +70,13 @@ def test_creator_heavy():
     assert not selector.creator_heavy(None) and not selector.creator_heavy(float("nan"))
 
 
-def test_a_creator_heavy_buy_stakes_at_most_the_cap():
+def test_a_creator_heavy_buy_stakes_at_most_its_share_of_the_bankroll():
     table = [{"lo": 0.0, "n": 100, "mean": 0.05, "win": 0.5, "kelly": 0.27}]
-    kw = dict(score=0.1, threshold=0.06, table=table, bankroll_sol=5.66, cash_sol=5.66, res_quote_sol=1000.0)
-    full, _ = sizing.size_position(**kw)
-    capped, why = sizing.size_position(**kw, creator_heavy=True)
-    assert full > config.CREATOR_HEAVY_CAP_SOL and capped == pytest.approx(config.CREATOR_HEAVY_CAP_SOL) and "creator-heavy cap" in why
-    poor = {**kw, "bankroll_sol": 0.8, "cash_sol": 0.8}
-    small, _ = sizing.size_position(**poor, creator_heavy=True); kelly_small, _ = sizing.size_position(**poor)
-    assert 0 < kelly_small < config.CREATOR_HEAVY_CAP_SOL and small == pytest.approx(kelly_small)           # never more than Kelly
-    rh = dict(kw, bankroll_sol=0.2, cash_sol=0.2, market=RH)
-    full_rh, _ = sizing.size_position(**rh)
-    capped_rh, _ = sizing.size_position(**rh, creator_heavy=True)
-    assert capped_rh == pytest.approx(min(full_rh, config.CREATOR_HEAVY_CAP_SOL * RH.k())) and capped_rh < full_rh      # 0.1 SOL's worth of ETH
+    size = lambda bankroll, **kw: sizing.size_position(0.1, 0.06, table, bankroll, bankroll, 1000.0, **kw)
+    share = config.CREATOR_HEAVY_CAP_FRACTION
+    for bankroll in (1.5, 5.0, 10.0):                                       # 0.1 SOL of a 5 SOL bankroll, 0.03 of 1.5, 0.2 of 10
+        (full, _), (capped, why) = size(bankroll), size(bankroll, creator_heavy=True)
+        assert full > share * bankroll and capped == pytest.approx(share * bankroll) and "creator-heavy cap" in why
+    assert size(0.8)[0] > 0 and size(0.8, creator_heavy=True)[0] == 0.0     # its share of 0.8 SOL is below the minimum buy: none
+    full_rh, capped_rh = size(0.2, market=RH)[0], size(0.2, market=RH, creator_heavy=True)[0]
+    assert capped_rh == pytest.approx(share * 0.2) and capped_rh < full_rh  # RH: its share of the ETH bankroll
