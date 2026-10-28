@@ -3,7 +3,19 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
-## Unreleased
+## 2026-10-29, release 16: The launch block's wallets count as the creator's, and a coin with no creator facts is never traded
+
+Release 16 changes which coins the models may trade. The models are unchanged: selector #640 and fly #641, as in releases
+12 to 15. The rule has run on the development install since 2026-10-29 01:25 (UTC+8).
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 16`. The change reaches live trading: which coins are bought.
+- **Positions open when the release installs are held as before:** the rule decides buys only.
+
+### Trading
 
 - **The wallets that bought in a coin's launch block count as its creator's, and a coin with no creator facts is never
   traded.** Release 15 looked at the creator's own wallet only, so a creator who spread the supply over wallets buying in
