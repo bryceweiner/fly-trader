@@ -3,7 +3,20 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
-## Unreleased
+## 2026-10-29, release 17: A creator-heavy coin's buy cap scales with the bankroll
+
+Release 17 changes one sizing cap. The models are unchanged: selector #640 and fly #641, as in releases 12 to 16. No
+trade changes today: no buy reaches this cap since release 15.
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 17`.
+- **`CREATOR_HEAVY_CAP_SOL` is gone:** set `CREATOR_HEAVY_CAP_FRACTION` instead. An old `CREATOR_HEAVY_CAP_SOL` setting is
+  ignored.
+
+### Trading
 
 - **A buy of a creator-heavy coin stakes at most 2 % of the bankroll, not a fixed 0.1 SOL.** A creator-heavy coin is one
   whose creator bought more than 70 % of its supply at launch. The fixed cap was set for a 5 SOL bankroll, so an install
