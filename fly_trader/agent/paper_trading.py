@@ -89,7 +89,8 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
         mg = None if size_margins is None else float(size_margins[k]); mg = mg if mg is not None and np.isfinite(mg) else None
         pc = None if correctness is None else float(correctness[k]); pc = pc if pc is not None and np.isfinite(pc) else None
         cx = {key: v for key, v in (("correctness", pc), ("size_margin", mg)) if v is not None}      # only where correctness sizes or scores the row
-        size, why = sizing.size_position(float(sc), thr_k, tab_k or [], bankroll, cash, i["resq"], flat=flat, market=market, margin=mg)
+        size, why = sizing.size_position(float(sc), thr_k, tab_k or [], bankroll, cash, i["resq"], flat=flat, market=market, margin=mg,
+                                         creator_heavy=bool(i.get("creator_heavy")))
         denied = allow is not None and not bool(allow[k])
         if m in open_mints or blocked or denied or size <= 0:
             rail = blocked or ("held" if m in open_mints else (str(reasons[k]) if denied and reasons is not None else "filtered") if denied else "sizing")

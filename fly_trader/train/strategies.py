@@ -220,9 +220,10 @@ def beats_random_removal(ds: DecisionSet, pick_before: np.ndarray, pick_after: n
 # ---------------------------------------------------------------- walk-forward primitives
 def _cache_path(ds: DecisionSet, cols: list[str], tag: str) -> "Path":
     from .mature import AGG_VERSION
-    from .selector import DATA_VERSION
+    from .selector import DATA_VERSION, UNIVERSE_VERSION
     k = repr((str(ds.days[0]), str(ds.days[-1]), int(len(ds.y)), float(ds.horizon_s), list(cols), tag,          # the corpus build version keys
               AGG_VERSION, DATA_VERSION.get("features"), DATA_VERSION.get("costs"), OBJECTIVE)                    # the cache, not the model's validity
+             + ((("universe", UNIVERSE_VERSION),) if getattr(ds, "gate", "memecoin") == "memecoin" else ())    # the memecoin universe (selector.in_universe)
              + (("label-known-purge",) if getattr(ds, "label_ts", None) is not None else ())
              + ((("data", getattr(ds, "data_version")),) if getattr(ds, "data_version", None) is not None else ())     # e.g. the Kalshi feature version
              + ((("train_max_rows", int(getattr(ds, "train_max_rows"))),) if getattr(ds, "train_max_rows", None) else ()))

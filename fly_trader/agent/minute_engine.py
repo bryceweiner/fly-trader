@@ -53,7 +53,7 @@ from ..train.corpus_meta import FEATURE_COLS as META_COLS, sol_select
 from ..train.decisions import MIN_RESQ_SOL, MIN_VOL_15M_SOL, X_COLS
 from ..train.flow import FlowWindow, MarketWindow
 from ..train.mature import MASKED
-from ..train.selector import in_universe
+from ..train.selector import creator_heavy, in_universe
 from . import live_first
 
 log = logging.getLogger(__name__)
@@ -275,7 +275,8 @@ class MinuteEngine:
                 "age_h": (t_end - s.graduated_at) / 3600 if s.graduated_at else None,
                 "mcap": price * s.meta.supply, "fee_rate": a.get("fee_rate"), "decimals": s.decimals, "pool": s.pool, "program_label": s.program_label, "broken": s.broken,
                 "skill_missing": a.get("skill_buy") is None, "curve_known": bool(meta.get("curve_known")), "chain": self.spec.chain,
-                "quote_class": meta.get("quote_class"), "source": meta.get("source"), "seen_h": (t_end - s.first_seen) / 3600.0}
+                "quote_class": meta.get("quote_class"), "source": meta.get("source"), "seen_h": (t_end - s.first_seen) / 3600.0,
+                "creator_heavy": creator_heavy(meta.get("dev_share"))}          # its buys are capped (agent/sizing.size_position)
         return x, info
 
     def eligible(self, info: dict) -> bool:

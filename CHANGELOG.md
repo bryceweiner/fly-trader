@@ -3,6 +3,39 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## 2026-10-28, release 13: Coins whose creator bought most of the supply are traded briefly and small, serial ruggers' never
+
+Release 13 changes which coins the models may trade and how much a risky one gets. The models are unchanged: selector #640
+and fly #641, as in release 12. The rules have traded the development install since 2026-10-28 02:21 (UTC+8).
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 13`. The change reaches live trading: which coins are bought, and the size of some buys.
+
+### Trading
+
+- **Coins whose creator bought most of the supply at launch are traded only briefly and small, and a serial rugger's
+  coins not at all.** On 2026-10-27 the live book lost 0.37 SOL on USDP. Its creator bought 79 % of the supply in the
+  launch transaction, which graduated it the same second. It was drained 13.7 h later, 97 minutes after the buy.
+  - **A creator-heavy coin** is one whose creator's launch buy was more than 70 % of the supply. Its position must be
+    sold before the coin is 12 h old, so it is bought only up to 8 h after graduation, before a 4-hour hold. A buy stakes
+    at most 0.1 SOL (on Robinhood Chain, 0.1 SOL's worth of ETH), never more than its Kelly size.
+    - Why: of the coins whose creator bought at least half the supply at launch and that still stood 6 h after
+      graduation, 82 % later fell 90 % within an hour, a median 24 h after graduation. Other graduates: 24 %.
+  - **A serial rugger** has at least one earlier graduation with a known outcome, and at least half of those fell 90 %
+    within an hour of graduating. Its coins are never traded.
+    - Why: it was the only one of 16 rug signals, fixed before the test, whose exclusion raised selector #640's
+      out-of-sample growth in every period.
+  - Both rules belong to the models' universe (`train/selector.in_universe`): live, paper, both chains and every future
+    fit. The cap is `CREATOR_HEAVY_CAP_SOL` (agent/sizing.py).
+  - On #640's out-of-sample book (2026-05-10..10-22, quarter-Kelly sizing), the rules together give +39 log points of
+    growth on +2,453, with 129 trades that lost 80 % or more instead of 158. But they cost growth from 05-10 to 07-21
+    (−51) and from 10-02 to 10-22 (−61), and gain it from 07-21 to 10-01 (+152).
+  - The walk-forward caches are keyed by the universe now, so a refit on the same corpus does not reuse walk-forwards
+    fitted on the old one.
+
 ## 2026-10-26, release 12: `ev` trades beside `capitulation` again: selector #640 and fly #641
 
 Release 12 ships selector #640 and fly #641 in place of release 11's #595 and #604. It is again a matched pair, trained on

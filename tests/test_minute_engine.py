@@ -72,6 +72,26 @@ def test_graduation_time_comes_from_corpus_meta(db_conn):
     db_conn.commit()
 
 
+def test_a_creator_heavy_coin_is_marked_and_leaves_the_universe_at_8_h(db_conn):
+    from fly_trader.train.selector import in_universe
+    s = _engine()
+    g = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+    with db_conn.cursor() as cur:
+        cur.execute("DELETE FROM corpus_meta WHERE mint IN ('Hvpump', 'Ltpump')")
+        cur.execute("INSERT INTO corpus_meta (mint, graduated_at, ttg_min, dev_sol, dev_share) VALUES ('Hvpump', %s, 0.0, 85.0, 0.7931), ('Ltpump', %s, 30.0, 1.0, 0.05)", (g, g))
+    db_conn.commit()
+    a = {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "buy": 6.0, "sell": 0.0, "nb": 2, "ns": 0, "n_traders": 2, "resq": 60.0, "pool": "P", "program_label": "Pump.fun Amm"}
+    seen = {}
+    for mint in ("Hvpump", "Ltpump"):
+        for h in (7.0, 9.0):
+            x, info = s._features(db_conn, mint, a, g.timestamp() + h * 3600)
+            seen[(mint, h)] = (info["creator_heavy"], bool(in_universe(x[None], X_COLS)[0]))
+    assert seen == {("Hvpump", 7.0): (True, True), ("Hvpump", 9.0): (True, False), ("Ltpump", 7.0): (False, True), ("Ltpump", 9.0): (False, True)}
+    with db_conn.cursor() as cur:
+        cur.execute("DELETE FROM corpus_meta WHERE mint IN ('Hvpump', 'Ltpump')")
+    db_conn.commit()
+
+
 class _Book:
     def __init__(self, name, fail=False):
         self.name, self.fail, self.done, self.seen = name, fail, False, None
