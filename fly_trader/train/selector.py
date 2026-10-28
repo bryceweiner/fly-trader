@@ -76,15 +76,16 @@ MIN_AGE_H = 6.0                      # trade only tokens at least this long past
 # whose creator bought ≥ half the supply at launch and that still stood 6 h after graduation, 82 % later fell 90 % within
 # an hour, median 24 h after graduation (other graduates: 24 %); data/scratch/rug_20261028.
 # A coin whose creator owned more than CREATOR_HEAVY_SHARE of the supply -- its launch buy, or what it held when the coin
-# graduated -- is never traded. Until 2026-10-29 it was traded up to 8 h after graduation at 0.1 SOL; that night two
-# "XTO" coins, each launched by a fresh wallet that bought the whole curve (79 %), were drained 7.9 and 7.6 h after
-# graduating, 111 and 6 minutes after the live book bought them.
+# graduated together with the wallets that bought in its launch block -- is never traded, and neither is a coin whose
+# launch or curve is unknown (no creator facts: it can't be shown to be clean). Until 2026-10-29 such a coin was traded up
+# to 8 h after graduation at 0.1 SOL; that night two "XTO" coins, each launched by a fresh wallet that bought the whole
+# curve (79 %), were drained 7.9 and 7.6 h after graduating, 111 and 6 minutes after the live book bought them.
 # A serial rugger -- at least one earlier graduation with a known outcome, and at least SERIAL_RUG_SHARE of them fell
 # 90 % within an hour of graduating -- is never traded: of 16 rug signals fixed before the test, the only one whose
 # exclusion raised selector #640's out-of-sample growth in the selection half, the evaluation half and the holdout.
 CREATOR_HEAVY_SHARE = 0.7
 SERIAL_RUG_SHARE = 0.5
-UNIVERSE_VERSION = "creator-2"      # keys the walk-forward caches (train/strategies._cache_path): a changed universe refits them
+UNIVERSE_VERSION = "creator-3"      # keys the walk-forward caches (train/strategies._cache_path): a changed universe refits them
 MIN_EV = 0.01                       # the buy line of a model before its walk-forward chose one
 LINE_CANDIDATES = (0.0, 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03)
 MIN_LINE_TRADES = 100
@@ -99,16 +100,19 @@ def creator_heavy(dev_share) -> bool:
 
 def in_universe(X: np.ndarray, cols: list[str]) -> np.ndarray:
     """Rows the models may trade: age unknown (graduated before the archive) or at least ``MIN_AGE_H`` hours old; never
-    a serial rugger's coin, nor one whose creator's launch buy (dev_share) or holding at graduation (dev_hold_share) was
-    more than ``CREATOR_HEAVY_SHARE`` of the supply. Inputs a caller's columns lack leave their rule out."""
+    a serial rugger's coin, nor one whose creator owned more than ``CREATOR_HEAVY_SHARE`` of the supply -- its launch buy
+    (dev_share), or its holding at graduation with the launch block's wallets (dev_hold_share + bundle_share) -- nor one
+    whose launch (meta_known) or curve (curve_known) is unknown. Inputs a caller's columns lack leave their rule out."""
     X = np.atleast_2d(X); c = {n: i for i, n in enumerate(cols)}
     known = X[:, c["age_known"]] != 0; age = np.expm1(X[:, c["log_age_h"]])
     ok = ~known | (age >= MIN_AGE_H)
     if "prior_known" in c and "prior_rug_share" in c:
         ok &= ~((X[:, c["prior_known"]] >= 1) & (X[:, c["prior_rug_share"]] >= SERIAL_RUG_SHARE))
-    for col in ("dev_share", "dev_hold_share"):
-        if col in c:
-            ok &= ~(X[:, c[col]] > CREATOR_HEAVY_SHARE)
+    for flag in ("meta_known", "curve_known"):                    # NaN (unknown in a training row) fails too
+        if flag in c:
+            ok &= X[:, c[flag]] > 0.5
+    share = lambda n: np.nan_to_num(X[:, c[n]]) if n in c else np.zeros(len(X), np.float32)
+    ok &= ~(np.maximum(share("dev_share"), share("dev_hold_share") + share("bundle_share")) > CREATOR_HEAVY_SHARE)
     return ok
 
 

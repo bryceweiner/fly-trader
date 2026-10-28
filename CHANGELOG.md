@@ -3,6 +3,36 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## 2026-10-29, release 16: The launch block's wallets count as the creator's, and a coin with no creator facts is never traded
+
+Release 16 changes which coins the models may trade. The models are unchanged: selector #640 and fly #641, as in releases
+12 to 15. The rule has run on the development install since 2026-10-29 01:25 (UTC+8).
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 16`. The change reaches live trading: which coins are bought.
+- **Positions open when the release installs are held as before:** the rule decides buys only.
+
+### Trading
+
+- **The wallets that bought in a coin's launch block count as its creator's, and a coin with no creator facts is never
+  traded.** Release 15 looked at the creator's own wallet only, so a creator who spread the supply over wallets buying in
+  the same block as the launch still passed. A coin whose launch or curve was never seen passed too, as if its creator
+  owned nothing.
+  - **The rule:** a coin is never traded when its creator's launch buy, or what the creator and the launch block's
+    wallets held together when it graduated, was more than 70 % of the supply. Nor is a coin whose launch or bonding
+    curve is not on record (`meta_known`, `curve_known`): it cannot be shown to be clean.
+  - **Scale:** in the 14 days to 2026-10-29, 1,876 of 14,073 Solana graduates (13 %) passed release 15's rule but held
+    more than 70 % with the launch block's wallets, and 44 had no launch or curve on record. In the 30 days before, the
+    live book bought 3 coins of the first kind and lost 0.12 SOL on them (−31 %).
+  - **Robinhood Chain:** 8 of 208 Pons graduates are out. Plain Uniswap v4 pools have no launch or curve on record, so
+    they stay out until they do; they had no picks before either.
+  - **What no rule here can see:** wallets that buy in later blocks, or after graduation, are not tied to the creator.
+  - Every live and paper book on both chains, and every future fit (`train/selector.in_universe`; `UNIVERSE_VERSION`
+    creator-3 refits the walk-forward caches).
+
 ## 2026-10-29, release 15: A coin whose creator owns most of its supply is never traded
 
 Release 15 changes which coins the models may trade. The models are unchanged: selector #640 and fly #641, as in releases
