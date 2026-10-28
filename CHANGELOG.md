@@ -3,6 +3,37 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## 2026-10-29, release 15: A coin whose creator owns most of its supply is never traded
+
+Release 15 changes which coins the models may trade. The models are unchanged: selector #640 and fly #641, as in releases
+12 to 14. The rule has run on the development install since 2026-10-29 01:02 (UTC+8).
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 15`. The change reaches live trading: which coins are bought.
+- **Positions open when the release installs are held as before:** the rule decides buys only.
+
+### Trading
+
+- **A coin whose creator owns most of its supply is never traded.** On the night of 2026-10-28 the live book lost about
+  0.2 SOL on two coins named XTO, bought at 21:29 and 23:46 (UTC+8). Each was launched by a wallet that bought the whole
+  bonding curve in the launch transaction (79 % of the supply), which graduated it the same second. Release 13 still
+  traded such coins up to 8 h after graduation, at 0.1 SOL a buy. The first was drained 7.9 h after graduating, 111
+  minutes after the buy; the second had already fallen 94 % when it was bought, and was drained 6 minutes later.
+  - **The rule:** a coin is out of the models' universe when its creator's launch buy, or what the creator held when the
+    coin graduated, was more than 70 % of the supply. It applies to every live and paper book on both chains, and to
+    every future fit (`train/selector.in_universe`; `UNIVERSE_VERSION` creator-2 refits the walk-forward caches).
+  - **Why creator history did not catch them:** XTO is a factory. Since 2026-10-14, 77 coins named XTO were launched
+    exactly this way from 73 wallets, so the serial-rugger rule, which follows a wallet, saw almost none of them.
+  - **Cost, measured on a close set:** on selector #640's out-of-sample book, leaving out every self-graduated coin
+    (creator launch buy of at least half the supply, graduation within a minute) cost about 40 of 2,453 log points of
+    growth (2026-10-28 study). This exact rule was not measured.
+  - In the 14 days to 2026-10-29, 3,568 of 14,083 graduates (25 %) had a creator launch buy above 70 %, and 170 more a
+    creator holding above 70 % at graduation.
+  - The 0.1 SOL cap for these coins (`CREATOR_HEAVY_CAP_SOL`) no longer comes into play.
+
 ## 2026-10-28, release 14: A coin bought far below its high is sold once it doubles
 
 Release 14 changes when some positions are sold. The models are unchanged: selector #640 and fly #641, as in releases 12
