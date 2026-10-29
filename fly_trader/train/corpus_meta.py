@@ -44,8 +44,9 @@ WSOL = "So11111111111111111111111111111111111111112"
 # pump.fun seeded the pool in those (17 % of graduations on 2026-10-20). They are SOL inputs only when the quote is SOL or
 # not known (the archive before 2026-10-23 did not keep it); otherwise they read as unknown (``sol_select``).
 QUOTE_UNIT_COLS = ("dev_sol", "rq0")
-# the venues whose SOL legs make a pump.fun coin's minutes, live (ingest/pumpstream.py) and in training (train/mature.py):
-# its PumpSwap pools and, since 2026-10-23, its Meteora DLMM pools (each minute keeps the pool with the most legs)
+# the venues whose SOL legs make a pump.fun coin's minutes in training (train/mature.py): its PumpSwap pools and, since
+# 2026-10-23, its Meteora DLMM pools (each minute keeps the pool with the most legs). Live minutes keep PumpSwap only since
+# 2026-10-29 (ingest/pumpstream.FEED_POOLS): nothing is bought on a DLMM pool.
 UNIVERSE_POOLS = ("pump-amm", "meteora-dlmm")
 CURVE_COLS = ["bundle_share", "dev_hold_share", "dev_sold_frac", "grad_hhi"]
 FEATURE_COLS = ["ttg_min", "dev_sol", "dev_share", "mayhem", "rq0", "prior_launches", "prior_grads", "prior_known", "prior_rug_share", "prior_moon_share",

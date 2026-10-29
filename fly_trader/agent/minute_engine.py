@@ -234,7 +234,7 @@ class MinuteEngine:
 
     # ---- one minute ----
     def _aggregate(self, conn, m0: datetime, m1: datetime) -> dict[str, dict]:
-        """PumpAPI minutes: every pump.fun token's SOL-quoted PumpSwap or Meteora DLMM pool with the most legs that minute, the
+        """PumpAPI minutes: every pump.fun token's SOL-quoted PumpSwap pool with the most legs that minute (no DLMM), the
         same fields as the archive. Robinhood Chain: the
         rh_minutes of graduated Pons pools in ETH (rh/minutes.py), under the same keys."""
         if self.rh:

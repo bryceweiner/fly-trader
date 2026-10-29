@@ -1,5 +1,6 @@
-"""Meteora DLMM pools of pump.fun coins make their minutes too (2026-10-23), and the archive keeps every venue's SOL legs:
-the hour files, the refetch that rewrites older hours, the stream, a graduation's quote asset and the relay."""
+"""Meteora DLMM pools of pump.fun coins make their minutes in training (2026-10-23) but never live (2026-10-29: the stream
+and the relay drop every DLMM leg), and the archive keeps every venue's SOL legs: the hour files, the refetch that
+rewrites older hours, the stream, a graduation's quote asset and the relay."""
 import importlib.util
 import os
 import time
@@ -57,16 +58,18 @@ def test_refetch_plans_older_unstamped_hours_newest_first(tmp_path, monkeypatch)
     assert replay_pull.refetch_plan(now) == [now - timedelta(hours=20), now - timedelta(hours=30)]   # the newest 6 h are the console's
 
 
-def test_stream_keeps_pumpfun_dlmm_legs_and_learns_graduation_quotes():
+def test_stream_drops_every_dlmm_leg_and_learns_graduation_quotes():
     agg = pumpstream.Aggregator(); m = 1_800_000_000
-    agg.ingest(_trade("meteora-dlmm", "Apump", WSOL, (m + 1) * 1000, "DLMM_A"))
+    agg.ingest(_trade("meteora-dlmm", "Apump", WSOL, (m + 1) * 1000, "DLMM_A"))                # a pump.fun coin's DLMM pool: dropped
     agg.ingest(_trade("meteora-dlmm", "Apump", WSOL, (m + 2) * 1000, "DLMM_A", "sell"))
     agg.ingest(_trade("pump-amm", "Apump", WSOL, (m + 3) * 1000, "SWAP_A"))
-    agg.ingest(_trade("meteora-dlmm", "Zother", WSOL, (m + 4) * 1000, "DLMM_Z"))                # not a pump.fun coin
+    agg.ingest(_trade("meteora-dlmm", "Zother", WSOL, (m + 4) * 1000, "DLMM_Z"))
     agg.ingest(_trade("raydium-clmm", "Apump", WSOL, (m + 5) * 1000, "CLMM_A"))                # not a universe venue
     agg.ingest(_trade("pump-amm", "Bpump", USDC, (m + 6) * 1000, "SWAP_B"))                    # a graduate's own pool in USDC
-    assert set(agg.minutes[m]) == {"Apump"} and set(agg.minutes[m]["Apump"]) == {"DLMM_A", "SWAP_A"}
-    assert agg.row(m, "Apump").pool_id == "DLMM_A"                                             # the pool with the most legs
+    assert set(agg.minutes[m]) == {"Apump"} and set(agg.minutes[m]["Apump"]) == {"SWAP_A"}
+    assert agg.row(m, "Apump").pool_id == "SWAP_A"                                             # its PumpSwap pool, though DLMM had more legs
+    agg.ingest(_trade("meteora-dlmm", "Cpump", WSOL, (m + 8) * 1000, "DLMM_C"))                # a coin whose only SOL market is DLMM
+    assert "Cpump" not in agg.minutes[m]
     assert agg.pending_quotes == [("Bpump", "SWAP_B", USDC)]
     agg.ingest(_trade("pump-amm", "Bpump", USDC, (m + 7) * 1000, "SWAP_B"))
     assert len(agg.pending_quotes) == 1                                                        # one per pool
@@ -111,11 +114,11 @@ def test_aggregate_day_lets_a_dlmm_pool_make_the_minute(db_conn, tmp_path, monke
         db_conn.execute("DELETE FROM mature_days WHERE day = %s", (d,)); db_conn.commit()
 
 
-def test_relay_forwards_graduates_without_the_suffix_and_dlmm_legs():
+def test_relay_forwards_graduates_without_the_suffix_and_no_dlmm_legs():
     spec = importlib.util.spec_from_file_location("stream_relay_relay_v", ROOT / "stream_relay" / "relay.py")
     relay = importlib.util.module_from_spec(spec); spec.loader.exec_module(relay)
     assert relay.keep(_trade("pump-amm", "GradNoSuffix", WSOL, 1, "P", by="pump"))                      # a migration's pool
     assert not relay.keep(_trade("pump-amm", "Other", WSOL, 1, "P", by="custom"))
     assert relay.keep(_trade("pump-amm", "Xpump", WSOL, 1, "P", by="custom"))                            # suffixed: as before (blocked downstream)
-    assert relay.keep(_trade("meteora-dlmm", "Anything", WSOL, 1, "D")) and not relay.keep(_trade("meteora-dlmm", "Anything", USDC, 1, "D"))
+    assert not relay.keep(_trade("meteora-dlmm", "Xpump", WSOL, 1, "D")) and not relay.keep(_trade("meteora-dlmm", "Anything", USDC, 1, "D"))
     assert not relay.keep(_trade("orca-whirlpool", "Xpump", WSOL, 1, "O"))

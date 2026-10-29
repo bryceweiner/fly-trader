@@ -6,8 +6,8 @@ identical to the replay archive. From Asia it falls behind and reconnects about 
 ``SOL_FEED=relay`` (ingest/relay_feed.py: PumpAPI's events from our relay near its source, stream_relay/) or
 ``SOL_FEED=helius`` (ingest/helius_feed.py: the same events decoded from Helius). Each transaction is taken once from
 whichever feed brought it first (``Aggregator.ingest_from``), and the backup's clock counts only while the primary is down.
-This worker keeps only what the selector needs: SOL-quoted buys and sells in PumpSwap (``pump-amm``) and Meteora DLMM pools
-(``corpus_meta.UNIVERSE_POOLS``; DLMM since 2026-10-23) of pump.fun-origin mints (a ``pump`` mint, or a pump.fun graduate
+This worker keeps only what the selector needs: SOL-quoted buys and sells in PumpSwap (``pump-amm``) pools
+(``FEED_POOLS``; every Meteora DLMM leg is dropped since 2026-10-29) of pump.fun-origin mints (a ``pump`` mint, or a pump.fun graduate
 without the suffix: one whose migration the stream saw or ``corpus_meta`` holds, reloaded every 5 minutes), aggregated per
 (mint, minute) into the same fields ``train/mature.py``
 derives from the archive, with the same filters: legs in a pool created directly rather than by a pump.fun migration
@@ -51,11 +51,14 @@ from .. import config
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..logging_setup import setup
-from ..train.corpus_meta import CURVE_COLS, UNIVERSE_POOLS, blocked_pool_ids, creator_history, curve_facts, pumpfun_graduates, record_grad_quotes
+from ..train.corpus_meta import CURVE_COLS, blocked_pool_ids, creator_history, curve_facts, pumpfun_graduates, record_grad_quotes
 from ..train.flow import minute_wallet_cols
 
 log = logging.getLogger(__name__)
 WSOL = "So11111111111111111111111111111111111111112"
+# the venues whose legs make live minutes: PumpSwap only. A Meteora DLMM pool's liquidity providers can pull it at any time:
+# capitulation buys there lost 32 % a trade (2026-10-23..29), so since 2026-10-29 no DLMM leg is kept, and nothing is bought there
+FEED_POOLS = ("pump-amm",)
 RESQ_BAND = (0.001, 100000.0)     # train/mature.py: quote_in_pool BETWEEN 0.001 AND 100000
 PRICE_BAND = 50.0                  # train/mature.py: within 50x of the trailing median of the mint's previous 200 legs
 REF_LEGS = 200
@@ -165,7 +168,7 @@ class Aggregator:
             self._curve(e)
             return
         if a in ("buy", "sell"):
-            if pool not in UNIVERSE_POOLS or not self.pumpfun(mint):
+            if pool not in FEED_POOLS or not self.pumpfun(mint):
                 return
             if e.get("quoteMint") != WSOL:
                 if pool == "pump-amm":                  # maybe the graduate's own pool, seeded in another quote: its graduation's quote

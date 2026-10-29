@@ -7,9 +7,8 @@ From Asia, PumpAPI's stream (Frankfurt) falls behind and reconnects about once a
 only what fly-trader's aggregator (fly_trader/ingest/pumpstream.py) reads:
 
 - the events: SOL-quoted buys and sells of pump.fun coins in PumpSwap (a "pump" mint, or any mint in a pool pump.fun's
-  migration created: ``poolCreatedBy`` "pump") and every SOL-quoted Meteora DLMM buy and sell (the aggregator keeps
-  pump.fun coins' only), bonding-curve buys and sells, creates, migrations and pool creations (``keep``) -- everything
-  else (transfers, other venues, other quotes) is dropped;
+  migration created: ``poolCreatedBy`` "pump"), bonding-curve buys and sells, creates, migrations and pool creations
+  (``keep``) -- everything else (transfers, other venues such as Meteora DLMM since 2026-10-29, other quotes) is dropped;
 - the fields: only those the aggregator reads (``FIELDS``, ``LEG_FIELDS``; tests/test_stream_relay.py checks them
   against pumpstream.py), unchanged.
 
@@ -61,11 +60,9 @@ log = logging.getLogger("stream_relay")
 
 def keep(e: dict) -> bool:
     """The events the aggregator uses (pumpstream.Aggregator.ingest): SOL-quoted PumpSwap trades of pump.fun coins (a
-    "pump" mint, or a graduate without the suffix in its migration's pool), SOL-quoted Meteora DLMM trades, pool
-    creations and migrations; bonding-curve trades and creates."""
+    "pump" mint, or a graduate without the suffix in its migration's pool), pool creations and migrations; bonding-curve
+    trades and creates. No Meteora DLMM trade (2026-10-29)."""
     a, pool = e.get("action"), e.get("pool")
-    if pool == "meteora-dlmm":
-        return a in ("buy", "sell") and e.get("quoteMint") == WSOL
     if pool == "pump-amm":
         if a in ("buy", "sell"):
             return e.get("quoteMint") == WSOL and (str(e.get("mint") or "").endswith("pump") or e.get("poolCreatedBy") == "pump")
