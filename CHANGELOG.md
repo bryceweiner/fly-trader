@@ -3,7 +3,19 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
-## Unreleased
+## 2026-10-29, release 18: Nothing is bought on a Meteora DLMM pool
+
+Release 18 changes which pools the live feed reads. The models are unchanged: selector #640 and fly #641, as in releases
+12 to 17.
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual.
+- **A server on the host updater** (`deploy/fly_update.py`) holds this code release for 24 hours, or applies it at once
+  with `fly_update.py approve 18`. The change reaches live trading: which coins are bought.
+- **Positions open when the release installs still sell when their hold ends,** a position on a DLMM pool included.
+
+### Trading
 
 - **Nothing is bought on a Meteora DLMM pool: the live feed keeps pump.fun's own PumpSwap pools only.** Since 2026-10-23
   a pump.fun coin's DLMM pool could make its live minutes, and the models bought there. Anyone can create a DLMM pool,
