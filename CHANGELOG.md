@@ -3,6 +3,18 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## Unreleased
+
+- **Nothing is bought on a Meteora DLMM pool: the live feed keeps pump.fun's own PumpSwap pools only.** Since 2026-10-23
+  a pump.fun coin's DLMM pool could make its live minutes, and the models bought there. Anyone can create a DLMM pool,
+  and its liquidity providers can pull their liquidity at any time.
+  - **Cost:** from 2026-10-23 to 10-29 the capitulation strategy's 5 buys on DLMM pools lost 32 % on average, 4 of them
+    at a loss. On 2026-10-29 the live book lost 0.13 SOL on one, Grokbot: bought after a 63 % fall, sold 32 % lower
+    as the pool emptied.
+  - **The rule:** the live feed drops every Meteora DLMM trade. A coin trades only on its PumpSwap pool, and a coin whose
+    only SOL market is a DLMM pool is not traded at all. The stream relay forwards no DLMM trades either.
+  - **No retrain:** the models and their training data are unchanged.
+
 ## 2026-10-29, release 17: A creator-heavy coin's buy cap scales with the bankroll
 
 Release 17 changes one sizing cap. The models are unchanged: selector #640 and fly #641, as in releases 12 to 16. No
