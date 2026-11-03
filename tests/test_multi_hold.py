@@ -1,0 +1,100 @@
+"""Per-strategy holds: labels for several holds computed at once equal single-hold builds, and the one-position-per-token
+rule with per-row holds equals the scalar rule when holds are equal and respects each position's own exit otherwise."""
+from datetime import date, datetime, timedelta, timezone
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pytest
+
+from fly_trader.market.features import FEATURES
+from fly_trader.train import decisions, mature
+from fly_trader.train.decisions import taken_idx
+from fly_trader.train.flow import FLOW_COLS, MARKET_COLS, SKILL_COLS
+
+
+def _part(tmp_path):
+    rng = np.random.default_rng(1); base = datetime(2026, 9, 1, tzinfo=timezone.utc); rows = []
+    for mint in ("Apump", "Bpump"):
+        price = 1.0
+        for o in sorted(rng.choice(600, 300, replace=False).tolist()):
+            price *= float(np.exp(rng.normal(0, 0.02)))
+            rows.append({**{f: 0.0 for f in FEATURES + FLOW_COLS + SKILL_COLS + MARKET_COLS}, "mint": mint, "ts": base + timedelta(minutes=int(o)),
+                         "open": price * float(np.exp(rng.normal(0, 0.004))), "close": price, "resq": 50.0, "age_h": 30.0, "traders_15m": 10.0, "traders_1h": 40.0,
+                         "n_trades_1m": 3.0, "logvol_15m": 3.0, "exit_cost_0p1": float(rng.uniform(0.005, 0.02))})
+    root = tmp_path / "feat"
+    mature.write_part(pa.Table.from_pandas(pd.DataFrame(rows), preserve_index=False), root / "2026-09-01" / "part.parquet", mature.FEATURE_VERSION, {"fly_agg": mature.AGG_VERSION})
+    return root
+
+
+def test_multi_hold_labels_equal_single_hold_builds(tmp_path):
+    root = _part(tmp_path)
+    ds = decisions.build(days=None, horizon_min=30, feature_dir=root, holds=[10, 30, 60])
+    assert np.allclose(ds.fwd_h[30], ds.fwd_pess, equal_nan=True)
+    for H in (10, 60):
+        one = decisions.build(days=None, horizon_min=H, feature_dir=root)
+        key = pd.Series(one.fwd_pess, index=pd.MultiIndex.from_arrays([one.mint, one.ts]))
+        got = pd.Series(ds.fwd_h[H], index=pd.MultiIndex.from_arrays([ds.mint, ds.ts]))
+        common = key.index.intersection(got.index)
+        assert len(common) > 100 and np.allclose(got[common].to_numpy(), key[common].to_numpy(), equal_nan=True)
+
+
+def test_per_row_holds_in_taken_idx():
+    rng = np.random.default_rng(0); n = 2000
+    ts = rng.integers(0, 20000, n).astype(float) * 60; mint = rng.choice([f"m{i}" for i in range(30)], n); idx = rng.choice(n, 900, replace=False)
+    assert np.array_equal(taken_idx(ts, mint, np.full(n, 1800.0), idx), taken_idx(ts, mint, 1800.0, idx))
+    hold = np.where(rng.random(n) < 0.5, 600.0, 14400.0)
+    got = taken_idx(ts, mint, hold, idx)
+    by = {}
+    for i in got:                                                        # no taken entry falls inside an earlier position's own hold
+        by.setdefault(mint[i], []).append(i)
+    for m, ii in by.items():
+        ii = sorted(ii, key=lambda i: ts[i])
+        for a, b in zip(ii, ii[1:]):
+            assert ts[b] >= ts[a] + hold[a]
+
+
+def test_trades_and_random_with_per_row_holds(tmp_path):
+    root = _part(tmp_path)
+    ds = decisions.build(days=None, horizon_min=30, feature_dir=root, holds=[10, 30])
+    pick = np.isfinite(ds.fwd_h[10]); hold = np.full(len(ds.y), 600.0)
+    r = decisions.trades_from_picks(ds, pick, returns=ds.fwd_h[10], hold_s=hold)
+    assert len(r) == len(taken_idx(ds.ts, ds.mint, hold, np.flatnonzero(pick))) and len(r) > len(decisions.trades_from_picks(ds, pick))
+    ev = decisions.evaluate(ds, np.where(pick, 1.0, np.nan), pick, 0.5, hold_s=hold, returns=ds.fwd_h[10])
+    assert ev["pooled"]["n"] == len(r)
+
+
+def test_the_label_is_costed_at_the_size_the_book_trades():
+    """exit_cost_0p1 is priced for 0.1 SOL; positions are Kelly-sized well above that and impact grows with size, so the
+    label must reprice both sides or every backtest return is optimistic."""
+    import pandas as pd
+    from fly_trader import config
+    from fly_trader.market.exit_cost import exit_cost_fraction
+    from fly_trader.train.decisions import _label_exit_cost
+    resq = np.array([25.0, 150.0, 2000.0])
+    ec01 = np.array([exit_cost_fraction(0.1, r, 5e5, None) for r in resq])
+    got = _label_exit_cost(pd.DataFrame({"exit_cost_0p1": ec01, "resq": resq}))
+    size = config.LABEL_SIZE_SOL or config.MAX_POSITION_FRACTION * config.CAPITAL_SOL
+    want = [exit_cost_fraction(min(size, config.MAX_POOL_SHARE * r), r, 5e5, None) for r in resq]
+    assert got == pytest.approx(want, abs=2e-4)          # matches the live cost model at the traded size
+    assert (got > ec01).all()                            # and is strictly dearer than the 0.1 SOL assumption
+    blind = _label_exit_cost(pd.DataFrame({"exit_cost_0p1": [0.01], "resq": [float("nan")]}))
+    assert blind[0] == 1.0                               # unknown liquidity: assume the position cannot be exited
+
+
+def test_subset_keeps_days_rows_and_every_hold():
+    """The fly's teacher is built with DecisionSet.subset; if it dropped days or per-hold labels the bootstrap would fit
+    on a silently smaller corpus than intended."""
+    from fly_trader.train.decisions import X_COLS, DecisionSet
+    n = 600
+    days = np.array([date(2026, 7, 1) + timedelta(days=int(i // 100)) for i in range(n)], dtype=object)
+    ds = DecisionSet(X=np.zeros((n, len(X_COLS)), np.float32), y=np.zeros(n, np.int8), fwd=np.arange(n, dtype=np.float32),
+                     fwd_pess=np.arange(n, dtype=np.float32), day=days, ts=np.arange(n, dtype=float) * 60.0,
+                     mint=np.array([f"m{i}" for i in range(n)]), cols=list(X_COLS), horizon_s=1800.0,
+                     fwd_h={h: np.arange(n, dtype=np.float32) + h for h in (10, 120)})
+    m = ds.day < date(2026, 7, 4)
+    sub = ds.subset(m)
+    assert len(sub.y) == int(m.sum()) and sub.days == sorted(set(days[m].tolist()))
+    assert sorted(sub.fwd_h) == [10, 120] and all(len(v) == len(sub.y) for v in sub.fwd_h.values())
+    assert sub.fwd_h[120][0] == pytest.approx(ds.fwd_h[120][np.flatnonzero(m)[0]])   # labels follow their rows
+    assert sub.cols == ds.cols and sub.horizon_s == ds.horizon_s

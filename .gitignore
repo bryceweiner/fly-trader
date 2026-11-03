@@ -1,0 +1,21 @@
+.env
+.venv/
+data/
+logs/
+dist/
+# the wallet-skill table (~300 MB) is not in git: it ships in signed releases, and docker/bootstrap.sh downloads it and checks models/wallet_skill/TABLE.sha256
+models/wallet_skill/*.parquet
+# generated neuron geometry for the console's 3D view (brain/geometry.py); the distribution ships it under models/geometry
+fly_trader/ui/static/brain/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.vite/
+.DS_Store
+.agents/
+.claude/
+
+# large media assets - deployed straight to Gandi, not tracked in GitHub source repo
+web/assets/*.mp4
+media/*.mp4

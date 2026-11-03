@@ -1,0 +1,47 @@
+# fly-trader, fire-and-forget: one Postgres, one trading container. The console is published on 127.0.0.1 unless
+# CONSOLE_PUBLISH in .env widens it to your network -- it has no login, can start and stop the workers and clear the kill
+# switch, so it must never face the internet.
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: fly
+      POSTGRES_PASSWORD: fly
+      POSTGRES_DB: fly_trader
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fly -d fly_trader"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  fly:
+    build: .
+    # root inside the container: the self-updater (AUTO_UPDATE=1) replaces the code in /app, and data/, logs/ and .env
+    # are folders and a file of yours bind-mounted from here
+    user: "0:0"
+    # every key (BOT_PRIVATE_KEY, and RH_BOT_PRIVATE_KEY for Robinhood Chain live) comes from .env at run time, never the image
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://fly:fly@db:5432/fly_trader
+      DATA_DIR: /app/data
+      LOG_DIR: /app/logs
+      DEVICE: auto          # the CPU in this image; an NVIDIA GPU with docker-compose.cuda.yml, an AMD one with docker-compose.rocm.yml
+      # Robinhood Chain is opt-in: set RH_ENABLED=1 in .env (it needs ENVIO_API_TOKEN and room for its history)
+      RH_ENABLED: ${RH_ENABLED:-0}
+    volumes:
+      - ./data:/app/data        # models, the fly's plastic state, its hourly snapshots: survives restarts and rebuilds
+      - ./logs:/app/logs
+      - ./.env:/app/.env        # `fly-trader wallet new` writes the bot key here
+    ports:
+      # CONSOLE_PUBLISH=0.0.0.0 in .env: every device on your network (then CONSOLE_ALLOWED_HOSTS names the address)
+      - "${CONSOLE_PUBLISH:-127.0.0.1}:8501:8501"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:

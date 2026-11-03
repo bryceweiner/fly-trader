@@ -1,0 +1,20 @@
+# The same trader on an AMD GPU (ROCm). Layer it over the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.rocm.yml up -d --build
+#
+# Host prerequisites: the amdgpu kernel driver, nothing else. The ROCm 7.2 runtime ships inside the torch wheel (built
+# for gfx1030, gfx1100-1103, gfx1150/1151 -- Ryzen AI Max -- gfx1200/1201 and the Instinct cards), so neither ROCm on
+# the host nor a ROCm base image is needed. The container reaches the GPU through two device nodes: /dev/kfd (compute)
+# and /dev/dri (the render nodes). It runs as root (the base file), which opens them without the host's render group.
+# DEVICE=auto picks the GPU when the container sees one. An integrated GPU draws on system memory: DEVICE_MEMORY_GB caps
+# the batch sizes derived from what the driver reports.
+services:
+  fly:
+    build:
+      args:
+        TORCH_INDEX: rocm72
+    environment:
+      DEVICE: auto
+    devices:
+      - /dev/kfd
+      - /dev/dri

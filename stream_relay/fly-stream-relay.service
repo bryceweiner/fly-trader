@@ -1,0 +1,20 @@
+[Unit]
+Description=fly-trader stream relay (PumpAPI's firehose, filtered and forwarded over TLS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/fly-stream-relay.env
+ExecStart=/opt/fly-stream-relay/venv/bin/python /opt/fly-stream-relay/relay.py
+User=flyrelay
+Group=flyrelay
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/fly-stream-relay
+
+[Install]
+WantedBy=multi-user.target

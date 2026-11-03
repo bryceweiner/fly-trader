@@ -1,0 +1,12 @@
+# Text files are stored and checked out with LF endings on every OS, Windows included: the container runs docker/*.sh
+# and install.sh with /bin/sh and bash, which a CRLF checkout breaks.
+* text=auto eol=lf
+# vendored as published
+console/src/vendor/** -text
+# model and data files
+*.npz binary
+*.pt binary
+*.skops binary
+*.bin binary
+*.parquet binary
+*.zst binary

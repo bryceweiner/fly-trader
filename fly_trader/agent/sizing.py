@@ -1,0 +1,124 @@
+"""Position sizing: how much of the bankroll a buy gets, from how certain the model is that the trade will profit.
+
+Certainty is measured, not assumed. During training the backtest's out-of-sample trades are grouped by how far their
+score cleared the buy line (``build_table``: equal-count bands of ``score − threshold``). For each band the growth-optimal
+(Kelly) fraction is found on the band's actual net returns — the bet f that maximises the average of log(1 + f·r), so the
+rare −100 % rugs count in full; a band with no edge gets 0. Live (``size_position``): the current score's band →
+``KELLY_FRACTION`` of that fraction of the deployable bankroll (wealth at cost minus the gas reserve); ``flat`` (the
+fly, ``config.FLY_SIZING``): ``MAX_POSITION_FRACTION`` of it on every buy that cleared the line, no bands. Either way
+capped at ``MAX_POSITION_FRACTION`` of the deployable bankroll, the free cash above the reserve, and the label size
+(``market/exit_cost.label_size``: ``LABEL_SIZE_SOL`` or ``MAX_POOL_SHARE`` of the pool) -- the size every edge was
+measured at, so the book behaves the same with 5 SOL or 500: a bigger bankroll buys no bigger than the backtest did,
+it only runs out of cash later. A coin whose creator bought most of its supply at launch stakes at most
+``CREATOR_HEAVY_CAP_FRACTION`` of the bankroll, 0.1 SOL of 5 (they rug often; train/selector.py). Below ``MIN_POSITION_SOL`` the buy is skipped. A model without a table (trained
+before sizing) trades the fixed ``MAX_POSITION_SOL``, under the same caps.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+from .. import config
+from ..market.exit_cost import label_size
+
+N_BANDS = 4
+MIN_BAND_TRADES = 50
+_F_GRID = np.linspace(0.0, 0.99, 100)
+
+
+def kelly_fraction(r: np.ndarray) -> float:
+    """Fraction of the bankroll per bet that maximises mean log growth over the empirical net returns ``r`` (0 if no edge)."""
+    r = np.asarray(r, dtype=float)
+    r = r[np.isfinite(r)]
+    if len(r) == 0 or r.mean() <= 0:
+        return 0.0
+    growth = np.log1p(np.clip(_F_GRID[:, None] * r[None, :], -0.999999, None)).mean(axis=1)
+    return float(_F_GRID[int(np.argmax(growth))])
+
+
+def build_table(margins: np.ndarray, returns: np.ndarray, n_bands: int = N_BANDS) -> list[dict]:
+    """Bands of score margin (score − the model's threshold) over out-of-sample trades, lowest first:
+    [{lo, n, mean, win, kelly}] where ``lo`` is the band's lowest margin (the first band starts at 0)."""
+    m = np.asarray(margins, dtype=float); r = np.asarray(returns, dtype=float)
+    ok = np.isfinite(m) & np.isfinite(r); m, r = m[ok], r[ok]
+    if len(r) < MIN_BAND_TRADES:
+        return []
+    k = max(1, min(n_bands, len(r) // MIN_BAND_TRADES))
+    edges = np.quantile(m, np.linspace(0, 1, k + 1)); edges[0] = 0.0
+    out = []
+    for b in range(k):
+        sel = (m >= edges[b]) & ((m < edges[b + 1]) if b < k - 1 else np.ones(len(m), bool))
+        rb = r[sel]
+        out.append({"lo": float(edges[b]), "n": int(len(rb)), "mean": float(rb.mean()) if len(rb) else None,
+                    "win": float((rb > 0).mean()) if len(rb) else None, "kelly": kelly_fraction(rb)})
+    return out
+
+
+def band_for(table: list[dict], margin: float) -> dict | None:
+    best = None
+    for b in table:
+        if margin >= b["lo"]:
+            best = b
+    return best
+
+
+def size_position(score: float, threshold: float, table: list[dict] | None, bankroll_sol: float, cash_sol: float,
+                  res_quote_sol: float | None, flat: bool = False, market=None, margin: float | None = None,
+                  creator_heavy: bool = False) -> tuple[float, str]:
+    """(size in the book's unit, why). Size 0 means skip the buy. ``flat``: ``MAX_POSITION_FRACTION`` of the deployable
+    bankroll on every buy that cleared the line (the fly); otherwise the Kelly band of ``table``. ``market``
+    (fly_trader/markets; default Solana): the gas reserve, minimum position and label size of the book's own market.
+    ``margin``: where the strategy's correctness sizes the row (train/strategies.decide's ``size_margin``), the margin its
+    correctness bands are read at, P(clean) − the bands' p0, instead of score − threshold. ``creator_heavy``: the coin's
+    creator bought most of its supply at launch (train/selector.creator_heavy) -- at most ``CREATOR_HEAVY_CAP_FRACTION`` of
+    the bankroll."""
+    rh = market is not None and market.chain != "sol"
+    reserve = market.gas_reserve() if rh else config.GAS_RESERVE_SOL; free = cash_sol - reserve
+    min_pos = market.min_position() if rh else config.MIN_POSITION_SOL
+    deployable = max(0.0, bankroll_sol - reserve)
+    if flat:
+        size = config.MAX_POSITION_FRACTION * deployable; why = f"flat {config.MAX_POSITION_FRACTION:g} of {deployable:.2f} SOL"
+    elif not table:
+        size = config.MAX_POSITION_SOL * (market.k() if rh else 1.0); why = f"fixed {size:g} {'ETH' if rh else 'SOL'} (model has no sizing table)"
+    else:
+        by_c = margin is not None and np.isfinite(margin)
+        b = band_for(table, float(margin) if by_c else score - threshold)
+        if b is None or b["kelly"] <= 0:
+            return 0.0, "no edge in this correctness band" if by_c else "no edge in this score band"
+        size = config.KELLY_FRACTION * b["kelly"] * deployable
+        why = (f"correctness band from +{b['lo']:.3f}" if by_c else f"band from +{b['lo']:.3f} over the line") + f": Kelly {b['kelly']:.2f} × {config.KELLY_FRACTION:g} of {deployable:.2f} SOL"
+    # the label size is the largest buy any backtest measured: past it the edge is an extrapolation that impact eats
+    caps = {"bankroll cap": config.MAX_POSITION_FRACTION * deployable, "free cash": free, "label size": label_size(res_quote_sol, market if rh else None)}
+    if creator_heavy:
+        caps["creator-heavy cap"] = config.CREATOR_HEAVY_CAP_FRACTION * bankroll_sol      # a share, so in the book's unit (ETH on RH)
+    limit = min(caps, key=caps.get)
+    if caps[limit] < size:
+        size = caps[limit]; why += f", capped by {limit}"
+    if size < min_pos:
+        return 0.0, why + f" → {max(size, 0.0):.6f} is below the {min_pos:g} minimum"
+    return float(size), why + f" → {size:.3f} SOL"
+
+
+def simulate_bankroll(ts: np.ndarray, horizon_s, margins: np.ndarray, returns: np.ndarray, table: list[dict] | None,
+                      start_sol: float | None = None, res_quote: np.ndarray | None = None, tables: list | None = None) -> dict:
+    """Replay out-of-sample trades in entry order with the sizing rule (positions overlap for ``horizon_s``; cash, the
+    reserve and — given ``res_quote``, each trade's pool quote reserve — the pool-depth cap are enforced, as live).
+    Returns the final bankroll, its multiple and the worst drawdown."""
+    start = float(start_sol or config.CAPITAL_SOL or 1.0); cash = start; open_: list[tuple[float, float, float]] = []   # (exit_ts, cost, return)
+    hv = np.asarray(horizon_s, dtype=np.float64); hold = np.full(len(ts), float(hv)) if hv.ndim == 0 else hv    # per-trade holds allowed
+    peak = start; mdd = 0.0; n = 0
+    for i in np.argsort(ts, kind="stable"):
+        t = float(ts[i])
+        still = []
+        for x in open_:
+            if x[0] <= t:
+                cash += x[1] * (1 + x[2])
+            else:
+                still.append(x)
+        open_ = still
+        bankroll = cash + sum(x[1] for x in open_)
+        size, _ = size_position(float(margins[i]), 0.0, tables[i] if tables is not None else table, bankroll, cash, float(res_quote[i]) if res_quote is not None else None)
+        if size > 0:
+            cash -= size; open_.append((t + float(hold[i]), size, float(returns[i]))); n += 1
+        w = cash + sum(x[1] for x in open_); peak = max(peak, w); mdd = max(mdd, 1 - w / peak if peak > 0 else 0.0)
+    final = cash + sum(x[1] * (1 + x[2]) for x in open_)
+    return {"start_sol": start, "final_sol": final, "multiple": final / start if start > 0 else None, "max_drawdown": mdd, "trades": n}

@@ -1,0 +1,144 @@
+"""Package what a fresh install needs to trade: the deployed selector and fly, the connectome they run on, and the
+database rows that admit them -- written for the container's layout (``/app/data``).
+
+Run on the machine that trained them (a master checkout with its database), after a passed replay:
+
+    .venv/bin/python tools/make_seed.py --out dist
+
+Outputs, under ``--out``:
+  models/policies/<fly>.pt, models/selectors/<selector>.skops, models/connectome/{current.txt, <npz>, scale.json}
+  seed/seed.sql  -- brain_snapshots rows (ids kept, so the pin still points at its selector), ui_settings: the replay
+                    verdict the fly session requires, the selector pin, autostart for the trading workers (rh_stream
+                    too), and the small Robinhood Chain reference table rh_assets when this database has it.
+                    Idempotent: every statement is ON CONFLICT DO NOTHING, so a running install is never overwritten.
+
+The distribution branch copies these into its tracked ``models/`` and ``seed/`` -- that is the whole "refresh" step.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import shutil
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))     # runnable as a script from any directory
+
+from fly_trader import config  # noqa: E402
+from fly_trader.agent.selector_session import pinned_snapshot
+from fly_trader.db.connection import transaction
+from fly_trader.train import fly_selector, selector
+
+CONTAINER_DATA = "/app/data"
+AUTOSTART = {"pumpstream": True, "runner": True, "train": False, "replay": False, "discover": False, "rh_stream": True}
+# Robinhood Chain reference rows shipped with the seed (small, and slow to rediscover: each quote asset's decimals, class
+# and price path to WETH). Bulk RH data (rh_swaps, rh_minutes, ...) never ships in the seed.
+RH_ASSET_COLS = ("asset", "symbol", "class", "decimals", "approved", "graduation_threshold_raw", "ref_pool", "ref_kind", "ref_quote",
+                 "ref_fee_bps", "trading_hours", "note", "ref_path")
+
+
+def _lit(v) -> str:
+    """A SQL literal: strings quoted, JSON for dicts, NULL for None."""
+    if v is None:
+        return "NULL"
+    if isinstance(v, dict):
+        v = json.dumps(v, default=str)
+    return "'" + str(v).replace("'", "''") + "'"
+
+
+def main(out: Path) -> None:
+    with transaction() as conn:
+        fly = fly_selector.latest_deployable(conn)
+        if not fly:
+            raise SystemExit("no deployable fly: bootstrap one first (fly-trader train-fly-selector) and run the replay")
+        pin = pinned_snapshot()
+        sel_id = pin if pin is not None else (selector.latest_current(conn) or {}).get("id")
+        if sel_id is None:
+            raise SystemExit("no deployed selector: pin one (ui_settings.pinned_selector_snapshot) or train one that qualifies")
+        taught_by = (fly.get("meta") or {}).get("teacher_snapshot")
+        if taught_by is not None and int(taught_by) != int(sel_id):        # its gate would have no teacher on an install
+            raise SystemExit(f"fly #{fly['id']} was taught by selector #{taught_by}, not the selector being shipped (#{sel_id}): pin its "
+                             "teacher, or bootstrap a fly from the shipped selector")
+        rows = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM brain_snapshots WHERE id = ANY(%s)", ([int(fly["id"]), int(sel_id)],)).fetchall()}
+        verdict = conn.execute("SELECT value FROM ui_settings WHERE key = 'fly_replay'").fetchone()
+        has_rh = conn.execute("SELECT to_regclass('rh_assets') IS NOT NULL AS ok").fetchone()["ok"]
+        rh_assets = [{c: (str(r[c]) if c == "graduation_threshold_raw" and r[c] is not None else r[c]) for c in RH_ASSET_COLS}
+                     for r in conn.execute(f"SELECT {', '.join(RH_ASSET_COLS)} FROM rh_assets ORDER BY asset").fetchall()] if has_rh else []
+    if not verdict:
+        raise SystemExit("no replay verdict stored: the fly session refuses to trade without one (fly-trader fly-replay)")
+    v = verdict["value"] if isinstance(verdict["value"], dict) else json.loads(verdict["value"])
+    if not v.get("passed") or not selector.defs_match(v.get("data"), fly_selector.verdict_version()):     # as the fly session and apply-release judge it
+        raise SystemExit("the stored replay verdict did not pass on the current definitions: run fly-trader fly-replay again")
+
+    models = out / "models"; (models / "policies").mkdir(parents=True, exist_ok=True); (models / "selectors").mkdir(exist_ok=True); (models / "connectome").mkdir(exist_ok=True)
+    for sub in ("policies", "selectors"):              # exactly this release's fly and selector: an older one left here would ship too
+        for f in (models / sub).iterdir():             # (a stale selector .joblib makes apply-release refuse the whole release)
+            if f.is_file():
+                f.unlink()
+    stmts = ["-- generated by tools/make_seed.py: the rows a fresh install needs to trade. Safe to re-run: nothing here overwrites."]
+    for sid, r in sorted(rows.items()):
+        src = Path(r["path"]); sub = "policies" if r["kind"] == "fly_selector" else "selectors"
+        shutil.copy2(src, models / sub / src.name)
+        r["path"] = f"{CONTAINER_DATA}/brain/{sub}/{src.name}"
+        cols = ("id", "ts", "run_id", "beat_id", "path", "sha256", "kind", "promoted_at", "promoted_by", "note")
+        stmts.append(f"INSERT INTO brain_snapshots ({', '.join(cols)}) VALUES ({', '.join(_lit(r[c]) for c in cols)}) ON CONFLICT (id) DO NOTHING;")
+    stmts.append("SELECT setval('brain_snapshots_id_seq', GREATEST((SELECT max(id) FROM brain_snapshots), 1));")
+    settings = {"fly_replay": v, "autostart": AUTOSTART}      # no pin: the book loads the newest deployable selector on its own
+    for k, val in settings.items():
+        stmts.append(f"INSERT INTO ui_settings (key, value) VALUES ({_lit(k)}, {_lit(val)}::jsonb) ON CONFLICT (key) DO NOTHING;")
+    for a in rh_assets:
+        vals = ", ".join("NULL" if a[c] is None else (_lit(json.dumps(a[c])) + "::jsonb" if c in ("trading_hours", "ref_path") else
+                                                    str(a[c]).lower() if isinstance(a[c], bool) else _lit(a[c])) for c in RH_ASSET_COLS)
+        stmts.append(f"INSERT INTO rh_assets ({', '.join(RH_ASSET_COLS)}) VALUES ({vals}) ON CONFLICT (asset) DO NOTHING;")
+    (out / "seed").mkdir(exist_ok=True)
+    (out / "seed" / "seed.sql").write_text("\n".join(stmts) + "\n")
+    # the same rows WITHOUT ids, for installs that are already running (ops/release.apply_release assigns fresh ids)
+    import hashlib
+    def _sha(pth: Path) -> str:
+        return hashlib.sha256(pth.read_bytes()).hexdigest()
+    snaps = []
+    for sid, r in sorted(rows.items()):
+        sub = "policies" if r["kind"] == "fly_selector" else "selectors"
+        f = models / sub / Path(r["path"]).name
+        snaps.append({"kind": r["kind"], "file": f.name, "sha256": _sha(f), "note": r["note"], "source_id": sid})
+    pin_sha = next(x["sha256"] for x in snaps if x["source_id"] == int(sel_id))
+    (out / "seed" / "release_seed.json").write_text(json.dumps(
+        {"snapshots": snaps, "verdict": v, "pinned_selector_sha256": pin_sha, "autostart": AUTOSTART, "rh_assets": rh_assets}, indent=1, default=str) + "\n")
+
+    cdir = config.BRAIN_DIR / "connectome"; current = (cdir / "current.txt").read_text().strip()
+    for name in ("current.txt", "scale.json", current):
+        shutil.copy2(cdir / name, models / "connectome" / name)
+    # The fly's inputs include wallet skill: config.json names the fitted (h, L) that FLY_VERSION carries, and the day's
+    # table maps wallets to skill deciles. The newest table ships in the signed release (~300 MB: too big for GitHub, so
+    # a git checkout has only its name and sha256, and docker/bootstrap.sh downloads and checks it); the engine falls
+    # back to it while it goes stale.
+    from fly_trader.train.mature import SKILL_DIR
+    tables = sorted(SKILL_DIR.glob("????-??-??.parquet"))
+    if not (SKILL_DIR / "config.json").exists() or not tables:
+        raise SystemExit("no wallet-skill config or tables: the fly's inputs need them (fly-trader fit-wallet-skill)")
+    sk = models / "wallet_skill"; sk.mkdir(exist_ok=True)
+    for name in ("config.json", "fit.json"):
+        if (SKILL_DIR / name).exists():
+            shutil.copy2(SKILL_DIR / name, sk / name)
+    shutil.copy2(tables[-1], sk / tables[-1].name); (sk / "TABLE").write_text(tables[-1].name + "\n")
+    # the table is not in git: a self-hosted install downloads it and uses it only if it has this sha256
+    (sk / "TABLE.sha256").write_text(hashlib.sha256((sk / tables[-1].name).read_bytes()).hexdigest() + "\n")
+    # The console's 3D brain view needs each neuron's position (brain/geometry.py), built from the FlyWire annotations
+    # TSV that a distribution does not ship; the built files depend only on the connectome, so they ship instead and
+    # docker/entrypoint.sh copies them into the console's static directory.
+    from fly_trader.brain.geometry import build_geometry
+    build_geometry(models / "geometry")
+    from fly_trader.train import model_io
+    for f in sorted(models.rglob("*")):             # the server's apply-release refuses anything that could run code
+        if f.is_file():
+            model_io.check_file(f)
+    print(f"seed written to {out}/: fly #{fly['id']} ({Path(rows[int(fly['id'])]['path']).name}), selector #{sel_id}, connectome {current}, skill table {tables[-1].name}")
+    print(f"  fly taught by: {fly['meta'].get('teacher')}")
+    print(f"  replay verdict: {v.get('reason')}")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--out", type=Path, default=Path("dist"), help="output directory (default: dist/)")
+    main(ap.parse_args().out)

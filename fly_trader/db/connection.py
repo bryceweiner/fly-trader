@@ -1,0 +1,86 @@
+"""psycopg 3 connections to the fly_trader database.
+
+Pattern from better_bot code/db_connection.py: a production database is refused while pytest is
+running unless its name contains "test" (the autouse fixture in tests/conftest.py points
+DATABASE_URL at fly_trader_test).
+"""
+from __future__ import annotations
+
+import os
+import time
+from contextlib import contextmanager
+
+import psycopg
+from psycopg.conninfo import conninfo_to_dict
+from psycopg.rows import dict_row
+
+from .. import config
+
+
+class ProductionDatabaseUnderPytest(RuntimeError):
+    pass
+
+
+def database_url() -> str:
+    return os.environ.get("DATABASE_URL") or config.DATABASE_URL
+
+
+def database_name(url: str | None = None) -> str:
+    return conninfo_to_dict(url or database_url()).get("dbname") or "fly_trader"   # URL or key=value DSN
+
+
+def _refuse_production_under_pytest(url: str) -> None:
+    from ..netguard import under_test                  # pytest's per-test variable, or FLY_TRADER_TESTING from conftest's first line
+    if under_test() and "test" not in database_name(url):
+        raise ProductionDatabaseUnderPytest(
+            f"refusing to open non-test database {database_name(url)!r} under pytest"
+        )
+
+
+def connect(url: str | None = None, *, autocommit: bool = False) -> psycopg.Connection:
+    url = url or database_url()
+    _refuse_production_under_pytest(url)
+    last: Exception | None = None
+    for attempt in range(3):          # a busy machine can refuse one connection; a long training run must not die for it,
+        # but an unreachable database must still report in seconds, not half a minute: three short attempts, ~10 s in all
+        try:
+            return psycopg.connect(url, autocommit=autocommit, row_factory=dict_row, options="-c timezone=UTC", connect_timeout=3)
+        except psycopg.OperationalError as e:
+            last = e
+            if attempt < 2:
+                time.sleep(0.25 * 2 ** attempt)
+    raise last
+
+
+@contextmanager
+def transaction(url: str | None = None):
+    """One transaction; commits on success, rolls back on exception."""
+    conn = connect(url)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def fetch_all(sql: str, params=None, url: str | None = None) -> list[dict]:
+    with connect(url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+
+
+def fetch_one(sql: str, params=None, url: str | None = None) -> dict | None:
+    with connect(url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchone()
+
+
+def execute(sql: str, params=None, url: str | None = None) -> None:
+    with transaction(url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)

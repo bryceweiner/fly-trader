@@ -1,0 +1,620 @@
+"""Live execution through Jupiter Swap API v2 with balance-verified fills (plan §9).
+
+Per attempt (several mints' swaps in flight at once, one per mint: execution/worker.py):
+  assert_signing_allowed() -> pre = snapshot_balances() beside GET /order (taker = bot, excludeRouters=
+  jupiterz) and the signing, taken before anything is sent -> assert signatureFeePayer == taker -> orders row (status
+  'ordered') -> sign only our signer slot -> POST /execute -> orders row updated -> poll getSignatureStatuses every
+  ``CONFIRM_POLL_S`` until confirmed or getBlockHeight() > lastValidBlockHeight (no other timeout) -> post = snapshot
+  beside the swap's own transaction, whose deltas are the fill (another swap may land between the two snapshots) ->
+  fill iff the input balance decreased AND the output balance increased (a confirmed sell whose token
+  balance fell is a fill even when the SOL delta is <= 0: dust proceeds below fees) -> fills row.
+
+Jupiter's execute status is recorded but never trusted alone: 'Failed' with moved balances is a
+fill (verified_by='balance_delta_despite_failed'); 'Success' without movement is a fills row with
+verified_by='unverified' plus an events row after a getTransaction check. On execute code -1000
+(failed to land) or a slippage error with NO balance movement the order is retried with
+slippage + step_bps up to max_slippage_bps; each attempt is its own orders row. A buy given its decision's paper
+fill price (``ref_price``) is refused before signing when the /order quote's price (amount in / outAmount) is more
+than ``MAX_ENTRY_CHASE`` above it: slippage is measured against the fresh quote only, which may already have run.
+
+orders.status words: ordered | order_error | price_ran | sign_error | executed | execute_error | confirmed |
+failed_on_chain | expired | unsent.   fills.verified_by: balance_delta |
+balance_delta_despite_failed | unverified.   price_sol = |sol delta| / 1e9 / (|token delta| /
+10^decimals) — an all-in effective price (transaction fee, priority fee and any ATA rent are inside
+the SOL delta; fee_lamports carries the estimate so the ledger must not add it again).
+Every write is committed immediately so a crash mid-poll leaves an auditable row for verify-fills.
+"""
+from __future__ import annotations
+
+import logging
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+
+from psycopg.types.json import Jsonb
+from .. import config
+from ..chain.balances import tx_deltas, tx_hop_deposits, Snapshot, compute_delta, snapshot_balances
+from ..chain.cluster_guard import assert_signing_allowed
+from ..chain.jupiter_swap import JupiterError, JupiterSwap
+from ..db.connection import transaction
+from ..chain.rpc import TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, HttpSolanaRpc
+from ..chain.signing import n_lookup_programs, static_program_ids
+from ..signer import client as signer_client
+from ..signer.client import SignerUnavailable
+from ..signer.policy import EXCLUDE_ROUTERS, PolicyError
+from ..db.apilog import record_event
+from ..db.connection import connect, transaction
+from ..logging_setup import scrub
+from . import ledger
+
+log = logging.getLogger(__name__)
+
+_INFLIGHT = threading.Lock()  # one token-account close at a time (``close_empty_atas``)
+_UNSETTLED: dict[str, dict] = {}   # token-account closes sent whose wait ended before they landed or expired (``settle_closes``)
+_UNSETTLED_LOCK = threading.Lock()
+_IO = ThreadPoolExecutor(max_workers=8, thread_name_prefix="runner-exec-io")   # a swap's reads beside its order, signing and confirmation
+_SWAPS = {"active": 0, "started": 0}               # swaps in flight now / ever: whether another swap's balances moved between a swap's snapshots
+_SWAPS_LOCK = threading.Lock()
+
+CONFIRM_POLL_S = 0.4          # one slot
+BLOCKHASH_VALIDITY_BLOCKS = 150  # fallback horizon when /order carries no lastValidBlockHeight
+CLOSE_ATA_BATCH = 10
+BASE_FEE_LAMPORTS = 5_000       # one signature, no priority fee: what the signer's close transaction pays
+SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
+COMPUTE_BUDGET_PROGRAM_ID = "ComputeBudget111111111111111111111111111111"
+ASSOCIATED_TOKEN_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+JUPITER_PROGRAM_IDS = ("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",)
+KNOWN_PROGRAM_IDS = frozenset({SYSTEM_PROGRAM_ID, COMPUTE_BUDGET_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID,
+                               TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, *JUPITER_PROGRAM_IDS})
+RETRY_CODES = frozenset({-1000})  # aggregator: failed to land
+_SLIPPAGE_RE = re.compile(r"slippage|0x1771|\b6001\b", re.IGNORECASE)  # Jupiter SlippageToleranceExceeded = 6001
+
+
+@dataclass
+class FillResult:
+    ok: bool
+    order_id: int | None
+    fill_id: int | None
+    signature: str | None
+    status: str | None
+    code: int | None
+    error: str | None
+    token_delta: int
+    lamports_delta: int               # the trade's SOL: the wallet's change less what went into (or came back from) the mint's token account
+    price_sol: float | None
+    attempts: int
+    deposit_lamports: int = 0         # SOL the swap put into the mint's token account (its rent, a first buy) or took back out (< 0)
+    hops: dict = field(default_factory=dict)   # {mint: lamports} it put into the token accounts a multi-hop route opened for its intermediate tokens
+
+
+def _int_or_none(v) -> int | None:
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def await_confirmation(rpc, signature: str | None, last_valid_block_height: int | None, until=None) -> tuple[str, dict | None]:
+    """Poll until the signature is confirmed/finalized, fails on chain, or the chain's block height
+    passes ``last_valid_block_height`` with no status for the signature (it can then never land; a
+    signature already seen as processed keeps being polled until it confirms or its status disappears).
+    Sleeps 1 s between polls; there is deliberately no other timeout, except ``until``: checked ten times a poll, its
+    True ends the wait with 'pending' (the transaction may still land until its blockhash expires)."""
+    if not signature:
+        return "unsent", None
+    if last_valid_block_height is None:
+        last_valid_block_height = rpc.get_block_height() + BLOCKHASH_VALIDITY_BLOCKS
+    while True:
+        st = (rpc.get_signature_statuses([signature]) or [None])[0]
+        if st:
+            if st.get("err") is not None:
+                return "failed_on_chain", st
+            if st.get("confirmationStatus") in ("confirmed", "finalized"):
+                return "confirmed", st
+        if not st and rpc.get_block_height() > last_valid_block_height:
+            return "expired", st
+        if until is None:
+            time.sleep(CONFIRM_POLL_S)
+            continue
+        for _ in range(10):
+            if until():
+                return "pending", st
+            time.sleep(CONFIRM_POLL_S / 10)
+
+
+class LiveBroker:
+    """Swaps through Jupiter; ``signer`` (fly_trader/signer) checks and signs each transaction."""
+
+    def __init__(self, rpc=None, jup=None, signer=None):
+        self._rpc = rpc
+        self._jup = jup
+        self._signer = signer
+        self._pubkey: str | None = None
+        self._labels: dict[str, str] | None = None
+
+    @property
+    def rpc(self):
+        if self._rpc is None:
+            self._rpc = HttpSolanaRpc()
+        return self._rpc
+
+    @property
+    def jup(self):
+        if self._jup is None:
+            self._jup = JupiterSwap()
+        return self._jup
+
+    @property
+    def signer(self):
+        if self._signer is None:
+            self._signer = signer_client.get()
+        return self._signer
+
+    @property
+    def pubkey(self) -> str:
+        if self._pubkey is None:
+            self._pubkey = self.signer.call("pubkeys")["trading"]
+        return self._pubkey
+
+    @property
+    def labels(self) -> dict[str, str]:
+        if self._labels is None:
+            try:
+                self._labels = dict(self.jup.program_id_to_label())
+            except Exception as e:
+                log.warning("program-id-to-label unavailable: %s", type(e).__name__)
+                self._labels = {}
+        return self._labels
+
+    # ---- public ----
+    def swap(self, conn, *, decision_id: int | None, book: str, side: str, mint: str, amount_in: int,
+             slippage_bps: int, max_slippage_bps: int, step_bps: int, ref_price: float | None = None, decimals: int | None = None) -> FillResult:
+        """Buy (lamports in -> ``mint``) or sell (raw token units in -> SOL) with balance verification. ``ref_price`` (a
+        buy: SOL per whole token, ``decimals`` the token's): the most its quote may exceed by ``MAX_ENTRY_CHASE``."""
+        assert_signing_allowed()
+        if side not in ("buy", "sell"):
+            raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
+        amount_in = int(amount_in)
+        if amount_in <= 0:
+            raise ValueError("amount_in must be positive")
+        if side == "buy":
+            input_mint, output_mint = config.WSOL_MINT, mint
+        else:
+            input_mint, output_mint = mint, config.WSOL_MINT
+        slip = int(slippage_bps)
+        attempt = 0
+        while True:
+            attempt += 1
+            with _SWAPS_LOCK:
+                seen = (_SWAPS["active"], _SWAPS["started"]); _SWAPS["active"] += 1; _SWAPS["started"] += 1
+            try:
+                result, retryable = self._attempt(
+                    conn, decision_id=decision_id, book=book, side=side, mint=mint, input_mint=input_mint,
+                    output_mint=output_mint, amount_in=amount_in, slippage_bps=slip, attempt=attempt,
+                    ref_price=ref_price if side == "buy" else None, decimals=decimals, seen=seen)
+            finally:
+                with _SWAPS_LOCK:
+                    _SWAPS["active"] -= 1
+            result.attempts = attempt
+            if result.ok or not retryable or step_bps <= 0 or slip + step_bps > max_slippage_bps:
+                if retryable and not result.ok:
+                    log.warning("order %s not retried: slippage ladder exhausted at %d bps", result.order_id, slip)
+                return result
+            slip += int(step_bps)
+            log.warning("retrying %s %s after %s (code %s) with slippage %d bps",
+                        side, mint, result.status, result.code, slip)
+
+    # ---- one attempt ----
+    def _attempt(self, conn, *, decision_id, book, side, mint, input_mint, output_mint, amount_in,
+                 slippage_bps, attempt, ref_price=None, decimals=None, seen=(0, 0)) -> tuple[FillResult, bool]:
+        """``seen``: (swaps in flight, swaps started) when this one began (``swap``)."""
+        taker = self.pubkey
+        pre_f = _IO.submit(snapshot_balances, self.rpc, taker)          # the balances before, read beside the order and the signing
+        request = {"inputMint": input_mint, "outputMint": output_mint, "amount": str(amount_in), "taker": taker,
+                   "slippageBps": slippage_bps, "excludeRouters": EXCLUDE_ROUTERS}
+        base = dict(decision_id=decision_id, book=book, attempt=attempt, side=side, input_mint=input_mint,
+                    output_mint=output_mint, amount_in=amount_in, slippage_bps=slippage_bps, request=request)
+
+        def fail(status, error, code=None, order_response=None, order_id=None):
+            if order_id is None:
+                order_id = self._insert_order(conn, **base, order_response=order_response, status=status,
+                                              error_code=code, error=error)
+            else:
+                self._update_order(conn, order_id, status=status, error_code=code, error=error)
+            log.error("%s %s attempt %d: %s: %s", side, mint, attempt, status, error)
+            return FillResult(False, order_id, None, None, status, code, error, 0, 0, None, attempt), False
+
+        # 1. order
+        try:
+            order = self.jup.order(input_mint, output_mint, amount_in, taker=taker, slippage_bps=slippage_bps, exclude_routers=EXCLUDE_ROUTERS)
+        except JupiterError as e:
+            return fail("order_error", scrub(str(e)))
+        err_code = _int_or_none(order.get("errorCode"))
+        tx_b64 = order.get("transaction")
+        if err_code is not None or not tx_b64:
+            msg = order.get("errorMessage") or order.get("error") or "no transaction in /order response"
+            return fail("order_error", scrub(str(msg)), err_code, order)
+        fee_payer = order.get("signatureFeePayer")
+        if fee_payer and fee_payer != taker:
+            return fail("order_error", f"signatureFeePayer {fee_payer} != taker", None, order)
+        if ref_price and decimals is not None:          # the quote against its decision's paper fill: nothing signed yet
+            out = _int_or_none(order.get("outAmount")) or 0
+            px = (amount_in / config.LAMPORTS_PER_SOL) / (out / 10 ** int(decimals)) if out > 0 else float("inf")
+            if px > ref_price * (1.0 + config.MAX_ENTRY_CHASE):
+                return fail("price_ran", f"price ran: quoted {px:.6g} SOL per token, {px / ref_price - 1:+.1%} over the decision's {ref_price:.6g} "
+                                         f"(at most +{config.MAX_ENTRY_CHASE:.0%})", None, order)
+        lvbh = _int_or_none(order.get("lastValidBlockHeight"))
+        program_ids = static_program_ids(tx_b64)
+        unknown = [p for p in program_ids if p not in KNOWN_PROGRAM_IDS and p not in self.labels]
+        if unknown:
+            log.warning("order references unknown static program ids: %s", unknown)
+        n_lookup = n_lookup_programs(tx_b64)
+        if n_lookup:
+            log.warning("%d instruction(s) use program ids from lookup tables (unresolved in v1)", n_lookup)
+        order_id = self._insert_order(
+            conn, **base, order_response=order, request_id=order.get("requestId"), router=order.get("router"),
+            fee_bps=_int_or_none(order.get("feeBps")), program_ids=program_ids, lvbh=lvbh, status="ordered")
+
+        # 2. sign: the signer checks the transaction (programs, roles, a simulation of our balances) and signs our slot
+        try:
+            signed = self.signer.call("sign_swap", tx=tx_b64, in_mint=input_mint, out_mint=output_mint, in_amount=amount_in,
+                                      min_out=max(1, int(_int_or_none(order.get("otherAmountThreshold")) or 1)))
+        except PolicyError as e:
+            r = fail("sign_refused", f"{e.code}: {scrub(str(e))}", None, order_id=order_id)
+            if e.code == "policy":
+                record_event("error", "signer", f"swap refused: {e}", {"order_id": order_id, "side": side, "mint": mint})
+            return r[0], e.code == "in_flight"          # a simulation that failed (slippage, stale route): retry with a new order
+        except SignerUnavailable as e:
+            return fail("sign_error", scrub(str(e)), None, order_id=order_id)
+        signed_b64, tx_sig = signed["tx"], signed["signature"]
+        try:
+            pre = pre_f.result()                         # taken before anything is sent
+        except Exception as e:
+            return fail("unsent", f"the balances before could not be read: {type(e).__name__}: {scrub(str(e))}", None, order_id=order_id)
+
+        # 3. execute
+        exec_req = {"requestId": order.get("requestId"), "lastValidBlockHeight": lvbh, "signedTransaction": signed_b64}
+        ex: dict | None
+        try:
+            ex = self.jup.execute(signed_b64, order.get("requestId"), lvbh)
+        except JupiterError as e:
+            ex = None
+            code = None
+            error = scrub(str(e))
+            signature = tx_sig  # the transaction may still have been broadcast: poll it anyway
+            self._update_order(conn, order_id, execute_request=exec_req, execute_response=None, signature=signature,
+                               status="execute_error", error_code=None, error=error)
+        else:
+            code = _int_or_none(ex.get("code"))
+            error = ex.get("error")
+            signature = ex.get("signature") or tx_sig
+            if ex.get("signature") and ex["signature"] != tx_sig:
+                log.warning("execute signature %s differs from our transaction id %s", ex["signature"], tx_sig)
+            self._update_order(conn, order_id, execute_request=exec_req, execute_response=ex, signature=signature,
+                               status="executed", error_code=code, error=error, latency_ms=ex.get("_latency_ms"))
+
+        # 4. confirm (or expire), 5. verify: the balances after, beside the swap's own transaction — retried: a transport
+        # error here must not leave a landed swap unrecorded
+        chain_status = st = post = tx = None; last_exc = None
+        for k in range(4):
+            try:
+                if chain_status is None:
+                    chain_status, st = await_confirmation(self.rpc, signature, lvbh)
+                    self._update_order(conn, order_id, status=chain_status)
+                post_f = _IO.submit(snapshot_balances, self.rpc, taker)
+                tx_f = _IO.submit(self._landed, signature) if chain_status == "confirmed" else None
+                post = post_f.result(); tx = tx_f.result() if tx_f is not None else None; break
+            except Exception as e:                       # RPC transport / RPC errors
+                last_exc = e; log.warning("confirm/verify attempt %d for %s failed: %s", k + 1, signature, scrub(str(e)))
+                time.sleep(2.0 * (k + 1))
+        # another swap, a deposit or a token-account close left unsettled may move the wallet between the
+        # two snapshots: the fill is the swap's own transaction's deltas, so SOL landing meanwhile never becomes part of a
+        # trade's cost or proceeds; with other swaps in flight the snapshots cannot stand in for an unreadable transaction
+        exact = tx_deltas(tx, str(taker), mint) if tx else None
+        with _SWAPS_LOCK:
+            moved = seen[0] > 0 or _SWAPS["started"] - seen[1] > 1
+        if post is None or (chain_status == "confirmed" and exact is None and moved):
+            why = "could not confirm or verify after retries" if post is None else "its transaction could not be read and other swaps moved the wallet meanwhile"
+            fill_id = self._insert_fill(conn, order_id, book, signature, None, mint, side, 0, 0, None, None, order.get("platformFee"), "unknown", pre, post or pre)
+            record_event("error", "broker_live", f"fill unknown: {why}; entries paused until reconciled (verify-fills)",
+                         {"order_id": order_id, "signature": signature, "side": side, "mint": mint, "error": scrub(str(last_exc))[:200]})
+            try:                                            # a landed but unrecorded swap must not be bought again or leave a stale position
+                with transaction() as c2:
+                    c2.execute("UPDATE circuit_state SET entries_paused = true, updated_at = now() WHERE id = 1")
+                    c2.execute("INSERT INTO circuit_events (kind, detail) VALUES ('unknown_fill_pause', %s)", (Jsonb({"order_id": order_id, "signature": signature, "mint": mint, "side": side}),))
+            except Exception:
+                log.exception("could not pause entries after an unknown fill")
+            raise RuntimeError(f"confirm/verify failed for {signature}: {why}") from last_exc
+        delta = compute_delta(pre, post)
+        lam = int(delta["lamports_delta"])
+        tok = int(delta["token_deltas"].get(mint, 0))
+        if exact is not None and chain_status == "confirmed":
+            if exact != (lam, tok):
+                log.warning("fill %s: snapshot deltas (%d, %d) differ from the transaction's (%d, %d); using the transaction",
+                            signature[:12], lam, tok, exact[0], exact[1])
+            lam, tok = exact
+        # the rent a first buy pays to open the mint's token account (~0.0015 SOL) is a deposit the account's close returns,
+        # not the trade: the trade's SOL, its price and the position's cost leave it out (it is kept on the position)
+        dep = int(post.deposits.get(mint, 0)) - int(pre.deposits.get(mint, 0))
+        # nor is the rent of the token accounts a multi-hop route opens for its intermediate tokens (~0.0015 SOL each): they
+        # are left empty and the mirror's close returns it (execution/worker.py ``emptied``). Read from the swap's own
+        # transaction; from the snapshots only when no other swap could have opened accounts between them
+        if exact is not None and chain_status == "confirmed":
+            hops = tx_hop_deposits(tx, str(taker), mint) or {}
+        elif not moved:
+            hops = {m: int(post.deposits.get(m, 0)) - int(pre.deposits.get(m, 0)) for m in set(pre.deposits) | set(post.deposits) if m != mint}
+            hops = {m: v for m, v in hops.items() if v}
+        else:
+            hops = {}
+        lam += dep + sum(hops.values())
+        # a confirmed sell that moved the tokens is a fill even at lam <= 0 (a rugged token's dust proceeds < fees)
+        verified = (lam < 0 and tok > 0) if side == "buy" else (tok < 0 and (lam > 0 or chain_status == "confirmed"))
+        jup_status = (ex or {}).get("status")
+        slot = _int_or_none((ex or {}).get("slot")) or _int_or_none((st or {}).get("slot"))
+        if verified:
+            verified_by = "balance_delta" if jup_status == "Success" else "balance_delta_despite_failed"
+            decimals = self._decimals(conn, mint, pre, post)
+            sol = abs(lam) if side == "buy" else max(lam, 0)
+            price = (sol / config.LAMPORTS_PER_SOL) / (abs(tok) / 10 ** decimals) if decimals is not None else None
+            fee = self._fee_lamports(side, lam, amount_in, ex, order)
+            fill_id = self._insert_fill(conn, order_id, book, signature, slot, mint, side, tok, lam, price, fee,
+                                        order.get("platformFee"), verified_by, pre, post)
+            log.info("fill %s: %s %s token_delta=%d lamports_delta=%d price_sol=%s (%s)",
+                     fill_id, side, mint, tok, lam, price, verified_by)
+            return FillResult(True, order_id, fill_id, signature, chain_status, code, error, tok, lam, price, attempt, dep, hops), False
+        if jup_status == "Success" or chain_status == "confirmed":
+            tx_info = tx
+            try:
+                tx_info = tx_info or self.rpc.get_transaction(signature)
+            except Exception as e:
+                log.warning("getTransaction failed for %s: %s", signature, type(e).__name__)
+            meta = (tx_info or {}).get("meta") or {}
+            record_event("warning", "broker_live",
+                         "fill unverified: execute reported success but balances did not move as expected",
+                         {"order_id": order_id, "signature": signature, "side": side, "mint": mint,
+                          "lamports_delta": lam, "token_delta": tok, "chain_status": chain_status,
+                          "jupiter_status": jup_status, "tx_found": tx_info is not None,
+                          "tx_err": meta.get("err"), "tx_fee": meta.get("fee"), "tx_slot": (tx_info or {}).get("slot")})
+            fill_id = self._insert_fill(conn, order_id, book, signature, slot, mint, side, tok, lam, None, None,
+                                        order.get("platformFee"), "unverified", pre, post)
+            return FillResult(False, order_id, fill_id, signature, chain_status, code, error, tok, lam, None, attempt), False
+        retryable = (code in RETRY_CODES) or bool(error and _SLIPPAGE_RE.search(str(error)))
+        log.error("%s %s attempt %d not filled: chain=%s jupiter=%s code=%s error=%s lamports_delta=%d token_delta=%d",
+                  side, mint, attempt, chain_status, jup_status, code, error, lam, tok)
+        return FillResult(False, order_id, None, signature, chain_status, code, error, tok, lam, None, attempt), retryable
+
+    # ---- helpers ----
+    def _landed(self, signature: str) -> dict | None:
+        """The confirmed swap's transaction; None when unreadable (a node may not serve it the moment it confirms)."""
+        for k in range(3):
+            try:
+                tx = self.rpc.get_transaction(signature)
+            except Exception as e:
+                tx = None; log.warning("getTransaction for the fill of %s failed: %s", signature[:12], type(e).__name__)
+            if tx:
+                return tx
+            time.sleep(0.3 * (k + 1))
+        return None
+
+    def _decimals(self, conn, mint: str, pre: Snapshot, post: Snapshot) -> int | None:
+        d = post.decimals.get(mint, pre.decimals.get(mint))
+        if d is not None:
+            return int(d)
+        try:
+            row = conn.execute("SELECT decimals FROM tokens WHERE mint = %s", (mint,)).fetchone()
+            if row and row["decimals"] is not None:
+                return int(row["decimals"])
+        except Exception:
+            conn.rollback()
+        try:
+            return self.rpc.get_mint_decimals(mint)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _fee_lamports(side: str, lam: int, amount_in: int, ex: dict | None, order: dict) -> int | None:
+        """Buy: lamports beyond the swap input (tx fee + priority fee + ATA rent). Sell: SOL the route
+        produced that did not reach the wallet. Approximations from execute amounts, else the order's
+        fee fields."""
+        ex = ex or {}
+        if side == "buy":
+            total_in = _int_or_none(ex.get("totalInputAmount")) or amount_in
+            return abs(lam) - total_in
+        total_out = _int_or_none(ex.get("totalOutputAmount"))
+        if total_out is not None:
+            return total_out - lam
+        sig_fee = _int_or_none(order.get("signatureFeeLamports")) or 0
+        prio = _int_or_none(order.get("prioritizationFeeLamports")) or 0
+        return sig_fee + prio
+
+    def _insert_order(self, conn, *, decision_id, book, attempt, side, input_mint, output_mint, amount_in,
+                      slippage_bps, request, order_response=None, request_id=None, router=None, fee_bps=None,
+                      program_ids=None, lvbh=None, status, error_code=None, error=None) -> int:
+        row = conn.execute(
+            "INSERT INTO orders (decision_id, book, attempt, side, input_mint, output_mint, amount_in, slippage_bps, "
+            "request, order_response, request_id, router, fee_bps, program_ids, last_valid_block_height, status, "
+            "error_code, error) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (decision_id, book, attempt, side, input_mint, output_mint, amount_in, slippage_bps, Jsonb(request),
+             Jsonb(order_response) if order_response is not None else None, request_id, router, fee_bps,
+             list(program_ids) if program_ids is not None else None, lvbh, status, error_code, error),
+        ).fetchone()
+        conn.commit()
+        return int(row["id"])
+
+    def _update_order(self, conn, order_id: int, **fields) -> None:
+        json_cols = {"execute_request", "execute_response", "order_response"}
+        cols, vals = [], []
+        for k, v in fields.items():
+            cols.append(f"{k} = %s")
+            vals.append(Jsonb(v) if k in json_cols and v is not None else v)
+        conn.execute(f"UPDATE orders SET {', '.join(cols)} WHERE id = %s", (*vals, order_id))
+        conn.commit()
+
+    def _insert_fill(self, conn, order_id, book, signature, slot, mint, side, token_delta, sol_delta_lamports,
+                     price_sol, fee_lamports, platform_fee, verified_by, pre: Snapshot, post: Snapshot) -> int:
+        row = conn.execute(
+            "INSERT INTO fills (order_id, book, signature, slot, mint, side, token_delta, sol_delta_lamports, price_sol, "
+            "fee_lamports, platform_fee, verified_by, pre_snapshot, post_snapshot) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (order_id, book, signature, slot, mint, side, token_delta, sol_delta_lamports, price_sol, fee_lamports,
+             Jsonb(platform_fee) if platform_fee is not None else None, verified_by,
+             Jsonb(pre.to_json()), Jsonb(post.to_json())),
+        ).fetchone()
+        conn.commit()
+        return int(row["id"])
+
+
+def swap_smoke(sol: float) -> None:
+    """Operator smoke test (plan phase 3.12): SOL -> USDC then USDC -> SOL through the live broker.
+    Requires the full live gate (LIVE_ENABLED=1 etc.). Prints both FillResults and the net lamports."""
+    assert_signing_allowed()
+    lamports = int(round(float(sol) * config.LAMPORTS_PER_SOL))
+    broker = LiveBroker()
+    print(f"swap-smoke: wallet {broker.pubkey}: {sol} SOL -> USDC -> SOL")
+    with connect() as conn:
+        r1 = broker.swap(conn, decision_id=None, book="live", side="buy", mint=config.USDC_MINT, amount_in=lamports,
+                         slippage_bps=config.SLIPPAGE_ENTRY_BPS, max_slippage_bps=config.MAX_SLIPPAGE_ENTRY_BPS,
+                         step_bps=config.SLIPPAGE_STEP_BPS)
+        print(f"leg 1 (buy USDC): {r1}")
+        net = r1.lamports_delta
+        if r1.ok and r1.token_delta > 0:
+            r2 = broker.swap(conn, decision_id=None, book="live", side="sell", mint=config.USDC_MINT,
+                             amount_in=r1.token_delta, slippage_bps=config.SLIPPAGE_EXIT_BPS,
+                             max_slippage_bps=config.SLIPPAGE_FORCED_BPS, step_bps=config.SLIPPAGE_STEP_BPS)
+            print(f"leg 2 (sell USDC): {r2}")
+            net += r2.lamports_delta
+        else:
+            print("leg 2 skipped: leg 1 was not a verified fill")
+    print(f"net lamports delta: {net} ({net / config.LAMPORTS_PER_SOL:.9f} SOL)")
+
+
+def close_empty_atas(rpc=None, signer=None, url: str | None = None, batch: int = CLOSE_ATA_BATCH, skip_mints: set | None = None,
+                     until=None) -> dict:
+    """Close every zero-balance token account owned by the bot (rent back to the wallet) and book what each returned
+    (``_book_close``). The signer builds and signs the CloseAccount transactions (it re-checks that each account is ours
+    and empty); each is recorded as wallet_events(kind='ata_closed'). A transaction holds the close lock from its
+    signing to its outcome; a swap meanwhile takes its fill from its own transaction. ``until``: checked while a close is awaited and
+    before each batch; its True starts no other and leaves the one in flight unsettled (``settle_closes`` books it; until
+    then swaps take their deltas from their own transactions)."""
+    assert_signing_allowed()
+    signer = signer or signer_client.get()
+    owner_s = signer.call("pubkeys")["trading"]
+    rpc = rpc or HttpSolanaRpc()
+    settle_closes(rpc, url=url)
+    skip = set(skip_mints or ())
+    sent = {a["address"] for c in list(_UNSETTLED.values()) for a in c["accounts"]}      # a close of theirs may still land
+    empties = [a for a in rpc.get_token_accounts_by_owner(owner_s)
+               if int(a["amount"]) == 0 and a["mint"] not in skip and not a.get("is_native") and a["address"] not in sent]
+    result = {"pubkey": owner_s, "candidates": len(empties), "closed": 0, "signatures": [], "failed": [], "pending": [], "credited": 0.0}
+    if not empties:
+        return result
+    for i in range(0, len(empties), batch):
+        if until is not None and until():
+            break
+        chunk = empties[i:i + batch]
+        accounts = [a["address"] for a in chunk]
+        with _INFLIGHT:                                 # no swap snapshots the wallet while the rent comes back
+            try:
+                built = signer.call("close_atas", accounts=accounts)
+            except (PolicyError, SignerUnavailable) as e:
+                result["failed"].append({"accounts": accounts, "error": str(e)})
+                record_event("error", "close_empty_atas", "the signer refused", {"accounts": accounts, "error": str(e)})
+                continue
+            if not built:
+                continue
+            try:
+                sig = rpc.send_transaction(built[0]["tx"])
+            except Exception as e:
+                err = f"{type(e).__name__}: {scrub(str(e))}"
+                result["failed"].append({"accounts": accounts, "error": err})
+                record_event("error", "close_empty_atas", "close transaction rejected", {"accounts": accounts, "error": err})
+                continue
+            close = {"owner": owner_s, "last_valid_block_height": built[0]["last_valid_block_height"],
+                     "accounts": [{"address": a["address"], "mint": a["mint"], "lamports": int(a.get("lamports") or 0)} for a in chunk]}
+            status, st = await_confirmation(rpc, sig, close["last_valid_block_height"], until=until)
+            if status == "pending":
+                with _UNSETTLED_LOCK:
+                    _UNSETTLED[sig] = close
+                result["pending"].append(sig)
+                log.info("close_empty_atas: %s not landed yet; settled later", sig)
+                break
+        n, credited = _book_close(rpc, sig, close, status, st, url=url)
+        result["closed"] += n; result["credited"] += credited
+        if status == "confirmed":
+            result["signatures"].append(sig)
+        else:
+            result["failed"].append({"accounts": accounts, "signature": sig, "status": status})
+    log.info("close_empty_atas: closed %d of %d (%d tx), %+.9f SOL booked", result["closed"], len(empties), len(result["signatures"]), result["credited"])
+    return result
+
+
+def unsettled_closes() -> bool:
+    return bool(_UNSETTLED)
+
+
+def settle_closes(rpc, conn=None, url: str | None = None) -> int:
+    """Book every unsettled close that has since landed and forget those that expired; returns how many are left."""
+    for sig, close in list(_UNSETTLED.items()):
+        st = (rpc.get_signature_statuses([sig]) or [None])[0]
+        if st and st.get("err") is not None:
+            status = "failed_on_chain"
+        elif st and st.get("confirmationStatus") in ("confirmed", "finalized"):
+            status = "confirmed"
+        elif not st and rpc.get_block_height() > int(close["last_valid_block_height"]):
+            status = "expired"
+        else:
+            continue
+        _book_close(rpc, sig, close, status, st, conn=conn, url=url)
+        with _UNSETTLED_LOCK:
+            _UNSETTLED.pop(sig, None)
+    return len(_UNSETTLED)
+
+
+def _refunds(tx: dict | None, close: dict, status: str) -> tuple[dict[str, int], int]:
+    """({account: lamports it returned, less its share of the fee}, the fee) of a close transaction that landed: an account
+    it closed had its lamports before and none after. Read from the transaction, else (unreadable) from the listing the
+    close was built from with the base fee of its one signature."""
+    accts = {a["address"]: a["lamports"] for a in close["accounts"]}
+    try:
+        keys = [k.get("pubkey") if isinstance(k, dict) else str(k) for k in tx["transaction"]["message"]["accountKeys"]]
+        meta = tx["meta"]; pre, post = meta["preBalances"], meta["postBalances"]
+        gone = {k: int(pre[i]) for i, k in enumerate(keys) if k in accts and int(post[i]) == 0 and int(pre[i]) > 0}
+        fee = int(meta.get("fee") or 0)
+    except (KeyError, TypeError, ValueError, IndexError):
+        gone, fee = (dict(accts) if status == "confirmed" else {}), BASE_FEE_LAMPORTS
+    n = len(gone)
+    return {k: v - fee // n - (fee % n if i == 0 else 0) for i, (k, v) in enumerate(gone.items())} if n else {}, fee
+
+
+def _book_close(rpc, sig: str, close: dict, status: str, st: dict | None, conn=None, url: str | None = None) -> tuple[int, float]:
+    """Record a close transaction's outcome (wallet_events 'ata_closed') and book what landed onto the live book: each
+    closed account's rent less its share of the fee (ledger.book_account_close), or only the fee when it failed. Returns
+    (accounts closed, SOL booked)."""
+    refunds, fee = {}, 0
+    if status in ("confirmed", "failed_on_chain"):            # landed: the rent (or only the fee) moved
+        try:
+            tx = rpc.get_transaction(sig)
+        except Exception as e:
+            tx = None; log.warning("getTransaction of close %s failed: %s", sig[:12], type(e).__name__)
+        refunds, fee = _refunds(tx, close, status)
+    if conn is None:
+        with transaction(url) as c:
+            return _book(c, sig, close, status, st, refunds, fee)
+    return _book(conn, sig, close, status, st, refunds, fee)
+
+
+def _book(conn, sig: str, close: dict, status: str, st: dict | None, refunds: dict[str, int], fee: int) -> tuple[int, float]:
+    mint_of = {a["address"]: a["mint"] for a in close["accounts"]}
+    booked, credited = {}, 0.0
+    for addr, lam in refunds.items():
+        sol, pid = ledger.book_account_close(conn, "live", mint_of[addr], lam)
+        credited += sol; booked[addr] = {"lamports": lam, "position": pid}
+    if status == "failed_on_chain" and fee and close["accounts"]:      # nothing closed, the fee paid: the latest sale's
+        sol, pid = ledger.book_account_close(conn, "live", close["accounts"][0]["mint"], -fee, closed=False)
+        credited += sol; booked["fee"] = {"lamports": -fee, "position": pid}
+    conn.execute("INSERT INTO wallet_events (kind, pubkey, detail) VALUES ('ata_closed', %s, %s)",
+                 (close["owner"], Jsonb({"accounts": [a["address"] for a in close["accounts"]], "mints": sorted(set(mint_of.values())), "signature": sig,
+                                         "status": status, "slot": int((st or {}).get("slot") or 0), "fee": fee, "booked": booked})))
+    return len(refunds), credited

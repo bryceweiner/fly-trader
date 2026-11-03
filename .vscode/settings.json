@@ -1,0 +1,17 @@
+{
+  // data/ (the corpus, hundreds of GB) and logs/ are written all day by the console. Extensions' file searches
+  // (workspace.findFiles) ignore .gitignore and honour only files.exclude: on 2026-10-17 one ran 1,222 rg processes over
+  // data/, load reached 975 and the live runner's warm-up stalled for 29 minutes.
+  "files.watcherExclude": {
+    "data/**": true,
+    "logs/**": true
+  },
+  "files.exclude": {
+    "data": true,
+    "logs": true
+  },
+  "search.exclude": {
+    "data": true,
+    "logs": true
+  }
+}

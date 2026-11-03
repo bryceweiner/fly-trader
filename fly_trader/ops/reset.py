@@ -1,0 +1,222 @@
+"""Reset the training state so a fresh runner never carries over a bad run — without touching the race or the fly.
+
+``reset_training_state`` (every runner start, ``RESET_ON_START``) wipes, after archiving them as CSV under
+data/pg_archive/reset_<ts>/, what belongs to no book that must persist: positions/orders/fills and wealth marks of any
+book but the live book and the two race books (``PRESERVED_BOOKS``), decisions and beats of runs that are not the race
+sessions' (``RACE_RUN_KINDS``), those runs, and brain snapshots that are not models (``MODEL_KINDS``). NEVER touched:
+the race books (paper_selector, paper_fly) and the live book with their runs, beats and decisions; the plastic fly's
+tables (fly_*) and state file; the circuit (kill switch, trip, failure count, peak wealth — only rails.reset_circuit
+re-arms it); wallet events, tokens, pools, market data, API logs, events, other ui_settings.
+
+``reset_fly`` is the explicit console action: the plastic fly starts again from its bootstrap (its book, its learned
+KC→MBON changes, scored minutes, calibrations, rollbacks, snapshots and its recorded network activity are archived and
+cleared; the bootstrap is kept). ``reset_training_state`` never touches the activity files either.
+
+``reset_paper_books`` zeroes the paper race books' stats when live money arrives (`fly-trader reset-paper`): their
+trades, fills, decisions, wealth marks and halts are archived and cleared so they start again from the wallet's funds
+(CAPITAL_SOL / RH_CAPITAL_ETH) — what the fly has learned, its race clock (in its state file), the live books and every
+other book are kept.
+``reset_training_stats`` is the training-side counterpart, run at the start of every training run: the previous runs'
+walk-forward / iteration events and the console's training status are archived and cleared (models are kept).
+"""
+from __future__ import annotations
+
+import json
+import logging
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .. import config
+from ..db.apilog import record_event
+from ..db.connection import transaction
+
+log = logging.getLogger(__name__)
+
+PRESERVED_BOOKS = ("live", "paper_selector", "paper_fly", "live_rh", "paper_rh_selector", "paper_rh_fly", "paper_kalshi_taker", "paper_kalshi_maker", "live_kalshi_taker", "live_kalshi_maker")
+RACE_RUN_KINDS = ("selector", "fly", "kalshi_fly", "selector_rh", "fly_rh")
+MODEL_KINDS = ("selector", "fly_selector", "fly_plastic", "kalshi_selector", "kalshi_fly_selector", "kalshi_fly_plastic")
+FLY_BOOK, FLY_RUN_KIND = "paper_fly", "fly"
+FLY_BOOKS, FLY_RUN_KINDS = ("paper_fly", "paper_rh_fly"), ("fly", "fly_rh")     # one brain: both chains' fly books reset together
+FLY_TABLES = ["fly_scored", "fly_calibrations", "fly_updates", "fly_rollbacks"]
+BOOK_TABLES = ["positions", "orders", "fills"]
+TRAINING_EVENTS = {"selector": "(source = 'selector' AND (message LIKE 'walk-forward%' OR message LIKE 'selector saved%'))",   # per regimen: a fly
+                   "fly_selector": "source = 'fly_selector'",                                                # run keeps the selector's
+                   "kalshi_selector": "(source = 'kalshi_selector' AND (message LIKE 'walk-forward%' OR message LIKE 'selector saved%'))",
+                   "kalshi_fly_selector": "source = 'kalshi_fly_selector'"}
+
+
+def _sql_list(xs) -> str:
+    return "(" + ",".join(f"'{x}'" for x in xs) + ")"
+
+
+_BOOKS, _KINDS, _RACE = _sql_list(PRESERVED_BOOKS), _sql_list(MODEL_KINDS), _sql_list(RACE_RUN_KINDS)
+_RACE_RUNS = f"SELECT run_id FROM runs WHERE kind IN {_RACE}"
+_KEPT_DECISIONS = (f"SELECT decision_id FROM orders WHERE book IN {_BOOKS} AND decision_id IS NOT NULL "
+                   f"UNION SELECT entry_decision_id FROM positions WHERE book IN {_BOOKS} AND entry_decision_id IS NOT NULL "
+                   f"UNION SELECT exit_decision_id FROM positions WHERE book IN {_BOOKS} AND exit_decision_id IS NOT NULL "
+                   f"UNION SELECT id FROM decisions WHERE run_id IN ({_RACE_RUNS})")
+_LIVE_DECISIONS = ("SELECT decision_id FROM orders WHERE book IN ('live', 'live_rh') AND decision_id IS NOT NULL "
+                   "UNION SELECT entry_decision_id FROM positions WHERE book IN ('live', 'live_rh') AND entry_decision_id IS NOT NULL "
+                   "UNION SELECT exit_decision_id FROM positions WHERE book IN ('live', 'live_rh') AND exit_decision_id IS NOT NULL")
+
+
+def _archive(conn, table: str, where: str, out_dir: Path) -> int:
+    n = conn.execute(f"SELECT count(*) AS n FROM {table} {where}").fetchone()["n"]
+    if n:
+        with open(out_dir / f"{table}.csv", "w") as f:
+            with conn.cursor() as cur:
+                with cur.copy(f"COPY (SELECT * FROM {table} {where}) TO STDOUT WITH CSV HEADER") as copy:
+                    for chunk in copy:
+                        f.write(bytes(chunk).decode("utf-8"))
+    return int(n)
+
+
+def _wipe(conn, plan: list[tuple[str, str]], out_dir: Path | None) -> dict[str, int]:
+    """Archive (when ``out_dir``) then delete each (table, WHERE clause); in order, so later clauses may read earlier tables."""
+    counts: dict[str, int] = {}
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for t, where in plan:
+            counts[t] = counts.get(t, 0) + _archive(conn, t, where, out_dir)
+    for t, where in plan:
+        conn.execute(f"DELETE FROM {t} {where}")
+    return counts
+
+
+PAPER_RACE_BOOKS = {"sol": ("paper_selector", "paper_fly"), "rh": ("paper_rh_selector", "paper_rh_fly")}
+
+
+def reset_paper_books(chains=("sol", "rh"), reason: str = "live funds arrived", archive: bool = True) -> dict:
+    """Archive and clear the paper race books of ``chains``: positions (open ones too), orders, fills, wealth marks, their
+    decisions (never one a live book references) and their halts. Run with the engine stopped; a paper book's cash is
+    derived from its capital and these rows (execution/ledger.py), so it restarts from the configured capital."""
+    books = [b for c in chains for b in PAPER_RACE_BOOKS[c]]
+    bl = _sql_list(books)
+    out_dir = config.PG_ARCHIVE_DIR / f"reset_paper_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    linked = (f"SELECT decision_id FROM orders WHERE book IN {bl} AND decision_id IS NOT NULL "
+              f"UNION SELECT entry_decision_id FROM positions WHERE book IN {bl} AND entry_decision_id IS NOT NULL "
+              f"UNION SELECT exit_decision_id FROM positions WHERE book IN {bl} AND exit_decision_id IS NOT NULL")
+    plan = [("decisions", f"WHERE (id IN ({linked}) OR detail->>'book' IN {bl} OR book_targets && ARRAY{books}::text[]) AND id NOT IN ({_LIVE_DECISIONS})"),
+            *[(t, f"WHERE book IN {bl}") for t in BOOK_TABLES],
+            ("wealth_marks", f"WHERE book IN {bl}"),
+            ("book_state", f"WHERE book IN {bl}")]
+    with transaction() as conn:
+        counts = _wipe(conn, plan, out_dir if archive else None)
+        conn.execute("INSERT INTO circuit_events (kind, detail) VALUES ('paper_reset', %s)", (json.dumps({"reason": reason, "books": books}),))
+    record_event("info", "reset", f"paper books reset ({reason}): {', '.join(books)}", {"archived_to": str(out_dir) if archive else None, "rows": counts})
+    log.info("paper books reset (%s): %s", reason, counts)
+    return {"archived_to": str(out_dir) if archive else None, "rows": counts, "books": books}
+
+
+def reset_training_state(reason: str = "runner start", archive: bool = True) -> dict:
+    out_dir = config.PG_ARCHIVE_DIR / f"reset_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    plan = [("decisions", f"WHERE id NOT IN ({_KEPT_DECISIONS})"),
+            ("beats", f"WHERE run_id IS NULL OR run_id NOT IN ({_RACE_RUNS})"),
+            ("wealth_marks", f"WHERE book NOT IN {_BOOKS}"),
+            ("brain_snapshots", f"WHERE kind NOT IN {_KINDS}"),
+            *[(t, f"WHERE book NOT IN {_BOOKS}") for t in BOOK_TABLES],
+            ("runs", f"WHERE kind NOT IN ('connectome_build','calibration') AND kind NOT IN {_RACE}")]
+    with transaction() as conn:
+        counts = _wipe(conn, plan, out_dir if archive else None)
+        conn.execute(f"UPDATE brain_state SET live_snapshot_id = CASE WHEN (SELECT kind FROM brain_snapshots WHERE id = live_snapshot_id) IN {_KINDS} THEN live_snapshot_id END, "
+                     f"pending_snapshot_id = CASE WHEN (SELECT kind FROM brain_snapshots WHERE id = pending_snapshot_id) IN {_KINDS} THEN pending_snapshot_id END, updated_at = now() WHERE singleton")
+        conn.execute("DELETE FROM ui_settings WHERE key IN ('selector_status', 'selector_status_rh')")
+        conn.execute("INSERT INTO circuit_events (kind, detail) VALUES ('training_reset', %s)", (f'{{"reason": "{reason}"}}',))
+    record_event("info", "reset", f"training state reset ({reason})", {"archived_to": str(out_dir) if archive else None, "rows": counts})
+    log.info("training state reset (%s): %s", reason, counts)
+    return {"archived_to": str(out_dir) if archive else None, "rows": counts}
+
+
+def fly_state_dir() -> Path:
+    return config.BRAIN_DIR / "plastic"
+
+
+def kalshi_fly_state_dir() -> Path:
+    return config.BRAIN_DIR / "plastic_kalshi"
+
+
+def kalshi_activity_dir() -> Path:
+    return config.BRAIN_DIR / "activity_kalshi"
+
+
+KALSHI_BOOKS = ("paper_kalshi_taker", "paper_kalshi_maker")
+KALSHI_FLY_TABLES = ["kalshi_fly_scored", "kalshi_fly_calibrations", "kalshi_fly_updates", "kalshi_fly_rollbacks"]
+KALSHI_BOOK_TABLES = ["kalshi_positions", "kalshi_orders", "kalshi_fills"]
+
+
+def reset_kalshi_fly(reason: str = "operator", archive: bool = True) -> dict:
+    """The visual (Kalshi) fly starts again from its bootstrap: its paper books, sessions, learned state, activity and
+    statistics are archived and cleared. The live Kalshi books and the bootstrap snapshots are kept."""
+    out_dir = config.PG_ARCHIVE_DIR / f"reset_kalshi_fly_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    runs = "SELECT run_id FROM runs WHERE kind = 'kalshi_fly'"
+    books = _sql_list(KALSHI_BOOKS)
+    plan = [("decisions", f"WHERE run_id IN ({runs}) AND (detail->>'book') IN {books}"),
+            ("beats", f"WHERE run_id IN ({runs})"),
+            ("wealth_marks", f"WHERE book IN {books}"),
+            *[(t, f"WHERE book IN {books}") for t in KALSHI_BOOK_TABLES],
+            ("brain_snapshots", "WHERE kind = 'kalshi_fly_plastic'"),
+            ("runs", "WHERE kind = 'kalshi_fly'"),
+            *[(t, "") for t in KALSHI_FLY_TABLES]]
+    with transaction() as conn:
+        counts = _wipe(conn, plan, out_dir if archive else None)
+        conn.execute("DELETE FROM book_state WHERE book = ANY(%s)", (list(KALSHI_BOOKS),))
+        conn.execute("DELETE FROM ui_settings WHERE key = 'kalshi_fly_status'")
+    for d, name in ((kalshi_fly_state_dir(), "plastic_kalshi"), (kalshi_activity_dir(), "activity_kalshi")):
+        if d.exists():
+            if archive:
+                out_dir.mkdir(parents=True, exist_ok=True); shutil.move(str(d), str(out_dir / name))
+            else:
+                shutil.rmtree(d)
+    record_event("warning", "reset", f"kalshi fly reset to its bootstrap ({reason})", {"archived_to": str(out_dir) if archive else None, "rows": counts})
+    log.info("kalshi fly reset (%s): %s", reason, counts)
+    return {"archived_to": str(out_dir) if archive else None, "rows": counts}
+
+
+def activity_dir() -> Path:
+    """The fly's per-minute network activity for the console's brain view (``brain/activity.py``)."""
+    return config.BRAIN_DIR / "activity"
+
+
+def reset_fly(reason: str = "operator", archive: bool = True) -> dict:
+    """The plastic fly starts again from its bootstrap: its paper book, sessions, learned state and statistics are
+    archived and cleared. The live book, the selector's book and the bootstrap snapshots are kept."""
+    out_dir = config.PG_ARCHIVE_DIR / f"reset_fly_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    kinds, books = _sql_list(FLY_RUN_KINDS), _sql_list(FLY_BOOKS)
+    fly_runs = f"SELECT run_id FROM runs WHERE kind IN {kinds}"
+    plan = [("decisions", f"WHERE run_id IN ({fly_runs}) AND id NOT IN ({_LIVE_DECISIONS})"),
+            ("beats", f"WHERE run_id IN ({fly_runs})"),
+            ("wealth_marks", f"WHERE book IN {books}"),
+            *[(t, f"WHERE book IN {books}") for t in BOOK_TABLES],
+            ("brain_snapshots", "WHERE kind = 'fly_plastic'"),
+            ("runs", f"WHERE kind IN {kinds}"),
+            *[(t, "") for t in FLY_TABLES]]
+    with transaction() as conn:
+        counts = _wipe(conn, plan, out_dir if archive else None)
+        conn.execute("DELETE FROM book_state WHERE book = ANY(%s)", (list(FLY_BOOKS),))
+        conn.execute("DELETE FROM ui_settings WHERE key IN ('fly_status', 'fly_status_rh')")
+    for d, name in ((fly_state_dir(), "plastic"), (activity_dir(), "activity")):     # its learned state and its recorded activity
+        if d.exists():
+            if archive:
+                out_dir.mkdir(parents=True, exist_ok=True); shutil.move(str(d), str(out_dir / name))
+            else:
+                shutil.rmtree(d)
+    record_event("warning", "reset", f"plastic fly reset to its bootstrap ({reason})", {"archived_to": str(out_dir) if archive else None, "rows": counts})
+    log.info("plastic fly reset (%s): %s", reason, counts)
+    return {"archived_to": str(out_dir) if archive else None, "rows": counts}
+
+
+def reset_training_stats(regimen: str, reason: str = "training start", archive: bool = True) -> dict:
+    """Clear the previous runs' statistics of this training ``regimen`` (selector walk-forward, fly comparisons; the console's training status) so a new run's numbers are never shown next to an old run's.
+    Other regimens' results and all trained models (brain_snapshots) are kept."""
+    where = TRAINING_EVENTS[regimen]
+    out_dir = config.PG_ARCHIVE_DIR / f"training_{regimen}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    with transaction() as conn:
+        n = 0
+        if archive:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            n = _archive(conn, "events", "WHERE " + where, out_dir)
+        conn.execute("DELETE FROM events WHERE " + where)
+        conn.execute("DELETE FROM ui_settings WHERE key = 'training_status'")
+    log.info("training stats reset (%s): %d events", reason, n)
+    return {"archived_to": str(out_dir) if archive else None, "events": n}

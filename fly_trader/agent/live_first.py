@@ -1,0 +1,261 @@
+"""Live money first and fast over paper, always (CLAUDE.md): when the live books' work runs.
+
+- ``LiveClock``: the live chains' sales due at a minute boundary go out the moment it passes, from a thread of their own
+  (``runner-live-clock``), every chain's side by side, started with the runner -- before its books load and the engine
+  warms up, so a restart never holds a sale back -- and at once for the minute it starts in (a restart may have
+  straddled a boundary).
+- ``chain_take_profits``: a live position's take-profit sale depends on its minute's close alone, so it goes out the
+  moment the engine reads the minute, before the minute's features and the fly's scores (agent/minute_engine.live_phase).
+- Anything that can run beside a live order does: the engine wakes the moment a stream writes a minute
+  (``minute_published``), each chain's wallet balance is read while its minute's features and scores are computed
+  (``prefetch``), and the chains' live phases run at once (agent/minute_engine.run_ready).
+- One live mirror per chain per process (``mirror``): made by whichever comes first, the clock at a boundary or the
+  fly's first live minute, and stopped by the runner when it stops (``stop_mirrors``), never by a book.
+- The engine runs every chain's newest minute for its live books first (the fly scores, its paper book plans, the
+  wallet's entries go out, committed at once), and only then any book's paper trades, learning and bookkeeping
+  (agent/minute_engine.main).
+- ``may_mark``: a wealth mark reads the wallet under the worker's lock, so it is taken between minutes once no order is
+  queued or in flight, and never within ``MARK_QUIET_S`` of a boundary, when the clock's sales go out.
+- ``mid_minute``: slow wallet bookkeeping (dead-bag sweeps, the RH reconcile) runs mid-minute, after the minute's
+  entries and done before the next boundary's sales.
+- The live stats follow the live orders, before anything else: once an order is booked and none waits, its mirror marks
+  the wallet at once and ``changed`` tells every listener (the console pushes its panels then, not at its next poll).
+"""
+from __future__ import annotations
+
+import logging
+import math
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+from .. import config
+from ..db.apilog import record_event
+from ..db.connection import transaction
+
+log = logging.getLogger(__name__)
+MARK_QUIET_S = 3.0            # no wallet read for a mark this close to a minute boundary: the clock's sales must not wait for it
+MID_MINUTE = (20.0, 40.0)     # seconds into a minute when slow wallet bookkeeping may start
+_MIRRORS: dict[str, object] = {}
+_MIRRORS_LOCK = threading.Lock()
+_LISTENERS: list = []
+_PUBLISHED = threading.Event()
+_PREFETCH = ThreadPoolExecutor(max_workers=2, thread_name_prefix="runner-prefetch")   # the live minutes' wallet reads
+_CLOCK = ThreadPoolExecutor(max_workers=4, thread_name_prefix="runner-live-clock")    # every chain's boundary sales at once
+
+
+def minute_published() -> None:
+    """A chain's stream has written a minute (ingest/pumpstream.py, rh/minutes.py): the engine's loop wakes at once."""
+    _PUBLISHED.set()
+
+
+def wait_published(timeout: float) -> None:
+    """The engine's loop between polls: back at the next published minute, else after ``timeout``."""
+    _PUBLISHED.wait(timeout)
+    _PUBLISHED.clear()
+
+
+def prefetch(chain: str, live: bool, m1_epoch: float) -> None:
+    """At a live minute's start, the chain's wallet balance read starts on its own thread, beside the minute's features
+    and the fly's scoring; the mirror sizes the minute's entries on it (``take_balance``)."""
+    m = _MIRRORS.get(chain)
+    if m is None or not live or not hasattr(m, "read_balance") or signing_refused(chain):
+        return
+    m.balance_ahead = (m1_epoch, _PREFETCH.submit(m.read_balance))
+
+
+def take_balance(m, m1_epoch: float):
+    """The balance ``prefetch`` started for this minute (its error raised here), else read now."""
+    ahead, m.balance_ahead = getattr(m, "balance_ahead", None), None
+    return ahead[1].result() if ahead is not None and ahead[0] == m1_epoch else m.read_balance()
+
+
+def may_mark(now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    return now % 60.0 < 60.0 - MARK_QUIET_S
+
+
+def mid_minute(now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    return MID_MINUTE[0] <= now % 60.0 < MID_MINUTE[1]
+
+
+def on_change(fn) -> None:
+    """``fn()`` runs after every live order booked and every live wealth mark (from the thread that did it)."""
+    _LISTENERS.append(fn)
+
+
+def off_change(fn) -> None:
+    if fn in _LISTENERS:
+        _LISTENERS.remove(fn)
+
+
+def changed() -> None:
+    for fn in list(_LISTENERS):
+        try:
+            fn()
+        except Exception:
+            log.debug("a live change listener failed", exc_info=True)
+
+
+def signing_refused(chain: str) -> str | None:
+    """Why the chain's wallet may not sign now (None: it may)."""
+    if chain != "sol":
+        missing = config.rh_live_prerequisites_missing()
+        return ", ".join(missing) if missing else None
+    from ..chain.cluster_guard import signing_allowed
+    return None if signing_allowed() else "signing is not allowed (LIVE_ENABLED=1 and the live prerequisites)"
+
+
+def trades_live(conn, chain: str, live: bool) -> bool:
+    """The chain's wallet trades: the runner may sign (``live``), and the chain's fly holds the seat or
+    LIVE_WITHOUT_HANDOVER says live money trades whoever holds it (the signing gates still apply)."""
+    from . import handover
+    return bool(live) and (config.LIVE_WITHOUT_HANDOVER or handover.state(conn, chain) is not None)
+
+
+def mirror(chain: str, horizon_s: float | None = None):
+    """The chain's live mirror (agent/fly_live.LiveMirror, rh/live.RhLiveMirror), one per process. ``horizon_s``: the fly's
+    longest hold, the hold of a position that carries none; the fly sets it when it runs a live minute (until then such
+    a position is not sold)."""
+    with _MIRRORS_LOCK:
+        m = _MIRRORS.get(chain)
+        if m is None:
+            if chain == "sol":
+                from .fly_live import LiveMirror
+                m = LiveMirror(horizon_s)
+                record_event("info", "fly_live", "the fly trades the bot wallet", {"chain": chain})
+            else:
+                from ..rh.live import RhLiveMirror
+                m = RhLiveMirror(horizon_s)
+                record_event("info", "rh_live", "the RH fly trades the ETH wallet", {"chain": chain})
+            _MIRRORS[chain] = m
+        elif horizon_s is not None:
+            m.H = float(horizon_s)
+        return m
+
+
+def mirror_of(chain: str):
+    """The chain's live mirror once made, else None."""
+    return _MIRRORS.get(chain)
+
+
+def chain_exits(chain: str, m1_epoch: float, live: bool, run_id: str | None = None) -> dict | None:
+    """The chain's live sales due at the minute boundary ``m1_epoch``, while its wallet trades, from the chain's mirror
+    (made now when the fly has not run a live minute yet: its book may still be loading)."""
+    if not live or signing_refused(chain):
+        return None
+    with transaction() as conn:
+        if not trades_live(conn, chain, live):
+            return None
+        return mirror(chain).exits(conn, m1=datetime.fromtimestamp(m1_epoch, timezone.utc), run_id=run_id)
+
+
+def chain_take_profits(chain: str, m1_epoch: float, prices: dict, live: bool, run_id: str | None = None) -> int:
+    """The chain's live sales of positions whose minute closed at their take-profit line (``prices``: the minute's closes;
+    its mirror's ``take_profits``), in a transaction of their own while its wallet trades; how many went out. The line is
+    each position's own, set at its entry (agent/paper_trading.take_profit_x): a position bought without one is held."""
+    if not live or signing_refused(chain):
+        return 0
+    m = mirror_of(chain)
+    if m is None:
+        return 0
+    with transaction() as conn:
+        if not trades_live(conn, chain, live):
+            return 0
+        return m.take_profits(conn, m1=datetime.fromtimestamp(m1_epoch, timezone.utc), prices=prices, run_id=run_id)
+
+
+SELL_NOW_WAIT_S = 90.0        # how long the operator's Sell Now waits for its sale to be booked (an RH sale can take a minute)
+
+
+def sell_now(chain: str, position_id: int, wait_s: float = SELL_NOW_WAIT_S) -> dict:
+    """The operator's Sell Now (the console's open positions, ui/api/overview.py): the chain's mirror sells one open live
+    position at once (its ``sell_now``), then this waits up to ``wait_s`` for the sale to be booked. {"booked", "realized",
+    "cost", "error"} (not booked and no error: not filled yet); ValueError with the reason when nothing was sent."""
+    m = mirror_of(chain)
+    if m is None:
+        raise ValueError("this chain's live mirror is not running in this console")
+    why = signing_refused(chain)
+    if why:
+        raise ValueError(f"its wallet may not sign: {why}")
+    with transaction() as conn:
+        did = m.sell_now(conn, position_id)
+    res = m.sale_result(did, wait_s)
+    with transaction() as conn:
+        p = conn.execute("SELECT status, realized_sol, cost_sol FROM positions WHERE id = %s", (position_id,)).fetchone()
+    booked = p is not None and p["status"] == "closed"
+    return {"booked": booked, "realized": float(p["realized_sol"]) if booked and p["realized_sol"] is not None else None,
+            "cost": float(p["cost_sol"]) if p is not None else None,
+            "error": None if booked or res is None else (res.error or "it sold only part of the position: the rest stays open")}
+
+
+def idle_mirrors() -> None:
+    """Between minutes: each mirror's bookkeeping that waits for an idle wallet (the wealth mark, sweeps, the reconcile)."""
+    for chain, m in list(_MIRRORS.items()):
+        try:
+            m.idle()
+        except Exception:
+            log.exception("%s live mirror: idle bookkeeping failed", chain)
+
+
+def stop_mirrors() -> None:
+    """Stop every mirror (each waits for its order in flight) and forget them: a runner started again in this process
+    makes new ones."""
+    with _MIRRORS_LOCK:
+        ms = list(_MIRRORS.items()); _MIRRORS.clear()
+    for chain, m in ms:
+        try:
+            m.stop()
+        except Exception:
+            log.exception("%s live mirror failed to stop", chain)
+
+
+class LiveClock:
+    """Sends every live chain's sales due at each minute boundary (``chain_exits``). ``books``: the runner's list; a
+    chain's live book lends its run id to the sales once it has loaded."""
+
+    def __init__(self, books: list, chains: list[str], live: bool, stop_event: threading.Event | None = None):
+        self.books, self.chains, self.live = books, list(chains), bool(live)
+        self.outer, self.stop_flag = stop_event, threading.Event()
+        self.thread = threading.Thread(target=self._loop, name="runner-live-clock", daemon=True)   # routed to the runner's log
+
+    def start(self) -> "LiveClock":
+        self.thread.start()
+        return self
+
+    def stopped(self) -> bool:
+        return self.stop_flag.is_set() or (self.outer is not None and self.outer.is_set())
+
+    def _loop(self) -> None:
+        self.tick(math.floor(time.time() / 60.0) * 60.0)               # the boundary a restart may have straddled
+        while not self.stopped():
+            nxt = math.floor(time.time() / 60.0) * 60.0 + 60.0
+            while not self.stopped() and time.time() < nxt:
+                self.stop_flag.wait(nxt - time.time())
+            if self.stopped():
+                break
+            self.tick(math.floor(time.time() / 60.0) * 60.0)        # the boundary just passed (a late wake takes the newest)
+
+    def tick(self, m1_epoch: float) -> None:
+        """Every live chain's sales due at the boundary, the chains side by side: one chain's slow reads never hold
+        another's sales back."""
+        list(_CLOCK.map(lambda chain: self._tick(chain, m1_epoch), self.chains))
+
+    def _tick(self, chain: str, m1_epoch: float) -> None:
+        run_id = next((b.run_id for b in list(self.books) if getattr(b, "LIVE", False) and getattr(b, "chain", "sol") == chain), None)
+        try:
+            out = chain_exits(chain, m1_epoch, self.live, run_id)
+            n = (out or {}).get("exited", 0) + (out or {}).get("liquidated", 0)
+            if n:
+                log.info("%s: %d live sale(s) sent at the minute boundary", chain, n)
+        except Exception as e:
+            log.exception("%s: live exits at the minute boundary failed", chain)
+            record_event("error", "fly_live" if chain == "sol" else "rh_live", f"live exits at the minute boundary failed: {type(e).__name__}: {str(e)[:160]}",
+                         {"chain": chain})
+
+    def close(self, timeout: float = 10.0) -> None:
+        self.stop_flag.set()
+        if self.thread.is_alive() and self.thread is not threading.current_thread():
+            self.thread.join(timeout)

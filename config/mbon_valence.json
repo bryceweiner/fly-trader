@@ -1,0 +1,27 @@
+{
+ "_citation": "Approach = MBON-11 (gamma1pedc>alpha/beta, GABA), 12, 13, 14, 15, 16, 18 (cholinergic) and avoidance = MBON-01..07 (all glutamatergic): Aso et al. 2014 eLife 3:e04580 (activation screen; 'all MBONs eliciting aversion were glutamatergic and all the MBONs eliciting attraction were either GABAergic or cholinergic'); NT per type from Aso et al. 2014 eLife 3:e04577 Table 1. MBON17 (alpha'3m) was tested jointly with MBON16 (alpha'3ap) in that screen. MBON19 and MBON23 are NOT in these lists: MBON19's NT is N.D. in Aso 2014 and MBON23 is a later hemibrain type (Li et al. 2020). MBON21, MBON29 (cholinergic, aversive) and MBON33 (attractive) per Rubin & Aso 2024 eLife 90523 (activation results read from partial text; verify). '-like' annotations are left unassigned (no valence evidence). PAM = reward, PPL1 = punishment: Aso et al. 2014 eLife 3:e04577 compartment map; Li et al. 2020 ('PPL1 DANs generally convey punishment, PAM DANs generally convey reward'). Learning = depression of opposite-valence KC->MBON synapses: Hige et al. 2015 Neuron, Owald et al. 2015 Neuron.",
+ "approach": [
+  "MBON11",
+  "MBON12",
+  "MBON13",
+  "MBON14",
+  "MBON15",
+  "MBON16",
+  "MBON17",
+  "MBON18",
+  "MBON33"
+ ],
+ "avoid": [
+  "MBON01",
+  "MBON02",
+  "MBON03",
+  "MBON04",
+  "MBON05",
+  "MBON06",
+  "MBON07",
+  "MBON21",
+  "MBON29"
+ ],
+ "dan_reward_prefix": "PAM",
+ "dan_punishment_prefix": "PPL1"
+}

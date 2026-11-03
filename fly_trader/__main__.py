@@ -1,0 +1,498 @@
+"""fly-trader command line. Every command is a thin wrapper over library functions that the
+operator console also calls. Always run as ``.venv/bin/python -m fly_trader <command>``."""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+
+
+def _cmd_init_db(args):
+    from .db import schema
+    from .db.connection import database_name
+    created = schema.ensure_database()
+    version = schema.apply_schema()
+    tables = schema.table_names()
+    print(f"database={database_name()} created={created} schema_version={version} tables={len(tables)}")
+    for t in tables:
+        print(f"  {t}")
+
+
+def _cmd_wallet(args):
+    from .chain import keys
+    if args.action == "new":
+        print(keys.create_wallet())
+    else:
+        print(keys.show_wallet())
+
+
+def _cmd_discover(args):
+    from .ingest import discovery
+    if args.once:
+        discovery.run_once()
+    else:
+        discovery.run_forever()
+
+
+def _cmd_build_connectome(args):
+    from .brain import connectome_build
+    connectome_build.main(annotations=args.annotations)
+
+
+def _cmd_run(args):
+    from .agent import runner
+    runner.main()
+
+
+def _cmd_swap_smoke(args):
+    from .execution import broker_live
+    broker_live.swap_smoke(args.sol)
+
+
+def _cmd_status(args):
+    from .db import queries
+    queries.print_status()
+
+
+def _cmd_reset_circuit(args):
+    from .agent import rails
+    rails.reset_circuit(kill=args.kill)
+
+
+def _cmd_pause(args):
+    from .agent import rails
+    rails.set_entries_paused(True)
+
+
+def _cmd_resume(args):
+    from .agent import rails
+    rails.set_entries_paused(False)
+
+
+def _cmd_reset_training(args):
+    from .ops.reset import reset_training_state
+    import json
+    print(json.dumps(reset_training_state(reason="cli", archive=not args.no_archive), indent=1))
+
+
+def _cmd_reset_paper(args):
+    """Zero the paper race books' stats (ops/reset.reset_paper_books), refused while a trading engine holds its lock."""
+    from .db.queries import q1
+    from .agent.runner import RUNNER_LOCK_KEY
+    held = q1("SELECT 1 AS held FROM pg_locks WHERE locktype = 'advisory' AND granted AND objsubid = 1 AND classid = %s::oid AND objid = %s::oid "
+              "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())", (RUNNER_LOCK_KEY >> 32, RUNNER_LOCK_KEY & 0xFFFFFFFF))
+    if held:
+        raise SystemExit("the trading engine is running: stop the console (or the runner) first")
+    from .ops.reset import reset_paper_books
+    chains = [c.strip() for c in args.chain.split(",") if c.strip()]
+    print(json.dumps(reset_paper_books(chains, reason=args.reason), indent=1, default=str))
+
+
+def _cmd_ui(args):
+    from .ops.supervisor import run_console
+    run_console(port=args.port, host=args.host, observe=args.observe)
+
+
+def _cmd_verify_fills(args):
+    from .execution import ledger
+    ledger.verify_fills()
+
+
+def _cmd_close_atas(args):
+    from .db.connection import transaction
+    from .execution import broker_live, ledger
+    with transaction() as conn:                          # a held token's account is never empty, but its buy may be landing
+        held = {p["mint"] for p in ledger.open_positions(conn, "live")}
+    r = broker_live.close_empty_atas(skip_mints=held)
+    print(f"closed {r['closed']} of {r['candidates']} empty token accounts, {r['credited']:+.9f} SOL booked; failed {len(r['failed'])}")
+
+
+def _cmd_replay_pull(args):
+    from .ingest import replay_pull
+    replay_pull.main()
+
+
+def _cmd_pumpstream(args):
+    from .ingest import pumpstream
+    pumpstream.main()
+
+
+def _cmd_relay_check(args):
+    import json
+    from .ingest import relay_feed
+    print(json.dumps(relay_feed.check(args.seconds), indent=1))
+
+
+def _cmd_build_corpus_features(args):
+    from .train import corpus_features
+    corpus_features.main()
+
+
+def _cmd_matched_pair(args):
+    from .train import matched_pair
+    out = matched_pair.cli(args)
+    print(json.dumps(out, default=str, indent=1))
+    return 1 if out.get("stopped") else 0
+
+
+def _cmd_rh_build_corpus(args):
+    from .logging_setup import setup
+    from .rh import corpus
+    setup("rh_corpus")
+    print(f"rh corpus: {corpus.run_locked(max_days=args.days)}")
+
+
+def _cmd_rh_v4_backfill(args):
+    from .rh import v4_universe
+    out = v4_universe.backfill_main(keys=not args.no_keys, history=not args.no_history)
+    print(f"rh v4 backfill: {out.get('keys', 0)} pool keys imported; history of {out.get('pools', 0)} live pools in {out.get('steps', 0)} steps; "
+          f"{out.get('outcomes', 0)} first-hour outcomes")
+
+
+def _cmd_refetch_archive(args):
+    from .ingest import replay_pull
+    out = replay_pull.refetch_main()
+    print(f"archive refetch: {out['done']} of {out['planned']} hours rewritten, {out['failed']} failed")
+
+
+def _cmd_refetch_pool_ids(args):
+    from .ingest import replay_pull
+    print(f"{replay_pull.refetch_missing_pool_id()} archive hours marked for re-download (run the replay worker or fly-trader replay-pull)")
+
+
+def _cmd_fit_wallet_skill(args):
+    from .logging_setup import setup
+    from .train import wallet_skill
+    setup("train")
+    out = wallet_skill.fit(days=args.days)
+    print(json.dumps({k: out.get(k) for k in ("h", "L", "selection", "evaluation", "baseline", "beats_baseline", "candidates", "stopped")}, indent=1, default=str))
+
+
+def _cmd_train_selector(args):
+    from .logging_setup import setup
+    from .train import selector
+    setup("train")
+    selector.main(days=args.days)
+
+
+def _use_device(args) -> None:
+    """--device overrides DEVICE from the environment for this command (brain/device.py resolves it)."""
+    if getattr(args, "device", None):
+        from . import config
+        from .brain import device
+        config.DEVICE = args.device; device.reset()
+
+
+def _cmd_train_fly_selector(args):
+    from .logging_setup import setup
+    from .train import fly_selector
+    setup("train"); _use_device(args)
+    fly_selector.main(days=args.days, epochs=args.epochs)
+
+
+def _cmd_fly_replay(args):
+    from .logging_setup import setup
+    from .train import fly_replay
+    setup("train"); _use_device(args)
+    out = fly_replay.main(days=args.days, start_day=args.start_day if args.start_day is not None else fly_replay.DEFAULT_START,
+                          only_chains=tuple(args.chains.split(",")) if args.chains else None)
+    print(json.dumps({k: out.get(k) for k in ("S", "passed", "reason", "alpha", "half_life_days", "evaluation", "random", "frozen", "plastic_beats_frozen")}, indent=1, default=str))
+
+
+def _cmd_selector_eval(args):
+    import runpy
+    runpy.run_module("fly_trader.train.selector_eval", run_name="__main__")
+
+
+def _cmd_build_mature(args):
+    from .train import mature
+    return mature.main(meta=args.meta)
+
+
+def _cmd_build_corpus_meta(args):
+    from .train import corpus_meta
+    corpus_meta.main()
+
+
+def _cmd_assemble_replay(args):
+    from .train import replay_assemble
+    replay_assemble.main()
+
+
+def _cmd_backtest_corpus(args):
+    from .train import corpus_backtest
+    argv = ["--fees", args.fees]
+    if args.max_tokens: argv += ["--max-tokens", str(args.max_tokens)]
+    if args.days: argv += ["--days", str(args.days)]
+    if args.only: argv += ["--only", args.only]
+    argv += ["--universe", args.universe]
+    corpus_backtest.main(argv)
+
+
+def _cmd_worker(args):
+    from .ops import procs
+    procs.worker_cli(args.action, args.name)
+
+
+def _cmd_kalshi_history(args):
+    from .kalshi import history
+    history.main()
+
+
+def _cmd_kalshi_build(args):
+    from .kalshi import mature
+    mature.main()
+
+
+def _cmd_kalshi_train_selector(args):
+    from .kalshi import selector
+    from .logging_setup import setup
+    setup("kalshi_train")
+    out = selector.main(days=args.days, holdout_days=args.holdout_days)
+    print(json.dumps({k: out.get(k) for k in ("snapshot_id", "deployable", "deploy_reason")}, indent=1, default=str))
+
+
+def _cmd_kalshi_train_fly(args):
+    from .kalshi import fly
+    from .logging_setup import setup
+    setup("kalshi_train"); _use_device(args)
+    out = fly.main(days=args.days, epochs=args.epochs)
+    print(json.dumps({k: out.get(k) for k in ("snapshot_id", "S", "lines", "calibration", "diagnostics", "gates_ok", "gate_failures", "teacher")}, indent=1, default=str))
+
+
+def _cmd_kalshi_fly_replay(args):
+    from .kalshi import fly_replay
+    from .logging_setup import setup
+    setup("kalshi_train"); _use_device(args)
+    out = fly_replay.main(days=args.days, start_day=args.start_day if args.start_day is not None else fly_replay.DEFAULT_START,
+                          only_chains=tuple(args.chains.split(",")) if args.chains else None)
+    print(json.dumps({k: out.get(k) for k in ("S", "passed", "reason", "alpha", "half_life_days", "evaluation", "random", "frozen", "plastic_beats_frozen")}, indent=1, default=str))
+
+
+def _cmd_kalshi_train(args):
+    from .kalshi import pipeline
+    pipeline.main()
+
+
+def _cmd_kalshi_stream(args):
+    from .kalshi import stream
+    stream.main()
+
+
+def _cmd_kalshi_run(args):
+    from .kalshi import engine
+    engine.main()
+
+
+def _cmd_kalshi_subaccount(args):
+    from .kalshi import client
+    if args.action == "create":
+        print(f"subaccount {client.subaccount_create()} created and written to .env")
+    else:
+        print(json.dumps(client.rest().subaccount_balances(), indent=1, default=str))
+
+
+def _cmd_kalshi_fund(args):
+    from .kalshi import client
+    print(json.dumps(client.fund(args.usd), indent=1, default=str))
+
+
+def _cmd_rh_backfill(args):
+    from .rh import stream
+    stream.main()
+
+
+def _cmd_rh_status(args):
+    from .rh import stream
+    print(json.dumps(stream.status(), indent=1, default=str))
+
+
+def _cmd_rh_probe(args):
+    from .rh import probe
+    print(json.dumps(probe.run(sample=args.sample), indent=1, default=str))
+
+
+def _cmd_rh_wallet(args):
+    from .rh import smoke
+    if args.action == "new":
+        print(f"RH bot wallet {smoke.new_key()} written to .env (RH_BOT_PRIVATE_KEY, RH_BOT_ADDRESS). Fund it with ETH on Robinhood Chain.")
+    else:
+        from . import config
+        from .rh.rpc import RhRpc
+        addr = (config.RH_BOT_ADDRESS or "").lower()
+        print(json.dumps({"address": addr or None, "eth": RhRpc().get_balance(addr) / 1e18 if addr else None,
+                          "live_prerequisites_missing": config.rh_live_prerequisites_missing()}, indent=1))
+
+
+def _cmd_rh_smoke(args):
+    if not args.yes:
+        raise SystemExit("rh-smoke sends real Robinhood Chain transactions: pass --yes")
+    from .rh import smoke
+    print(json.dumps(smoke.run(args.size, args.cap), indent=1, default=str))
+
+
+def _cmd_kalshi_status(args):
+    from .kalshi import client
+    print(json.dumps(client.status(), indent=1, default=str))
+
+
+def _cmd_kalshi_pause(args):
+    from .agent import rails
+    rails.set_entries_paused(True, rails.KALSHI_CIRCUIT)
+
+
+def _cmd_kalshi_resume(args):
+    from .agent import rails
+    rails.set_entries_paused(False, rails.KALSHI_CIRCUIT)
+
+
+def _cmd_kalshi_reset_circuit(args):
+    from .agent import rails
+    rails.reset_circuit(kill=args.kill, circuit_id=rails.KALSHI_CIRCUIT)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="fly-trader")
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("init-db").set_defaults(fn=_cmd_init_db)
+    w = sub.add_parser("wallet"); w.add_argument("action", choices=["new", "show"]); w.set_defaults(fn=_cmd_wallet)
+    d = sub.add_parser("discover"); d.add_argument("--once", action="store_true"); d.set_defaults(fn=_cmd_discover)
+    sub.add_parser("replay-pull").set_defaults(fn=_cmd_replay_pull)
+    sub.add_parser("refetch-pool-ids", help="mark archive hours without pool_id for re-download").set_defaults(fn=_cmd_refetch_pool_ids)
+    fw = sub.add_parser("fit-wallet-skill", help="fit the wallet-skill tables' hold and lookback by the selector's objective (one-off, many hours, resumable)")
+    fw.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)"); fw.set_defaults(fn=_cmd_fit_wallet_skill)
+    sub.add_parser("pumpstream").set_defaults(fn=_cmd_pumpstream)
+    rc = sub.add_parser("relay-check", help="connect to the stream relay (STREAM_RELAY_URL) for a while and report what arrives; switches nothing")
+    rc.add_argument("--seconds", type=float, default=30.0); rc.set_defaults(fn=_cmd_relay_check)
+    sub.add_parser("build-corpus-features").set_defaults(fn=_cmd_build_corpus_features)
+    sub.add_parser("assemble-replay").set_defaults(fn=_cmd_assemble_replay)
+    sub.add_parser("build-corpus-meta").set_defaults(fn=_cmd_build_corpus_meta)
+    p_bm = sub.add_parser("build-mature", help="one corpus build round (the console's replay worker runs it as a child process)")
+    p_bm.add_argument("--meta", action="store_true", help="rebuild corpus_meta first (the replay worker's round)")
+    p_bm.set_defaults(fn=_cmd_build_mature)
+    p_mp = sub.add_parser("matched-pair", help="train a selector and a fly on exactly the same pinned corpus into a scratch folder and score both on the "
+                                               "holdout (no registry rows; run apart from the console, under nice)")
+    p_mp.add_argument("out", help="the scratch folder (a rerun resumes it)")
+    p_mp.add_argument("--last-day", required=True, help="the corpus's last day, pinned (YYYY-MM-DD)")
+    p_mp.add_argument("--epochs", type=int, default=None, help="each fly's epoch cap (default fly_selector.EPOCHS; early stopping decides below it)")
+    p_mp.add_argument("--match-days", type=int, default=None, help="match the fly's lines on its last N training days only (default: all of them)")
+    p_mp.add_argument("--replay", action="store_true", help="also replay the blind fly's learning over the holdout days")
+    p_mp.add_argument("--no-blind-fly", action="store_true", help="skip the test fly: the report scores the selector's book alone, and the full fly's "
+                                                                   "evidence is the blind selector's holdout picks (it trades them at bootstrap)")
+    p_mp.set_defaults(fn=_cmd_matched_pair)
+    p_rc = sub.add_parser("rh-build-corpus", help="build the due Robinhood Chain corpus days (the stream starts it as a child process)")
+    p_rc.add_argument("--days", type=int, default=31, help="days at most per run (each run reads every minute's fee once)")
+    p_rc.set_defaults(fn=_cmd_rh_build_corpus)
+    p_v4 = sub.add_parser("rh-v4-backfill", help="import every Robinhood Chain v4 pool key, then backfill the live v4 pools' history (run apart from the console, under nice)")
+    p_v4.add_argument("--no-keys", action="store_true", help="skip the pool-key import")
+    p_v4.add_argument("--no-history", action="store_true", help="skip the live pools' history")
+    p_v4.set_defaults(fn=_cmd_rh_v4_backfill)
+    sub.add_parser("refetch-archive", help="download older archive hours again to keep every venue's SOL legs (run apart from the console, under nice)").set_defaults(fn=_cmd_refetch_archive)
+    sub.add_parser("selector-eval").set_defaults(fn=_cmd_selector_eval)
+    ts_ = sub.add_parser("train-selector"); ts_.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
+    ts_.set_defaults(fn=_cmd_train_selector)
+    tf_ = sub.add_parser("train-fly-selector"); tf_.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
+    tf_.add_argument("--epochs", type=int, default=None, help="cap on full passes over the distillation rows (default: until the fit stops improving)")
+    tf_.add_argument("--device", default=None, help="auto | cpu | cuda | cuda:N | rocm | rocm:N | mps (default: DEVICE from .env, auto)")
+    tf_.set_defaults(fn=_cmd_train_fly_selector)
+    fr = sub.add_parser("fly-replay", help="bootstrap the fly once, let it learn over the corpus, judge it (the gate before it trades)")
+    fr.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")
+    fr.add_argument("--device", default=None, help="auto | cpu | cuda | cuda:N | rocm | rocm:N | mps (default: DEVICE from .env, auto)")
+    fr.add_argument("--start-day", type=int, default=None,
+                    help="day index of the bootstrap (the selector teaches on the days before it); default: train/fly_replay.DEFAULT_START, "
+                         "the earliest day that leaves the teacher's walk-forward enough days in each half")
+    fr.add_argument("--chains", default=None, help="store the verdict of these chains only (comma list, e.g. rh); the others keep theirs")
+    fr.set_defaults(fn=_cmd_fly_replay)
+    bc = sub.add_parser("backtest-corpus"); bc.add_argument("--max-tokens", type=int, default=None); bc.add_argument("--days", type=int, default=None)
+    bc.add_argument("--fees", default="0.003,0.0055"); bc.add_argument("--only", default=None); bc.add_argument("--universe", default="graduation", choices=["graduation", "mature"]); bc.set_defaults(fn=_cmd_backtest_corpus)
+    b = sub.add_parser("build-connectome"); b.add_argument("--annotations", default=None); b.set_defaults(fn=_cmd_build_connectome)
+    sub.add_parser("run").set_defaults(fn=_cmd_run)
+    s = sub.add_parser("swap-smoke"); s.add_argument("--sol", type=float, default=0.01); s.set_defaults(fn=_cmd_swap_smoke)
+    sub.add_parser("status").set_defaults(fn=_cmd_status)
+    r = sub.add_parser("reset-circuit"); r.add_argument("--kill", action="store_true"); r.set_defaults(fn=_cmd_reset_circuit)
+    sub.add_parser("pause-entries").set_defaults(fn=_cmd_pause)
+    sub.add_parser("resume-entries").set_defaults(fn=_cmd_resume)
+    u = sub.add_parser("ui", help="the operator console: hosts the workers and serves the dashboard on 127.0.0.1:PORT")
+    u.add_argument("--port", type=int, default=8501)
+    u.add_argument("--host", default=None, help="address to bind (default CONSOLE_HOST, else 127.0.0.1; the container binds 0.0.0.0)")
+    u.add_argument("--observe", action="store_true", help="serve the dashboard without hosting workers (a preview next to a running console; controls are refused)")
+    u.set_defaults(fn=_cmd_ui)
+    rp = sub.add_parser("reset-paper", help="zero the paper race books' stats (they restart from CAPITAL_SOL / RH_CAPITAL_ETH); the fly's learning is kept")
+    rp.add_argument("--chain", default="sol,rh"); rp.add_argument("--reason", default="live funds arrived"); rp.set_defaults(fn=_cmd_reset_paper)
+    rt = sub.add_parser("reset-training"); rt.add_argument("--no-archive", action="store_true"); rt.set_defaults(fn=_cmd_reset_training)
+    sub.add_parser("verify-fills").set_defaults(fn=_cmd_verify_fills)
+    sub.add_parser("close-empty-atas").set_defaults(fn=_cmd_close_atas)
+    ar = sub.add_parser("apply-release", help="install a verified release's models (the bootstrap calls this)")
+    ar.add_argument("dir"); ar.add_argument("--bootstrap", action="store_true"); ar.set_defaults(fn=_cmd_apply_release)
+    sub.add_parser("health", help="exit 0 when the database answers and workers run (container HEALTHCHECK)").set_defaults(fn=_cmd_health)
+    sub.add_parser("ready-for-restart", help="exit 0 when no order is in flight").set_defaults(fn=_cmd_ready)
+    mc = sub.add_parser("models", help="convert: rewrite this machine's own .joblib selectors as .skops (pickles can run code)")
+    mc.add_argument("action", choices=["convert"]); mc.set_defaults(fn=_cmd_models)
+    wk = sub.add_parser("worker"); wk.add_argument("action", choices=["start", "stop", "status"]); wk.add_argument("name", nargs="?"); wk.set_defaults(fn=_cmd_worker)
+    # ---- Kalshi prediction markets (fly_trader/kalshi) ----
+    ks = sub.add_parser("kalshi-subaccount", help="create the fly's dedicated Kalshi subaccount (writes KALSHI_SUBACCOUNT to .env) or list balances")
+    ks.add_argument("action", choices=["create", "list"]); ks.set_defaults(fn=_cmd_kalshi_subaccount)
+    kf = sub.add_parser("kalshi-fund", help="move dollars from the primary Kalshi account into the fly's subaccount"); kf.add_argument("--usd", type=float, required=True); kf.set_defaults(fn=_cmd_kalshi_fund)
+    sub.add_parser("rh-backfill", help="the Robinhood Chain index from Pons V2's deployment to the head, then live (the rh_stream worker)").set_defaults(fn=_cmd_rh_backfill)
+    sub.add_parser("rh-status", help="Robinhood Chain index cursors, row counts and stream status").set_defaults(fn=_cmd_rh_status)
+    rp = sub.add_parser("rh-probe", help="read-only check of the Robinhood Chain path: contracts, Kyber / v4 routability and gas on recent Pons graduates")
+    rp.add_argument("--sample", type=int, default=12); rp.set_defaults(fn=_cmd_rh_probe)
+    rw = sub.add_parser("rh-wallet", help="new: create the RH bot key in .env (refuses to replace one); show: its address, ETH and what live trading still needs")
+    rw.add_argument("action", choices=["new", "show"]); rw.set_defaults(fn=_cmd_rh_wallet)
+    rs = sub.add_parser("rh-smoke", help="three tiny real RH round trips (Kyber, v4 fallback, non-ETH quote) booked and reconciled to the wei")
+    rs.add_argument("--size", type=float, default=0.002); rs.add_argument("--cap", type=float, default=0.01); rs.add_argument("--yes", action="store_true")
+    rs.set_defaults(fn=_cmd_rh_smoke)
+    sub.add_parser("kalshi-status", help="exchange status, subaccount balance, resting orders, positions, settlements").set_defaults(fn=_cmd_kalshi_status)
+    sub.add_parser("kalshi-history", help="the Kalshi corpus worker: dataset seed, settled markets, candles, trades").set_defaults(fn=_cmd_kalshi_history)
+    sub.add_parser("kalshi-build", help="build the Kalshi feature parts from the corpus").set_defaults(fn=_cmd_kalshi_build)
+    kts = sub.add_parser("kalshi-train-selector", help="fit the Kalshi strategy stack walk-forward and save it"); kts.add_argument("--days", type=int, default=None)
+    kts.add_argument("--holdout-days", type=int, default=None, help="last days withheld from every fit and scored once (default 21)")
+    kts.set_defaults(fn=_cmd_kalshi_train_selector)
+    ktf = sub.add_parser("kalshi-train-fly", help="bootstrap the Kalshi fly (optic lobes) from the deployable Kalshi selector")
+    ktf.add_argument("--days", type=int, default=None); ktf.add_argument("--epochs", type=int, default=None); ktf.add_argument("--device", default=None)
+    ktf.set_defaults(fn=_cmd_kalshi_train_fly)
+    kfr = sub.add_parser("kalshi-fly-replay", help="bootstrap the Kalshi fly once, let it learn from settlements over the corpus, judge it")
+    kfr.add_argument("--days", type=int, default=None); kfr.add_argument("--device", default=None); kfr.add_argument("--start-day", type=int, default=None)
+    kfr.set_defaults(fn=_cmd_kalshi_fly_replay)
+    sub.add_parser("kalshi-train", help="the Kalshi training pipeline worker (selector weekly, fly bootstrap when needed)").set_defaults(fn=_cmd_kalshi_train)
+    sub.add_parser("kalshi-stream", help="the Kalshi live feed worker (websocket → kalshi_minutes / kalshi_quotes)").set_defaults(fn=_cmd_kalshi_stream)
+    sub.add_parser("kalshi-run", help="the Kalshi trading engine worker (the visual fly's paper arms, live mirror behind KALSHI_LIVE_ENABLED)").set_defaults(fn=_cmd_kalshi_run)
+    sub.add_parser("kalshi-pause-entries").set_defaults(fn=_cmd_kalshi_pause)
+    sub.add_parser("kalshi-resume-entries").set_defaults(fn=_cmd_kalshi_resume)
+    kr = sub.add_parser("kalshi-reset-circuit"); kr.add_argument("--kill", action="store_true"); kr.set_defaults(fn=_cmd_kalshi_reset_circuit)
+    return p
+
+
+
+def _cmd_apply_release(args) -> None:
+    from pathlib import Path
+    from .ops import release
+    print(release.apply_release(Path(args.dir), bootstrap=args.bootstrap))
+
+
+def _cmd_health(args) -> None:
+    from .ops import release
+    ok, why = release.health(); print(why)
+    raise SystemExit(0 if ok else 1)
+
+
+def _cmd_models(args) -> None:
+    from .train import model_io
+    for r in model_io.convert_legacy():
+        print(f"selector #{r['id']} -> {r['path']}")
+
+
+def _cmd_ready(args) -> None:
+    from .ops import release
+    ok, why = release.ready_for_restart(); print(why)
+    raise SystemExit(0 if ok else 1)
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    rc = args.fn(args)
+    return rc if isinstance(rc, int) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

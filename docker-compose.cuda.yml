@@ -1,0 +1,22 @@
+# The same trader on an NVIDIA GPU. Layer it over the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.cuda.yml up -d --build
+#
+# Host prerequisites: an NVIDIA driver new enough for CUDA 12.6 (>= 560) and the NVIDIA Container Toolkit
+# (`nvidia-ctk runtime configure --runtime=docker`, then restart Docker). The CUDA runtime itself ships inside the torch
+# wheel, so no CUDA base image is needed. DEVICE=auto picks the GPU when the container sees one; DEVICE_MEMORY_GB caps
+# the batch sizes derived from its free memory when the card is shared.
+services:
+  fly:
+    build:
+      args:
+        TORCH_INDEX: cu126      # or cu130 for the newest driver
+    environment:
+      DEVICE: auto
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
