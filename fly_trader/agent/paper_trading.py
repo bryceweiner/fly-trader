@@ -3,7 +3,8 @@
 exits: positions held their own hold (the strategy's, stored on the position) or ``horizon_s`` are sold at this minute's
 price (or the last traded price: the training label's exit), and earlier a position whose minute closed at its
 take-profit line (``take_profit_x``: a buy of a coin trading far below its high since graduation is sold once it doubles,
-config.TAKE_PROFIT_X / TAKE_PROFIT_DIP; its token is not bought again before its hold would have ended);
+config.TAKE_PROFIT_X / TAKE_PROFIT_DIP; its token is not bought again before its hold would have ended), and a Solana
+position whose coin fell 25 % under its 5-minute high after its entry at that crash's price (agent/crash_exit.py);
 entries: scores at or above the book's line open a position sized from the book's certainty bands
 (``agent/sizing.py``), one position per token, unless blocked (global kill switch, paused entries, the book's own
 drawdown halt, a minute traded more than ``ENTRY_MAX_LAG_S`` after its end, or the caller's ``block``); marks and wealth
@@ -27,22 +28,33 @@ import json
 
 import numpy as np
 
-from . import rails, sizing
+from . import crash_exit, rails, sizing
 from .. import config
 from ..execution import ledger
 from ..market.exit_cost import exit_cost_fraction
 
 
-def take_profit_x(ctx, market, mint: str, price: float | None) -> float | None:
-    """The take-profit line of a buy of ``mint`` at ``price``, a multiple of its entry price: ``config.TAKE_PROFIT_X``
+def take_profit_base(ctx, market, mint: str, price: float | None) -> float | None:
+    """The base take-profit line of a buy of ``mint`` at ``price``, a multiple of its entry price: ``config.TAKE_PROFIT_X``
     when its chain takes profits (``TAKE_PROFIT_CHAINS``) and the coin trades at least ``TAKE_PROFIT_DIP`` below its high
-    since graduation (``ctx.high``: this minute's close included), else None (held its hold). Stored on the entry decision
-    (``detail.take_profit_x``), so a live position of the same decision carries it too (execution/ledger.open_positions)."""
+    since graduation (``ctx.high``: this minute's close included), else None (held its hold)."""
     high = getattr(ctx, "high", None)
     if config.TAKE_PROFIT_X <= 0 or market.chain not in config.TAKE_PROFIT_CHAINS or high is None or not price:
         return None
     hi = high(mint)
     return float(config.TAKE_PROFIT_X) if hi and price <= hi * (1.0 - config.TAKE_PROFIT_DIP) else None
+
+
+def take_profit_x(ctx, market, mint: str, price: float | None) -> float | None:
+    """The take-profit line a buy takes: the base rule's (``take_profit_base``), or on Robinhood Chain the line its recent
+    trades favour (agent/regime.ExitChoice, ``ctx.engine.exits``) when one beat the base rule. Stored on the entry decision
+    (``detail.take_profit_x``, the base rule's beside it as ``tp_base_x``), so a live position of the same decision carries
+    it too (execution/ledger.open_positions)."""
+    base = take_profit_base(ctx, market, mint, price)
+    choice = getattr(getattr(ctx, "engine", None), "exits", None)
+    if choice is None or config.TAKE_PROFIT_X <= 0 or market.chain not in config.TAKE_PROFIT_CHAINS or not price:
+        return base
+    return choice.line(base)
 
 
 def at_take_profit(p: dict, price: float | None) -> bool:
@@ -63,7 +75,7 @@ def took_profit(conn, book: str, m1, horizon_s: float) -> set:
 
 def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str, mints: list, infos: list, scores, threshold,
                 table: list | None, horizon_s: float, block: str | None = None, holds=None, strategies=None, allow=None, reasons=None,
-                tables: list | None = None, flat: bool = False, live_allow=None, size_margins=None, correctness=None) -> dict:
+                tables: list | None = None, flat: bool = False, live_allow=None, size_margins=None, correctness=None, marks: list | None = None) -> dict:
     """The minute's beat, exits and entries, decided and quoted but not booked: every entry and blocked pick is already a
     ``decisions`` row (the live mirror buys under the entry's id); ``book_minute`` books the rest.
 
@@ -82,7 +94,9 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
 
     ``size_margins`` / ``correctness`` (train/strategies.decide's ``size_margin`` / ``pclean``, per row): where the
     strategy's correctness sizes a row, its band is read at that margin instead of score − line; every decision, entry and
-    rebuy carries both (``size_margin``, ``correctness``: the console's correctness %), so a live mirror sizes it the same."""
+    rebuy carries both (``size_margin``, ``correctness``: the console's correctness %), so a live mirror sizes it the same.
+
+    ``marks`` (per row, a dict): carried the same way; its ``stake_x`` multiplies the row's stake (agent/rising_clean.py)."""
     conn, m1 = ctx.conn, ctx.m1
     beat = conn.execute("INSERT INTO beats (run_id, ts, beat_no, n_slots_active, notes) VALUES (%s,%s,%s,%s,%s) RETURNING id",
                         (run_id, m1, beat_no, len(mints), json.dumps({"minute": m1.isoformat(), "mints_traded": len(ctx.agg), "book": book}))).fetchone()["id"]
@@ -91,13 +105,15 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
     fresh = getattr(ctx, "lag_s", 0.0) <= config.ENTRY_MAX_LAG_S        # a take-profit on a minute's close, never on a minutes-old one
     for p in opens_before:
         held = (m1 - p["opened_at"]).total_seconds(); due = held >= float(p.get("hold_s") or horizon_s)
-        tp = not due and fresh and at_take_profit(p, ctx.prices.get(p["mint"]))
-        if not (due or tp):
+        crash = None if due else crash_exit.WATCH.crashed(p["mint"], p["opened_at"])      # sold at the crash's price (agent/crash_exit.py)
+        tp = not due and crash is None and fresh and at_take_profit(p, ctx.prices.get(p["mint"]))
+        if not (due or tp or crash):
             continue
-        px = ctx.prices.get(p["mint"]) or float(p.get("last_mark_price") or p["entry_price"])
-        kw = dict(price=ctx.prices.get(p["mint"]), res_quote_sol=ctx.resqs.get(p["mint"]) or ctx.last_resq(p["mint"]), mcap_sol=ctx.mcap(p["mint"], px),
+        sell_px = crash[1] if crash else ctx.prices.get(p["mint"])
+        px = sell_px or float(p.get("last_mark_price") or p["entry_price"])
+        kw = dict(price=sell_px, res_quote_sol=ctx.resqs.get(p["mint"]) or ctx.last_resq(p["mint"]), mcap_sol=ctx.mcap(p["mint"], px),
                   program_label=ctx.cost_label(p["mint"], p.get("program_label")), pool_fee=ctx.fee(p["mint"]))
-        exits.append((p, held, kw, broker.quote_sell(position=p, **kw), "take_profit" if tp else None))
+        exits.append((p, held, kw, broker.quote_sell(position=p, **kw), "crash" if crash else "take_profit" if tp else None))
     leaving = {int(p["id"]) for p, *_ in exits}
     opens_now = [p for p in opens_before if int(p["id"]) not in leaving]; open_mints = {p["mint"] for p in opens_now}
     paid = {p["mint"]: float(p["cost_sol"]) for p in opens_now}; rebuy = {}        # a token it keeps: what it paid, this minute's verdict on buying it again
@@ -123,8 +139,10 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
         mg = None if size_margins is None else float(size_margins[k]); mg = mg if mg is not None and np.isfinite(mg) else None
         pc = None if correctness is None else float(correctness[k]); pc = pc if pc is not None and np.isfinite(pc) else None
         cx = {key: v for key, v in (("correctness", pc), ("size_margin", mg)) if v is not None}      # only where correctness sizes or scores the row
+        if marks is not None:
+            cx.update(marks[k])
         size, why = sizing.size_position(float(sc), thr_k, tab_k or [], bankroll, cash, i["resq"], flat=flat, market=market, margin=mg,
-                                         creator_heavy=bool(i.get("creator_heavy")))
+                                         creator_heavy=bool(i.get("creator_heavy")), stake_x=cx.get("stake_x", 1.0))
         denied = allow is not None and not bool(allow[k])
         if tp_held is None:                                      # this minute's own take-profits are not booked yet
             tp_held = took_profit(conn, book, m1, horizon_s) | {p["mint"] for p, _, _, _, why in exits if why == "take_profit"}
@@ -147,7 +165,8 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
                 did = conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, m_hat, size_sol, forced, reason, book_targets, detail) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,false,%s,%s,%s) RETURNING id",
                                    (beat, run_id, m1, m, i["pool"], f"{kind}_enter", float(sc), size, f"live only ({rail} binds {book}): {strat_k + ': ' if strat_k else ''}score {sc:.3f} ≥ {thr_k:.3f}; {why}", None,
                                     json.dumps({"book": book, "live_only": True, "score": float(sc), "threshold": thr_k, "size_sol": size, "sizing": why, "resq": i["resq"], "age_h": i["age_h"],
-                                                "price": i["price"], "strategy": strat_k, "hold_s": hold_k, "take_profit_x": tp_k, **cx}))).fetchone()["id"]
+                                                "price": i["price"], "strategy": strat_k, "hold_s": hold_k, "take_profit_x": tp_k,
+                                                "tp_base_x": take_profit_base(ctx, market, m, i["price"]), **cx}))).fetchone()["id"]
                 q = broker.quote_buy(size_sol=size, price=i["price"], res_quote_sol=i["resq"], mcap_sol=i["mcap"], decimals=i["decimals"],
                                      program_label=ctx.cost_label(m, i["program_label"]), pool_fee=ctx.fee(m))
                 if q.ok:
@@ -161,7 +180,8 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
         did = conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, m_hat, size_sol, forced, reason, book_targets, detail) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,false,%s,%s,%s) RETURNING id",
                            (beat, run_id, m1, m, i["pool"], f"{kind}_enter", float(sc), size, f"{strat_k + ': ' if strat_k else ''}score {sc:.3f} ≥ {thr_k:.3f}; {why}", [book],
                             json.dumps({"book": book, "score": float(sc), "threshold": thr_k, "size_sol": size, "sizing": why, "resq": i["resq"], "age_h": i["age_h"], "price": i["price"],
-                                        "strategy": strat_k, "hold_s": hold_k, "take_profit_x": tp_k, **cx}))).fetchone()["id"]
+                                        "strategy": strat_k, "hold_s": hold_k, "take_profit_x": tp_k, "tp_base_x": take_profit_base(ctx, market, m, i["price"]),
+                                        **cx}))).fetchone()["id"]
         args = dict(size_sol=size, price=i["price"], res_quote_sol=i["resq"], mcap_sol=i["mcap"], decimals=i["decimals"],
                     program_label=ctx.cost_label(m, i["program_label"]), pool_fee=ctx.fee(m))
         q = broker.quote_buy(**args)
@@ -183,6 +203,7 @@ def book_minute(ctx, plan: dict) -> dict:
     n_exit = 0
     for p, held, kw, _, why in plan["exits"]:
         reason = (f"took profit: {kw['price'] / float(p['entry_price']) - 1:+.0%} over its entry (its ×{float(p['take_profit_x']):g} line)" if why == "take_profit"
+                  else f"crash: sold at {kw['price'] / float(p['entry_price']) - 1:+.0%} from its entry, 25% under its 5-minute high" if why == "crash"
                   else f"held {held/60:.0f} min")
         did = conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, size_sol, forced, reason, detail) VALUES (%s,%s,%s,%s,%s,%s,%s,false,%s,%s) RETURNING id",
                            (beat, plan["run_id"], m1, p["mint"], p["pool"], f"{plan['kind']}_exit", float(p["cost_sol"]), reason, json.dumps({"book": book}))).fetchone()["id"]

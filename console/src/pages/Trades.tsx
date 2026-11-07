@@ -20,7 +20,7 @@ const DONUT = ['#ffffff', 'rgba(255,255,255,0.6)', 'rgba(255,255,255,0.35)', 'rg
 type Books = { chain: string; unit: string; books: string[]; default: string; help: string; live?: boolean }
 type Summary = {
   chain: string; book: string; unit: string
-  metrics: { n: number; pnl: number | null; avg_ret: number | null; wins: number; win_rate: number | null; open: number; open_cost: number }
+  metrics: { n: number; pnl: number | null; realized?: number | null; avg_ret: number | null; wins: number; win_rate: number | null; open: number; open_cost: number }
   cum: [string, number][]
   daily: { day: string; n: number; pnl: number; wins: number }[]
   exits: { kind: string; n: number; pnl: number }[]
@@ -87,7 +87,8 @@ export default function Trades() {
 
 // ---------------------------------------------------------------- the book at a glance
 function Dashboard({ d }: { d: Summary }) {
-  const u = d.unit, m = d.metrics
+  const u = d.unit, m = d.metrics, realized = m.realized ?? m.pnl
+  const wallet = realized !== m.pnl, shift = (realized ?? 0) - (m.pnl ?? 0), cum = d.cum.map(([t, v]) => [t, v + shift] as [string, number])  // the line ends at the figure shown
   const losses = m.n - m.wins
   const best = d.daily.length ? d.daily.reduce((a, x) => (x.pnl > a.pnl ? x : a)) : null
   const worst = d.daily.length ? d.daily.reduce((a, x) => (x.pnl < a.pnl ? x : a)) : null
@@ -97,8 +98,9 @@ function Dashboard({ d }: { d: Summary }) {
       <WidgetGrid>
         <Widget label="Trades" value={int(m.n)} icon="count" spark={d.daily.map((x) => x.n)} sparkType="bar" delta={d.daily.length ? `${d.daily.length} trading days` : null} tone="off"
           help="Closed positions in this book; the bars are trades closed per day (last 90 days)." />
-        <Widget label="Realized P&L" value={amount(m.pnl, u, 4, true)} icon="pnl" spark={d.cum.map((x) => x[1])}
-          color={m.pnl == null || m.pnl === 0 ? null : m.pnl > 0 ? 'success' : 'danger'} help="Realized P&L of every closed trade; the line is its running total." />
+        <Widget label="Realized P&L" value={amount(realized, u, 4, true)} icon="pnl" spark={cum.map((x) => x[1])}
+          color={realized == null || realized === 0 ? null : realized > 0 ? 'success' : 'danger'}
+          help={wallet ? 'The wallet now, with open positions at cost, minus the starting amount.' : 'Realized P&L of every closed trade; the line is its running total.'} />
         <Widget label="Average return" value={pct(m.avg_ret)} icon="up" help="Per trade, after fees and price impact."
           color={m.avg_ret == null || m.avg_ret === 0 ? null : m.avg_ret > 0 ? 'teal' : 'danger'} />
         <Widget label="Winners" value={m.win_rate === null ? '—' : pct(m.win_rate, 0, false)} icon="target" progress={m.win_rate}
@@ -110,10 +112,10 @@ function Dashboard({ d }: { d: Summary }) {
         <div className="col-12 col-xl-8">
           <Card title="Cumulative realized P&L" icon="chart" sub={`${d.book} · ${u}`}>
             {d.cum.length > 1
-              ? <LineChart series={[{ name: `P&L (${u})`, data: d.cum }]} height={280} yFormat={(v) => fmtAxis(v)} />
+              ? <LineChart series={[{ name: `P&L (${u})`, data: cum }]} height={280} yFormat={(v) => fmtAxis(v)} />
               : <Empty>No closed trades in this book yet.</Empty>}
             <RowGroup items={[
-              { label: 'realized P&L', value: signed(m.pnl, amount(m.pnl, u, 4, true)) },
+              { label: 'realized P&L', value: signed(realized, amount(realized, u, 4, true)) },
               { label: 'average per trade', value: signed(m.avg_ret, pct(m.avg_ret)) },
               { label: 'best day', value: best ? signed(best.pnl, `${amount(best.pnl, u, 4, true)} · ${best.day.slice(5)}`) : '—' },
               { label: 'worst day', value: worst ? signed(worst.pnl, `${amount(worst.pnl, u, 4, true)} · ${worst.day.slice(5)}`) : '—' },

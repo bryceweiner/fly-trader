@@ -1,5 +1,5 @@
 """Overview: what the system is doing in plain words, the book the money is in (live, else the selector's paper book), this minute's scoring, the race between the selector
-and the plastic fly, and the open positions, each live one with its Sell Now (``overview.sell_now``). (The brain at the top of the page is ui/api/brain.py.)"""
+and the plastic fly, the rising + clean test and its go-live, and the open positions, each live one with its Sell Now (``overview.sell_now``). (The brain at the top of the page is ui/api/brain.py.)"""
 from __future__ import annotations
 
 import csv
@@ -9,12 +9,15 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from ... import config, markets
+from ...agent import rising_clean
 from ...agent.selector_session import pinned_snapshot
+from ...db.connection import transaction
 from ...db.queries import q, q1
+from ...ops import wallets
 from .. import runtime
 from ..cache import ttl_cache
 from ..hub import ActionError, action, topic
-from ..state import ago, backtest_line, labels, market_info, market_param, pct, system_state
+from ..state import ago, backtest_line, labels, market_info, market_param, pct, setting, system_state
 
 MAX_POINTS = 1500             # a 240 px line chart cannot show more; a month of minute marks is ~45,000 per book
 
@@ -85,10 +88,11 @@ def _series(rows: list[dict], books: list[str]) -> list[dict]:
 def summary(params: dict) -> dict:
     """The narrative and the money's metrics — the live book while live money trades, else the selector's paper book:
     wealth, realized P&L, closed (wins), open, drawdown, with sparklines (wealth and drawdown over the book's whole
-    history, realized P&L cumulative over the last 180 trades)."""
+    history, realized P&L cumulative over the last 180 trades). A live book's capital and realized P&L are its wallet's
+    (ops/wallets.money), so they hold what the trade ledger never sees."""
     mk = market_param(params); s = system_state(mk); live = bool(s["live_money"]); BOOK = mk.live_book if live else mk.selector_book; u = mk.unit
-    first = q1("SELECT wealth FROM wealth_marks WHERE book = %s ORDER BY ts LIMIT 1", (BOOK,)) if live else None
-    cap = float(first["wealth"]) if first and first.get("wealth") is not None else mk.capital()
+    money = wallets.money(mk) if live else None
+    cap = money["start"] if money else mk.capital()
     w = q1("SELECT wealth, exposure, n_open, drawdown FROM wealth_marks WHERE book = %s ORDER BY ts DESC LIMIT 1", (BOOK,)) or {}
     c = q1("SELECT count(*) AS n, sum(realized_sol) AS pnl, count(*) FILTER (WHERE realized_sol > 0) AS wins FROM positions WHERE book = %s AND status = 'closed'", (BOOK,)) or {}
     spark = [float(r["wealth"]) for r in marks([BOOK], points=180) if r["wealth"] is not None]      # the book since it started, thinned
@@ -96,11 +100,12 @@ def summary(params: dict) -> dict:
     for x in spark:                         # drawdown below the running peak, on the same points
         peak = max(peak, x); dd_spark.append(1 - x / peak if peak > 0 else 0.0)
     trades = [float(r["realized_sol"] or 0) for r in q("SELECT realized_sol FROM positions WHERE book = %s AND status = 'closed' ORDER BY closed_at DESC NULLS LAST, id DESC LIMIT 180", (BOOK,))][::-1]
-    base = float(c.get("pnl") or 0) - sum(trades); pnl_spark = []
+    pnl = money["realized"] if money else c.get("pnl")
+    base = float(pnl or 0) - sum(trades); pnl_spark = []
     for r in trades:                        # cumulative realized P&L, ending at the total
         base += r; pnl_spark.append(base)
     return {"market": market_info(mk), "narrative": narrative(s), "marked": bool(w), "wealth": w.get("wealth"), "exposure": w.get("exposure"),
-            "n_open": int(w.get("n_open") or 0), "drawdown": w.get("drawdown"), "capital": cap, "closed": int(c.get("n") or 0), "pnl": c.get("pnl"),
+            "n_open": int(w.get("n_open") or 0), "drawdown": w.get("drawdown"), "capital": cap, "closed": int(c.get("n") or 0), "pnl": pnl,
             "wins": int(c.get("wins") or 0), "spark": spark, "pnl_spark": pnl_spark, "dd_spark": dd_spark, "live": live, "book": BOOK,
             "label": "Live wealth" if live else "Paper wealth",
             "wealth_help": (f"The bot wallet: {u} plus open positions net of exit costs; started at {cap:g} {u}." if live
@@ -206,6 +211,70 @@ def sell_now(body: dict) -> dict:
     if out["error"]:
         raise ActionError(f"The sale of {name} failed: {out['error']}. The position is still open.")
     return {**out, "message": f"Selling {name}: sent, booked when it fills"}
+
+
+# ---------------------------------------------------------------- the rising + clean test (agent/rising_clean.py)
+GO_LIVE_PAST_S = 120.0        # a go-live this far in the past is a typing mistake, not "now"
+
+
+@topic("overview.rising", every=30)
+def rising(params: dict) -> dict:
+    """The paper test on Solana: the test book against the selector's since it started, its doubled trades and the rest,
+    the market's breadth now and the go-live."""
+    mk = market_param(params); observer = isinstance(runtime.sup(), runtime.Observer)
+    if mk.chain != "sol":
+        return {"hidden": True}
+    t, _ = setting(rising_clean.KEY)
+    if not t:
+        return {"hidden": False, "running": False, "days": rising_clean.TEST_DAYS, "observer": observer}
+    since = datetime.fromisoformat(t["started_at"]); books = [rising_clean.BOOK, mk.selector_book]
+    rows = q("""SELECT p.book, COALESCE((d.detail->>'stake_x')::float, 1) > 1 AS doubled, count(*) FILTER (WHERE p.status = 'closed') AS closed,
+                       count(*) FILTER (WHERE p.status = 'open') AS open, COALESCE(sum(p.realized_sol) FILTER (WHERE p.status = 'closed'), 0) AS pnl,
+                       COALESCE(sum(p.cost_sol) FILTER (WHERE p.status = 'closed'), 0) AS cost
+                FROM positions p LEFT JOIN decisions d ON d.id = p.entry_decision_id WHERE p.book = ANY(%s) AND p.opened_at >= %s GROUP BY 1, 2""", (books, since))
+
+    def stat(pick) -> dict:
+        got = [r for r in rows if pick(r)]; cost = sum(float(r["cost"]) for r in got); pnl = sum(float(r["pnl"]) for r in got)
+        return {"closed": sum(int(r["closed"]) for r in got), "open": sum(int(r["open"]) for r in got), "pnl": pnl, "mean": pnl / cost if cost else None}
+
+    series = []
+    for s_ in _series([r for r in marks(books, days=math.ceil((datetime.now(timezone.utc) - since).total_seconds() / 86400) + 1) if r["ts"] >= since], books):
+        w0 = s_["data"][0][1]; series.append({"name": s_["name"], "data": [[ts, w - w0] for ts, w in s_["data"]]})      # P&L since the test began
+    st, _ = setting(rising_clean.STATUS_KEY); chg = st.get("breadth_chg")
+    return {"hidden": False, "running": True, "observer": observer, "unit": mk.unit, "started_at": t["started_at"], "go_live_at": t.get("go_live_at"),
+            "live_since": t.get("live_since"), "held": t.get("held"), "breadth_chg": chg, "rise": rising_clean.RISE_6H, "rising": None if chg is None else chg >= rising_clean.RISE_6H,
+            "book": stat(lambda r: r["book"] == rising_clean.BOOK), "selector": stat(lambda r: r["book"] == mk.selector_book),
+            "doubled": stat(lambda r: r["book"] == rising_clean.BOOK and r["doubled"]), "rest": stat(lambda r: r["book"] == rising_clean.BOOK and not r["doubled"]), "series": series}
+
+
+@action("overview.rising_start")
+def rising_start(body: dict) -> dict:
+    with transaction() as conn:
+        if rising_clean.state(conn) is not None:
+            raise ActionError("The rising + clean test has already started.")
+        v = rising_clean.start(conn)
+    return {"message": "Rising + clean test started: its book joins within ten minutes", "go_live_at": v["go_live_at"]}
+
+
+@action("overview.rising_go_live")
+def rising_go_live(body: dict) -> dict:
+    """The go-live moves to ``at`` (an ISO time with its zone), or is cleared (``at`` null). The wallet goes back to its plain
+    stakes until the new time passes and the test is judged."""
+    at = body.get("at")
+    if at is not None:
+        try:
+            at = datetime.fromisoformat(at)
+        except (TypeError, ValueError):
+            raise ActionError("at must be an ISO time", 400)
+        if at.tzinfo is None:
+            raise ActionError("at must carry its time zone", 400)
+        if at.timestamp() < datetime.now(timezone.utc).timestamp() - GO_LIVE_PAST_S:
+            raise ActionError("That time has passed. Pick one from now on.")
+    with transaction() as conn:
+        if rising_clean.state(conn) is None:
+            raise ActionError("The rising + clean test has not started.")
+        rising_clean.set_go_live(conn, at)
+    return {"message": "Go-live cleared: the wallet keeps its plain stakes" if at is None else "Go-live moved"}
 
 
 # ---------------------------------------------------------------- trades by hour of day

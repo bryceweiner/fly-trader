@@ -2,7 +2,7 @@
 
 ``reset_training_state`` (every runner start, ``RESET_ON_START``) wipes, after archiving them as CSV under
 data/pg_archive/reset_<ts>/, what belongs to no book that must persist: positions/orders/fills and wealth marks of any
-book but the live book and the two race books (``PRESERVED_BOOKS``), decisions and beats of runs that are not the race
+book but the live book, the race books and a paper test's (``PRESERVED_BOOKS``), decisions and beats of runs that are not the race
 sessions' (``RACE_RUN_KINDS``), those runs, and brain snapshots that are not models (``MODEL_KINDS``). NEVER touched:
 the race books (paper_selector, paper_fly) and the live book with their runs, beats and decisions; the plastic fly's
 tables (fly_*) and state file; the circuit (kill switch, trip, failure count, peak wealth — only rails.reset_circuit
@@ -33,8 +33,8 @@ from ..db.connection import transaction
 
 log = logging.getLogger(__name__)
 
-PRESERVED_BOOKS = ("live", "paper_selector", "paper_fly", "live_rh", "paper_rh_selector", "paper_rh_fly", "paper_kalshi_taker", "paper_kalshi_maker", "live_kalshi_taker", "live_kalshi_maker")
-RACE_RUN_KINDS = ("selector", "fly", "kalshi_fly", "selector_rh", "fly_rh")
+PRESERVED_BOOKS = ("live", "paper_selector", "paper_fly", "live_rh", "paper_rh_selector", "paper_rh_fly", "paper_rising", "paper_kalshi_taker", "paper_kalshi_maker", "live_kalshi_taker", "live_kalshi_maker")
+RACE_RUN_KINDS = ("selector", "fly", "kalshi_fly", "selector_rh", "fly_rh", "rising")
 MODEL_KINDS = ("selector", "fly_selector", "fly_plastic", "kalshi_selector", "kalshi_fly_selector", "kalshi_fly_plastic")
 FLY_BOOK, FLY_RUN_KIND = "paper_fly", "fly"
 FLY_BOOKS, FLY_RUN_KINDS = ("paper_fly", "paper_rh_fly"), ("fly", "fly_rh")     # one brain: both chains' fly books reset together

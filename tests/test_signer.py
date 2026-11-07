@@ -197,6 +197,38 @@ def test_a_multi_hop_buys_account_for_its_intermediate_token_is_the_wallets_not_
         signer(chain(OTHER)).sign_swap(swap_tx([open_hop]), str(NATIVE_MINT), str(MEME), 50_000_000, 900_000)
 
 
+def test_a_fee_vault_the_route_opens_at_the_buyers_expense_is_not_an_overspend():
+    """Pump.fun's AMM opened a fee vault's empty wSOL account inside the route at the buyer's expense (34Ct2K, 2026-11-06:
+    1,488,440 lamports to an account of a program address); the signer refused the buy twice as spending more than ordered.
+    That rent is allowed; rent into a wallet's account, an account holding tokens, an account that existed, or a third
+    vault is not."""
+    rent = 1_488_440
+    vault_owner = Pubkey.find_program_address([b"creator_vault"], JUPITER_V6)[0]          # off the curve: a program's
+    vaults = [Keypair.from_seed(bytes([20 + i]) * 32).pubkey() for i in range(3)]
+
+    def tx(n=1):
+        wsol = policy.ata(ME, NATIVE_MINT)
+        return swap_tx(route_accounts=[AccountMeta(ME, True, True), AccountMeta(wsol, False, True)] + [AccountMeta(v, False, True) for v in vaults[:n]])
+
+    def chain(n=1, owner=vault_owner, amount=0, existed=False, lamports=rent):
+        rpc = FakeRpc(); wallet(rpc); after_buy(rpc)
+        rpc.post[ME] = {**rpc.post[ME], "lamports": rpc.post[ME]["lamports"] - n * lamports}
+        for v in vaults[:n]:
+            rpc.post[v] = {"lamports": lamports, "owner": TOKEN, "data": token_data(NATIVE_MINT, owner, amount)}
+            if existed:
+                rpc.acc[v] = {"lamports": lamports, "owner": TOKEN, "data": token_data(NATIVE_MINT, owner, amount)}
+                rpc.post[v] = {**rpc.post[v], "lamports": 2 * lamports}
+        return rpc
+    t = VersionedTransaction.from_bytes(base64.b64decode(tx()))
+    assert vaults[0] in policy.check_swap_static(t, ME, lambda k: [], 5_000_000).writable
+    out = signer(chain()).sign_swap(tx(), str(NATIVE_MINT), str(MEME), 50_000_000, 900_000)
+    assert out["vault_rent"] == rent and out["simulated"]["sol"] == -50_005_000 - rent
+    assert signer(chain(2)).sign_swap(tx(2), str(NATIVE_MINT), str(MEME), 50_000_000, 900_000)["vault_rent"] == 2 * rent
+    for rpc, n in ((chain(owner=OTHER), 1), (chain(amount=5), 1), (chain(existed=True), 1), (chain(3), 3), (chain(lamports=3_000_000), 1)):
+        with pytest.raises(PolicyError, match="spends"):                               # a wallet's; tokens; old; a third; more than rent
+            signer(rpc).sign_swap(tx(n), str(NATIVE_MINT), str(MEME), 50_000_000, 900_000)
+
+
 def test_buy_caps():
     rpc = FakeRpc(); wallet(rpc); after_buy(rpc)
     s = signer(rpc, max_buy_lamports=10_000_000)

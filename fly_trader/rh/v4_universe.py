@@ -16,8 +16,12 @@ outside the Pons pools (rh/index.step). Nothing below runs in front of a minute'
      key (``classify``) and registered in ``rh_pools`` (kind 'pons_other' or 'v4', not yet ``indexed``), and a plain
      coin is queued in ``rh_v4_tokens``;
    - ``RH_V4_CHECKS_PER_SLOT`` plain coins have their contract checked (rh/token_check.py), the busiest first;
+   - an accepted coin whose contract matches no known-good template (rh/templates.py) is refused, and ``RETEMPLATE_PER_SLOT``
+     coins accepted before that check (2026-11-06) have their code read again, the ones trading now first;
    - a qualifying pool goes live: its coin's rh_meta row (rh/meta.write_v4) and ``indexed`` with ``live_from`` (the
      next block the stream indexes) in one commit, so the next pass indexes its swaps with the Pons pools'.
+   A plain coin's row knows no launch until rh/v4_facts.py finds it (a child process, near the universe's age): it trades
+   from then on.
 3. ``backfill_main`` (``fly-trader rh-v4-backfill``, its own process): every Initialize since block 0 into
    ``rh_v4_keys``, then each live pool's swaps before ``live_from`` with its coin's minutes over them, and a plain
    coin's first-hour outcomes once its history is complete.
@@ -36,7 +40,7 @@ from datetime import datetime, timezone
 from .. import config
 from ..db.connection import transaction
 from ..chain.evm import EvmRpc, EvmRpcError
-from . import token_check, v4
+from . import templates, token_check, v4
 from .rpc import RhRpc, _rate_limited
 
 log = logging.getLogger(__name__)
@@ -49,6 +53,7 @@ FORGET_S = 86400.0              # a pool that is no coin's pool (a hook, two quo
 KEEP_SWAPS = 200_000            # swap logs kept between slots (~5 h at 2026-10-23's rate); older ones are dropped
 SLOT_TIMEOUT_S = 5.0            # one RPC read of a slot
 MAX_ATTEMPTS = 5                # contract checks of a coin before it is given up ('error')
+RETEMPLATE_PER_SLOT = 25        # accepted coins whose template is read again a slot (one batch of codes, ~0.7 s)
 HISTORY_CHUNK = 100_000         # backfill_main: blocks per history step (~3 h of chain)
 KEYS_STEP = 2_000_000           # backfill_main: blocks per key-import step
 _STASH: dict = {"inits": [], "swaps": []}
@@ -56,6 +61,7 @@ _ACT: dict[str, list] = {}      # pool id -> [bucket, n, |amount0|, |amount1|, n
 _KNOWN: set[str] = set()        # pools found in rh_pools (Pons pools, registered pools)
 _SEEN: dict[str, float] = {}    # pools looked at and not registered -> when to look again
 _RPC: dict = {"rpc": None}
+_RETEMPLATED: dict = {"done": False}   # every coin accepted before the template check has been read again
 
 
 class SlotOver(RuntimeError):
@@ -288,9 +294,13 @@ def refresh_activity(conn, now: float) -> None:
                                   [(n, ts, pid) for pid, n, ts in vals])
 
 
+CREATOR_MOVES = "its creator can move holders' tokens without approval"
+
+
 def run_checks(conn, rpc, limit: int | None = None) -> dict:
-    """The contract check (rh/token_check.check) of the busiest pending coins; the creator is the sender of the coin's
-    first pool's initialization. A ``SlotOver`` ends the checks without counting an attempt."""
+    """The contract check (rh/token_check.check) of the busiest pending coins, then the template (rh/templates.py), then the
+    creator probe; the creator is the sender of the coin's first pool's initialization. A ``SlotOver`` ends the checks
+    without counting an attempt."""
     limit = config.RH_V4_CHECKS_PER_SLOT if limit is None else limit
     todo = conn.execute("""SELECT v.token, (SELECT k.init_tx FROM rh_v4_keys k WHERE k.pool_id = v.first_pool) AS init_tx,
                                   (SELECT coalesce(sum(p.swaps_seen), 0) FROM rh_pools p WHERE p.token = v.token) AS swaps
@@ -302,6 +312,10 @@ def run_checks(conn, rpc, limit: int | None = None) -> dict:
             r = token_check.check(rpc, t["token"])
             tx = rpc.tx_by_hash(t["init_tx"]) if t["init_tx"] else None
             creator = ((tx or {}).get("from") or "").lower() or None
+            if r["ok"] and not templates.known(r.get("template")):
+                r = {**r, "ok": False, "reason": templates.DEVIATES}
+            if r["ok"] and creator and token_check.creator_can_move(rpc, t["token"], creator, config.V4_POOL_MANAGER):
+                r = {**r, "ok": False, "reason": CREATOR_MOVES}
         except SlotOver:
             raise
         except Exception as e:
@@ -316,6 +330,40 @@ def run_checks(conn, rpc, limit: int | None = None) -> dict:
         log.info("rh v4 coin %s (%s): %s, %s", t["token"], r["symbol"], st, r["reason"])
     return out
 
+
+def retemplate(conn, rpc, limit: int = RETEMPLATE_PER_SLOT) -> dict:
+    """Coins accepted before the template check (2026-11-06; no ``template`` in their check's detail), the ones trading in
+    the last two hours first, then the newest: their code read again (one batch, a minimal proxy's implementation in a
+    second), the template noted, and a coin that deviates refused. A refused coin keeps its bars (an open position still
+    exits) and is never bought again (agent/minute_engine.refused). Once none is left (a coin accepted since carries its
+    template), no slot looks again until a restart."""
+    if _RETEMPLATED["done"]:
+        return {}
+    todo = conn.execute("""WITH act AS (SELECT lower(mint) AS token, max(ts) AS last FROM rh_minutes WHERE ts > now() - interval '2 hours' GROUP BY 1)
+                           SELECT v.token, v.detail FROM rh_v4_tokens v LEFT JOIN act a ON a.token = v.token
+                           WHERE v.status = 'ok' AND NOT (coalesce(v.detail, '{}'::jsonb) ? 'template')
+                           ORDER BY a.last DESC NULLS LAST, v.first_ts DESC NULLS LAST LIMIT %s""", (limit,)).fetchall()
+    out = {"kept": 0, "refused": 0, "unread": 0}
+    if not todo:
+        _RETEMPLATED["done"] = True
+        return out
+    codes = rpc.batch([("eth_getCode", [t["token"], "latest"]) for t in todo])
+    impls = {i: token_check.clone_target(c) for i, c in enumerate(codes) if isinstance(c, str) and token_check.clone_target(c)}
+    if impls:
+        for i, c in zip(impls, rpc.batch([("eth_getCode", [a, "latest"]) for a in impls.values()])):
+            codes[i] = c if isinstance(c, str) else None
+    for t, code in zip(todo, codes):
+        if not isinstance(code, str):
+            out["unread"] += 1; continue                                    # read again next slot
+        tpl = templates.template_id(code)
+        detail = json.dumps({**(t["detail"] or {}), "template": tpl}, default=str)
+        if templates.known(tpl):
+            conn.execute("UPDATE rh_v4_tokens SET detail = %s WHERE token = %s AND status = 'ok'", (detail, t["token"])); out["kept"] += 1
+        else:
+            conn.execute("UPDATE rh_v4_tokens SET status = 'refused', reason = %s, detail = %s, checked_at = now() WHERE token = %s AND status = 'ok'",
+                         (templates.DEVIATES, detail, t["token"])); out["refused"] += 1
+            log.info("rh v4 coin %s: refused, %s", t["token"], templates.DEVIATES)
+    return out
 
 def go_live(conn, cursor: int) -> int:
     """Each registered pool that qualifies now (a graduated Pons coin's, or an accepted plain coin's) goes live: its
@@ -360,6 +408,14 @@ def slot(deadline: float, now: float | None = None) -> dict:
         out["stopped"] = str(e)[:200]
     except Exception as e:
         out["error"] = str(e)[:200]; log.exception("rh v4 slot: contract checks failed")
+    if "stopped" not in out:
+        try:
+            with transaction() as conn:
+                out["retemplate"] = retemplate(conn, rpc)
+        except SlotOver as e:
+            out["stopped"] = str(e)[:200]
+        except Exception as e:
+            out["error"] = str(e)[:200]; log.exception("rh v4 slot: template re-check failed")
     try:
         with transaction() as conn:
             cur = conn.execute("SELECT block FROM rh_scan WHERE name = 'rh'").fetchone()

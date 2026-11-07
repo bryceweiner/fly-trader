@@ -4,13 +4,14 @@ import os
 
 os.environ["DATABASE_URL"] = "postgresql:///fly_trader_test"
 os.environ["FLY_TRADER_TESTING"] = "1"           # fly_trader/netguard.py: no transaction, order or transfer leaves a test run
-for _name in ("BOT_PRIVATE_KEY", "BOT_PRIVATE_KEY_FILE", "RH_BOT_PRIVATE_KEY"):   # and the operator's signing keys
-    os.environ[_name] = ""                                                         # never load (empty = unset; .env never overrides)
-for _name in ("RH_RPC_URL_TX", "QUICKNODE_RH_API_URL", "QUICKNODE_RH_API_KEY"):   # no test reaches the real transaction endpoint
+for _name in ("BOT_PRIVATE_KEY", "BOT_PRIVATE_KEY_FILE", "RH_BOT_PRIVATE_KEY", "SIGNER_SOCKET"):   # and the operator's signing keys
+    os.environ[_name] = ""                                                         # (or signer) never load (empty = unset; .env never overrides)
+for _name in ("RH_RPC_URL_TX", "ALCHEMY_API_KEY", "QUICKNODE_RH_API_URL", "QUICKNODE_RH_API_KEY"):   # no test reaches the real transaction endpoint
     os.environ[_name] = ""
 for _name in ("LIVE_ENABLED", "RH_LIVE_ENABLED", "KALSHI_LIVE_ENABLED", "LIVE_WITHOUT_HANDOVER"):   # nor runs with the operator's
     os.environ[_name] = "0"                                                                   # live switches from .env
 os.environ["RH_CAPITAL_ETH"] = ""      # empty = the code's pinned default, not the operator's wallet balance (load_dotenv never overrides)
+os.environ["KELLY_FRACTION"] = ""      # and the code's default stake, not the operator's
 
 import pytest  # noqa: E402
 

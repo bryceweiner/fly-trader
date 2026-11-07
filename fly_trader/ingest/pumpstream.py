@@ -19,6 +19,7 @@ pool with the most legs. Minutes are written to ``pump_minutes`` once complete: 
 minute's end has arrived (event-time watermark) or, once no trade has arrived for 15 s, by wall clock; a leg for a minute
 already written is dropped (never merged into it). ``pumpstream_status.flushed_through``
 publishes the newest complete minute for the engine the moment it is written (the fly's live orders wait on it).
+Every kept leg's price of a coin a Solana book holds also goes to the crash watcher (agent/crash_exit.py) as it arrives.
 
 Lifecycle: ``create`` events go to ``pump_events`` as they arrive; at ``migrate`` a ``corpus_meta`` row is written
 with the creation facts and the creator's point-in-time history (``train/corpus_meta.creator_history``, the training
@@ -48,6 +49,7 @@ import pyarrow.parquet as pq
 import websockets
 
 from .. import config
+from ..agent import crash_exit
 from ..db.apilog import record_event
 from ..db.connection import transaction
 from ..logging_setup import setup
@@ -202,6 +204,7 @@ class Aggregator:
             if not ok:
                 self.stats["dropped_band"] += 1
                 return
+            crash_exit.WATCH.observe(mint, ts_s, p)          # a held coin 25 % under its 5-minute high is sold now (agent/crash_exit.py)
             m = int(ts_s // 60) * 60; pid = e.get("poolId") or ""
             if self.flushed_through is not None and m <= self.flushed_through.timestamp():
                 self.stats["dropped_late"] += 1           # its minute is written and consumed; a partial re-write would corrupt it

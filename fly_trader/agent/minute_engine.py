@@ -7,9 +7,11 @@ synthetic trades, exactly as in training. Graduation time and creation/creator f
 same source training uses. The full feature vector (``decisions.X_COLS``) of the rows in the models' universe
 (``selector.in_universe``) that pass the eligibility gate (pool ≥ ``MIN_RESQ_SOL``, 15-minute volume ≥
 ``MIN_VOL_15M_SOL``, no scale break — a close 50× from the previous one or a reserve above 100,000 SOL — since the
-mint's state began) goes to every book; each picks its model's columns by name.
+mint's state began; on Solana a creator that held under ``CREATOR_HELD_MAX`` at graduation) goes to every book; each picks
+its model's columns by name.
 
-Books — ``SelectorBook`` (agent/selector_session.py) and ``FlyBook`` (agent/fly_session.py) — implement ``name``,
+Books — ``SelectorBook`` (agent/selector_session.py), ``RisingBook`` (agent/rising_clean.py: a paper test on the selector's
+picks) and ``FlyBook`` (agent/fly_session.py) — implement ``name``,
 ``on_bars(t_start, bars)`` (every processed minute, warm-up included: open, close and exit cost of every traded mint),
 ``on_minute(ctx)``, ``open_mints(conn)``, ``maybe_reload()``, ``done`` and ``finish()``. Each book trades inside its own
 savepoint, so one book's failure never undoes the other's minute.
@@ -53,16 +55,21 @@ from ..market.exit_cost import cost_at_size, cost_label
 from ..market.features import FEATURES, FIDX, TokenMeta, TokenState
 from ..train.corpus_meta import FEATURE_COLS as META_COLS, sol_select
 from ..train.decisions import MIN_RESQ_SOL, MIN_VOL_15M_SOL, X_COLS
-from ..train.flow import FlowWindow, MarketWindow
+from ..train.flow import BreadthWindow, FlowWindow, MarketWindow
 from ..train.mature import MASKED
 from ..train.selector import creator_heavy, in_universe
-from . import live_first
+from . import live_first, regime
 
 log = logging.getLogger(__name__)
 WARMUP_MIN = 1440            # training warms each day on the previous day's candles
 V4_WARM_H = 3.0              # a plain v4 memecoin trades only once the engine has fed it this long (the longest feature window):
                              # it goes live mid-session without the history before (rh/v4_universe.go_live)
 IDLE_EVICT_S = 86400         # training has no history for a mint idle since before the previous day
+# A Solana coin whose creator still held this share of the supply at graduation is never bought (Bryce, 2026-11-01). Live rows
+# only, as the DLMM filter (ingest/pumpstream.FEED_POOLS): training keeps these coins, so no model or definition changes. On
+# the out-of-sample book they made -9.0 / -5.0 % a trade against +1.3 / +6.6 % for the rest, on real paper trades -5.8 % with
+# 24 % rugs against +8.8 % with 9 %; on Robinhood Chain they made money with no more rugs, so the rule stops at Solana.
+CREATOR_HELD_MAX = 0.10
 STREAM_STALE_S = 180         # no entries or exits when the stream's newest complete minute is older than this
 META_TTL_S = 600
 MODEL_CHECK_S = 600          # how often books reload newer models and new books are admitted
@@ -147,6 +154,10 @@ class MinuteEngine:
         self.states: dict[str, MintState] = {}
         self.meta_cache: dict[str, dict] = {}; self.last_sweep = time.time(); self.last_minute: float | None = None
         self.market = MarketWindow()                 # mkt_vol_1h over every traded mint (as mature._market_windows)
+        self.breadth = BreadthWindow()               # the share of coins rising (agent/rising_clean.py), warm-up included
+        self.quiet = None if self.rh else regime.QuietBar()   # few young coins pass the bar: old coins are not bought (agent/regime.py)
+        self.exits = regime.ExitChoice() if self.rh else None # the take-profit RH's recent trades favour (agent/regime.py)
+        self.refused: set[str] = set(); self.refused_at = -math.inf   # RH: plain v4 coins refused after they went live (rh/token_check)
 
     def has_book(self, name: str) -> bool:
         return any(b.name == name for b in self.books)
@@ -273,6 +284,8 @@ class MinuteEngine:
         s.hist.append((t_end, float(a["nb"] + a["ns"]), float(a["n_traders"])))
         s.flow.append(t_end, a["buy"], a["sell"], a.get("n_buyers"), a.get("wash_sol"), a.get("wash_buy_sol"), a.get("top_sell_sol"), a.get("insider_sell_sol"), a.get("skill_buy"))
         f, _mask = st.features(t_end, s.meta)
+        if not self.rh:
+            self.breadth.add(t_end - 60.0, resq, f[FIDX["ret_1h"]])
         ht = np.array([h[0] for h in s.hist]); hn = np.array([h[1] for h in s.hist]); htr = np.array([h[2] for h in s.hist])
         for k, w in (("1m", 60), ("5m", 300), ("15m", 900), ("1h", 3600)):
             f[FIDX[f"logn_{k}"]] = math.log1p(float(hn[ht > t_end - w].sum()))
@@ -298,14 +311,33 @@ class MinuteEngine:
                 "mcap": price * s.meta.supply, "fee_rate": a.get("fee_rate"), "decimals": s.decimals, "pool": s.pool, "program_label": s.program_label, "broken": s.broken,
                 "skill_missing": a.get("skill_buy") is None, "curve_known": bool(meta.get("curve_known")), "chain": self.spec.chain,
                 "quote_class": meta.get("quote_class"), "source": meta.get("source"), "seen_h": (t_end - s.first_seen) / 3600.0,
-                "creator_heavy": creator_heavy(meta.get("dev_share"))}          # its buys are capped (agent/sizing.size_position)
+                "creator_heavy": creator_heavy(meta.get("dev_share")),          # its buys are capped (agent/sizing.size_position)
+                "grad_hhi": meta.get("grad_hhi"),                               # a clean launch (agent/rising_clean.py): None, not known
+                "creator_held": meta.get("dev_hold_share")}                     # the creator's share at graduation (``eligible``)
         return x, info
+
+    def _refresh_refused(self, conn, now: float) -> None:
+        """RH: the plain v4 coins the contract check refused (rh_v4_tokens), at most every ``regime.REFRESH_S``: a coin refused
+        after it went live (a re-check found a power the first one missed) is never bought again; its minutes still price it."""
+        if not self.rh or now - self.refused_at < regime.REFRESH_S:
+            return
+        self.refused_at = now
+        try:
+            with conn.transaction():
+                self.refused = {r["token"].lower() for r in conn.execute("SELECT token FROM rh_v4_tokens WHERE status = 'refused'").fetchall()}
+        except Exception:
+            log.exception("rh: refused v4 coins: read failed; the last list stands")
 
     def eligible(self, info: dict) -> bool:
         if self.rh:                                      # the same gates in the chain's unit (x K), as training (train/decisions)
             if info.get("source") == "v4" and (info.get("seen_h") or 0.0) < V4_WARM_H:
                 return False                             # its feature windows are not full yet (V4_WARM_H)
             return not info["broken"] and info["resq"] is not None and info["resq"] >= self.spec.min_resq() and info["logvol_15m"] >= math.log1p(self.spec.min_vol_15m())
+        held = info.get("creator_held")
+        if held is not None and held >= CREATOR_HELD_MAX:
+            return False
+        if self.quiet is not None and self.quiet.blocks(info):
+            return False
         return not info["broken"] and info["resq"] is not None and info["resq"] >= MIN_RESQ_SOL and info["logvol_15m"] >= math.log1p(MIN_VOL_15M_SOL)
 
     def _stream_through(self) -> float | None:
@@ -329,7 +361,7 @@ class MinuteEngine:
         for mint, a in agg.items():
             x, info = self._features(conn, mint, a, m1_epoch)
             bars[mint] = (m1_epoch - 60.0, info["open"], info["price"], info["ec"])
-            if in_universe(x[None], X_COLS)[0] and self.eligible(info):        # the models' universe (train/selector.in_universe)
+            if in_universe(x[None], X_COLS)[0] and self.eligible(info) and mint not in self.refused:   # the models' universe (train/selector.in_universe)
                 xs.append(x); infos.append(info); mints.append(mint)
         return (np.stack(xs) if xs else np.zeros((0, len(X_COLS)), np.float32)), infos, mints, bars
 
@@ -347,6 +379,11 @@ class MinuteEngine:
                     bars[mint] = (t1 - 60.0, info["open"], info["price"], info["ec"])
                 for b in self.my_books():
                     b.on_bars(t1 - 60.0, bars)
+            if self.quiet is not None:
+                self.quiet.refresh(conn, m1_epoch)
+            if self.exits is not None:
+                self.exits.refresh(conn, m1_epoch)
+            self._refresh_refused(conn, m1_epoch)
         log.info("warm-up: %d token-minutes over the last %d minutes (%d tokens)", n, minutes, len(self.states))
         return n
 
@@ -426,6 +463,11 @@ class MinuteEngine:
                     log.exception("%s: minute %s failed", b.name, ctx.m1.isoformat())
                     record_event("error", b.name, f"minute failed: {ctx.m1.isoformat()}")
             self._sweep(ctx.m1_epoch, held)
+            if self.quiet is not None:                   # the next minutes' trigger, read after every order of this one
+                self.quiet.maybe_refresh(conn, ctx.m1_epoch); out["quiet_bar"] = self.quiet.status()
+            if self.exits is not None:                   # the next buys' take-profit, chosen after every order of this one
+                self.exits.maybe_refresh(conn, ctx.m1_epoch); out["take_profit"] = self.exits.status()
+            self._refresh_refused(conn, ctx.m1_epoch)
         for b in [b for b in self.my_books() if b.done]:
             b.finish(); self.books.remove(b)
         return out
@@ -456,7 +498,7 @@ def _status(key: str, value: dict) -> None:
 
 def admit_books(engine: MinuteEngine, live: bool) -> list:
     """Books that qualify now and are not running yet (the fly first: its presence decides whether the selector trades)."""
-    from . import fly_session, handover
+    from . import fly_session, handover, rising_clean
     from .selector_session import NoModel, SelectorBook
     new = []
     for m in markets.enabled():                         # Solana first: another chain's fly shares the Solana fly's brain
@@ -476,6 +518,14 @@ def admit_books(engine: MinuteEngine, live: bool) -> list:
                 new.append(SelectorBook(m.chain))
             except NoModel as e:
                 _status(m.selector_status_key, {"stage": "waiting for a model", "detail": str(e), "chain": m.chain})
+    if not engine.has_book(rising_clean.KIND):
+        try:                                            # a paper test never stops the runner
+            with transaction() as conn:
+                test = rising_clean.state(conn)
+            if test is not None:
+                new.append(rising_clean.RisingBook())
+        except Exception:
+            log.exception("the rising + clean book did not start")
     return new
 
 

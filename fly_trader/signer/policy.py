@@ -9,7 +9,8 @@
    accounts for its intermediate tokens hold their rent for the wallet). A buy may spend at most the ordered SOL (+ fees) and must deliver
    the bought token to the trading wallet; a sell may spend at most the ordered tokens and must return SOL to it; no
    other holding may shrink. So a route that pays someone else, drains another holding or overspends is refused
-   whatever the brain claimed.
+   whatever the brain claimed. One cost to others is allowed: the rent of an empty token account the route opens inside
+   itself for a program's vault (a pool's fee vault opened at the buyer's expense; ``rent_opened_for_others``).
 
 Pure functions only: the RPC calls live in core.py, which passes their results in here.
 """
@@ -35,6 +36,8 @@ SWAP_PROGRAMS = frozenset({SYSTEM, COMPUTE_BUDGET, TOKEN, TOKEN_2022, ATA, JUPIT
 EXCLUDE_ROUTERS = "jupiterz,dflow,okx"
 ATA_RENT_LAMPORTS = 2_039_280
 BASE_FEE_LAMPORTS = 5_000
+RENT_PER_BYTE_MAX = 6_960            # lamports per byte (+128 of overhead) a rent exemption cost before 2026; it is lower now
+OPENED_FOR_OTHERS_MAX = 2            # empty vault accounts a swap may open at the wallet's expense
 
 
 class PolicyError(RuntimeError):
@@ -71,6 +74,7 @@ class SwapCheck:
     priority_lamports: int
     creates_atas: int
     opens: list[Pubkey] = field(default_factory=list)   # the token accounts its ATA instructions open for the trading wallet
+    writable: list[Pubkey] = field(default_factory=list)  # every account the transaction may write (lookup tables resolved)
 
 
 def check_swap_static(tx: VersionedTransaction, trading: Pubkey, resolve_alt, max_priority_lamports: int) -> SwapCheck:
@@ -124,7 +128,18 @@ def check_swap_static(tx: VersionedTransaction, trading: Pubkey, resolve_alt, ma
     prio = cu_limit * cu_price // 1_000_000
     if prio > max_priority_lamports:
         raise PolicyError(f"priority fee {prio} lamports is above the cap {max_priority_lamports}")
-    return SwapCheck(signer_index=idx, fee_payer=static[0], priority_lamports=prio, creates_atas=creates, opens=opens)
+    return SwapCheck(signer_index=idx, fee_payer=static[0], priority_lamports=prio, creates_atas=creates, opens=opens,
+                     writable=writable_keys(msg, keys))
+
+
+def writable_keys(msg, keys: list[Pubkey]) -> list[Pubkey]:
+    """The accounts of ``keys`` (``account_keys`` order) the message may write: the writable signers, the writable
+    non-signers, then each lookup table's writable addresses."""
+    h = msg.header; ns = len(msg.account_keys)
+    n_sign, ro_sign, ro_unsigned = h.num_required_signatures, h.num_readonly_signed_accounts, h.num_readonly_unsigned_accounts
+    out = [k for i, k in enumerate(keys[:ns]) if i < n_sign - ro_sign or n_sign <= i < ns - ro_unsigned]
+    n_alt_w = sum(len(bytes(lk.writable_indexes)) for lk in getattr(msg, "address_table_lookups", []))
+    return out + list(keys[ns:ns + n_alt_w])
 
 
 def token_amount(data: bytes | None) -> int:
@@ -148,6 +163,25 @@ class Snapshot:
     """The trading wallet's lamports and each of its token accounts: address -> (mint, amount, lamports)."""
     lamports: int
     tokens: dict
+
+
+def rent_opened_for_others(pre_accounts: list[dict | None], post_accounts: list[dict | None]) -> int:
+    """Lamports a swap put into token accounts it opened for a program's vault, in the simulation (``pre_accounts`` and
+    ``post_accounts`` side by side, as ``Rpc.accounts`` reads them). Pump.fun's AMM opens a fee vault's empty wSOL
+    account at the buyer's expense: 34Ct2K, 2026-11-06, 1,488,440 lamports to an account of 5AmqLBHH (a program address),
+    and the signer refused the buy twice as an overspend. Counted: an account that did not exist, a token account whose
+    authority is a program address (off the curve: no wallet's), holding no tokens and no more lamports than the rent
+    exemption of its size; at most ``OPENED_FOR_OTHERS_MAX``. Rent to a wallet, or into an account that receives
+    tokens or SOL, is not."""
+    rents = []
+    for a0, a1 in zip(pre_accounts, post_accounts):
+        if (a0 and a0["lamports"]) or not a1 or a1["owner"] not in (TOKEN, TOKEN_2022) or len(a1["data"]) < 72:
+            continue
+        if token_owner(a1["data"]).is_on_curve() or token_amount(a1["data"]) != 0:
+            continue
+        if 0 < a1["lamports"] <= (128 + len(a1["data"])) * RENT_PER_BYTE_MAX:
+            rents.append(a1["lamports"])
+    return sum(sorted(rents)[:OPENED_FOR_OTHERS_MAX])
 
 
 def check_swap_effects(pre: Snapshot, post: Snapshot, *, in_mint: Pubkey, out_mint: Pubkey, in_amount: int, min_out: int,

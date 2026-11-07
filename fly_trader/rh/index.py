@@ -140,14 +140,19 @@ def fill_timestamps(rpc, events: list[dict], lo: int, hi: int) -> None:
         e["ts"] = t[e["block"]]
 
 
-def index_curve(conn, rpc, token: str, until_block: int) -> int:
-    """A graduating launch's curve trades (its own curve contract, launch → graduation). Idempotent; returns rows written."""
-    r = conn.execute("SELECT curve, launch_block, curve_indexed FROM rh_tokens WHERE token = %s", (token,)).fetchone()
-    if not r or not r["curve"] or r["launch_block"] is None or r["curve_indexed"]:
-        return 0
-    router = config.PONS_ROUTER.lower(); n = 0; lo = int(r["launch_block"]); step = scan.MAX_RANGE
-    while lo <= until_block:
-        hi = min(until_block, lo + step - 1)
+def index_curve_chunk(conn, rpc, token: str) -> tuple[int, bool]:
+    """One chunk (``scan.MAX_RANGE`` blocks) of a graduate's curve trades (its own curve contract, launch → its pool's
+    registration), from where the last chunk stopped (``rh_tokens.curve_through``); the last sets ``curve_indexed``.
+    Idempotent. Returns (rows written, done). Runs off the live stream (rh/curves.py): a coin that sat weeks on its curve
+    is hundreds of chunks, which held the live minutes for 40+ minutes while it ran inside the index step (2026-11-04)."""
+    r = conn.execute("SELECT curve, launch_block, COALESCE(curve_until, grad_block) AS until, curve_through, curve_indexed FROM rh_tokens WHERE token = %s",
+                     (token,)).fetchone()
+    if not r or not r["curve"] or r["launch_block"] is None or r["until"] is None or r["curve_indexed"]:
+        return 0, True
+    router = config.PONS_ROUTER.lower(); n = 0
+    lo = int(r["launch_block"]) if r["curve_through"] is None else int(r["curve_through"]) + 1; until = int(r["until"])
+    hi = min(until, lo + scan.MAX_RANGE - 1)
+    if lo <= until:
         logs = _get_logs(rpc, [r["curve"]], lo, hi, [[pons.TOPIC["CurveBuy"], pons.TOPIC["CurveSell"]]])
         evs = [pons.decode(x) for x in _order(logs)]; evs = [e for e in evs if e]
         fill_timestamps(rpc, evs, lo, hi)
@@ -157,9 +162,9 @@ def index_curve(conn, rpc, token: str, until_block: int) -> int:
                          "VALUES (%s, %s, %s, to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
                          (e["block"], e["log_index"], e["tx_hash"], e["ts"], token, e["side"], trader, e["recipient"], e["quote_raw"], e["tokens_raw"], e["fee_raw"], e["tax_raw"]))
             n += 1
-        lo = hi + 1
-    conn.execute("UPDATE rh_tokens SET curve_indexed = true WHERE token = %s", (token,))
-    return n
+    done = hi >= until
+    conn.execute("UPDATE rh_tokens SET curve_through = %s, curve_indexed = %s WHERE token = %s", (max(hi, lo - 1), done, token))
+    return n, done
 
 
 def apply_pons(conn, rpc, events: list[dict]) -> dict:
@@ -194,7 +199,7 @@ def apply_pons(conn, rpc, events: list[dict]) -> dict:
             conn.execute("UPDATE rh_tokens SET pool_id = %s, status = 'graduated', graduated_at = COALESCE(graduated_at, to_timestamp(%s)) WHERE token = %s",
                          (e["pool_id"], e["ts"], tok))
             n["pools"] += 1
-            n["curve_trades"] += index_curve(conn, rpc, tok, e["block"])
+            conn.execute("UPDATE rh_tokens SET curve_until = COALESCE(curve_until, %s) WHERE token = %s", (e["block"], tok))   # rh/curves.py back-fills it
     return n
 
 

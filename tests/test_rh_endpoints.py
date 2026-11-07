@@ -20,6 +20,25 @@ def test_quicknode_url(monkeypatch):
     assert config.quicknode_rh_url() == "https://x.robinhood-mainnet.quiknode.pro/"
 
 
+def test_alchemy_url(monkeypatch):
+    monkeypatch.delenv("ALCHEMY_API_KEY", raising=False)
+    assert config.alchemy_rh_url() is None
+    monkeypatch.setenv("ALCHEMY_API_KEY", KEY)
+    assert config.alchemy_rh_url() == f"https://robinhood-mainnet.g.alchemy.com/v2/{KEY}"
+
+
+def test_alchemy_comes_first_and_only_on_the_default_rpc(monkeypatch):
+    monkeypatch.delenv("RH_RPC_URL_TX", raising=False); monkeypatch.delenv("RH_RPC_URL", raising=False)
+    monkeypatch.setenv("ALCHEMY_API_KEY", KEY); monkeypatch.setenv("QUICKNODE_RH_API_URL", "https://x.robinhood-mainnet.quiknode.pro/")
+    assert config.rh_tx_url() == config.alchemy_rh_url()
+    monkeypatch.delenv("ALCHEMY_API_KEY")
+    assert config.rh_tx_url() == "https://x.robinhood-mainnet.quiknode.pro/"
+    monkeypatch.setenv("ALCHEMY_API_KEY", KEY); monkeypatch.setenv("RH_RPC_URL", "http://127.0.0.1:8545")
+    assert config.rh_tx_url() is None                                          # a run pointed at anvil never reaches mainnet
+    monkeypatch.setenv("RH_RPC_URL_TX", "https://tx.example")
+    assert config.rh_tx_url() == "https://tx.example"                          # named outright: it wins
+
+
 def test_tests_never_reach_quicknode():
     assert config.RH_RPC_URL_TX is None                                        # tests/conftest.py blanks it before import
 
@@ -43,3 +62,9 @@ def test_log_readers_never_use_the_transaction_endpoint(monkeypatch):
 def test_key_is_scrubbed(monkeypatch):
     monkeypatch.setenv("QUICKNODE_RH_API_KEY", KEY)
     assert KEY not in scrub(f"429 Too Many Requests for url 'https://x.robinhood-mainnet.quiknode.pro/{KEY}'")
+
+
+def test_alchemy_key_is_scrubbed(monkeypatch):
+    short = "abcdefghijklmnopqrstuvwxyz"                                       # Alchemy keys are shorter than QuickNode's
+    monkeypatch.setenv("ALCHEMY_API_KEY", short)
+    assert short not in scrub(f"429 Too Many Requests for url 'https://robinhood-mainnet.g.alchemy.com/v2/{short}'")

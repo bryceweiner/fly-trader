@@ -80,3 +80,64 @@ def test_a_creator_heavy_buy_stakes_at_most_its_share_of_the_bankroll():
     assert size(0.8)[0] > 0 and size(0.8, creator_heavy=True)[0] == 0.0     # its share of 0.8 SOL is below the minimum buy: none
     full_rh, capped_rh = size(0.2, market=RH)[0], size(0.2, market=RH, creator_heavy=True)[0]
     assert capped_rh == pytest.approx(share * 0.2) and capped_rh < full_rh  # RH: its share of the ETH bankroll
+
+
+def _held_info(engine, conn, mint, t, resq=60.0):
+    a = {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "buy": 60.0, "sell": 0.0, "nb": 2, "ns": 0, "n_traders": 2, "resq": resq, "pool": "P", "program_label": "Pump.fun Amm"}
+    return engine._features(conn, mint, a, t)[1]
+
+
+def _held_meta(conn, table, **rows):
+    with conn.cursor() as cur:
+        for mint, held in rows.items():
+            cur.execute(f"DELETE FROM {table} WHERE mint = %s", (mint,))
+            cur.execute(f"INSERT INTO {table} (mint, graduated_at, dev_hold_share) VALUES (%s, now(), %s)", (mint, held))
+    conn.commit()
+
+
+def test_a_solana_coin_whose_creator_held_a_tenth_at_graduation_is_never_bought(db_conn):
+    """The Saturween rule (2026-11-01): from 10 % held at graduation; a share not known passes here, the universe's own rule stops it."""
+    from fly_trader.agent import minute_engine as me
+    e = me.MinuteEngine(); t = 1_800_000_000.0
+    _held_meta(db_conn, "corpus_meta", CHAtpump=0.10, CHBelowpump=0.0999, CHZeropump=0.0, CHNonepump=None, CHBigpump=0.1695)
+    try:
+        got = {m: e.eligible(_held_info(e, db_conn, m, t)) for m in ("CHAtpump", "CHBelowpump", "CHZeropump", "CHNonepump", "CHBigpump")}
+    finally:
+        with db_conn.cursor() as cur:
+            cur.execute("DELETE FROM corpus_meta WHERE mint LIKE 'CH%%pump'")
+        db_conn.commit()
+    assert got == {"CHAtpump": False, "CHBelowpump": True, "CHZeropump": True, "CHNonepump": True, "CHBigpump": False}
+
+
+def test_the_rule_stops_at_solana(db_conn):
+    from fly_trader import markets
+    from fly_trader.agent import minute_engine as me
+    e = me.MinuteEngine(market=markets.RH)
+    base = {"broken": False, "resq": 100.0, "logvol_15m": 100.0, "source": "pons", "seen_h": 10.0}
+    assert e.eligible({**base, "creator_held": 0.5})
+
+
+def test_a_held_coin_can_still_be_sold_and_priced(db_conn):
+    """The rule takes a coin off the books' buy rows. Its minute still carries its price and bar, so an open position exits on time."""
+    from fly_trader.agent import minute_engine as me
+    e = me.MinuteEngine(); t = 1_800_000_000.0
+    _held_meta(db_conn, "corpus_meta", CHHeldpump=0.5)
+    a = {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "buy": 60.0, "sell": 0.0, "nb": 2, "ns": 0, "n_traders": 2, "resq": 60.0, "pool": "P", "program_label": "Pump.fun Amm"}
+    try:
+        X, infos, mints, bars = e._minute_rows(db_conn, {"CHHeldpump": a}, t)
+    finally:
+        with db_conn.cursor() as cur:
+            cur.execute("DELETE FROM corpus_meta WHERE mint = 'CHHeldpump'")
+        db_conn.commit()
+    assert mints == [] and "CHHeldpump" in bars
+
+
+def test_no_model_or_definition_moves(monkeypatch):
+    """Live rows only: training's universe and the definitions a model is matched on are untouched by the rule."""
+    import numpy as np
+    from fly_trader.agent import minute_engine as me
+    from fly_trader.train import selector
+    from fly_trader.train.decisions import X_COLS
+    x = np.zeros((1, len(X_COLS)), np.float32); c = {n: i for i, n in enumerate(X_COLS)}
+    x[0, c["age_known"]] = 1.0; x[0, c["log_age_h"]] = 3.0; x[0, c["meta_known"]] = 1.0; x[0, c["curve_known"]] = 1.0; x[0, c["dev_hold_share"]] = 0.5
+    assert selector.in_universe(x, X_COLS)[0] and selector.UNIVERSE_VERSION == "creator-3" and me.CREATOR_HELD_MAX == 0.10

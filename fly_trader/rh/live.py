@@ -265,6 +265,8 @@ class RhLiveMirror:
                 mint = e["mint"].lower()
                 if mint in held_mints:
                     skipped.append((mint, "held")); self._blocked(conn, ctx, run_id, beat_id, e, "held", "the wallet holds this token or has an order of it queued"); continue
+                if e["info"].get("source") == "v4" and not config.RH_V4_WALLET:
+                    skipped.append((mint, "v4 paper only")); self._blocked(conn, ctx, run_id, beat_id, e, "v4 paper only", "a plain v4 coin: the wallet waits for the operator (RH_V4_WALLET)"); continue
                 pool = pool_of(conn, e["info"].get("pool")); quote = ((pool or {}).get("quote_asset") or ZERO).lower()
                 _, stale_mark = A.base_mark(conn, quote)
                 if stale_mark:
@@ -385,8 +387,12 @@ class RhLiveMirror:
         rows = conn.execute("""SELECT l.realized_sol / NULLIF(l.cost_sol, 0) AS rl, p.realized_sol / NULLIF(p.cost_sol, 0) AS rp
                                FROM positions l JOIN positions p ON p.entry_decision_id = l.entry_decision_id AND p.book = %s AND p.status = 'closed'
                                WHERE l.book = %s AND l.status = 'closed' AND l.entry_decision_id IS NOT NULL AND COALESCE(l.forced_exit_kind, '') <> 'operator'
+                                 AND NOT EXISTS (SELECT 1 FROM circuit_events e WHERE e.kind = 'rh_reconcile' AND e.ts >= l.opened_at
+                                                 AND e.ts <= COALESCE(l.closed_at, now()) AND e.detail::text ILIKE '%%' || lower(l.mint) || '%%')
                                ORDER BY l.closed_at DESC LIMIT %s""",
-                            (MIRROR, BOOK, GAP_TRADES)).fetchall()             # an operator's Sell Now is the operator's choice, not an execution gap
+                            (MIRROR, BOOK, GAP_TRADES)).fetchall()             # an operator's Sell Now is the operator's choice, not an execution gap;
+        # nor a position the reconciler found gone from the wallet while it was held (ANT 2026-11-03, 0x493f2e7b 11-05: the coin's
+        # contract took or wiped the tokens; the reconcile pause handles those, and two of them alone read as a 3.2-point gap)
         pairs = [(r["rl"], r["rp"]) for r in rows if r["rl"] is not None and r["rp"] is not None]
         rl = np.array([a for a, _ in pairs], dtype=np.float64); rp = np.array([b for _, b in pairs], dtype=np.float64)
         out = {"trades": int(len(rl)), "live_mean": float(rl.mean()) if len(rl) else None, "mirror_mean": float(rp.mean()) if len(rp) else None}

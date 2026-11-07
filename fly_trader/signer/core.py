@@ -109,12 +109,13 @@ class Signer:
         mint_acc = f_mints.result()
         progs = {m: (a["owner"] if a else TOKEN) for m, a in zip((in_m, out_m), mint_acc)}
         addrs = [me] + f_spl.result() + f_t22.result()
-        for a in [policy.ata(me, m, progs[m]) for m in (in_m, out_m)] + chk.opens:
+        for a in [policy.ata(me, m, progs[m]) for m in (in_m, out_m)] + chk.opens + chk.writable:   # writable: accounts the route opens
             if a not in addrs:
                 addrs.append(a)
         f_pre = _IO.submit(self.rpc.accounts, addrs)
         f_sims = [_IO.submit(self.rpc.simulate, tx, addrs[i:i + SIM_MAX_ACCOUNTS]) for i in range(0, len(addrs), SIM_MAX_ACCOUNTS)]   # in chunks: the RPC caps accounts per simulation
-        pre = self._snapshot(f_pre.result(), addrs)
+        pre_accs = f_pre.result()
+        pre = self._snapshot(pre_accs, addrs)
         post_accs: list[dict | None] = []
         for f in f_sims:
             sim = f.result()
@@ -123,7 +124,8 @@ class Signer:
             post_accs += [None if a is None else {"lamports": a["lamports"], "owner": Pubkey.from_string(a["owner"]), "data": base64.b64decode(a["data"][0])}
                           for a in sim["accounts"]]
         post = self._snapshot(post_accs, addrs)
-        slack = policy.BASE_FEE_LAMPORTS * vt.message.header.num_required_signatures + chk.priority_lamports + 10_000
+        vault_rent = policy.rent_opened_for_others(pre_accs, post_accs)          # a pool's fee vault opened at our expense
+        slack = policy.BASE_FEE_LAMPORTS * vt.message.header.num_required_signatures + chk.priority_lamports + 10_000 + vault_rent
         eff = policy.check_swap_effects(pre, post, in_mint=in_m, out_mint=out_m, in_amount=int(in_amount), min_out=int(min_out), slack_lamports=slack)
         tok_acc = mint_acc[1] if buy else mint_acc[0]
         prices = f_prices.result()
@@ -134,7 +136,7 @@ class Signer:
         signed = VersionedTransaction.populate(vt.message, sigs)
         sig = str(sigs[chk.signer_index])
         self.ledger.record_swap("buy" if buy else "sell", in_mint, out_mint, int(in_amount), -eff["sol"], sig)
-        return {"tx": _b64(signed), "signature": sig, "simulated": eff, "value_ratio": ratio}
+        return {"tx": _b64(signed), "signature": sig, "simulated": eff, "value_ratio": ratio, "vault_rent": vault_rent}
 
     def close_atas(self, accounts: list[str]) -> list[dict]:
         me = self.trading.pubkey()

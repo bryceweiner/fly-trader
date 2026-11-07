@@ -99,7 +99,7 @@ class Relay:
         if e.get("pool") == "pump-amm" and e.get("action") in ("buy", "sell") and isinstance(e.get("timestamp"), (int, float)):
             self.wm = max(self.wm, e["timestamp"] / 1000.0)
         slot = self.next_seq % self.size
-        self.ring[slot] = dumps(trim(e)); self.ring_wm[slot] = self.wm
+        self.ring[slot] = bytes(memoryview(dumps(trim(e)))); self.ring_wm[slot] = self.wm   # a copy: orjson's own bytes can hold its 8 KB work block
         self.next_seq += 1; self.stats["forwarded"] += 1
 
     def batch(self, start: int) -> tuple[bytes, int]:

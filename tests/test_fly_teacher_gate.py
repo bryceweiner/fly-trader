@@ -51,7 +51,7 @@ def test_until_the_fly_wins_its_race_the_wallet_trades_the_selectors_decision(mo
     monkeypatch.setattr(fly_session.paper_trading, "plan_minute", lambda ctx, **kw: planned.append(kw) or {"beat_id": 7, "entries": ["the plan's entries"], "rebuy": {}})
     for seat in (False, True):
         me = SimpleNamespace(_commands=lambda conn, t: None, _fast=lambda: True, _decide=lambda c: {"decision": d, "picks": 2}, race_started_at=0.0, beat_no=0,
-                             BOOK="paper_fly", run_id="run", broker=None, KIND="fly", names=["capitulation"], holds={"capitulation": 14400.0}, has_seat=seat,
+                             BOOK="paper_fly", run_id="run", broker=None, KIND="fly", names=["capitulation"], holds={"capitulation": 14400.0}, has_seat=seat, rising_live=False,
                              trades_live=lambda conn: True, _go_live=lambda c, beat, entries, rebuy: sent.append((beat, entries)) or {"sent": len(entries)})
         ctx = SimpleNamespace(conn=None, m1=datetime(2026, 10, 22, tzinfo=timezone.utc), m1_epoch=0.0, lag_s=0.0, trade=True, fresh=True,
                               mints=["KEEPpump", "VETOpump", "DUMPpump"], infos=[{}] * 3)

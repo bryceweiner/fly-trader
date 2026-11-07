@@ -149,6 +149,13 @@ def _cmd_rh_v4_backfill(args):
           f"{out.get('outcomes', 0)} first-hour outcomes")
 
 
+def _cmd_rh_v4_facts(args):
+    from .logging_setup import setup
+    from .rh import v4_facts
+    setup("rh_v4_facts")
+    print(f"rh v4 facts: {v4_facts.run_locked(limit=args.limit)}")
+
+
 def _cmd_refetch_archive(args):
     from .ingest import replay_pull
     out = replay_pull.refetch_main()
@@ -387,6 +394,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_v4.add_argument("--no-keys", action="store_true", help="skip the pool-key import")
     p_v4.add_argument("--no-history", action="store_true", help="skip the live pools' history")
     p_v4.set_defaults(fn=_cmd_rh_v4_backfill)
+    p_vf = sub.add_parser("rh-v4-facts", help="find the launch facts of plain v4 coins near the universe's age (the stream starts it as a child process)")
+    p_vf.add_argument("--limit", type=int, default=20)
+    p_vf.set_defaults(fn=_cmd_rh_v4_facts)
     sub.add_parser("refetch-archive", help="download older archive hours again to keep every venue's SOL legs (run apart from the console, under nice)").set_defaults(fn=_cmd_refetch_archive)
     sub.add_parser("selector-eval").set_defaults(fn=_cmd_selector_eval)
     ts_ = sub.add_parser("train-selector"); ts_.add_argument("--days", type=int, default=None, help="most recent days only (default: the whole corpus)")

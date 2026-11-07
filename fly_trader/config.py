@@ -16,7 +16,7 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 
 SECRET_ENV_NAMES = ("HELIUS_API_KEY", "JUPITER_API_KEY", "BOT_PRIVATE_KEY", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH",
                     "SIGNER_RPC_URL", "RH_BOT_PRIVATE_KEY", "RH_RPC_URL_LOGS", "ENVIO_API_TOKEN", "QUICKNODE_API_KEY",
-                    "QUICKNODE_RH_API_KEY", "QUICKNODE_RH_API_URL", "RH_RPC_URL_TX", "STREAM_RELAY_TOKEN")
+                    "QUICKNODE_RH_API_KEY", "QUICKNODE_RH_API_URL", "RH_RPC_URL_TX", "STREAM_RELAY_TOKEN", "ALCHEMY_API_KEY")
 
 
 def utcnow() -> datetime:
@@ -253,11 +253,22 @@ def quicknode_rh_url() -> str | None:
     return url if not key or key in url else url.rstrip("/") + "/" + key
 
 
+def alchemy_rh_url() -> str | None:
+    """The Alchemy RH endpoint, from ALCHEMY_API_KEY."""
+    key = env_str("ALCHEMY_API_KEY")
+    return f"https://robinhood-mainnet.g.alchemy.com/v2/{key}" if key else None
+
+
+def rh_tx_url() -> str | None:
+    """RH_RPC_URL_TX, else Alchemy, else QuickNode. Those two serve mainnet only while RH_RPC_URL is the default: a run that
+    points RH_RPC_URL elsewhere (anvil, the testnet rehearsal) sends there."""
+    return env_str("RH_RPC_URL_TX") or ((alchemy_rh_url() or quicknode_rh_url()) if env_str("RH_RPC_URL") is None and not RH_TESTNET else None)
+
+
 # sending and reading transactions (sends, receipts, nonces, balances, eth_call, gas): every RhRpc() without an explicit URL.
-# Never logs: QuickNode's free Discover plan caps eth_getLogs at 5 blocks (measured 2026-10-09), so logs stay on HyperSync /
-# RH_RPC_URL_LOGS / RH_RPC_URL; its 10M credits a month cover the trading path, not a log tail. QuickNode serves mainnet
-# only while RH_RPC_URL is the default: a run that points RH_RPC_URL elsewhere (anvil, the testnet rehearsal) sends there.
-RH_RPC_URL_TX = env_str("RH_RPC_URL_TX") or (quicknode_rh_url() if env_str("RH_RPC_URL") is None and not RH_TESTNET else None)
+# Never logs: QuickNode's free Discover plan capped eth_getLogs at 5 blocks (measured 2026-10-09), so logs stay on HyperSync /
+# RH_RPC_URL_LOGS / RH_RPC_URL; a free plan's credits cover the trading path, not a log tail.
+RH_RPC_URL_TX = rh_tx_url()
 # block headers for timing the index (rh/blocktime.py): PublicNode serves header batches fast but refuses eth_getLogs (403),
 # the official RPC serves logs but rate-limits at ~20 requests/min (measured 2026-09-28) — so each does what it does well
 RH_RPC_URL_BLOCKS = env_str("RH_RPC_URL_BLOCKS", "https://robinhood-rpc.publicnode.com")
@@ -314,6 +325,7 @@ RH_V4_ENABLED = env_bool("RH_V4_ENABLED", True)                     # find, chec
 RH_V4_QUOTES = tuple(a.strip().lower() for a in env_str("RH_V4_QUOTES", RH_USDG).split(",") if a.strip())   # beside ETH and WETH: a plain memecoin's quote
 RH_V4_HOOKS = tuple(a.strip().lower() for a in env_str("RH_V4_HOOKS", "").split(",") if a.strip())          # hooks allowed besides none (fees outside the Swap event)
 RH_V4_CHECKS_PER_SLOT = env_int("RH_V4_CHECKS_PER_SLOT", 1)          # contract checks a minute (each ~10 reads of the public RPC)
+RH_V4_WALLET = env_bool("RH_V4_WALLET", False)                       # the wallet buys plain v4 coins (0: the paper books trade them, the wallet waits for the operator)
 RH_V4_BACKFILL_RPM = env_float("RH_V4_BACKFILL_RPM", 30)             # fly-trader rh-v4-backfill's own HyperSync pace (the console keeps its share)
 KYBER_API = env_str("KYBER_API", "https://aggregator-api.kyberswap.com/robinhood/api/v1")
 KYBER_ROUTER = env_str("KYBER_ROUTER", "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5")  # MetaAggregationRouterV2: the only router a built Kyber tx may call

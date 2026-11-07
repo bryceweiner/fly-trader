@@ -10,12 +10,20 @@ upgradeable and refused) and the dispatcher's selectors, and refuses a token who
 AccessControl roles hold a power (``POWERS``), one with a built-in buy or sell tax (``TAXES``), one that is not 18 decimals,
 and one whose name or symbol marks a major, a stablecoin or a tokenized stock. Functions are matched by selector: a power
 under an unusual name is missed, which the floors and the creator history (rh/meta.py) still stand behind.
+
+``creator_can_move(rpc, token, creator, holder)`` tries what a selector cannot show: a power hidden inside a standard
+function. It simulates ``transferFrom(holder, dead, 1)`` sent by the creator, who holds no allowance: a standard ERC-20
+reverts. ANT (0x36c2861a, 2026-11-03) passed the selector check with no owner; 22 s after the wallet bought it, its creator
+called transferFrom and burned the wallet's tokens. Its simulation succeeds; on 40 coins the check had passed it reverted on all.
+
+``check`` also returns the code's template (rh/templates.py, a minimal proxy's implementation in its place): rh/v4_universe
+refuses a coin whose template is not known good.
 """
 from __future__ import annotations
 
 import re
 
-from . import abi
+from . import abi, templates
 
 POWERS: dict[str, tuple[str, ...]] = {
     "mint": ("mint(address,uint256)", "mint(uint256)", "mintTo(address,uint256)", "grantMintRole(address)", "grantMintAndBurnRoles(address)",
@@ -103,6 +111,25 @@ def _str(v) -> str | None:
         return None
 
 
+TRANSFER_FROM = abi.selector("transferFrom(address,address,uint256)").hex()
+DEAD_ADDR = "000000000000000000000000000000000000dead"
+
+
+def creator_can_move(rpc, token: str, creator: str, holder: str) -> bool:
+    """Whether ``creator`` moves ``holder``'s tokens without an allowance (a simulated ``transferFrom(holder, dead, 1)`` from
+    the creator does not revert). ``holder`` must hold the token (a v4 coin's PoolManager holds its pools' liquidity); an
+    unreadable answer raises (the caller retries later)."""
+    from ..chain.evm import EvmRpcError
+    data = "0x" + TRANSFER_FROM + "0" * 24 + holder.lower()[2:] + "0" * 24 + DEAD_ADDR + format(1, "064x")
+    try:
+        out = rpc.call("eth_call", [{"from": creator.lower(), "to": token.lower(), "data": data}, "latest"])
+    except EvmRpcError as e:
+        if "revert" in str(e).lower():
+            return False
+        raise
+    return isinstance(out, str) and (out in ("0x", "") or int(out, 16) != 0)        # true, or a token that returns nothing
+
+
 def check(rpc, token: str) -> dict:
     """The contract check of ``token`` (two batched RPC reads at most). ``ok`` False with ``reason`` when refused; an
     unreadable token raises (the caller retries later)."""
@@ -128,4 +155,4 @@ def check(rpc, token: str) -> dict:
     accepted, reason, powers = judge(sels, owner_live=owner_live, upgradeable=upgradeable, decimals=dec, symbol=sym, name=nm)
     return {"ok": accepted, "reason": reason, "powers": powers, "decimals": dec, "symbol": sym, "name": nm, "supply_raw": supply, "impl": impl,
             "owner": owner, "owner_live": owner_live, "upgradeable": upgradeable, "taxes": bool(sels & TAX_SEL), "roles": bool(sels & ROLE_SEL),
-            "code_len": (len(body) - 2) // 2, "n_selectors": len(sels)}
+            "code_len": (len(body) - 2) // 2, "n_selectors": len(sels), "template": templates.template_id(body)}

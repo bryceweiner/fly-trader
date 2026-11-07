@@ -84,6 +84,14 @@ def _ev(i, mint="Apump"):
             "quoteInPool": 80.0, "signature": f"sig{i}", "breakdown": [{"action": "buy", "trader": f"t{i}", "quoteAmount": 0.1}]}
 
 
+def test_the_ring_holds_an_exact_copy_of_each_event_not_orjsons_own_bytes(monkeypatch):
+    """orjson's bytes can sit in the 8 KB block its buffer grew to: on macOS a full ring took 2.4 GB, not 280 MB."""
+    real, made = relay.dumps, []
+    monkeypatch.setattr(relay, "dumps", lambda o: made.append(real(o)) or made[-1])
+    r = relay.Relay(size=8); r.add(_ev(0))
+    assert r.ring[1] == made[0] and r.ring[1] is not made[0]
+
+
 def test_a_batch_carries_the_watermark_as_of_its_own_last_event_and_an_old_resume_is_a_gap():
     r = relay.Relay(size=8); r.connected = True; r.last_upstream = time.time()
     for i in range(5):

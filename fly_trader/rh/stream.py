@@ -30,6 +30,8 @@ RPC_CATCHUP_S = 3.0             # between catch-up passes while HyperSync is dow
 SLOW_EVERY_S = 60.0             # meta and corpus refresh with each written minute, else at least this often
 _SLOW = {"at": 0.0}
 _V4 = {"minute": None}          # the minute whose v4 slot ran (rh/v4_universe.slot: once a minute)
+_FACTS = {"proc": None, "at": 0.0}   # the launch-facts child (``facts_apart``) and when it last started
+FACTS_EVERY_S = 600.0
 _CORPUS: dict = {"proc": None}  # the child building a due corpus day (rh/corpus.run_locked)
 
 
@@ -115,6 +117,8 @@ def main(stop_event: threading.Event | None = None) -> None:
     from ..db import schema
     schema.apply_schema()
     rpc = logs_rpc(); stop = stop_event or threading.Event()
+    from . import curves
+    curves.start(stop)                                          # graduates' curve back-fills, never in front of a pass
     log.info("rh_stream: logs from %s; the head from %s", "HyperSync" if config.env_str("ENVIO_API_TOKEN") else "the RPC",
              "the dedicated RPC (RH_RPC_URL_LOGS)" if config.RH_RPC_URL_LOGS else "HyperSync / the public RPC")
     while not stop.is_set():
@@ -154,13 +158,13 @@ def corpus_apart() -> dict:
 
 
 def _stop_corpus() -> None:
-    p = _CORPUS["proc"]
-    if p is not None and p.poll() is None:
-        p.terminate()                                            # every file is written atomically: an ended child loses only its day
-        try:
-            p.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            p.kill()
+    for p in (_CORPUS["proc"], _FACTS["proc"]):
+        if p is not None and p.poll() is None:
+            p.terminate()                                        # every file is written atomically, each coin's facts in one commit: an ended child loses little
+            try:
+                p.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                p.kill()
 
 
 def _orders_pending() -> bool:
@@ -190,8 +194,28 @@ def v4_slot(out: dict, now: float | None = None) -> dict:
         return {}
     _V4["minute"] = m
     res = v4_universe.slot(deadline=m * 60 + live_first.MID_MINUTE[1], now=t)
-    _status(v4=res)
+    fx = facts_apart()
+    _status(v4=res, v4_facts=fx or None)
     return res
+
+
+def facts_apart() -> dict:
+    """Plain v4 coins' launch facts are found by a child process at the lowest CPU priority (``fly-trader rh-v4-facts``,
+    rh/v4_facts.py), never in this thread: one child at a time, started at most every ``FACTS_EVERY_S`` from the v4 slot, so
+    mid-minute with no live order waiting. It is the child that looks for due coins; this only starts it."""
+    p = _FACTS["proc"]
+    if p is not None and p.poll() is None:
+        return {"running": p.pid}
+    if p is not None:
+        _FACTS["proc"] = None
+        if p.returncode:
+            log.warning("rh v4 facts child %d exited %d (its log: rh_v4_facts.log)", p.pid, p.returncode)
+    if time.monotonic() - _FACTS["at"] < FACTS_EVERY_S:
+        return {}
+    _FACTS["at"] = time.monotonic()
+    nice = ["/usr/bin/nice", "-n", "19"] if os.path.exists("/usr/bin/nice") else []      # not preexec_fn: unsafe in a threaded process
+    p = _FACTS["proc"] = subprocess.Popen([*nice, sys.executable, "-m", "fly_trader", "rh-v4-facts"], stdout=subprocess.DEVNULL)
+    return {"started": p.pid}
 
 
 def _wait_s(written_through: int | None, now: float | None = None) -> float:

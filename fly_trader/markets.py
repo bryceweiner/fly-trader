@@ -39,14 +39,15 @@ class MarketSpec:
     _gas_reserve: str
     _kill_drawdown: str
     _k: str | None                   # config name of ETH-per-SOL, None for SOL (k = 1)
+    test_books: tuple[str, ...] = () # paper books on trial beside the race (agent/rising_clean.py)
 
     @property
     def books(self) -> tuple[str, str, str]:
         return self.selector_book, self.fly_book, self.live_book
 
     @property
-    def paper_books(self) -> tuple[str, str]:
-        return self.selector_book, self.fly_book
+    def paper_books(self) -> tuple[str, ...]:
+        return self.selector_book, self.fly_book, *self.test_books
 
     def k(self) -> float:
         return 1.0 if self._k is None else float(getattr(config, self._k))
@@ -78,7 +79,8 @@ class MarketSpec:
 SOL = MarketSpec(chain="sol", name="Solana", unit="SOL", circuit_id=SOLANA_CIRCUIT, selector_book="paper_selector", fly_book="paper_fly",
                  live_book="live", handover_key="handover", fly_status_key="fly_status", selector_status_key="selector_status",
                  stream_status_key="pumpstream_status", program_label="Pump.fun Amm", _capital="CAPITAL_SOL", _label_size="LABEL_SIZE_SOL",
-                 _min_position="MIN_POSITION_SOL", _gas_reserve="GAS_RESERVE_SOL", _kill_drawdown="KILL_SWITCH_DRAWDOWN", _k=None)
+                 _min_position="MIN_POSITION_SOL", _gas_reserve="GAS_RESERVE_SOL", _kill_drawdown="KILL_SWITCH_DRAWDOWN", _k=None,
+                 test_books=("paper_rising",))
 RH = MarketSpec(chain="rh", name="Robinhood Chain", unit="ETH", circuit_id=RH_CIRCUIT, selector_book="paper_rh_selector", fly_book="paper_rh_fly",
                 live_book="live_rh", handover_key="handover_rh", fly_status_key="fly_status_rh", selector_status_key="selector_status_rh",
                 stream_status_key="rh_stream_status", program_label="Pons v4", _capital="RH_CAPITAL_ETH", _label_size="RH_LABEL_SIZE_ETH",

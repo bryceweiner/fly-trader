@@ -86,6 +86,8 @@ def test_the_slot_waits_for_live_orders_and_the_minute(monkeypatch):
     monkeypatch.setattr(stream, "_status", lambda **kv: None)
     monkeypatch.setattr(prefetch, "hypersync_down", lambda: False)
     monkeypatch.setattr(stream, "_orders_pending", lambda: False)
+    facts = []
+    monkeypatch.setattr(stream, "facts_apart", lambda: facts.append(1) or {})          # its child starts only from a slot that ran
     m0 = 1_900_000_020 - 1_900_000_020 % 60
     written = {"minutes": {"through": m0}}
     stream._V4["minute"] = None
@@ -97,6 +99,7 @@ def test_the_slot_waits_for_live_orders_and_the_minute(monkeypatch):
     assert stream.v4_slot(written, now=m0 + 25) == {"ran": True} and ran == [m0 + 40]
     assert stream.v4_slot(written, now=m0 + 30) == {}                 # once a minute
     assert stream.v4_slot({"minutes": {"through": m0 + 60}}, now=m0 + 60 + 45) == {}   # past the window
+    assert facts == [1]
 
 
 def test_a_coins_minute_comes_from_its_busiest_pool(db_conn):

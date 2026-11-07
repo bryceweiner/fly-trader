@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from ... import markets
 from ...db.queries import q, q1
-from ...ops.wallets import explorer
+from ...ops.wallets import explorer, money
 from ..hub import TopicError, topic
 from ..state import system_state, labels, market_param
 
 # The decision log's "Show" pills → the decision kinds each covers (the selector's, the fly's and the older generic kinds).
-KINDS = {"Bought": ("selector_enter", "fly_enter", "enter"), "Sold": ("selector_exit", "fly_exit", "exit"), "Not taken": ("blocked",)}
+KINDS = {"Bought": ("selector_enter", "fly_enter", "rising_enter", "enter"), "Sold": ("selector_exit", "fly_exit", "rising_exit", "exit"), "Not taken": ("blocked",)}
 ACTION = {k: p for p, ks in KINDS.items() for k in ks}
 LIMIT = 300
 
@@ -46,8 +46,9 @@ def _thin(points: list, n: int = 180) -> list:
 @topic("trades.summary", every=15)
 def summary(params: dict) -> dict:
     """The book's results at a glance: the closed-trade metrics, the open positions, realized P&L cumulated trade by
-    trade and per day, and how the trades exited and which strategy took them."""
-    mk = market_param(params); book = _book(params, mk)
+    trade and per day, and how the trades exited and which strategy took them. The live book's ``realized`` is its
+    wallet's (ops/wallets.money); ``pnl`` stays the closed trades'."""
+    mk = market_param(params); book = _book(params, mk); w = money(mk) if book == mk.live_book else None
     c = q1("SELECT count(*) AS n, sum(realized_sol) AS pnl, avg(realized_sol / NULLIF(cost_sol, 0)) AS avg_ret, "
            "count(*) FILTER (WHERE realized_sol > 0) AS wins FROM positions WHERE book = %s AND status = 'closed'", (book,)) or {}
     o = q1("SELECT count(*) AS n, COALESCE(sum(cost_sol), 0) AS cost FROM positions WHERE book = %s AND status = 'open'", (book,)) or {}
@@ -62,7 +63,7 @@ def summary(params: dict) -> dict:
     strategies = q("SELECT COALESCE(strategy, '') AS strategy, count(*) AS n, sum(realized_sol) AS pnl, count(*) FILTER (WHERE realized_sol > 0) AS wins "
                    "FROM positions WHERE book = %s AND status = 'closed' GROUP BY 1 ORDER BY 2 DESC, 1", (book,))
     return {"chain": mk.chain, "book": book, "unit": mk.unit,
-            "metrics": {"n": n, "pnl": c.get("pnl"), "avg_ret": c.get("avg_ret"), "wins": wins, "win_rate": wins / n if n else None,
+            "metrics": {"n": n, "pnl": c.get("pnl"), "realized": w["realized"] if w else c.get("pnl"), "avg_ret": c.get("avg_ret"), "wins": wins, "win_rate": wins / n if n else None,
                         "open": int(o.get("n") or 0), "open_cost": float(o.get("cost") or 0)},
             "cum": _thin(cum), "daily": [{"day": d["day"].isoformat(), "n": d["n"], "pnl": float(d["pnl"] or 0), "wins": d["wins"]} for d in daily],
             "exits": [{"kind": e["kind"], "n": e["n"], "pnl": float(e["pnl"] or 0)} for e in exits],

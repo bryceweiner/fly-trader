@@ -11,6 +11,8 @@ The paper book ``paper_fly`` keeps running as the mirror. Only after the handove
   agent/live_first.chain_take_profits): a position whose minute closed at its take-profit line (set at its entry on a
   coin bought far below its high, agent/paper_trading.take_profit_x) is sold at the exit slippage, as a 'take_profit'
   exit, tried again each minute that closes at the line;
+- crash exits (``crash_exit``, agent/crash_exit.py: any moment, from the crash watcher's thread): a held coin 25 % under
+  its 5-minute high is sold at once at the forced slippage, as a 'crash' exit;
 - entries (``minute``: the moment the fly has decided, before any paper trade, learning or bookkeeping of the minute):
   the execution worker's results are drained (execution/worker.py books live positions from balance-verified fills);
   every paper entry of this minute is mirrored with the same score, line and certainty bands, sized from the wallet
@@ -188,6 +190,20 @@ class LiveMirror:
                 n += self._sell(p, did, config.SLIPPAGE_EXIT_BPS, "take_profit")
         return n
 
+    def crash_exit(self, conn, mint: str, why: str) -> int:
+        """``mint`` crashed (agent/crash_exit.py): its open position sold at once at the forced slippage, as a forced
+        'crash' exit (paper sells it the same way: in the gap like any exit); how many went out (0: none open, or an order
+        of it already queued or in flight)."""
+        n = 0
+        with self.exit_lock:
+            if mint in self.worker.pending():
+                return 0
+            for p in ledger.open_positions(conn, BOOK):
+                if p["mint"] == mint:
+                    did = self._decision(conn, datetime.now(timezone.utc), None, None, p, why, True)
+                    n += self._sell(p, did, config.SLIPPAGE_FORCED_BPS, "crash")
+        return n
+
     def sell_now(self, conn, position_id: int) -> int:
         """The operator's Sell Now (the console's open positions, agent/live_first.sell_now): one open position of this book
         sold at once, at the exit's slippage stepping up to the forced one, and booked by the worker like any exit, as a
@@ -261,12 +277,13 @@ class LiveMirror:
                     skipped.append((e["mint"], "held")); self._blocked(conn, ctx, run_id, beat_id, e, "held", "the wallet holds this token or has an order of it queued"); continue
                 size, why = sizing.size_position(e["score"], e.get("threshold", line), e.get("table") or table or [], bankroll, cash, e["info"]["resq"],
                                                  flat=config.FLY_SIZING == "flat", margin=e.get("size_margin"),
-                                                 creator_heavy=bool(e["info"].get("creator_heavy")))
+                                                 creator_heavy=bool(e["info"].get("creator_heavy")), stake_x=e.get("stake_x", 1.0))
                 if blocked or size <= 0:
                     skipped.append((e["mint"], blocked or why)); self._blocked(conn, ctx, run_id, beat_id, e, blocked or "sizing", why, size); continue
                 if self._buy(e, size):
                     n_enter += 1; cash -= size; held_mints.add(e["mint"]); self.sent[e["decision_id"]] = {"e": e, "ts": m1, "tries": 1}
-                    conn.execute("UPDATE decisions SET book_targets = array_append(COALESCE(book_targets, '{}'), 'live') WHERE id = %s", (e["decision_id"],))
+                    conn.execute("UPDATE decisions SET book_targets = array_append(COALESCE(book_targets, '{}'), 'live'), detail = detail || %s::jsonb WHERE id = %s",
+                                 (json.dumps({"live_stake_x": e["stake_x"]} if "stake_x" in e else {}), e["decision_id"]))       # which buys the go-live doubled (agent/rising_clean.py)
                 else:
                     skipped.append((e["mint"], "held")); self._blocked(conn, ctx, run_id, beat_id, e, "held", "an order of this token is queued or in flight", size)
         self.due_mark = self.mark_ctx = (ctx, beat_id)

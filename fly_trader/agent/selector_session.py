@@ -75,12 +75,13 @@ def fail_closed(groups: set, infos: list, d: dict) -> dict:
 
 
 class SelectorBook:
-    def __init__(self, chain: str = "sol"):
+    def __init__(self, chain: str = "sol", names: tuple[str, str, str] | None = None):
+        """``names``: (name, book, status key) of a book that trades the selector on its own ledger (agent/rising_clean.py)."""
         from .. import markets
         from ..train import selector as sel
         self.chain = chain; self.market = markets.for_chain(chain)
-        self.name = "selector" if chain == "sol" else f"selector_{chain}"
-        self.BOOK = self.market.selector_book; self.KIND = self.name; self.status_key = self.market.selector_status_key
+        self.name, self.BOOK, self.status_key = names or ("selector" if chain == "sol" else f"selector_{chain}", self.market.selector_book, self.market.selector_status_key)
+        self.KIND = self.name
         pin = pinned_snapshot()
         self.model = sel.load_snapshot(pin) if pin is not None else sel.load_latest()
         if self.model is None:
@@ -144,6 +145,14 @@ class SelectorBook:
         d = self.model.decide(ctx.X, X_COLS, ctx.t_start)
         return fail_closed(set((getattr(self.model, "metrics", None) or {}).get("groups") or []), ctx.infos, d)
 
+    def _handed(self, conn, ctx) -> bool:
+        """The fly holds this chain's seat and trades: this book stops entering and exits to flat."""
+        return handover.state(conn, self.chain) is not None and ctx.engine.has_book("fly" if self.chain == "sol" else f"fly_{self.chain}")
+
+    def _marks(self, ctx) -> list | None:
+        """Per row, what the book adds to its picks (agent/paper_trading.plan_minute's ``marks``)."""
+        return None
+
     def on_minute(self, ctx) -> dict:
         conn = ctx.conn
         d = self._decide(ctx)
@@ -162,13 +171,13 @@ class SelectorBook:
             status = {**summary, "stage": "stream stale: holding (no entries or exits)", "updated_at": datetime.now(timezone.utc).isoformat()}
             self._write_status(conn, status)
             return status
-        handed = handover.state(conn, self.chain) is not None and ctx.engine.has_book("fly" if self.chain == "sol" else f"fly_{self.chain}")
+        handed = self._handed(conn, ctx)
         self.beat_no += 1
         extra = {} if d is None else {"holds": d["hold_s"], "strategies": d["strategy"], "allow": d["allow"], "reasons": d["reason"], "tables": d["tables"],
                                       "size_margins": d.get("size_margin"), "correctness": d.get("pclean")}
         st = paper_trading.trade_minute(ctx, book=self.BOOK, run_id=self.run_id, beat_no=self.beat_no, broker=self.broker, kind=self.KIND, mints=ctx.mints, infos=ctx.infos,
                                         scores=scores, threshold=thr, table=getattr(self.model, "sizing", None), horizon_s=self.horizon_s,
-                                        block="handed over to the fly" if handed else None, **extra)
+                                        block="handed over to the fly" if handed else None, marks=self._marks(ctx), **extra)
         if handed and st["open"] == 0:
             self.done = True
             record_event("info", "selector", "selector retired: the fly holds the seat and the book is flat", {"run_id": self.run_id})

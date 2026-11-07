@@ -3,7 +3,181 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
-## Unreleased
+## 2026-11-07, release 20: A Solana coin that falls 25 % within 5 minutes is sold at once
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual. The models are
+  release 19's (selector and fly of 2026-10-26).
+
+### Robinhood Chain
+
+- **A plain v4 coin is bought only when its contract matches a known-good template.** Both coins that took the wallet's
+  tokens passed every check we had, each with a backdoor of its own. Each coin's code is now reduced to a template: the
+  compiler's metadata and every constant or address masked, so coins built from one source share it. A template is known
+  good when at least 5 coins from 5 different creators built from it did not rug, none of its coins is a scam or was
+  refused for its code, and it is not a proxy. Did not rug means 24 or more 15-minute stretches clearing the live floors
+  at 6 hours old or more. Built from 13,753 plain v4 coins to 2026-11-05.
+  - **Nine templates pass,** covering 63.5 % of the coins. Every plain v4 trade the books ever made (both scams and one
+    other coin, 23 live and 6 paper trades) was outside them.
+  - **A coin off every template is refused** at registration, before the creator probe. Coins accepted before the check
+    are read again, 25 a minute, the ones trading now first; one that deviates is never bought again (its minutes still
+    price it). A template that reaches the rule later needs a rebuild to be added.
+- **A coin that took the wallet's tokens no longer pauses RH as an execution gap.** The gap check pauses RH entries when
+  live trails its paper twin by 2 points a trade over 50 trades. It counted the two coins whose contracts took or wiped
+  the wallet's tokens (live −100 %, paper about −8 %), which alone read as a 3.2-point gap and paused RH from 2026-11-05
+  20:20. It now leaves out a position the wallet check found gone from the wallet while it was held, as it leaves out an
+  operator's sale. Without those two, live ran 0.6 points ahead of paper. A loss the wallet's own orders made still counts.
+- **A graduating coin's curve history no longer stops RH's minutes.** When a Pons coin graduates, its curve trades give
+  its launch facts. The live stream read them inside its index step, and a coin that sat weeks on its curve took hundreds
+  of queries. On 2026-11-04 and 11-05 two such graduations held every RH minute, and the fly, for 40+ minutes each. A
+  thread of the RH stream now back-fills them one chunk at a time, saving its progress, so a restart resumes. The live
+  step only notes where the curve ends.
+  - **A graduate's facts wait for its back-fill:** its rh_meta row is built once the curve is in, as before. A new
+    graduate cannot trade for its first 6 hours anyway.
+- **A plain v4 coin whose creator can move holders' tokens is never bought.** On 2026-11-03 the wallet bought ANT
+  (0x36c2861a) at 11:05. 22 seconds later its creator called the token's `transferFrom` with no allowance and burned the
+  wallet's 3,714.6 tokens. The wallet check then paused RH entries, the timed sale reverted with nothing to sell, and the
+  position was written off for 0.00226 ETH. The contract check had passed it ("no owner or admin powers"): it reads
+  function names, and this power was hidden inside the standard `transferFrom`.
+  - **The check now simulates it.** At registration it sends `transferFrom(PoolManager, dead, 1)` from the creator, who
+    holds no allowance. A standard token reverts; a coin where it succeeds is refused.
+  - **Coins already live** were probed the same way. Of the 92 with the launch facts to trade, ANT alone failed. A coin
+    refused after it went live is never bought again; its minutes still price it.
+- **Each new buy takes the take-profit its recent trades favour.** Every 10 minutes the engine replays the selector book's
+  trades closed in the last 14 days on their own minute closes. It compares the base rule (sell at x2 on a coin bought far
+  below its high, else hold) with a sale at +20, +30 or +50 % on any coin. A line replaces the base rule only when its
+  mean beat the base rule's over at least 8 trades. A tie goes to the later sale.
+  - **Why:** when Robinhood coins pop and fade, a lower line keeps the pop. On the out-of-sample RH book (08-09..11-02) the
+    choice added +0.136 of the bankroll against the base rule's +1.598, ahead in each period and in every half-month it
+    changed anything. Over 21 and 28 days it was ahead too; over 7 days it lost. On Solana every window lost, so Solana
+    keeps the base rule.
+  - **The line in use never decides its own comparison.** Each buy's decision stores the base rule's line
+    (`tp_base_x`) beside the one it took. Every line is replayed on the path, with the real exit's costs kept as a share.
+  - **Live orders stay first.** The choice is made in the paper phase, after the wallet's orders. A live position takes
+    its paper entry's line, as before. Each change rings the console's bell.
+- **Plain Uniswap v4 coins can trade.** Selector #791 was refit with their history, and now each such coin gets the
+  launch facts that model trained on, so the creator rules can read it. A coin without those facts stays out, as before.
+  The wallet buys these coins only with `RH_V4_WALLET=1`; at the default `0` the paper books trade them alone.
+  - **The facts:** `fly-trader rh-v4-facts` finds a coin's launch block, its creator (the mint's sender), who held what at
+    that block, and its opening reserve. The stream starts this as a child process at the lowest CPU priority, mid-minute
+    with no live order waiting, at most every 10 minutes. It takes the busiest coins within an hour of the 6-hour age
+    floor that clear the floors now.
+  - **The job runs inside HyperSync's 10 calls a minute.** Since 2026-11-02 18:01 HyperSync answers 10 a minute and the
+    live feed uses them all, so the job, which stood down at every refusal, found no new coin's facts. Its calls now wait
+    for a slot: 8-20 s into a minute, once the stream has written the minute that ended, two a minute at most. It stands
+    down only when HyperSync fails some other way, or the live index is silent or more than 120 blocks behind. Its first
+    runs, on 2026-11-03, found three coins' facts in 29-87 s each.
+  - **The 2,469 coins #791 trained on** took their facts from that research, so a live row is the row the model saw.
+  - **Measured:** read-only on 30 live coins, 28 found a launch and 27 of those matched the research on creator, launch
+    time and holdings; the other two stay out, as a coin with no launch does. On a local fork, 28 of 30 coins completed a
+    buy and a sell through the real order code, at a median cost of 1.26 % before gas.
+
+- **Robinhood Chain transactions go through Alchemy when `ALCHEMY_API_KEY` is set.** QuickNode's free trial ended on
+  2026-10-30, and from then every send, receipt and balance read failed. The wallet's balance could not be read, so no
+  Robinhood Chain buy could start. No live position was open.
+  - **Now:** Alchemy comes first, then QuickNode, for every Robinhood Chain call except log reads. `RH_RPC_URL_TX` still
+    wins when set. Like QuickNode, Alchemy serves mainnet only while `RH_RPC_URL` is the default, so a run pointed at
+    anvil or the testnet rehearsal never reaches it.
+  - **Measured on 2026-10-31:** every trading call, past-block reads to 20,000 blocks, batches and sends worked; 69 steady
+    reads had a p90 of 307 ms and no errors. The console has used it since that day.
+  - **Cost:** a new connection takes about 1.1 s and a reused one 330-520 ms, against QuickNode's 438 and 138 ms, so an
+    order is an estimated 2 s slower.
+  - Tests blank `ALCHEMY_API_KEY`, and logged errors scrub it.
+
+### Trading
+
+- **A Solana coin that falls 25 % within 5 minutes is sold at once.** On 2026-11-07 the wallet bought 519AMD at 04:08.
+  From 04:31 to 04:38 its holders sold about 75 SOL and the price fell 90 %. The position was held its 240 minutes and
+  sold at −82 % (−0.195 SOL). Every price the Solana stream keeps for a held coin is now checked as it arrives. A price
+  25 % or more under the coin's high of the last 5 minutes (since the entry, the entry price included) sells the
+  wallet's position then, at the forced slippage, as a 'crash' exit. The sale is sent again every 15 s while it stays
+  open.
+  - **Paper books sell the same coin** in that minute's bookkeeping, at the first price 5 s or more after the crash,
+    about when the wallet's sale lands. A coin that passes the bar again may be bought again at once.
+  - **Replayed** on the Solana trades since 10-17, selling at the crash's price made live +0.30 SOL since 10-28 instead
+    of −0.24, and 519AMD −25 % instead of −82 %. Checked only on minute closes it made no difference, so it watches every
+    swap.
+  - **Not on Robinhood Chain:** the same replay lost there in every variant.
+- **A Solana buy whose pool opens a fee vault at the buyer's expense is signed.** On 2026-11-06 the signer refused the
+  buy of 34Ct2K twice as spending more than ordered. Pump.fun's AMM had opened an empty wrapped-SOL account for a fee
+  vault inside the route, and the wallet paid its rent (1,488,440 lamports). The paper books bought it and sold it at
+  +18 %. The signer now looks at every account the transaction writes. It allows the rent of up to 2 empty token
+  accounts the route newly opens for a program's vault, each holding no more than the rent of its size. Rent into a
+  wallet's account, an account that receives tokens, or one that already existed is still refused.
+- **While few young coins pass the bar, a Solana coin 20 hours or more past graduation is not bought.** The rule switches
+  itself on and off with the selector's own pass rate. When fewer coins pass than usual, the older ones that still pass
+  have been losers.
+  - **The trigger:** the buys the selector allowed of coins younger than 20.4 hours, one per coin per 240 minutes, a day
+    over the last 3 days against the last 30. Quiet when the log ratio is -0.23 or lower, the lowest fifth of the history
+    before 2026-10-02. Only young coins count, so the rule never feeds its own trigger. With under 14 days of history, or
+    a failed read, the rule stands aside.
+  - **Why:** on the out-of-sample book under today's rules, the old coins bought in quiet spells averaged -3.5 % a trade,
+    against +10.5 % for the rest. The rule helped in 8 of the 9 half-months it acted in. Skipping old coins whatever the
+    pass rate loses money, so the rule acts only in quiet spells.
+  - **On the live wallet since 2026-10-17** it would have skipped 7 buys that lost 0.304 SOL, both 7rTNgVdQ buys among
+    them.
+  - **Solana only:** on Robinhood Chain it does not help.
+  - **Live orders stay first.** The trigger is read in the paper phase, at most every 10 minutes (one indexed query, about
+    0.35 s). The buy rows read the stored flag. Training and every model stay as they were. Each switch rings the
+    console's bell.
+- **Strategy 1 runs as a two-week paper test, and its go-live moves from the console.** A selector pick takes twice its
+  stake when the market is recovering and the coin's launch was clean. A new Solana paper book, `paper_rising`, trades the
+  selector's picks that way beside `paper_selector`. The wallet changes only after a go-live passes. Nothing runs until
+  an operator starts a test on the Overview page.
+  - **Rising:** the share of coins with a pool of at least 10 SOL that are up on the hour gained at least 2.76 points over
+    6 hours, read from closed minutes. **Clean:** holder concentration at graduation (`grad_hhi`) is at most 0.0197, and
+    unknown is not clean. Both cuts come from trades before 2026-09-12 and stay frozen.
+  - **The go-live is a stored time, not an `.env` setting.** The Overview's new card sets, moves or clears it, with no
+    restart. A new test sets it 14 days out.
+  - **At that time the test is judged once.** If its closed doubled trades made money, the wallet doubles these stakes.
+    If not, the wallet stays as it is, the date clears and the console's bell says why. Moving or clearing the date takes
+    the wallet back to plain stakes from its next buy.
+  - **Live orders stay first.** Before a go-live, a live minute only counts its breadth, which takes under 0.1 ms. After
+    one, a minute with a buy reads the setting once more, so a cleared date binds that buy. If doubling fails, that
+    minute's orders still go out at plain stakes. The doubled size keeps every cap, and a failed buy is tried again at its
+    plain stake.
+  - **Measured:** 7,466 real minutes (10-26 to 10-31) through the real engine and selector #640 on a copy of the data.
+    The book made the selector's 30 buys, in the same minutes, with the same 30 exits, and the 12 buys since the current
+    rules are exactly what the live console bought. The live breadth matches the study's (correlation 0.993; rising or
+    not agrees 97.9 % of the time).
+  - **Tests** no longer take `KELLY_FRACTION` from the operator's `.env`.
+- **A Solana coin whose creator held 10 % or more at graduation is never bought.** On 2026-11-01 one such coin lost 89 %,
+  nearly all of that day's loss. The filter applies to live rows only, like the DLMM filter, so training and every model
+  stay as they were.
+  - **Why this cut:** on the out-of-sample book these coins made -9.0 and -5.0 % a trade in the two later periods, against
+    +1.3 and +6.6 % for the rest. On real paper trades they made -5.8 % with 24 % rugs, against +8.8 % with 9 %.
+  - **Solana only:** on Robinhood Chain these coins made money with no more rugs than the rest, so that chain is unchanged.
+
+### Console
+
+- **Realized P&L on both chains now comes from the wallet.** The console added up closed trades, so it missed money that
+  moved the wallet without a trade. It now shows what the wallet holds, with open positions at cost, minus the starting
+  amount, on the Overview and the Trades page. The Trades page's line ends at that figure. Starting amounts are unchanged:
+  5.000011 SOL and 0.225 ETH.
+  - **Solana:** +0.0320 SOL, not +0.0008. All 565 wallet transactions add up to the lamport. The wallet received +0.0312
+    SOL from pump.fun's `DistributeFeeToHolders` as a holder of the coins it bought.
+  - A withdrawal is not a loss, and an open position counts at cost until it is sold.
+- **Robinhood Chain sizing reasons say ETH.** They said SOL.
+
+### Platform
+
+- **A full stream relay buffer takes about 350 MB, not 2.4 GB.** Each buffered event stayed in the 8 KB block orjson had
+  built it in, for an event under 1 KB. The relay now keeps an exact-size copy. `SOL_FEED` still defaults to `pumpapi`.
+  - **Measured:** one archived hour (2.9 M events) through the relay on macOS: 2,427 MB before, 361 MB after. With the
+    buffer full on the 1 GB Linux server: 345 MB, and 402 MB a day later.
+  - **The steady memory climb with the buffer full is gone.** glibc's thread cache kept freed events from merging, so the
+    heap grew ~24 MB/h and a 1 GB server would have run out in under a day. The service and the Docker image now turn
+    that cache off (`GLIBC_TUNABLES`). In a loopback test, memory stayed flat through 22 buffer turnovers; the test
+    without it grew in a straight line. The live server grew ~3 MB/h over its first day: ~0.2 MB/h between client
+    reconnects when measured, with rises across them.
+  - **The setup guide's numbers were out of date:** the relay forwards 23 % of the events, not 10 %, at ~52 KB/s
+    (75 KB/s in the busiest minute), and the default buffer covers 17-27 minutes in a busy hour (65 on 10-31), not 30+. A
+    512 MB server is too small.
+  - **The setup guide's order:** the certificate step now comes after the install, so its hook can start the relay, and
+    BBR is a step.
+
+## 2026-11-04, release 19: Code no install ever ran is gone
 
 ### Upgrading
 

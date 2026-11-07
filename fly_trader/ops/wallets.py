@@ -10,6 +10,7 @@ from ..chain import withdraw as sol_withdraw
 from ..chain.cluster_guard import SigningRefused
 from ..chain.keys import WalletKeyError
 from ..db.connection import transaction
+from ..execution import ledger
 from ..logging_setup import scrub
 from ..markets import MARKETS
 from ..rh import guard as rh_guard, withdraw as rh_withdraw
@@ -40,6 +41,25 @@ def address(chain: str) -> str | None:
         with transaction() as conn:
             r = conn.execute("SELECT pubkey FROM wallet_events WHERE kind = 'created' ORDER BY id DESC LIMIT 1").fetchone()
         return r["pubkey"] if r else None
+
+
+def money(spec) -> dict | None:
+    """The live book's money from its wallet, not its trades (None before the first wealth mark): ``start`` the first
+    mark, the amount it started with, and ``realized`` what it holds with open positions at cost, plus what was taken out,
+    less ``start``."""
+    book = spec.live_book
+    with transaction() as conn:
+        m = conn.execute("SELECT wealth, positions_value, exposure FROM wealth_marks WHERE book = %s ORDER BY ts DESC LIMIT 1", (book,)).fetchone()
+        if m is None:
+            return None
+        start = float(conn.execute("SELECT wealth FROM wealth_marks WHERE book = %s ORDER BY ts LIMIT 1", (book,)).fetchone()["wealth"])
+        if spec.chain == "sol":
+            out = float(conn.execute("SELECT COALESCE(sum((detail->>'sol')::float8), 0) AS s FROM wallet_events WHERE kind = 'withdrawal' AND detail->>'status' = 'confirmed'").fetchone()["s"])
+            held = ledger.deposits_held(conn, book)
+        else:
+            out = float(conn.execute("SELECT COALESCE(sum(wei), 0) AS w FROM rh_wallet_flows WHERE kind IN ('withdrawal', 'payout')").fetchone()["w"]) / rh_withdraw.WEI
+            held = float(conn.execute("SELECT COALESCE(sum(basis_eth), 0) AS s FROM rh_base_lots WHERE status = 'open'").fetchone()["s"])
+    return {"start": start, "realized": float(m["wealth"]) - float(m["positions_value"] or 0) + float(m["exposure"] or 0) + held + out - start}
 
 
 def _positions(book: str) -> dict:

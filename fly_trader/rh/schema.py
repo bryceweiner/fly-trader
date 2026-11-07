@@ -132,6 +132,9 @@ RH_DDL: list[str] = [
     "ALTER TABLE rh_minutes ADD COLUMN IF NOT EXISTS fee_v smallint",
     "ALTER TABLE rh_pools ADD COLUMN IF NOT EXISTS fee_obs int NOT NULL DEFAULT 0",
     "ALTER TABLE rh_tokens ADD COLUMN IF NOT EXISTS curve_indexed boolean NOT NULL DEFAULT false",
+    # the graduate's curve back-fill (rh/curves.py, off the live stream): the block it runs to (the pool's registration) and how far it got
+    "ALTER TABLE rh_tokens ADD COLUMN IF NOT EXISTS curve_until bigint",
+    "ALTER TABLE rh_tokens ADD COLUMN IF NOT EXISTS curve_through bigint",
     "ALTER TABLE rh_assets ADD COLUMN IF NOT EXISTS ref_path jsonb",
     "ALTER TABLE positions ADD COLUMN IF NOT EXISTS chain text NOT NULL DEFAULT 'sol'",
     "ALTER TABLE positions ADD COLUMN IF NOT EXISTS quote_asset text",

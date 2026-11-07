@@ -59,7 +59,7 @@ from ..execution.broker_paper import PaperBroker
 from ..ops.reset import activity_dir, fly_state_dir
 from ..train import fly_calibrate, fly_governance as gov, fly_selector, selector, strategies
 from ..train.decisions import X_COLS
-from . import handover, live_first, paper_trading
+from . import handover, live_first, paper_trading, rising_clean
 
 log = logging.getLogger(__name__)
 BOOK, KIND = "paper_fly", "fly"            # the Solana book's names (another chain's book takes its own from fly_trader/markets)
@@ -164,6 +164,7 @@ class FlyBook:
                          (self.run_id, self.KIND, json.dumps({"channels": self.cfg, "book": self.BOOK, "chain": chain}, default=str), self.boot_id))
             self._restore_tags(conn)
             self.has_seat = handover.state(conn, chain) is not None     # whose decision the wallet trades (on_minute); refreshed after each minute's live orders
+            self.rising_live = chain == "sol" and rising_clean.wallet_doubles(conn)   # the wallet doubles rising + clean picks; refreshed the same way
         record_event("info", "fly", "fly session started", {"run_id": self.run_id, "bootstrap": self.boot_id, "channels": self.cfg, "lines": self.lines["plastic"],
                                                             "pending": len(self.pending), "learning_frozen": self.learning_frozen})
         log.info("fly session: bootstrap %d on %s, channels %s, lines %s, %d pending tags", self.boot_id, brain_device.describe(self.fly.net.dev), self.cfg,
@@ -524,8 +525,11 @@ class FlyBook:
                                              allow=d.get("allow"), reasons=d.get("reason"), live_allow=live_allow,
                                              size_margins=d.get("size_margin"), correctness=d.get("pclean"))
             if self.trades_live(conn):
+                failed = self._double(ctx, plan["entries"]) if self.rising_live and plan["entries"] else None
                 live = self._go_live(ctx, plan["beat_id"], plan["entries"], plan["rebuy"])
                 timing["orders_s"] = time.time() - ctx.m1_epoch                          # the wallet's orders queued
+                if failed:
+                    record_event("error", "fly_live", f"rising + clean stakes failed: {failed}", {"chain": self.chain, "minute": ctx.m1.isoformat()})
         self._phase = {"m1": ctx.m1, "picks": scored["picks"], "plan": plan, "live": live, "timing": timing}
         return {"minute": ctx.m1.isoformat(), "picks": scored["picks"], "live": live}
 
@@ -567,6 +571,7 @@ class FlyBook:
         elif hour > self.last_hour:
             self.last_hour = hour; self._hourly(conn, ctx.m1_epoch)
         self.has_seat = handover.state(conn, self.chain) is not None     # for the next live phase: a handover, or the seat cleared by hand
+        self.rising_live = self.chain == "sol" and rising_clean.wallet_doubles(conn)     # the go-live passed or moved: from the next live phase
         self._write_capture()
         self._write_state()
         if learned.get("keys"):          # a row still waiting for its live fill keeps its features (tags survive restarts)
@@ -597,6 +602,19 @@ class FlyBook:
     def mirror(self):
         """The chain's live mirror, one per process and owned by the runner (agent/live_first.py); None until made."""
         return live_first.mirror_of(self.chain)
+
+    def _double(self, ctx, entries: list) -> str | None:
+        """The wallet's rising + clean stakes (agent/rising_clean.py), in their own savepoint, read again here: the operator
+        may have cleared the go-live since ``rising_live`` was. Should they fail, this minute's orders still go out, at
+        plain stakes, and the error comes back to be recorded after them."""
+        try:
+            with ctx.conn.transaction():
+                if rising_clean.wallet_doubles(ctx.conn):
+                    rising_clean.for_wallet(ctx, entries, self.broker)
+        except Exception as e:
+            log.exception("%s: rising + clean stakes of minute %s failed; plain stakes", self.name, ctx.m1.isoformat())
+            return f"{type(e).__name__}: {str(e)[:160]}"
+        return None
 
     def _go_live(self, ctx, beat_id: int, entries: list, rebuy: dict) -> dict:
         """The wallet's orders of this minute, in their own savepoint: a wallet RPC timeout must not roll back the paper plan."""

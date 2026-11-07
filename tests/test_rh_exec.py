@@ -296,6 +296,34 @@ def test_mirror_sizes_rh_entries_and_respects_circuit_3(chain, monkeypatch):
     assert out["entered"] == 0 and out["blocked"] == "kill switch"
 
 
+def test_the_wallet_stays_out_of_plain_v4_coins_until_the_operator_says(chain, monkeypatch):
+    """Their launch facts put them in the universe, so the paper books trade them; the wallet buys them at RH_V4_WALLET=1."""
+    from fly_trader.rh.live import RhLiveMirror
+    monkeypatch.setattr(config, "FLY_SIZING", "flat")
+    monkeypatch.setattr(config, "RH_V4_WALLET", False)                # the operator's .env may have it on
+    ex = chain.ex(); m = RhLiveMirror(600.0, executor=ex)
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    with transaction() as conn:
+        run = str(uuid.uuid4()); conn.execute("INSERT INTO runs (run_id, kind, status) VALUES (%s, 'fly_rh', 'running')", (run,))
+        beat = conn.execute("INSERT INTO beats (run_id, beat_no) VALUES (%s, 1) RETURNING id", (run,)).fetchone()["id"]
+        did = conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, kind, size_sol) VALUES (%s, %s, %s, %s, 'enter', 0.01) RETURNING id",
+                           (beat, run, now, TOKEN)).fetchone()["id"]
+        ctx = SimpleNamespace(conn=conn, m1=now, m1_epoch=now.timestamp(), prices={TOKEN: 1e-6}, resqs={TOKEN: 10.0}, fees={}, last_resq=lambda x: 10.0,
+                              fee=lambda x: None, lag_s=0.0)
+        e = {"mint": TOKEN, "decision_id": did, "score": 0.1, "threshold": 0.0, "table": None, "hold_s": 600.0, "strategy": "ev",
+             "info": {"pool": None, "resq": 10.0, "decimals": 18, "source": "v4"}}
+        out = m.minute(ctx, run_id=run, beat_id=beat, entries=[e])
+        assert out["entered"] == 0 and out["skipped"] == [(TOKEN, "v4 paper only")] and ex.pending() == set()
+        r = conn.execute("SELECT rail, detail FROM decisions WHERE run_id = %s AND kind = 'blocked'", (run,)).fetchone()
+        assert r["rail"] == "v4 paper only" and r["detail"]["of_decision"] == did
+        monkeypatch.setattr(config, "RH_V4_WALLET", True)
+        out = m.minute(ctx, run_id=run, beat_id=beat, entries=[e])
+        assert out["entered"] == 1 and ex.pending() == {TOKEN}
+        ex.q.get_nowait(); ex._pending.clear()
+        conn.execute("DELETE FROM decisions WHERE run_id = %s", (run,)); conn.execute("DELETE FROM beats WHERE run_id = %s", (run,))
+        conn.execute("DELETE FROM runs WHERE run_id = %s", (run,))
+
+
 def test_a_buy_climbs_the_slippage_ladder_to_the_entry_maximum(chain, monkeypatch):
     """A buy reverted at the entry slippage is not given up: it climbs the ladder to its maximum, as on Solana."""
     monkeypatch.setattr(config, "SLIPPAGE_STEP_BPS", 100)

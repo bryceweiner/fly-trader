@@ -107,8 +107,8 @@ def _history(conn, creator: str | None, since, g, mint: str) -> dict:
 def build_v4(conn, token: str) -> dict | None:
     """rh_meta facts of a plain v4 memecoin that passed its contract check (rh/v4_universe.py): its age counts from its
     first pool's initialization (``graduated_at``: the 6 h floor), its creator is that pool's initializer, and what only a
-    Pons launch records (curve, dev buy, seed reserve, time to graduate) is unknown, as for a Solana coin graduated before
-    the archive. Supply in whole tokens (18 decimals)."""
+    Pons launch records (curve, dev buy, seed reserve, time to graduate) is unknown until rh/v4_facts.py finds the coin's
+    launch on the chain, and the universe refuses it until then. Supply in whole tokens (18 decimals)."""
     t = conn.execute("SELECT v.*, a.class AS qclass FROM rh_v4_tokens v LEFT JOIN rh_assets a ON a.asset = v.quote_asset WHERE v.token = %s AND v.status = 'ok'",
                      (token,)).fetchone()
     if not t or t["first_ts"] is None:
@@ -135,7 +135,8 @@ def run_once(limit: int = 500) -> dict:
     n_new = n_out = 0
     with transaction() as conn:
         todo = conn.execute("SELECT t.token FROM rh_tokens t LEFT JOIN rh_meta m ON m.mint = t.token WHERE t.status = 'graduated' AND t.graduated_at IS NOT NULL "
-                            "AND m.mint IS NULL ORDER BY t.graduated_at LIMIT %s", (limit,)).fetchall()
+                            "AND m.mint IS NULL AND (t.curve_indexed OR t.curve IS NULL OR t.launch_block IS NULL OR COALESCE(t.curve_until, t.grad_block) IS NULL) "
+                            "ORDER BY t.graduated_at LIMIT %s", (limit,)).fetchall()       # a row is built once: after its curve back-fill (rh/curves.py)
         for r in todo:
             row = build(conn, r["token"])
             if row is None:

@@ -1,7 +1,8 @@
 // Overview, laid out like Dashtreme's index: the selector book's KPI widgets, what the system is doing in plain words
 // beside the win rate, the money's book (its wealth and open positions), the fly's brain, this minute's scoring with the top
-// scores, the race between the selector and the plastic fly, the selector's setups per day, and the live ticker
-// (ui/api/overview.py; the brain ui/api/brain.py).
+// scores, the race between the selector and the plastic fly, the rising + clean test and its go-live, the selector's setups
+// per day, and the live ticker (ui/api/overview.py; the brain ui/api/brain.py).
+import { useState } from 'react'
 import { BrainPanel } from '../brain'
 import { PageHead } from '../components/ChainPicker'
 import { BarChart, LineChart, RadialGauge, type Series } from '../components/Charts'
@@ -55,6 +56,10 @@ type Minute = {
 }
 type RaceBook = { book: string; title: string; pnl: number | null; n: number; daily: number[] }
 type Race = { hidden: boolean; unit: string; handover?: boolean; success?: string | null; caption?: string | null; metrics?: RaceBook[]; series?: Series[]; days?: string[] }
+type RisingStat = { closed: number; open: number; pnl: number; mean: number | null }
+type Rising = { hidden: boolean; running?: boolean; observer?: boolean; days?: number; unit?: string; started_at?: string; go_live_at?: string | null
+  live_since?: string | null; held?: { trades: number; pnl_sol: number; go_live_at: string } | null; breadth_chg?: number | null; rise?: number; rising?: boolean | null
+  book?: RisingStat; selector?: RisingStat; doubled?: RisingStat; rest?: RisingStat; series?: Series[] }
 type Position = { id: number; mint: string; token: string; strategy: string; held_min: number; exits_in_min: number; cost: number; ret: number | null
   correctness?: number | null }
 type Book = { unit: string; history: [string, number][]; positions: Position[]; live?: boolean; book?: string; title?: string; sub?: string; observer?: boolean
@@ -91,7 +96,7 @@ function SummaryPanel() {
             <WidgetGrid>
               <Widget label={d.label} icon="wealth" value={amount(d.wealth, u)} color={d.live ? 'magenta' : null} help={d.wealth_help} spark={d.spark.length > 1 ? d.spark : null}
                 delta={d.wealth !== null ? `${signed(d.wealth - d.capital, 4)} ${u} since start` : null} />
-              <Widget label="Realized P&L" icon="pnl" value={amount(d.pnl, u, 4, true)} help="Closed trades, after fees and price impact."
+              <Widget label="Realized P&L" icon="pnl" value={amount(d.pnl, u, 4, true)} help={d.live ? 'The wallet now, with open positions at cost, minus the starting amount.' : 'Closed trades, after fees and price impact.'}
                 spark={d.pnl_spark.length > 1 ? d.pnl_spark : null} />
               <Widget label="Closed trades" icon="count" value={int(d.closed)} delta={winRate !== null ? `${Math.round(winRate * 100)}% winners` : null} tone="off"
                 progress={winRate} />
@@ -187,6 +192,70 @@ function RacePanel() {
         </div>
       </div>
     </div>
+  )
+}
+
+/** A time as a datetime-local input's value: this machine's local time, to the minute. */
+const localInput = (iso: string) => {
+  const d = new Date(iso)
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16)
+}
+
+const localText = (iso: string) => localInput(iso).replace('T', ' ')
+
+/** The rising + clean paper test: the test book against the selector's since it started, and the go-live, set here. */
+function RisingPanel() {
+  const { chain } = useApp()
+  const r = useTopic<Rising>('overview.rising', { chain })
+  const [edit, setEdit] = useState<string | null>(null)                       // the time being typed; null: the saved one
+  if (!r.data) return r.error ? <Callout kind="error">{r.error}</Callout> : null
+  const d = r.data
+  if (d.hidden) return null
+  const title = 'Strategy 1: rising + clean'
+  const sub = 'A selector pick takes twice its stake when the market is recovering and the launch was clean.'
+  if (!d.running) {
+    return (
+      <Card title={title} icon="up" sub={sub} actions={(
+        <ActionButton label={`Start the ${d.days}-day test`} icon="play" name="overview.rising_start" disabled={d.observer}
+          help={d.observer ? 'This console only observes: start it from the console that hosts the workers.' : undefined}
+          confirm={{ title: 'Start the paper test?', confirmLabel: 'Start', body: <>A paper book takes the selector's picks with these stakes doubled, beside the selector's own book. Nothing changes on the wallet. The go-live is set {d.days} days out, and you can move it here.</> }} />
+      )}>
+        <Caption>No test is running.</Caption>
+      </Card>
+    )
+  }
+  const u = d.unit ?? 'SOL'
+  const saved = d.go_live_at ? localInput(d.go_live_at) : ''
+  const when = edit ?? saved
+  const parsed = when ? new Date(when) : null                                 // a year out of range is an invalid date, not a crash
+  const iso = parsed && !Number.isNaN(parsed.getTime()) ? parsed.toISOString() : null
+  const stat = (s?: RisingStat) => `${s?.closed ?? 0} closed · ${s?.open ?? 0} open`
+  return (
+    <Card title={title} icon="up" sub={sub}>
+      {r.error && <Callout kind="error">{r.error} (showing the last good data)</Callout>}
+      {d.live_since && <Callout kind="success" icon="payments">Live since {localText(d.live_since)}: the wallet doubles these stakes.</Callout>}
+      {d.held && <Callout kind="warning">Stayed on paper at {localText(d.held.go_live_at)}: {d.held.trades} doubled trades made {amount(d.held.pnl_sol, u, 4, true)}. Set a new go-live below.</Callout>}
+      <Metrics min={170}>
+        <Metric compact label="Test book" icon="up" value={amount(d.book?.pnl, u, 4, true)} delta={stat(d.book)} tone="off" help="Realized P&L of paper_rising since the test began." />
+        <Metric compact label="Selector" icon={BOOK_ICON.selector} value={amount(d.selector?.pnl, u, 4, true)} delta={stat(d.selector)} tone="off" help="Realized P&L of paper_selector over the same time: the same picks at plain stakes." />
+        <Metric compact label="Doubled trades" icon="target" value={amount(d.doubled?.pnl, u, 4, true)} delta={`${stat(d.doubled)}${d.doubled?.mean == null ? '' : ` · ${pct(d.doubled.mean, 1)}`}`} tone="off" help="What the go-live judges: its closed doubled trades must have made money." />
+        <Metric compact label="Rest of the trades" icon="count" value={amount(d.rest?.pnl, u, 4, true)} delta={`${stat(d.rest)}${d.rest?.mean == null ? '' : ` · ${pct(d.rest.mean, 1)}`}`} tone="off" />
+        <Metric compact label="Breadth, 6 h" icon="pulse" value={d.breadth_chg == null ? '—' : `${num(d.breadth_chg * 100, 1, true)} pts`} delta={d.rising == null ? null : d.rising ? 'rising' : `needs ${num((d.rise ?? 0) * 100, 1, true)} pts`} tone="off" help="Change over 6 hours in the share of coins (pool at least 10 SOL) up on the hour." />
+      </Metrics>
+      {(d.series ?? []).length > 0 && <LineChart series={d.series!} height={220} yFormat={(v) => `${v.toFixed(3)} ${u}`} />}
+      <div className="d-flex flex-wrap align-items-end gap-2 mt-3">
+        <div>
+          <label className="form-label" htmlFor="rising-go-live">Go-live (this machine's time)</label>
+          <input id="rising-go-live" className="form-control" type="datetime-local" max="9999-12-31T23:59" value={when} disabled={d.observer} onChange={(e) => setEdit(e.target.value)} />
+        </div>
+        <ActionButton label="Save" icon="calendar" name="overview.rising_go_live" body={{ at: iso }} variant="primary" disabled={d.observer || !iso || when === saved} onDone={() => setEdit(null)}
+          confirm={{ title: `Go-live ${iso ? localText(iso) : ''}?`, confirmLabel: 'Save', danger: true,
+            body: <>At that time the test is judged. If its doubled trades have made money, the wallet starts doubling these stakes. If not, it stays on paper and the date clears.{d.live_since ? ' The wallet goes back to plain stakes until then.' : ''}</> }} />
+        <ActionButton label="No date" icon="trash" name="overview.rising_go_live" body={{ at: null }} disabled={d.observer || !d.go_live_at} onDone={() => setEdit(null)}
+          confirm={{ title: 'Clear the go-live?', confirmLabel: 'Clear', body: <>The wallet keeps plain stakes until you set a date{d.live_since ? ', from its next buy' : ''}. The paper test keeps running.</> }} />
+      </div>
+      {!d.live_since && !d.held && <Caption>{d.go_live_at ? `Goes live ${localText(d.go_live_at)} if the doubled trades have made money by then.` : 'No go-live date: the wallet keeps plain stakes.'} Test started {ago(d.started_at)}.</Caption>}
+    </Card>
   )
 }
 
@@ -355,6 +424,7 @@ export default function Overview() {
       <BrainPanel variant="memecoin" />
       <ThisMinute />
       <RacePanel />
+      <RisingPanel />
       <SetupsPanel />
       <HoursPanel />
       <TickerCard />

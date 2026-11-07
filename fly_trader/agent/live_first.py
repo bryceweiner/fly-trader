@@ -6,6 +6,8 @@
   straddled a boundary).
 - ``chain_take_profits``: a live position's take-profit sale depends on its minute's close alone, so it goes out the
   moment the engine reads the minute, before the minute's features and the fly's scores (agent/minute_engine.live_phase).
+- ``crash_sale``: a held Solana coin 25 % under its 5-minute high (agent/crash_exit.py) is sold the moment the stream
+  sees the price, from the crash watcher's thread, not at a minute.
 - Anything that can run beside a live order does: the engine wakes the moment a stream writes a minute
   (``minute_published``), each chain's wallet balance is read while its minute's features and scores are computed
   (``prefetch``), and the chains' live phases run at once (agent/minute_engine.run_ready).
@@ -190,6 +192,17 @@ def sell_now(chain: str, position_id: int, wait_s: float = SELL_NOW_WAIT_S) -> d
             "cost": float(p["cost_sol"]) if p is not None else None,
             "error": None if booked or res is None else (res.error or "it sold only part of the position: the rest stays open")}
 
+
+
+def crash_sale(chain: str, mint: str, why: str) -> int:
+    """A coin the wallet holds crashed (agent/crash_exit.py): the chain's mirror sells it at once (its ``crash_exit``),
+    from the crash watcher's own thread, not waiting for any minute. How many sales went out (0: none held, one in
+    flight, or the wallet may not sign)."""
+    m = mirror_of(chain)
+    if m is None or signing_refused(chain):
+        return 0
+    with transaction() as conn:
+        return m.crash_exit(conn, mint, why)
 
 def idle_mirrors() -> None:
     """Between minutes: each mirror's bookkeeping that waits for an idle wallet (the wealth mark, sweeps, the reconcile)."""

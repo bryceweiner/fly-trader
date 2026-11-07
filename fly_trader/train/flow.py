@@ -11,7 +11,8 @@ index 10 = wallet without a score; None when the day has no table). The archive 
 
 ``FlowWindow`` turns a mint's minutes into the derived model inputs (``FLOW_COLS`` + ``SKILL_COLS``), fed the same way
 by ``mature.build_day`` and the live engine (``agent/minute_engine.py``); ``mkt_vol_1h`` is the market's total SOL volume
-over the last hour (all mints), computed from the same minute rows in both paths.
+over the last hour (all mints), computed from the same minute rows in both paths. ``BreadthWindow`` is the live market
+breadth (agent/rising_clean.py), the study's series on ``features_mature`` rows fed minute by minute.
 """
 from __future__ import annotations
 
@@ -28,6 +29,10 @@ FLOW_COLS = ["top_sell_share_1m", "insider_sell_share_1m", "log_insider_sell_15m
              "org_imb_5m", "org_imb_15m", "wash_share_15m", "log_org_vol_15m"]
 SKILL_COLS = [f"skill_top{q}_15m" for q in range(1, 10)] + ["skill_known_15m"]
 MARKET_COLS = ["mkt_vol_1h"]
+BREADTH_MIN_RESQ = 10.0          # a coin counts towards the market's breadth with a pool of at least this many SOL
+BREADTH_BUCKET_S = 300           # one 5-minute bucket of minute starts
+BREADTH_LAG = 72                 # 6 h of buckets between the two shares ``BreadthWindow.change`` compares
+BREADTH_FILL = 12                # a bucket with no coin in it takes the last share at most this many buckets back
 RAW_COLS = ["n_buyers", "wash_sol", "wash_buy_sol", "top_sell_sol", "insider_sell_sol", "skill_buy"]
 
 
@@ -141,3 +146,37 @@ class MarketWindow:
 
     def value(self, t_end: float) -> float:
         return math.log1p(sum(v for t, v in self.q if t_end - WINDOW_S < t <= t_end))
+
+
+class BreadthWindow:
+    """The share of coins rising, per 5-minute bucket of minute starts: of the traded mint-minutes with a pool of at least
+    ``BREADTH_MIN_RESQ``, those up on the hour (``ret_1h`` > 0). ``change`` is the winners study's ``up_chg_6h``
+    (data/scratch/winners_20261031/w_market.py): the last closed bucket's share minus the share 6 h before it."""
+    __slots__ = ("b",)
+
+    def __init__(self):
+        self.b: dict[int, list] = {}             # bucket -> [mint-minutes counted, those up on the hour]
+
+    def add(self, t_start: float, resq: float | None, ret_1h: float) -> None:
+        if resq is None or resq < BREADTH_MIN_RESQ:
+            return
+        k = int(t_start // BREADTH_BUCKET_S); c = self.b.get(k)
+        if c is None:
+            c = self.b[k] = [0, 0]
+            for old in [x for x in self.b if x < k - BREADTH_LAG - BREADTH_FILL - 1]:
+                del self.b[old]
+        c[0] += 1; c[1] += bool(ret_1h > 0)
+
+    def _share(self, k: int) -> float | None:
+        for j in range(k, k - BREADTH_FILL - 1, -1):
+            c = self.b.get(j)
+            if c is not None:
+                return c[1] / c[0]
+        return None
+
+    def change(self, t_start: float) -> float | None:
+        """For a row of the minute starting ``t_start``: the change in the share over 6 h, from buckets closed by then; None
+        when either share is unknown."""
+        k = int(t_start // BREADTH_BUCKET_S) - 1
+        now, then = self._share(k), self._share(k - BREADTH_LAG)
+        return None if now is None or then is None else now - then

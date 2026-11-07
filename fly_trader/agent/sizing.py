@@ -11,7 +11,8 @@ capped at ``MAX_POSITION_FRACTION`` of the deployable bankroll, the free cash ab
 measured at, so the book behaves the same with 5 SOL or 500: a bigger bankroll buys no bigger than the backtest did,
 it only runs out of cash later. A coin whose creator bought most of its supply at launch stakes at most
 ``CREATOR_HEAVY_CAP_FRACTION`` of the bankroll, 0.1 SOL of 5 (they rug often; train/selector.py). Below ``MIN_POSITION_SOL`` the buy is skipped. A model without a table (trained
-before sizing) trades the fixed ``MAX_POSITION_SOL``, under the same caps.
+before sizing) trades the fixed ``MAX_POSITION_SOL``, under the same caps. ``stake_x`` multiplies the stake before the caps
+(agent/rising_clean.py: a rising market and a clean launch).
 """
 from __future__ import annotations
 
@@ -63,29 +64,31 @@ def band_for(table: list[dict], margin: float) -> dict | None:
 
 def size_position(score: float, threshold: float, table: list[dict] | None, bankroll_sol: float, cash_sol: float,
                   res_quote_sol: float | None, flat: bool = False, market=None, margin: float | None = None,
-                  creator_heavy: bool = False) -> tuple[float, str]:
+                  creator_heavy: bool = False, stake_x: float = 1.0) -> tuple[float, str]:
     """(size in the book's unit, why). Size 0 means skip the buy. ``flat``: ``MAX_POSITION_FRACTION`` of the deployable
     bankroll on every buy that cleared the line (the fly); otherwise the Kelly band of ``table``. ``market``
     (fly_trader/markets; default Solana): the gas reserve, minimum position and label size of the book's own market.
     ``margin``: where the strategy's correctness sizes the row (train/strategies.decide's ``size_margin``), the margin its
     correctness bands are read at, P(clean) − the bands' p0, instead of score − threshold. ``creator_heavy``: the coin's
     creator bought most of its supply at launch (train/selector.creator_heavy) -- at most ``CREATOR_HEAVY_CAP_FRACTION`` of
-    the bankroll."""
-    rh = market is not None and market.chain != "sol"
+    the bankroll. ``stake_x``: a multiple of the stake, under the same caps."""
+    rh = market is not None and market.chain != "sol"; unit = market.unit if rh else "SOL"
     reserve = market.gas_reserve() if rh else config.GAS_RESERVE_SOL; free = cash_sol - reserve
     min_pos = market.min_position() if rh else config.MIN_POSITION_SOL
     deployable = max(0.0, bankroll_sol - reserve)
     if flat:
-        size = config.MAX_POSITION_FRACTION * deployable; why = f"flat {config.MAX_POSITION_FRACTION:g} of {deployable:.2f} SOL"
+        size = config.MAX_POSITION_FRACTION * deployable; why = f"flat {config.MAX_POSITION_FRACTION:g} of {deployable:.2f} {unit}"
     elif not table:
-        size = config.MAX_POSITION_SOL * (market.k() if rh else 1.0); why = f"fixed {size:g} {'ETH' if rh else 'SOL'} (model has no sizing table)"
+        size = config.MAX_POSITION_SOL * (market.k() if rh else 1.0); why = f"fixed {size:g} {unit} (model has no sizing table)"
     else:
         by_c = margin is not None and np.isfinite(margin)
         b = band_for(table, float(margin) if by_c else score - threshold)
         if b is None or b["kelly"] <= 0:
             return 0.0, "no edge in this correctness band" if by_c else "no edge in this score band"
         size = config.KELLY_FRACTION * b["kelly"] * deployable
-        why = (f"correctness band from +{b['lo']:.3f}" if by_c else f"band from +{b['lo']:.3f} over the line") + f": Kelly {b['kelly']:.2f} × {config.KELLY_FRACTION:g} of {deployable:.2f} SOL"
+        why = (f"correctness band from +{b['lo']:.3f}" if by_c else f"band from +{b['lo']:.3f} over the line") + f": Kelly {b['kelly']:.2f} × {config.KELLY_FRACTION:g} of {deployable:.2f} {unit}"
+    if stake_x != 1.0:
+        size *= stake_x; why += f" × {stake_x:g}"
     # the label size is the largest buy any backtest measured: past it the edge is an extrapolation that impact eats
     caps = {"bankroll cap": config.MAX_POSITION_FRACTION * deployable, "free cash": free, "label size": label_size(res_quote_sol, market if rh else None)}
     if creator_heavy:
@@ -95,7 +98,7 @@ def size_position(score: float, threshold: float, table: list[dict] | None, bank
         size = caps[limit]; why += f", capped by {limit}"
     if size < min_pos:
         return 0.0, why + f" → {max(size, 0.0):.6f} is below the {min_pos:g} minimum"
-    return float(size), why + f" → {size:.3f} SOL"
+    return float(size), why + f" → {size:.3f} {unit}"
 
 
 def simulate_bankroll(ts: np.ndarray, horizon_s, margins: np.ndarray, returns: np.ndarray, table: list[dict] | None,
