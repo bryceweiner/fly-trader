@@ -8,6 +8,7 @@ What an intent books (every figure measured, never assumed):
 - a buy opens a position whose ``cost_sol`` (ETH) is the ETH spent + the gas of every transaction of the intent
   (approvals and reverted attempts included) + the basis of a consumed base lot; ``gas_q`` keeps the gas part;
 - a buy that produced no tokens is booked as an aborted position (qty 0, closed at once): realized = −gas − base loss;
+- a dead-bag sweep that failed charges its gas to the written-off position (not an aborted position);
 - a sale's proceeds are the ETH received − the gas of the exit intent; realized = proceeds − cost;
 - two-leg routes (rh/exec.py fallback) pass through ``rh_base_lots``: an entry leg's base is a lot consumed by the
   meme buy; an exit leg's base is a lot valued at the mark when the position closes, and its liquidation books the
@@ -130,8 +131,9 @@ def book_sweep(conn, *, intent_id: int, position_id: int, eth_in_wei: int, lot_v
 
 
 def charge_gas(conn, intent_id: int, position_id: int | None) -> float:
-    """A failed intent's gas: onto its open position's cost when it has one (an exit that reverted), else the book's
-    overhead as an aborted zero-quantity position (a failed entry). Returns the ETH charged."""
+    """A failed intent's gas: onto its open position's cost when it has one (an exit that reverted); a failed dead-bag
+    sweep's onto the position its token was written off from (it is that position's cleanup, not a trade); else the
+    book's overhead as an aborted zero-quantity position (a failed entry). Returns the ETH charged."""
     gas = intent_gas_wei(conn, intent_id) / WEI
     if gas <= 0:
         return 0.0
@@ -139,7 +141,13 @@ def charge_gas(conn, intent_id: int, position_id: int | None) -> float:
         conn.execute("UPDATE positions SET cost_sol = cost_sol + %s, fees_sol = fees_sol + %s, gas_q = gas_q + %s WHERE id = %s",
                      (gas, gas, gas, position_id))
         return gas
-    it = conn.execute("SELECT token, decision_id FROM rh_intents WHERE id = %s", (intent_id,)).fetchone()
+    it = conn.execute("SELECT token, decision_id, kind FROM rh_intents WHERE id = %s", (intent_id,)).fetchone()
+    dead = ledger.last_dead_bag(conn, BOOK, it["token"]) if it["kind"] == "sweep" and it["token"] else None
+    if dead is not None:
+        ledger.credit(conn, dead, -gas)
+        conn.execute("UPDATE positions SET fees_sol = fees_sol + %s, gas_q = gas_q + %s WHERE id = %s", (gas, gas, dead))
+        conn.execute("UPDATE rh_intents SET position_id = %s WHERE id = %s", (dead, intent_id))
+        return gas
     now = datetime.now(timezone.utc)
     pid = ledger.open_position(conn, book=BOOK, mint=it["token"] or "gas", pool=None, qty_raw=0, cost_sol=gas, entry_price=0.0, decision_id=None,
                                fees_sol=gas, ts=now)

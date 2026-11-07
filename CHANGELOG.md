@@ -3,6 +3,23 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## 2026-11-07, release 21: The RH win rate counts trades only, and failed sweeps of a written-off token stop
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual. The models are
+  release 19's (selector and fly of 2026-10-26).
+
+### Robinhood Chain
+
+- **The Trades page's RH win rate counts trades only: 54 %, not 39 %.** Since 2026-11-05 the hourly clean-up of
+  written-off tokens tried to sell 0x493f2e7b, the coin that wiped the wallet's tokens. Its contract reports a balance it
+  never lets move, so every try sent an approve and then failed. Each failure's gas was booked as an aborted buy with no
+  tokens, 48 of them, and the Trades page and the Overview counted those as losing trades.
+  - **A written-off token is left alone after 3 failed sweeps.**
+  - **A failed sweep's gas goes onto the position the token was written off from,** not into a new aborted position.
+  - **An aborted position is no trade:** not counted, listed or charted on either chain.
+
 ## 2026-11-07, release 20: A Solana coin that falls 25 % within 5 minutes is sold at once
 
 ### Upgrading

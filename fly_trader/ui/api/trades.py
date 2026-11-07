@@ -50,18 +50,18 @@ def summary(params: dict) -> dict:
     wallet's (ops/wallets.money); ``pnl`` stays the closed trades'."""
     mk = market_param(params); book = _book(params, mk); w = money(mk) if book == mk.live_book else None
     c = q1("SELECT count(*) AS n, sum(realized_sol) AS pnl, avg(realized_sol / NULLIF(cost_sol, 0)) AS avg_ret, "
-           "count(*) FILTER (WHERE realized_sol > 0) AS wins FROM positions WHERE book = %s AND status = 'closed'", (book,)) or {}
+           "count(*) FILTER (WHERE realized_sol > 0) AS wins FROM positions WHERE book = %s AND status = 'closed' AND COALESCE(forced_exit_kind, '') <> 'aborted'", (book,)) or {}
     o = q1("SELECT count(*) AS n, COALESCE(sum(cost_sol), 0) AS cost FROM positions WHERE book = %s AND status = 'open'", (book,)) or {}
     n, wins = int(c.get("n") or 0), int(c.get("wins") or 0)
     cum, run = [], 0.0
-    for r in q("SELECT closed_at, realized_sol FROM positions WHERE book = %s AND status = 'closed' AND closed_at IS NOT NULL ORDER BY closed_at, id", (book,)):
+    for r in q("SELECT closed_at, realized_sol FROM positions WHERE book = %s AND status = 'closed' AND COALESCE(forced_exit_kind, '') <> 'aborted' AND closed_at IS NOT NULL ORDER BY closed_at, id", (book,)):
         run += float(r["realized_sol"] or 0); cum.append([r["closed_at"], run])
     daily = list(reversed(q("SELECT (closed_at AT TIME ZONE 'UTC')::date AS day, count(*) AS n, sum(realized_sol) AS pnl, count(*) FILTER (WHERE realized_sol > 0) AS wins "
-                            "FROM positions WHERE book = %s AND status = 'closed' AND closed_at IS NOT NULL GROUP BY 1 ORDER BY 1 DESC LIMIT 90", (book,))))
-    exits = q("SELECT COALESCE(forced_exit_kind, 'time') AS kind, count(*) AS n, sum(realized_sol) AS pnl FROM positions WHERE book = %s AND status = 'closed' "
+                            "FROM positions WHERE book = %s AND status = 'closed' AND COALESCE(forced_exit_kind, '') <> 'aborted' AND closed_at IS NOT NULL GROUP BY 1 ORDER BY 1 DESC LIMIT 90", (book,))))
+    exits = q("SELECT COALESCE(forced_exit_kind, 'time') AS kind, count(*) AS n, sum(realized_sol) AS pnl FROM positions WHERE book = %s AND status = 'closed' AND COALESCE(forced_exit_kind, '') <> 'aborted' "
               "GROUP BY 1 ORDER BY 2 DESC, 1", (book,))
     strategies = q("SELECT COALESCE(strategy, '') AS strategy, count(*) AS n, sum(realized_sol) AS pnl, count(*) FILTER (WHERE realized_sol > 0) AS wins "
-                   "FROM positions WHERE book = %s AND status = 'closed' GROUP BY 1 ORDER BY 2 DESC, 1", (book,))
+                   "FROM positions WHERE book = %s AND status = 'closed' AND COALESCE(forced_exit_kind, '') <> 'aborted' GROUP BY 1 ORDER BY 2 DESC, 1", (book,))
     return {"chain": mk.chain, "book": book, "unit": mk.unit,
             "metrics": {"n": n, "pnl": c.get("pnl"), "realized": w["realized"] if w else c.get("pnl"), "avg_ret": c.get("avg_ret"), "wins": wins, "win_rate": wins / n if n else None,
                         "open": int(o.get("n") or 0), "open_cost": float(o.get("cost") or 0)},
@@ -73,7 +73,7 @@ def summary(params: dict) -> dict:
 @topic("trades.closed", every=10)
 def closed(params: dict) -> dict:
     mk = market_param(params); book = _book(params, mk)
-    rows = q("SELECT mint, opened_at, closed_at, cost_sol, realized_sol, forced_exit_kind, strategy FROM positions WHERE book = %s AND status = 'closed' "
+    rows = q("SELECT mint, opened_at, closed_at, cost_sol, realized_sol, forced_exit_kind, strategy FROM positions WHERE book = %s AND status = 'closed' AND COALESCE(forced_exit_kind, '') <> 'aborted' "
              "ORDER BY closed_at DESC LIMIT %s", (book, LIMIT))
     names = labels([r["mint"] for r in rows])
     out = []

@@ -94,12 +94,12 @@ def summary(params: dict) -> dict:
     money = wallets.money(mk) if live else None
     cap = money["start"] if money else mk.capital()
     w = q1("SELECT wealth, exposure, n_open, drawdown FROM wealth_marks WHERE book = %s ORDER BY ts DESC LIMIT 1", (BOOK,)) or {}
-    c = q1("SELECT count(*) AS n, sum(realized_sol) AS pnl, count(*) FILTER (WHERE realized_sol > 0) AS wins FROM positions WHERE book = %s AND status = 'closed'", (BOOK,)) or {}
+    c = q1("SELECT count(*) AS n, sum(realized_sol) AS pnl, count(*) FILTER (WHERE realized_sol > 0) AS wins FROM positions WHERE book = %s AND status = 'closed' AND COALESCE(forced_exit_kind, '') <> 'aborted'", (BOOK,)) or {}
     spark = [float(r["wealth"]) for r in marks([BOOK], points=180) if r["wealth"] is not None]      # the book since it started, thinned
     peak, dd_spark = 0.0, []
     for x in spark:                         # drawdown below the running peak, on the same points
         peak = max(peak, x); dd_spark.append(1 - x / peak if peak > 0 else 0.0)
-    trades = [float(r["realized_sol"] or 0) for r in q("SELECT realized_sol FROM positions WHERE book = %s AND status = 'closed' ORDER BY closed_at DESC NULLS LAST, id DESC LIMIT 180", (BOOK,))][::-1]
+    trades = [float(r["realized_sol"] or 0) for r in q("SELECT realized_sol FROM positions WHERE book = %s AND status = 'closed' AND COALESCE(forced_exit_kind, '') <> 'aborted' ORDER BY closed_at DESC NULLS LAST, id DESC LIMIT 180", (BOOK,))][::-1]
     pnl = money["realized"] if money else c.get("pnl")
     base = float(pnl or 0) - sum(trades); pnl_spark = []
     for r in trades:                        # cumulative realized P&L, ending at the total

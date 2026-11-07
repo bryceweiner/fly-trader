@@ -54,6 +54,8 @@ from .exec import ZERO, RhExecutor, RhRequest
 log = logging.getLogger(__name__)
 BOOK, MIRROR = RH.live_book, RH.fly_book
 DEAD_BAG_S, OVERDUE_S, SWEEP_S, RECONCILE_S = 3 * 3600.0, 600.0, 3600.0, 600.0
+SWEEP_GIVE_UP = 3              # failed sweeps of a written-off token before it is left alone (0x493f2e7b, 2026-11-05: its contract
+                               # reports a balance it never lets move; the sweep's approve cost gas every hour)
 GAP_TRADES, GAP_MAX = 50, 0.02
 MARK_WAIT_S = 2.0             # how long the wealth mark waits for the wallet lock (an intent between its snapshot and its booking)
 
@@ -407,11 +409,14 @@ class RhLiveMirror:
     def sweep(self, conn, m1) -> int:
         """Sell the last week's dead-bag tokens (their proceeds are booked onto the latest dead-bag of the token,
         rh/exec.py) and every open base lot (exit legs that stopped half way, stray base). Never a token the book holds
-        again: its balance is that position's."""
+        again (its balance is that position's), nor one whose sweep failed ``SWEEP_GIVE_UP`` times since its write-off."""
         n = 0; inflight = self.ex.pending(); held = {p["mint"].lower() for p in ledger.open_positions(conn, BOOK)}
-        for r in conn.execute("SELECT DISTINCT mint, pool, quote_asset FROM positions WHERE book = %s AND forced_exit_kind = 'dead_bag' AND closed_at > %s",
+        for r in conn.execute("""SELECT p.mint, any_value(p.pool) AS pool, any_value(p.quote_asset) AS quote_asset,
+                                        (SELECT count(*) FROM rh_intents i WHERE i.kind = 'sweep' AND i.state IN ('failed', 'aborted') AND lower(i.token) = lower(p.mint)
+                                           AND i.created_at > max(p.closed_at)) AS failed
+                                 FROM positions p WHERE p.book = %s AND p.forced_exit_kind = 'dead_bag' AND p.closed_at > %s GROUP BY p.mint""",
                               (BOOK, m1 - timedelta(days=7))).fetchall():
-            if r["mint"].lower() in held or r["mint"].lower() in inflight:
+            if r["mint"].lower() in held or r["mint"].lower() in inflight or r["failed"] >= SWEEP_GIVE_UP:
                 continue
             amt = self.wallet.balance_of(r["mint"])
             if amt > 0:

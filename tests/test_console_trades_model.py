@@ -105,6 +105,22 @@ def test_book_summary(console, seeded):
     assert [(x["strategy"], x["n"], x["wins"]) for x in d["strategies"]] == [("ev", 2, 1), ("capitulation", 1, 1)]
 
 
+
+def test_an_aborted_position_is_not_a_trade(console, seeded):
+    """A failed transaction's gas booked as an aborted zero-quantity position (RH: 48 failed sweeps of one written-off
+    token, 2026-11-05..07, read as a 39 % win rate) is no trade: not counted, listed or charted."""
+    with transaction() as conn:
+        pid = conn.execute("INSERT INTO positions (book, mint, qty, cost_sol, realized_sol, status, opened_at, closed_at, forced_exit_kind) "
+                           "VALUES (%s, 'MintABORTED1', 0, 0.00001, -0.00001, 'closed', %s, %s, 'aborted') RETURNING id",
+                           (seeded["book"], datetime(2026, 10, 5, tzinfo=timezone.utc), datetime(2026, 10, 5, tzinfo=timezone.utc))).fetchone()["id"]
+    try:
+        d = _get(console, "trades.summary", chain="sol", book=seeded["book"]); rows = _get(console, "trades.closed", chain="sol", book=seeded["book"])["rows"]
+    finally:
+        with transaction() as conn:
+            conn.execute("DELETE FROM positions WHERE id = %s", (pid,))
+    assert d["metrics"]["n"] == 3 and d["metrics"]["win_rate"] == pytest.approx(2 / 3) and "aborted" not in {e["kind"] for e in d["exits"]}
+    assert "MintABORTED1" not in [r["mint"] for r in rows] and len(d["cum"]) == 3
+
 def test_summary_of_an_empty_book(console):
     d = _get(console, "trades.summary", chain="sol", book=f"replay_empty_{uuid.uuid4().hex[:6]}")
     assert d["metrics"]["n"] == 0 and d["metrics"]["win_rate"] is None and d["metrics"]["pnl"] is None and d["metrics"]["open"] == 0
