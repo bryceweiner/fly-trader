@@ -4,6 +4,10 @@
 # install: copies skip files that exist, and apply-release reuses rows it already has.
 set -e
 cd /app
+# A self-update downloads every file without its mode, so entrypoint.sh lands in the container unexecutable. An image
+# built before 2026-11-14 execs it directly, and a restarted container (a reboot, Docker Desktop starting) then fails
+# with "exec /app/docker/entrypoint.sh: permission denied". This runs after every install, from the new tree.
+chmod 755 docker/entrypoint.sh docker/bootstrap.sh 2>/dev/null || true
 until pg_isready -d "$DATABASE_URL" >/dev/null 2>&1; do echo "fly-trader: waiting for postgres"; sleep 2; done
 fly-trader init-db
 # models/ holds exactly this release's fly and selector: an earlier release's (the updater before signed releases never

@@ -3,6 +3,25 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## 2026-11-14, release 22: A self-updated trader starts again after a restart
+
+### Upgrading
+
+- **Nothing to do on a running Docker install:** its updater installs this release within the hour, as usual. The
+  models are release 19's (selector and fly of 2026-10-26).
+- **A trader that will not start with `exec /app/docker/entrypoint.sh: permission denied`:** run
+  `docker compose up -d --force-recreate fly` once. It installs this release, and from then on the container starts
+  again after a reboot or a Docker Desktop restart.
+
+### Docker
+
+- **A self-updated trader starts again after a restart.** An update downloads every file without its permissions, so
+  the container's start script lost its executable bit. A brand-new container ran, but the same container started
+  again (a Windows reboot, Docker Desktop restarting, `docker compose up -d` after a stop) failed with
+  `permission denied` and stayed down, with open positions unsold, until someone recreated it.
+  - Every install and every boot now gives the start script its executable bit back.
+  - A newly built image runs the start script through `sh`, so the bit no longer matters.
+
 ## 2026-11-07, release 21: The RH win rate counts trades only, and failed sweeps of a written-off token stop
 
 ### Upgrading

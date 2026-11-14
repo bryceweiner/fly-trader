@@ -148,3 +148,33 @@ def test_the_real_verifier_refuses_an_unsigned_release(tmp_path, monkeypatch):
     monkeypatch.setattr(au, "_FU", fu)
     with pytest.raises(au.Refused, match="does NOT verify"):
         au.fetch_verified("d" * 40)
+
+
+ROOT = Path(__file__).parents[1]
+
+
+def test_an_install_gives_the_start_script_its_executable_bit_back(tmp_path):
+    """A release's files arrive without their mode; bootstrap.sh (run from the new tree after every install and boot)
+    makes entrypoint.sh executable again before anything can stop it, so a restarted container can exec it."""
+    import os
+    import subprocess
+
+    import pytest
+    lines = (ROOT / "docker" / "bootstrap.sh").read_text().splitlines()
+    head = lines[:next(i for i, l in enumerate(lines) if l.startswith("until pg_isready"))]
+    assert "cd /app" in head
+    script = "\n".join(f"cd {tmp_path}" if l == "cd /app" else l for l in head) + "\n"
+    (tmp_path / "docker").mkdir()
+    for name in ("entrypoint.sh", "bootstrap.sh"):
+        (tmp_path / "docker" / name).write_text("#!/bin/sh\necho started\n"); (tmp_path / "docker" / name).chmod(0o644)
+    with pytest.raises(PermissionError):                                  # what Docker hit: exec of a downloaded script
+        subprocess.run([str(tmp_path / "docker" / "entrypoint.sh")])
+    subprocess.run(["sh", "-c", script], check=True)
+    assert os.access(tmp_path / "docker" / "entrypoint.sh", os.X_OK)
+    assert subprocess.run([str(tmp_path / "docker" / "entrypoint.sh")], capture_output=True, text=True).stdout == "started\n"
+
+
+def test_the_image_runs_the_start_script_through_sh():
+    """A newly built image does not need the executable bit at all."""
+    entry = [l for l in (ROOT / "Dockerfile").read_text().splitlines() if l.startswith("ENTRYPOINT")]
+    assert entry == ['ENTRYPOINT ["/bin/sh", "/app/docker/entrypoint.sh"]']

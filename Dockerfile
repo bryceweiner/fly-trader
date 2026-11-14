@@ -36,4 +36,5 @@ USER 10001:10000
 EXPOSE 8501
 # healthy = the database answers and the console's worker threads run
 HEALTHCHECK --interval=30s --timeout=20s --start-period=300s --retries=5 CMD fly-trader health || exit 1
-ENTRYPOINT ["/app/docker/entrypoint.sh"]
+# through sh: a self-update rewrites entrypoint.sh without its executable bit (fly_update downloads keep no file mode)
+ENTRYPOINT ["/bin/sh", "/app/docker/entrypoint.sh"]
