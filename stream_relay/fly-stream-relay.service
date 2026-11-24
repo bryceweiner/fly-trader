@@ -17,6 +17,9 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadOnlyPaths=/etc/fly-stream-relay
+# graduated coins' transfers (RELAY_TRANSFERS_DIR=/var/lib/fly-stream-relay/transfers): the one writable directory
+StateDirectory=fly-stream-relay
+StateDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target

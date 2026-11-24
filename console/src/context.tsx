@@ -13,6 +13,14 @@ export type Meta = {
   markets: Market[]
   kalshi_books: Record<string, string>
   version: string
+  versions?: Versions
+}
+
+/** What this console runs: its code (read when it started) and each chain's selector and fly (the `meta` topic). */
+export type ModelVersion = { id: number; sha: string | null; file: string | null }
+export type Versions = {
+  code: { label: string; commit: string | null; release: number | null; changed: boolean; source: string; detail: string }
+  models: { chain: 'sol' | 'rh'; selector: ModelVersion | null; fly: ModelVersion | null }[]
 }
 
 /** What the inspector opens: a memecoin token on a chain, or a Kalshi market ticker. */

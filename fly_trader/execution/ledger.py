@@ -69,9 +69,11 @@ def _chain_of(book: str) -> str:
 
 def open_position(conn, *, book: str, mint: str, pool: str | None, qty_raw: int, cost_sol: float,
                   entry_price: float, decision_id: int | None, fees_sol: float, ts: datetime | None = None,
-                  hold_s: float | None = None, strategy: str | None = None, deposit_sol: float = 0.0) -> int:
+                  hold_s: float | None = None, strategy: str | None = None, deposit_sol: float = 0.0,
+                  add_hold_s: float | None = None) -> int:
     """``deposit_sol``: what the buy put into the mint's token account (its rent, a first live buy), kept apart from
-    ``cost_sol``: the account's close returns it (``refund_deposits``)."""
+    ``cost_sol``: the account's close returns it (``refund_deposits``). ``add_hold_s``: a re-pick's add to the open
+    position (agent/paper_trading.plan_minute): its new hold, counted from the position's entry decision as before."""
     ts = ts or datetime.now(timezone.utc)
     existing = conn.execute("SELECT id, qty, cost_sol, entry_price FROM positions WHERE book=%s AND mint=%s AND status='open'",
                             (book, mint)).fetchone()
@@ -80,8 +82,8 @@ def open_position(conn, *, book: str, mint: str, pool: str | None, qty_raw: int,
         q1, c1 = q0 + qty_raw, c0 + cost_sol
         p1 = (float(existing["entry_price"] or entry_price) * q0 + entry_price * qty_raw) / max(q1, 1)
         conn.execute("UPDATE positions SET qty=%s, cost_sol=%s, entry_price=%s, fees_sol=fees_sol+%s, last_mark_price=%s, last_mark_ts=%s, "
-                     "deposit_sol = NULLIF(COALESCE(deposit_sol, 0) + %s, 0) WHERE id=%s",
-                     (q1, c1, p1, fees_sol, entry_price, ts, deposit_sol, existing["id"]))
+                     "deposit_sol = NULLIF(COALESCE(deposit_sol, 0) + %s, 0), hold_s = COALESCE(%s, hold_s) WHERE id=%s",
+                     (q1, c1, p1, fees_sol, entry_price, ts, deposit_sol, add_hold_s, existing["id"]))
         return int(existing["id"])
     row = conn.execute(
         """INSERT INTO positions (book, mint, pool, opened_at, entry_decision_id, qty, cost_sol, entry_price, peak_price,

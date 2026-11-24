@@ -21,8 +21,11 @@ The paper book ``paper_fly`` keeps running as the mirror. Only after the handove
   again this minute), never more than ``MAX_ENTRY_CHASE`` above its paper fill price, unless the kill switch, the
   circuit breaker (until ``CIRCUIT_COOLDOWN_S`` after its last failure) or paused entries block. A buy that failed
   without moving anything is sent again, re-sized, on the next minutes while its paper position is open, up to
-  ``ENTRY_RETRY_MIN`` after its decision. Every paper entry the wallet did not take is a decisions row of this book
-  (kind 'blocked', the reason as its rail, ``of_decision`` the paper entry);
+  ``ENTRY_RETRY_MIN`` after its decision. A paper re-pick add (``of_entry``, agent/paper_trading.plan_minute) buys into the
+  wallet's open position of that same entry decision, sized from the wallet with that position's cost against the caps,
+  never while an order of the token is queued or in flight, never retried; the position is then held its new hold. Every
+  paper entry the wallet did not take is a decisions row of this book (kind 'blocked', the reason as its rail,
+  ``of_decision`` the paper entry);
 - bookkeeping (``after``: once every chain's live orders are out): ``DEAD_BAG_S`` past the hold a position that could
   not be sold is written off (dead-bag: closed at 0, so it leaves wealth); the gap: over the last ``GAP_TRADES`` closed
   live trades, the mean return per trade trailing the paper mirror's same decisions by more than ``GAP_MAX`` pauses
@@ -110,8 +113,9 @@ class LiveMirror:
         if f is None or r.ok:
             return
         rail = "price ran" if (r.error or "").startswith("price ran") else "entry failed"
-        self._blocked(conn, ctx, run_id, beat_id, f["e"], rail, (r.error or "failed")[:300], r.request.size_sol, attempt=f["tries"], retry=bool(r.retryable))
-        if r.retryable:
+        add = f["e"].get("of_entry") is not None                 # a re-pick add is not tried again
+        self._blocked(conn, ctx, run_id, beat_id, f["e"], rail, (r.error or "failed")[:300], r.request.size_sol, attempt=f["tries"], retry=bool(r.retryable) and not add)
+        if r.retryable and not add:
             self.failed[did] = {**f, "error": r.error}
 
     def _retry_over(self, conn, ctx, did: int, f: dict) -> str | None:
@@ -125,7 +129,8 @@ class LiveMirror:
     def _buy(self, e: dict, size: float, retry: int = 0) -> bool:
         return self.worker.submit(ExecRequest(decision_id=e["decision_id"], mint=e["mint"], pool=e["info"]["pool"], side="buy", amount_in=int(size * config.LAMPORTS_PER_SOL),
                                               slippage_bps=config.SLIPPAGE_ENTRY_BPS, max_slippage_bps=config.MAX_SLIPPAGE_ENTRY_BPS, decimals=int(e["info"]["decimals"] or 6),
-                                              size_sol=size, hold_s=e.get("hold_s"), strategy=e.get("strategy"), ref_price=e.get("ref_price"), retry=retry))
+                                              size_sol=size, hold_s=e.get("hold_s"), strategy=e.get("strategy"), ref_price=e.get("ref_price"), retry=retry,
+                                              add=e.get("of_entry") is not None))
 
     def read_balance(self) -> int:
         """The wallet's SOL (lamports); started beside the minute's scoring by live_first.prefetch."""
@@ -249,7 +254,7 @@ class LiveMirror:
         held_mints = {p["mint"] for p in opens if p["mint"] not in selling} | (inflight - selling)
         c = rails.load_circuit(conn)
         blocked = "kill switch" if c.kill_switch else "circuit tripped" if rails.breaker_blocks(c) else "paused" if c.entries_paused else None
-        n_enter = n_retry = 0; skipped = []
+        n_enter = n_retry = n_add = 0; skipped = []
         if self.failed or entries:
             sol_free = live_first.take_balance(self, ctx.m1_epoch) / config.LAMPORTS_PER_SOL; self.wallet_sol = sol_free
             # sized on the whole book (not a dead-bag ``after`` writes off this minute), spent only from the wallet's SOL (cash)
@@ -273,6 +278,24 @@ class LiveMirror:
                     self.failed.pop(did); self.sent[did] = {**f, "e": e, "tries": f["tries"] + 1}
                     n_enter += 1; n_retry += 1; cash -= size; held_mints.add(e["mint"])
             for e in entries:
+                if e.get("of_entry") is not None:            # a paper re-pick add: into the wallet's position of the same entry decision
+                    p = next((q for q in opens if q["mint"] == e["mint"]), None)
+                    rail = blocked or ("add: no such position" if p is None or p.get("entry_decision_id") != e["of_entry"] else None) \
+                        or ("held" if e["mint"] in inflight else None)
+                    size, why = (0.0, "") if rail else sizing.size_position(e["score"], e.get("threshold", line), e.get("table") or table or [], bankroll, cash, e["info"]["resq"],
+                                                                            flat=config.FLY_SIZING == "flat", margin=e.get("size_margin"),
+                                                                            creator_heavy=bool(e["info"].get("creator_heavy")), stake_x=e.get("stake_x", 1.0),
+                                                                            held_cost=float(p["cost_sol"]))
+                    if rail or size <= 0:
+                        why = {"held": "an order of this token is queued or in flight", "add: no such position": "the wallet holds no position of this add's entry"}.get(rail, rail or why)
+                        skipped.append((e["mint"], rail or why)); self._blocked(conn, ctx, run_id, beat_id, e, rail or "sizing", why, size, add=True); continue
+                    if self._buy(e, size):
+                        n_add += 1; cash -= size; self.sent[e["decision_id"]] = {"e": e, "ts": m1, "tries": 1}
+                        conn.execute("UPDATE decisions SET book_targets = array_append(COALESCE(book_targets, '{}'), 'live'), detail = detail || %s::jsonb WHERE id = %s",
+                                     (json.dumps({"live_stake_x": e["stake_x"]} if "stake_x" in e else {}), e["decision_id"]))
+                    else:
+                        skipped.append((e["mint"], "held")); self._blocked(conn, ctx, run_id, beat_id, e, "held", "an order of this token is queued or in flight", size, add=True)
+                    continue
                 if e["mint"] in held_mints:
                     skipped.append((e["mint"], "held")); self._blocked(conn, ctx, run_id, beat_id, e, "held", "the wallet holds this token or has an order of it queued"); continue
                 size, why = sizing.size_position(e["score"], e.get("threshold", line), e.get("table") or table or [], bankroll, cash, e["info"]["resq"],
@@ -287,7 +310,7 @@ class LiveMirror:
                 else:
                     skipped.append((e["mint"], "held")); self._blocked(conn, ctx, run_id, beat_id, e, "held", "an order of this token is queued or in flight", size)
         self.due_mark = self.mark_ctx = (ctx, beat_id)
-        return {"stage": "trading live", "wallet_sol": self.wallet_sol, "entered": n_enter, "retried": n_retry, "exited": ex["exited"], "liquidated": ex["liquidated"],
+        return {"stage": "trading live", "wallet_sol": self.wallet_sol, "entered": n_enter, "retried": n_retry, "added": n_add, "exited": ex["exited"], "liquidated": ex["liquidated"],
                 "in_flight": len(inflight), "blocked": blocked, "skipped": skipped[:10], "failed_orders": sum(1 for r in drained if not r.ok),
                 "awaiting_retry": len(self.failed)}
 
@@ -431,10 +454,13 @@ class LiveMirror:
 
     def gap(self, conn) -> dict:
         """Live vs its paper mirror on the same decisions; pauses entries when live trails by more than ``GAP_MAX`` per trade.
-        An operator's Sell Now (forced 'operator') is the operator's choice, not an execution gap: left out."""
+        An operator's Sell Now (forced 'operator') is the operator's choice, not an execution gap: left out; so is a trade paper
+        added to on a re-pick (agent/paper_trading.plan_minute): the wallet's add may have been sized out or skipped, and the
+        two are then no longer the same trade."""
         rows = conn.execute(f"""SELECT l.realized_sol / NULLIF(l.cost_sol, 0) AS rl, p.realized_sol / NULLIF(p.cost_sol, 0) AS rp
                                FROM positions l JOIN positions p ON p.entry_decision_id = l.entry_decision_id AND p.book = '{MIRROR}' AND p.status = 'closed'
                                WHERE l.book = '{BOOK}' AND l.status = 'closed' AND l.entry_decision_id IS NOT NULL AND COALESCE(l.forced_exit_kind, '') <> 'operator'
+                                 AND NOT EXISTS (SELECT 1 FROM decisions a WHERE a.kind = 'fly_add' AND (a.detail->>'of_entry')::bigint = l.entry_decision_id)
                                ORDER BY l.closed_at DESC LIMIT %s""", (GAP_TRADES,)).fetchall()
         rl = np.array([r["rl"] for r in rows if r["rl"] is not None and r["rp"] is not None], dtype=np.float64)
         rp = np.array([r["rp"] for r in rows if r["rl"] is not None and r["rp"] is not None], dtype=np.float64)

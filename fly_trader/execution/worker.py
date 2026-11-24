@@ -49,6 +49,7 @@ class ExecRequest:
     strategy: str | None = None
     ref_price: float | None = None   # buy: its decision's paper fill price (SOL per token): a quote above it by more than MAX_ENTRY_CHASE is refused
     retry: int = 0                # a buy sent again after a failure (agent/fly_live.py): its failure was counted on the circuit the first time
+    add: bool = False             # buy: a re-pick's add into the open position of its token, ``hold_s`` that position's new hold
     enqueued_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -211,8 +212,11 @@ class ExecutionWorker:
     def _execute(self, req: ExecRequest) -> ExecResult:
         try:
             with transaction() as conn:
-                if req.side == "buy" and conn.execute("SELECT 1 FROM positions WHERE book = 'live' AND mint = %s AND status = 'open'", (req.mint,)).fetchone():
+                held = req.side == "buy" and conn.execute("SELECT 1 FROM positions WHERE book = 'live' AND mint = %s AND status = 'open'", (req.mint,)).fetchone()
+                if held and not req.add:
                     return ExecResult(req, False, error="held: the live book still holds this token (the sale before this buy did not close it)", retryable=True)
+                if req.add and not held:          # sold since the add was decided: nothing to add to
+                    return ExecResult(req, False, error="held: the position this add was for is closed", retryable=False)
                 fr = self.broker.swap(conn, decision_id=req.decision_id, book="live", side=req.side, mint=req.mint,
                                       amount_in=req.amount_in, slippage_bps=req.slippage_bps,
                                       max_slippage_bps=req.max_slippage_bps, step_bps=config.SLIPPAGE_STEP_BPS,
@@ -231,8 +235,9 @@ class ExecutionWorker:
                     price = fr.price_sol or (cost / max(fr.token_delta / (10 ** req.decimals), 1e-12))
                     pid = ledger.open_position(conn, book="live", mint=req.mint, pool=req.pool, qty_raw=fr.token_delta,
                                                cost_sol=cost, entry_price=price, decision_id=req.decision_id,
-                                               fees_sol=0.0, ts=ts, hold_s=req.hold_s, strategy=req.strategy,
-                                               deposit_sol=max(fr.deposit_lamports, 0) / config.LAMPORTS_PER_SOL)
+                                               fees_sol=0.0, ts=ts, hold_s=None if req.add else req.hold_s, strategy=req.strategy,
+                                               deposit_sol=max(fr.deposit_lamports, 0) / config.LAMPORTS_PER_SOL,
+                                               add_hold_s=req.hold_s if req.add else None)
                     rails.record_notional(conn, cost, "entry")
                     return ExecResult(req, True, fr.fill_id, fr.signature, fr.token_delta, fr.lamports_delta, price, position_id=pid)
                 else:

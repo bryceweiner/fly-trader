@@ -211,3 +211,44 @@ def test_the_relay_takes_pumpapis_stream_and_forwards_only_what_is_kept(monkeypa
     kept = [orjson.loads(r.ring[s % r.size]) for s in range(1, r.next_seq)]
     assert {(e["pool"], e["action"]) for e in kept} == {("pump", "create"), ("pump", "buy"), ("pump-amm", "buy"), ("pump-amm", "sell"), ("pump-amm", "createPool"), ("pump-amm", "migrate")}
     assert all(set(e) <= relay.FIELDS for e in kept) and r.wm == M + 30
+
+
+def test_the_tap_keeps_graduated_coins_transfers_on_disk_and_forwards_none(tmp_path):
+    """Transfers of a mint the relay has seen trade on PumpSwap go to that day's file, whole; a curve coin's, or any coin's
+    before it graduated, do not; the forwarded ring is the same with the tap as without it."""
+    import gzip, json as _json
+    tap = relay.TransferTap(str(tmp_path), start=False)
+    with_tap, without = relay.Relay(size=16, tap=tap), relay.Relay(size=16)
+    swap = {"action": "buy", "pool": "pump-amm", "mint": "Gpump", "quoteMint": WSOL, "timestamp": M * 1000, "price": 1.0, "quoteInPool": 50.0}
+    early = {"action": "transfer", "pool": None, "mint": "Gpump", "timestamp": (M - 5) * 1000, "from": "a", "to": "b", "amount": 1}
+    later = {"action": "transfer", "pool": None, "mint": "Gpump", "timestamp": (M + 5) * 1000, "from": "c", "to": "d", "amount": 2, "extra": {"x": 1}}
+    curve = {"action": "transfer", "pool": None, "mint": "Cpump", "timestamp": (M + 6) * 1000, "from": "e", "to": "f", "amount": 3}
+    for e in (early, swap, later, curve):
+        with_tap.add(dict(e)); without.add(dict(e))
+    while not tap.q.empty():
+        tap.write(tap.q.get_nowait())
+    tap.close()
+    day = time.strftime("%Y-%m-%d", time.gmtime(M + 5))
+    with gzip.open(tmp_path / f"transfers-{day}.jsonl.gz") as f:
+        rows = [_json.loads(l) for l in f]
+    assert rows == [later]                                                            # whole, the graduate's, after it graduated
+    assert with_tap.next_seq == without.next_seq == 2 and with_tap.ring[1] == without.ring[1]
+    assert tap.stats["tap_seen"] == 1 and tap.stats["tap_written"] == 1 and "tap_graduates" in with_tap.health()
+
+
+def test_the_tap_stops_at_its_daily_cap_and_counts_what_it_drops(tmp_path):
+    tap = relay.TransferTap(str(tmp_path), max_mb=0.0002, start=False)                  # 200 bytes a day
+    tap.note("Gpump")
+    for k in range(10):
+        tap.write({"action": "transfer", "mint": "Gpump", "timestamp": M * 1000, "from": "a" * 20, "to": "b" * 20, "amount": k})
+    tap.close()
+    assert tap.stats["tap_written"] >= 1 and tap.stats["tap_dropped"] >= 1 and tap.stats["tap_written"] + tap.stats["tap_dropped"] == 10
+    assert tap.stats["tap_bytes_today"] <= 200
+
+
+def test_the_tap_deletes_day_files_past_its_keep(tmp_path):
+    for d in ("2026-11-01", "2026-11-10", "2026-11-17"):
+        (tmp_path / f"transfers-{d}.jsonl.gz").write_bytes(b"")
+    (tmp_path / "other.txt").write_bytes(b"")
+    relay.TransferTap(str(tmp_path), start=False, keep_days=14).prune("2026-11-18")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["other.txt", "transfers-2026-11-10.jsonl.gz", "transfers-2026-11-17.jsonl.gz"]

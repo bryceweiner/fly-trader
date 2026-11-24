@@ -12,6 +12,13 @@ only what fly-trader's aggregator (fly_trader/ingest/pumpstream.py) reads:
 - the fields: only those the aggregator reads (``FIELDS``, ``LEG_FIELDS``; tests/test_stream_relay.py checks them
   against pumpstream.py), unchanged.
 
+Transfers of graduated coins (``TransferTap``, Bryce 2026-11-18: split wallets gathering supply before a dump, as in
+7rTNgVdQ, Saturween and 519AMD, are invisible to the swaps): with ``RELAY_TRANSFERS_DIR`` set, every ``transfer`` event of
+a mint this relay has seen graduate or trade on PumpSwap is written whole, on its own thread, to a gzipped JSON-lines file
+per UTC day there (``transfers-YYYY-MM-DD.jsonl.gz``), within ``RELAY_TRANSFERS_MAX_MB`` a day and never below
+``RELAY_TRANSFERS_MIN_FREE_GB`` of free disk; files older than ``RELAY_TRANSFERS_KEEP_DAYS`` are deleted (the Mac pulls
+them first: stream_relay/pull_transfers.sh). None of it is forwarded: the clients' stream is unchanged.
+
 Each event gets a sequence number and stays in a memory ring (``RELAY_BUFFER`` events): a client that reconnects
 resumes where it left off, losing nothing within the ring (else it is told the gap). Batches go out every
 ``RELAY_BATCH_S`` and a heartbeat every second, each with the relay's watermark (its newest PumpSwap trade time up to
@@ -21,11 +28,15 @@ that batch) and whether PumpAPI is connected. Clients connect over TLS (``RELAY_
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hmac
 import json
 import logging
 import os
+import queue
+import shutil
 import ssl
+import threading
 import time
 from http import HTTPStatus
 
@@ -55,7 +66,102 @@ FIELDS = frozenset({"action", "pool", "mint", "timestamp", "signature", "block",
                     "quoteAmount", "tokenAmount", "poolFeeRate", "poolCreatedBy", "breakdown", "supply", "initialBuy", "mayhemMode", "name",
                     "symbol", "uri"})
 LEG_FIELDS = frozenset({"action", "trader", "quoteAmount", "tokenAmount"})
+TRANSFERS_DIR = os.environ.get("RELAY_TRANSFERS_DIR", "")                 # unset: no transfer is kept
+TRANSFERS_MAX_MB = float(os.environ.get("RELAY_TRANSFERS_MAX_MB", "1024"))     # written a UTC day, at most
+TRANSFERS_MIN_FREE_GB = float(os.environ.get("RELAY_TRANSFERS_MIN_FREE_GB", "3"))
+TRANSFERS_KEEP_DAYS = int(os.environ.get("RELAY_TRANSFERS_KEEP_DAYS", "14"))   # older day files are deleted (the Mac pulls them first)
+TAP_QUEUE, TAP_MINTS = 200_000, 300_000                                    # events waiting for the writer; graduates remembered
 log = logging.getLogger("stream_relay")
+
+
+class TransferTap:
+    """Transfers of graduated coins, written whole to a gzipped JSON-lines file per UTC day, never forwarded. ``note`` (from
+    ``Relay.add``, every kept PumpSwap event or migration) remembers a mint as graduated; ``offer`` queues a transfer of
+    one; the writer thread drains the queue, so the event loop only does a dict lookup and a put. A full queue, the day's
+    size cap or low disk drops events and counts them (``stats``)."""
+
+    def __init__(self, folder: str, max_mb: float = TRANSFERS_MAX_MB, min_free_gb: float = TRANSFERS_MIN_FREE_GB, start: bool = True,
+                 keep_days: int = TRANSFERS_KEEP_DAYS):
+        self.folder = folder; self.max_bytes = int(max_mb * 1e6); self.min_free = int(min_free_gb * 1e9); self.keep_days = keep_days
+        os.makedirs(folder, exist_ok=True)
+        self.mints: dict[str, None] = {}; self.q: queue.Queue = queue.Queue(maxsize=TAP_QUEUE)
+        self.stats = {"tap_seen": 0, "tap_written": 0, "tap_dropped": 0, "tap_bytes_today": 0}
+        self._day = None; self._f = None; self._stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="transfer-tap", daemon=True)
+        if start:
+            self.thread.start()
+
+    def note(self, mint) -> None:
+        if isinstance(mint, str) and mint and mint not in self.mints:
+            self.mints[mint] = None
+            if len(self.mints) > TAP_MINTS:                       # forget the oldest graduate
+                self.mints.pop(next(iter(self.mints)))
+
+    def offer(self, e: dict) -> None:
+        if e.get("action") != "transfer" or e.get("mint") not in self.mints:
+            return
+        self.stats["tap_seen"] += 1
+        try:
+            self.q.put_nowait(e)
+        except queue.Full:
+            self.stats["tap_dropped"] += 1
+
+    def _file(self, day: str):
+        if day != self._day:
+            if self._f is not None:
+                self._f.close()
+            path = os.path.join(self.folder, f"transfers-{day}.jsonl.gz")
+            self._day = day; self.stats["tap_bytes_today"] = os.path.getsize(path) if os.path.exists(path) else 0
+            self._f = gzip.open(path, "ab")
+            self.prune(day)
+        return self._f
+
+    def prune(self, today: str) -> None:
+        """Day files older than ``keep_days`` before ``today`` are deleted."""
+        cut = time.strftime("%Y-%m-%d", time.gmtime(time.mktime(time.strptime(today, "%Y-%m-%d")) - self.keep_days * 86400))
+        for name in os.listdir(self.folder):
+            if name.startswith("transfers-") and name.endswith(".jsonl.gz") and name[len("transfers-"):-len(".jsonl.gz")] < cut:
+                try:
+                    os.remove(os.path.join(self.folder, name))
+                except OSError:
+                    pass
+
+    def write(self, e: dict) -> None:
+        """One event to its day's file (the writer thread; tests call it directly)."""
+        ts = e.get("timestamp"); t = ts / 1000.0 if isinstance(ts, (int, float)) else time.time()
+        day = time.strftime("%Y-%m-%d", time.gmtime(t)); line = dumps(e) + b"\n"
+        if self.stats["tap_bytes_today"] + len(line) > self.max_bytes or shutil.disk_usage(self.folder).free < self.min_free:
+            self.stats["tap_dropped"] += 1; return
+        f = self._file(day)
+        f.write(line); self.stats["tap_bytes_today"] += len(line); self.stats["tap_written"] += 1
+
+    def _run(self) -> None:
+        last_flush = time.time()
+        while not self._stop.is_set():
+            try:
+                self.write(self.q.get(timeout=1.0))
+            except queue.Empty:
+                pass
+            except Exception as ex:                               # a bad event or a disk error never stops the relay
+                self.stats["tap_dropped"] += 1; log.warning("transfer tap: %s", str(ex)[:200])
+            if self._f is not None and time.time() - last_flush > 5.0:
+                try:
+                    self._f.flush()
+                except Exception:
+                    pass
+                last_flush = time.time()
+
+    def close(self) -> None:
+        self._stop.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=5)
+        while True:                                               # what is still queued
+            try:
+                self.write(self.q.get_nowait())
+            except queue.Empty:
+                break
+        if self._f is not None:
+            self._f.close(); self._f = None
 
 
 def keep(e: dict) -> bool:
@@ -80,10 +186,11 @@ def trim(e: dict) -> dict:
 class Relay:
     """The ring of forwarded events (seq -> serialized event, and the watermark as of it) and PumpAPI's state."""
 
-    def __init__(self, size: int = BUFFER):
+    def __init__(self, size: int = BUFFER, tap: TransferTap | None = None):
         self.size = size; self.ring: list = [None] * size; self.ring_wm: list = [0.0] * size
         self.next_seq = 1; self.wm = 0.0; self.connected = False; self.last_upstream = 0.0
         self.stats = {"upstream_events": 0, "forwarded": 0, "reconnects": 0, "clients": 0, "bytes_sent": 0, "started": time.time()}
+        self.tap = tap
 
     def oldest(self) -> int:
         return max(1, self.next_seq - self.size)
@@ -94,8 +201,14 @@ class Relay:
     def add(self, e: dict) -> None:
         """An upstream event: forwarded when the aggregator uses it."""
         self.stats["upstream_events"] += 1; self.last_upstream = time.time()
-        if not isinstance(e, dict) or not keep(e):
+        if not isinstance(e, dict):
             return
+        if self.tap is not None and e.get("action") == "transfer":
+            self.tap.offer(e)                                     # kept on disk, never forwarded
+        if not keep(e):
+            return
+        if self.tap is not None and e.get("pool") == "pump-amm":
+            self.tap.note(e.get("mint"))                          # a graduate: its transfers are kept
         if e.get("pool") == "pump-amm" and e.get("action") in ("buy", "sell") and isinstance(e.get("timestamp"), (int, float)):
             self.wm = max(self.wm, e["timestamp"] / 1000.0)
         slot = self.next_seq % self.size
@@ -160,7 +273,8 @@ class Relay:
 
     def health(self) -> dict:
         return {"ok": self.up(), "upstream_connected": self.connected, "watermark_lag_s": round(time.time() - self.wm, 1) if self.wm else None,
-                "next_seq": self.next_seq, "oldest": self.oldest(), **{k: (round(v) if k == "started" else v) for k, v in self.stats.items()}}
+                "next_seq": self.next_seq, "oldest": self.oldest(), **{k: (round(v) if k == "started" else v) for k, v in self.stats.items()},
+                **({**self.tap.stats, "tap_graduates": len(self.tap.mints), "tap_queue": self.tap.q.qsize()} if self.tap is not None else {})}
 
 
 def authorized(header: str | None) -> bool:
@@ -168,7 +282,7 @@ def authorized(header: str | None) -> bool:
 
 
 async def main(stop: asyncio.Event | None = None, relay: Relay | None = None, port: int | None = None, upstream: bool = True) -> None:
-    relay = relay or Relay(); stop = stop or asyncio.Event()
+    relay = relay or Relay(tap=TransferTap(TRANSFERS_DIR) if TRANSFERS_DIR else None); stop = stop or asyncio.Event()
     if not TOKEN:
         raise SystemExit("RELAY_TOKEN is not set")
     if not (TLS_CERT and TLS_KEY) and not ALLOW_PLAIN:
@@ -198,6 +312,8 @@ async def main(stop: asyncio.Event | None = None, relay: Relay | None = None, po
             stop.set()
             for j in jobs:
                 j.cancel()
+            if relay.tap is not None:
+                relay.tap.close()
 
 
 if __name__ == "__main__":

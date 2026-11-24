@@ -141,13 +141,20 @@ def latest_snapshot(kind: str = "selector", deployable: bool = False) -> dict | 
     return None
 
 
-def loaded_model() -> dict | None:
-    """The snapshot the running selector session loaded (its runs row), with its backtest."""
-    r = q1("SELECT brain_snapshot_id, config, started_at FROM runs WHERE kind = 'selector' AND status = 'running' ORDER BY started_at DESC LIMIT 1")
-    if not r or not r["brain_snapshot_id"]:
+def loaded_model(market: markets.MarketSpec | None = None) -> dict | None:
+    """The selector at work on a market (default Solana), with its backtest and its newest session's settings: the fly's
+    gate (fly_status*: ``gate``, the selector every buy of the fly needs), else the selector book's own report. Not the
+    newest runs row marked running: a session that died unclosed leaves one, and after a handover the selector book has no
+    session, so on 2026-11-12 that row (10-17) named #154 while the fly bought on #791."""
+    m = market or markets.SOL
+    fly, _ = setting(m.fly_status_key); sel, _ = setting(m.selector_status_key)
+    sid = fly.get("gate") or sel.get("snapshot")
+    s = snapshot(int(sid)) if sid is not None else None
+    if not s:
         return None
-    s = snapshot(int(r["brain_snapshot_id"]))
-    return {**s, "run": jv(r["config"]), "since": r["started_at"]} if s else None
+    r = q1("""SELECT config, started_at FROM runs WHERE kind = 'selector' AND brain_snapshot_id = %s AND coalesce(config->>'chain', 'sol') = %s
+              ORDER BY started_at DESC LIMIT 1""", (int(sid), m.chain))
+    return {**s, "run": jv(r["config"]) if r else {}, "since": r["started_at"] if r else None}
 
 
 def outdated_line(meta: dict) -> str:
@@ -269,9 +276,12 @@ def system_state(market: markets.MarketSpec | None = None) -> dict:
         signing = signing_allowed()
     seat = bool(ho) or config.LIVE_WITHOUT_HANDOVER           # the fly holds the seat, or live money trades whoever holds it
     live_money = seat and runner and fly.get("stage") == "trading" and signing      # and may sign (agent/fly_live.py, rh/live.py)
-    return {"market": m, "workers": ws, "runner": runner, "trading": trading, "trading_why": why, "live_money": live_money,
+    # the book whose money the pages show: the wallet's while live money trades, else the paper book that holds the seat --
+    # the fly's after its handover (the selector book stops then: a paper-only install's pages froze at its 2026-11-04 handover)
+    money_book = m.live_book if live_money else (m.fly_book if ho else m.selector_book)
+    return {"market": m, "workers": ws, "runner": runner, "trading": trading, "trading_why": why, "live_money": live_money, "money_book": money_book,
             "fly": fly, "fly_at": fly_at, "handover": ho or None, "replay": rp or None,
-            "model": loaded_model() if runner else None, "latest": latest_snapshot("selector"), "deployable": latest_snapshot("selector", deployable=True),
+            "model": loaded_model(m) if runner else None, "latest": latest_snapshot("selector"), "deployable": latest_snapshot("selector", deployable=True),
             "training": training, "train_status": tr, "train_at": tr_at,
             "train_external": training and not ws["train"]["alive"], "selector": sel, "selector_at": sel_at, "feed": ps, "feed_ok": feed_ok, "feed_age": feed_age,
             "circuit": circuit}
@@ -345,8 +355,9 @@ def memecoin_widgets() -> list[dict]:
     text, color = TRADING_STATE[s["trading"]]
     out.append(widget("engine", "Trading engine", text, color, "candlestick", TRADING_SUB.get(s["trading"], "every minute" if s["trading"] == "trading" else None), s["trading_why"]))
     m, latest, dep = s["model"], s["latest"], s["deployable"]
+    from ..agent.selector_session import pinned_snapshot
     sub = None; color = "violet" if m else "gray"
-    if m and dep and dep["id"] > m["id"]:
+    if m and dep and dep["id"] > m["id"] and pinned_snapshot() is None:          # a pinned model stays at work
         sub = f"switching to #{dep['id']}"
     elif latest and not is_deployable(latest["meta"]) and (not m or latest["id"] > m["id"]):
         sub = f"#{latest['id']} not put to work"; color = "orange" if not m else color

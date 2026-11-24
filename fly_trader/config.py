@@ -74,6 +74,10 @@ MAX_POSITION_SOL = env_float("MAX_POSITION_SOL", 0.0)
 GAS_RESERVE_SOL = env_float("GAS_RESERVE_SOL", 0.30)
 # position sizing (agent/sizing.py): a fraction of the growth-optimal (Kelly) bet measured per score band in the backtest
 KELLY_FRACTION = env_float("KELLY_FRACTION", 0.25)                 # quarter Kelly: the band estimates are noisy
+# Robinhood Chain's own fraction (agent/sizing.py; its paper books and the live_rh wallet), KELLY_FRACTION unless set. On
+# 2026-11-18 (data/scratch/bear_20261118) RH earned about 4x Solana's return on capital and its real fills cost ~2.7 %
+# a side almost regardless of size at today's 0.05-0.3 % pool shares: twice the stake added ~0.1-0.3 pts a trade.
+RH_KELLY_FRACTION = env_float("RH_KELLY_FRACTION", KELLY_FRACTION)
 MAX_POSITION_FRACTION = env_float("MAX_POSITION_FRACTION", 0.10)   # of the deployable bankroll (wealth minus the gas reserve)
 MAX_POOL_SHARE = env_float("MAX_POOL_SHARE", 0.02)                 # of the pool's quote reserve (bounds price impact)
 CREATOR_HEAVY_CAP_FRACTION = env_float("CREATOR_HEAVY_CAP_FRACTION", 0.02)   # of the bankroll, most a buy of a creator-heavy coin stakes, 0.1 SOL of 5 (train/selector.CREATOR_HEAVY_SHARE): they rug often
@@ -104,6 +108,19 @@ ENTRY_MAX_LAG_S = env_float("ENTRY_MAX_LAG_S", 90.0)              # no entries (
 TAKE_PROFIT_X = env_float("TAKE_PROFIT_X", 2.0)                    # 0: no take-profit on new buys
 TAKE_PROFIT_DIP = env_float("TAKE_PROFIT_DIP", 0.5)
 TAKE_PROFIT_CHAINS = env_list("TAKE_PROFIT_CHAINS", ["sol", "rh"])
+# Re-pick add (agent/paper_trading.plan_minute): a held position whose coin the book picks again at least REPICK_ADD_MIN_S
+# after its entry, at or below (1 - REPICK_ADD_DIP) x its entry price, is bought once more (one add per position, the
+# pick's own sizing, the position's total under the bankroll and label-size caps) and then held REPICK_ADD's hold from the
+# add -- paper and live alike, on the chains in REPICK_ADD_CHAINS. On the real logged re-picks of 10-17..11-18 and of the
+# archived 09-20..10-16 books (data/scratch/bear_20261118 s2_repick, v1_repick): +5..+10 %/trade on Solana in every book,
+# +10..+12 % on RH; a dip without the model's re-pick did less on Solana in 4 of 5 books.
+REPICK_ADD_DIP = env_float("REPICK_ADD_DIP", 0.10)                 # 0: no adds
+REPICK_ADD_MIN_S = env_float("REPICK_ADD_MIN_S", 300.0)
+REPICK_ADD_CHAINS = env_list("REPICK_ADD_CHAINS", ["sol", "rh"])
+# A coin a book sold in a crash exit (agent/crash_exit.py) is not bought again by it for this many minutes. Since the crash
+# exit went live (2026-11-07) the wallet's rebuys within 60 minutes of one lost -0.586 SOL on 29 buys, 4 winners, the same
+# in every Solana book (data/scratch/bear_20261118 v2_crash). 0: rebuys at once, as before.
+CRASH_REBUY_COOLDOWN_MIN = env_float("CRASH_REBUY_COOLDOWN_MIN", 60.0)
 EXECUTABILITY_MAX_IMPACT = env_float("EXECUTABILITY_MAX_IMPACT", 0.30)
 SLIPPAGE_ENTRY_BPS = env_int("SLIPPAGE_ENTRY_BPS", 150)
 SLIPPAGE_EXIT_BPS = env_int("SLIPPAGE_EXIT_BPS", 300)

@@ -17,7 +17,9 @@ variant: not used there.
   bookkeeping, as forced 'crash' exits, at the first price the stream saw ``FILL_DELAY_S`` or more after the crash
   (about when the wallet's sale lands; the crash's own price until one comes): a paper fill at the crash's very price
   would beat the wallet's on every crash and read as an execution gap (agent/fly_live.LiveMirror.gap).
-- A crashed coin may be bought again whenever it passes the bar again.
+- A crashed coin is not bought again by a book that sold it in a crash for ``config.CRASH_REBUY_COOLDOWN_MIN`` (60 min;
+  agent/paper_trading.cooling, rail 'crashed'), then whenever it passes the bar again: from 11-07 to 11-18 the
+  wallet's rebuys within an hour of a crash sale lost 25 of 29 times, -0.586 SOL (data/scratch/bear_20261118).
 - The held coins are re-read every ``REFRESH_S`` (a new position is watched within seconds of its entry).
 """
 from __future__ import annotations

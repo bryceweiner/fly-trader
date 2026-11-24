@@ -3,6 +3,90 @@
 Releases are identified by date. The Docker distribution (branch `distribution`, Hugging Face `bryceweiner/fly-trader`)
 ships signed releases built from this development line.
 
+## 2026-11-18, release 23: A held coin the model picks again under its entry is bought once more, and a crash-sold coin waits an hour
+
+### Upgrading
+
+- **Nothing to do on a Docker install:** its updater installs this release within the hour, as usual. The models are
+  release 19's (selector and fly of 2026-10-26).
+- **On by default:** the re-pick add and the crash cooldown. `REPICK_ADD_DIP=0` and `CRASH_REBUY_COOLDOWN_MIN=0` turn
+  them off; Robinhood Chain sizes as before unless `RH_KELLY_FRACTION` is set.
+
+### Both chains
+
+- **A held coin the model picks again 10 % or more under its entry is bought once more.** The selector re-picks coins it
+  already holds every minute, and those picks were simply skipped. On the real logged re-picks a buy there made money:
+  10-17..11-18, +8.6 % a trade on Solana (paper_fly, 99 adds) and +11.5 % on RH; the archived books of 09-20..10-16, +5
+  to +7 % on Solana and about +30 % on RH; every book of both periods positive. A plain dip
+  without the re-pick did less on Solana in 4 of 5 books, so the model's pick matters.
+  - **One add per position,** at the first re-pick 5 or more minutes after the entry at or under 90 % of the entry price
+    (`REPICK_ADD_DIP`, `REPICK_ADD_MIN_S`, `REPICK_ADD_CHAINS`; `REPICK_ADD_DIP=0` turns it off).
+  - **It joins the position:** the add's tokens and cost go into the open position, its entry price is the average, and
+    the position is then held its hold from the add (it was held 240 minutes from the add in the study). Sized as the
+    pick is, with the position's cost counted against the bankroll cap, the label size and the creator-heavy cap, so a
+    position never grows past them.
+  - **The wallet adds only to its own position of the same entry,** never while an order of the token is queued or in
+    flight, never to a plain v4 coin while `RH_V4_WALLET` is off, and never tries a failed add again. A decision of kind
+    `fly_add` (`fly_rh_add` on RH); the ticker shows it as a buy, "added".
+  - **The live-vs-paper gap check leaves out a trade paper added to:** the wallet's add may have been sized out or
+    skipped, and the two are then no longer the same trade.
+
+### Solana
+
+- **A coin sold in a crash exit is not bought again for an hour.** Since the crash exit went live on 2026-11-07 the
+  wallet bought crashed coins back within the hour 29 times: 25 lost, −0.586 SOL by its own fills, and every Solana book
+  shows the same. The crash sale alone was about even. `CRASH_REBUY_COOLDOWN_MIN` (60; 0 buys back at once, as before);
+  the skipped pick's rail is `crashed`. A book counts its own crash sales; the fly's book, which the wallet mirrors, also
+  the wallet's. Read in the same query as the take-profit cooldown, so the minute's live entries wait on nothing new.
+
+### Robinhood Chain
+
+- **Robinhood Chain can size at its own Kelly fraction.** `RH_KELLY_FRACTION` sizes Robinhood Chain's buys (its paper
+  books and the wallet); unset, it is `KELLY_FRACTION`, so an install sizes exactly as before until it is set. Over
+  2026-10-17..11-18 the RH wallet here grew 19 % to Solana's 4.6 %, and its real fills cost about 2.7 % a side whatever
+  the size at today's stakes (0.05..0.3 % of a pool): twice the stake added about 0.1..0.3 points a trade. The Safety
+  page shows both fractions when they differ.
+
+### Fly
+
+- **The selector's would-be trades keep their features after they resolve.** The fly scores every eligible coin each
+  minute and dropped each row's feature vector once its outcome was known, so no live pick could ever train or test a
+  bad-coin veto (0 of 5,739 resolved picks kept it, 2026-11-18). A row the selector would trade keeps its features and
+  outcome for a year (about 240 a day, about 26 MB a year); every other row loses them as before and goes after 35 days.
+
+### Platform
+
+- **The stream relay can keep graduated coins' token transfers.** Split wallets gathering supply before a dump (7rTNgVdQ,
+  Saturween, 519AMD) never show in the swaps, and the relay dropped every transfer. With `RELAY_TRANSFERS_DIR` set it
+  writes each transfer of a coin it has seen trade on PumpSwap, whole, to a gzipped file per UTC day, on its own thread,
+  within a daily size cap and a free-disk floor, and deletes files after 14 days. Nothing more is forwarded: the clients'
+  stream is unchanged. `stream_relay/pull_transfers.sh` copies the files to `data/corpus/transfers/`. Off until the
+  setting is made on the relay server.
+
+### Console
+
+- **The model at work is the selector the fly buys on: #791, not "#154, switching to #791".** The Selector tile, the
+  Overview's description, its open positions' hold and the Model page took the newest selector session marked running.
+  After the handover the selector book has no session, and three that died unclosed were still marked running, the
+  newest from 10-17 on #154 with a 120-minute hold. They now read the fly's gate, else the selector book's own report.
+  The tile no longer says "switching to" while a model is pinned.
+- **Without live money, the Overview and the Trades page show the paper book that trades: the fly's after its
+  handover.** They showed the selector book, which stops at the handover, so a paper-only install's pages stayed at 5.42 SOL
+  with no trade since 2026-11-04 while its fly traded every day (5.30 SOL by 11-11). The money's numbers, the open
+  positions, the wealth chart and the Trades page's default book now follow the seat. A machine with live money shows
+  the wallet as before, and one with no handover the selector's book.
+- **The Overview's setups chart counts the book that trades: the fly's after its handover.** It counted the selector
+  book alone, which stops at the handover, so a paper-only install's chart showed no setups from 2026-11-04 while its fly traded
+  every day (19 paper trades by 11-08). The selector's picks count until the handover and the fly's from then on, and
+  the chart says which. A machine with no handover, like the Mac, shows the selector's as before.
+- **The code, selector and fly in use show along the top of every page,** so two installs can be compared at a glance.
+  - **Code:** the git commit the console started from, marked when tracked files had uncommitted changes. A Docker install
+    shows its release number and commit, and a deploy can set its own label with `FLY_CODE_VERSION`.
+  - **Models:** each chain's fly and the selector its buys need (the one it follows, which the selector book also trades;
+    after a handover the selector book stops and only the fly's gate is current), by the first 8 characters of their
+    file's sha256. The same model shows the same hash on every machine. Hovering shows the model's number in this install and its file name. The two chains show as
+    one pair while they run the same models.
+
 ## 2026-11-14, release 22: A self-updated trader starts again after a restart
 
 ### Upgrading

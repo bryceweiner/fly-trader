@@ -115,8 +115,9 @@ class RhLiveMirror:
         if f is None or r.ok:
             return
         rail = "price ran" if (r.error or "").startswith("price ran") else "entry failed"
-        self._blocked(conn, ctx, run_id, beat_id, f["e"], rail, (r.error or "failed")[:300], r.request.amount_in / A.WEI, attempt=f["tries"], retry=bool(r.retryable))
-        if r.retryable:
+        add = f["e"].get("of_entry") is not None                 # a re-pick add is not tried again
+        self._blocked(conn, ctx, run_id, beat_id, f["e"], rail, (r.error or "failed")[:300], r.request.amount_in / A.WEI, attempt=f["tries"], retry=bool(r.retryable) and not add)
+        if r.retryable and not add:
             self.failed[did] = {**f, "error": r.error}
 
     def _retry_over(self, conn, ctx, did: int, f: dict) -> str | None:
@@ -130,7 +131,8 @@ class RhLiveMirror:
     def _buy(self, e: dict, mint: str, quote: str, pool: dict | None, size: float, retry: int = 0) -> bool:
         return self.ex.submit(RhRequest(kind="buy", token=mint, quote_asset=quote, amount_in=int(size * A.WEI), slippage_bps=config.SLIPPAGE_ENTRY_BPS,
                                         max_slippage_bps=config.MAX_SLIPPAGE_ENTRY_BPS, pool=pool, decision_id=e["decision_id"], hold_s=e.get("hold_s"),
-                                        strategy=e.get("strategy"), decimals=int(e["info"].get("decimals") or 18), ref_price=e.get("ref_price"), retry=retry))
+                                        strategy=e.get("strategy"), decimals=int(e["info"].get("decimals") or 18), ref_price=e.get("ref_price"), retry=retry,
+                                        add=e.get("of_entry") is not None))
 
     def _sell(self, conn, p: dict, did: int | None, slip: float, forced_kind: str | None = None) -> bool:
         pool = pool_of(conn, p.get("pool"))
@@ -237,7 +239,7 @@ class RhLiveMirror:
         held_mints = {p["mint"].lower() for p in opens if p["mint"].lower() not in selling} | (inflight - selling)
         c = rails.load_circuit(conn, RH_CIRCUIT)
         blocked = "kill switch" if c.kill_switch else "circuit tripped" if rails.breaker_blocks(c) else "paused" if c.entries_paused else None
-        n_enter = n_retry = 0; skipped = []
+        n_enter = n_retry = n_add = 0; skipped = []
         if self.failed or entries:
             native_eth = live_first.take_balance(self, ctx.m1_epoch) / A.WEI; self.wallet_eth = native_eth
             committed = self.ex.committed_wei() / A.WEI
@@ -265,6 +267,27 @@ class RhLiveMirror:
                     n_enter += 1; n_retry += 1; cash -= size; held_mints.add(mint)
             for e in entries:
                 mint = e["mint"].lower()
+                if e.get("of_entry") is not None:            # a paper re-pick add: into the wallet's position of the same entry decision
+                    p = next((q for q in opens if q["mint"].lower() == mint), None)
+                    pool = pool_of(conn, e["info"].get("pool")); quote = ((pool or {}).get("quote_asset") or ZERO).lower()
+                    rail = blocked or ("add: no such position" if p is None or p.get("entry_decision_id") != e["of_entry"] else None) \
+                        or ("held" if mint in inflight else None) \
+                        or ("v4 paper only" if e["info"].get("source") == "v4" and not config.RH_V4_WALLET else None) \
+                        or ("base mark stale" if A.base_mark(conn, quote)[1] else None)
+                    size, why = (0.0, "") if rail else sizing.size_position(e["score"], e.get("threshold", 0.0), e.get("table") or [], bankroll, cash, e["info"]["resq"],
+                                                                            flat=config.FLY_SIZING == "flat", market=RH, margin=e.get("size_margin"),
+                                                                            creator_heavy=bool(e["info"].get("creator_heavy")), held_cost=float(p["cost_sol"]))
+                    if rail or size <= 0:
+                        why = {"held": "an order of this token is queued or in flight", "add: no such position": "the wallet holds no position of this add's entry",
+                               "v4 paper only": "a plain v4 coin: the wallet waits for the operator (RH_V4_WALLET)",
+                               "base mark stale": f"no fresh ETH mark of its quote {quote}"}.get(rail, rail or why)
+                        skipped.append((mint, rail or why)); self._blocked(conn, ctx, run_id, beat_id, e, rail or "sizing", why, size, add=True); continue
+                    if self._buy(e, mint, quote, pool, size):
+                        n_add += 1; cash -= size; self.sent[e["decision_id"]] = {"e": e, "ts": m1, "tries": 1}
+                        conn.execute("UPDATE decisions SET book_targets = array_append(COALESCE(book_targets, '{}'), %s) WHERE id = %s", (BOOK, e["decision_id"]))
+                    else:
+                        skipped.append((mint, "held")); self._blocked(conn, ctx, run_id, beat_id, e, "held", "an order of this token is queued or in flight", size, add=True)
+                    continue
                 if mint in held_mints:
                     skipped.append((mint, "held")); self._blocked(conn, ctx, run_id, beat_id, e, "held", "the wallet holds this token or has an order of it queued"); continue
                 if e["info"].get("source") == "v4" and not config.RH_V4_WALLET:
@@ -284,7 +307,7 @@ class RhLiveMirror:
                 else:
                     skipped.append((mint, "held")); self._blocked(conn, ctx, run_id, beat_id, e, "held", "an order of this token is queued or in flight", size)
         self.due_mark = self.mark_ctx = (ctx, beat_id)
-        return {"stage": "trading live", "wallet_eth": self.wallet_eth, "entered": n_enter, "retried": n_retry, "exited": ex["exited"], "liquidated": ex["liquidated"],
+        return {"stage": "trading live", "wallet_eth": self.wallet_eth, "entered": n_enter, "retried": n_retry, "added": n_add, "exited": ex["exited"], "liquidated": ex["liquidated"],
                 "in_flight": len(inflight), "blocked": blocked, "skipped": skipped[:10], "failed_orders": sum(1 for r in drained if not r.ok),
                 "awaiting_retry": len(self.failed)}
 
@@ -391,8 +414,10 @@ class RhLiveMirror:
                                WHERE l.book = %s AND l.status = 'closed' AND l.entry_decision_id IS NOT NULL AND COALESCE(l.forced_exit_kind, '') <> 'operator'
                                  AND NOT EXISTS (SELECT 1 FROM circuit_events e WHERE e.kind = 'rh_reconcile' AND e.ts >= l.opened_at
                                                  AND e.ts <= COALESCE(l.closed_at, now()) AND e.detail::text ILIKE '%%' || lower(l.mint) || '%%')
+                                 AND NOT EXISTS (SELECT 1 FROM decisions a WHERE a.kind = 'fly_rh_add' AND (a.detail->>'of_entry')::bigint = l.entry_decision_id)
                                ORDER BY l.closed_at DESC LIMIT %s""",
                             (MIRROR, BOOK, GAP_TRADES)).fetchall()             # an operator's Sell Now is the operator's choice, not an execution gap;
+        # nor a trade paper added to on a re-pick (its add may have been sized out or skipped on the wallet: no longer the same trade);
         # nor a position the reconciler found gone from the wallet while it was held (ANT 2026-11-03, 0x493f2e7b 11-05: the coin's
         # contract took or wiped the tokens; the reconcile pause handles those, and two of them alone read as a 3.2-point gap)
         pairs = [(r["rl"], r["rp"]) for r in rows if r["rl"] is not None and r["rp"] is not None]

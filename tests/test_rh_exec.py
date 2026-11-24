@@ -515,3 +515,30 @@ def test_the_rh_mirror_marks_after_each_intent_and_tells_the_console(monkeypatch
         live_first._LISTENERS.clear()
     assert calls == [True] and len(told) == 2
 
+
+
+def test_a_repick_add_joins_the_open_position_and_a_failed_add_leaves_it_open(chain):
+    """A re-pick's add (agent/paper_trading.plan_minute, rh/live.py): its tokens and cost join the open position, its gas adds
+    to the position's, and the position takes its new hold; an add that bought nothing is an aborted row of its own, closed
+    at once, and the open position is untouched. A plain buy of a held token is still refused, and an add with nothing to
+    add to is refused for good."""
+    ex = chain.ex(); amt = WEI // 100
+    b = ex.execute(RhRequest(kind="buy", token=TOKEN, amount_in=amt, hold_s=600.0))
+    p0 = _pos(b.position_id)
+    plain = ex.execute(RhRequest(kind="buy", token=TOKEN, amount_in=amt, hold_s=600.0))
+    a = ex.execute(RhRequest(kind="buy", token=TOKEN, amount_in=amt, hold_s=900.0, add=True))
+    p1 = _pos(b.position_id)
+    chain.c.revert_onchain[(K.NATIVE, TOKEN)] = 5
+    f = ex.execute(RhRequest(kind="buy", token=TOKEN, amount_in=amt, slippage_bps=150, max_slippage_bps=150, hold_s=1200.0, add=True))
+    p2 = _pos(b.position_id)
+    with transaction() as conn:
+        aborted = conn.execute("SELECT status, qty, realized_sol FROM positions WHERE book = 'live_rh' AND forced_exit_kind = 'aborted'").fetchall()
+        conn.execute("UPDATE positions SET status = 'closed', closed_at = now() WHERE id = %s", (b.position_id,))
+    gone = ex.execute(RhRequest(kind="buy", token=TOKEN, amount_in=amt, hold_s=900.0, add=True))
+    assert not plain.ok and plain.error.startswith("held:") and plain.retryable
+    assert a.ok and a.position_id == b.position_id and int(p1["qty"]) == 2 * int(p0["qty"])
+    assert float(p1["cost_sol"]) == pytest.approx(2 * (amt + FEE) / WEI) and float(p1["gas_q"]) == pytest.approx(2 * FEE / WEI)
+    assert float(p1["hold_s"]) == pytest.approx(900.0) and p1["status"] == "open"
+    assert not f.ok and p2["status"] == "open" and int(p2["qty"]) == int(p1["qty"]) and float(p2["cost_sol"]) == pytest.approx(float(p1["cost_sol"]))
+    assert len(aborted) == 1 and aborted[0]["status"] == "closed" and aborted[0]["qty"] == 0 and aborted[0]["realized_sol"] < 0
+    assert not gone.ok and not gone.retryable and "closed" in gone.error

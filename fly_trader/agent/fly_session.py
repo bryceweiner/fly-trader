@@ -17,7 +17,9 @@ first (CLAUDE.md): ``on_minute`` runs before any other book's minute, ``after_mi
    seat; before that (LIVE_WITHOUT_HANDOVER) the selector's -- the fly's learned veto binds only its paper book, which is
    what its race measures;
 4. after the live orders (``after_minute``): the scored rows stored (``fly_scored``: pending rows keep the feature
-   vector, so tags survive restarts), the paper trades booked, then outcomes: tags whose exit minute has now been seen
+   vector, so tags survive restarts; a row the selector would trade keeps it after it resolves too, with its outcome,
+   for ``PICKS_KEEP_DAYS``: the examples a bad-coin veto learns and is judged on), the paper trades booked, then outcomes:
+   tags whose exit minute has now been seen
    teach the mushroom body's outcome pathway what the row made -- the book's realized return when it traded the row,
    else its label (``resolve_label``, exactly as ``train/decisions.build`` labels a row); a row the wallet bought too
    then teaches the fill pathway what the real fills added (live realized − outcome) once its live position has closed
@@ -73,6 +75,19 @@ FILL_WAIT_S = 4 * 3600.0     # ... until this long after its hold (a live positi
 FILL_IC_DAYS, FILL_IC_MIN = 7, 30   # the fill pathway's check: its predictions against the fills it learned
 ROLLBACK_PAUSE_S, ROLLBACK_LIMIT, ROLLBACK_WINDOW_S, ROLLBACK_MIN_AGE_S = 86400.0, 3, 7 * 86400.0, 86400.0
 SNAP_HOURLY_DAYS, SCORED_KEEP_DAYS = 7, 35
+PICKS_KEEP_DAYS = 365      # a row the selector would trade (teacher_allow) keeps its features and outcome this long: a bad-coin veto trains on them
+# resolving a scored row: its features go, unless the selector would trade it (or it still waits for its live fill)
+RESOLVE_SQL = "UPDATE fly_scored SET state = 'resolved', resolved_at = now(), x = CASE WHEN teacher_allow THEN x END WHERE ts = %s AND mint = %s AND strategy = %s"
+LABEL_SQL = ("UPDATE fly_scored SET label = %s, state = %s, outcome = %s, resolved_at = now(), x = CASE WHEN %s = 'awaiting_fill' OR teacher_allow THEN x END "
+             "WHERE ts = %s AND mint = %s AND strategy = %s")
+FILL_SQL = "UPDATE fly_scored SET fill = %s, state = 'resolved', resolved_at = now(), x = CASE WHEN teacher_allow THEN x END WHERE ts = %s AND mint = %s AND strategy = %s"
+
+
+def prune_scored(conn, now: float) -> None:
+    """Resolved scored rows older than ``SCORED_KEEP_DAYS`` go; the selector's would-be trades (teacher_allow) stay for
+    ``PICKS_KEEP_DAYS`` with their features and outcomes."""
+    keep = datetime.fromtimestamp(now - SCORED_KEEP_DAYS * 86400.0, timezone.utc); picks = datetime.fromtimestamp(now - PICKS_KEEP_DAYS * 86400.0, timezone.utc)
+    conn.execute("DELETE FROM fly_scored WHERE state <> 'pending' AND ts < %s AND (NOT COALESCE(teacher_allow, false) OR ts < %s)", (keep, picks))
 COMMAND_KEY = "fly_command"
 COMMAND_MAX_AGE_S = 600.0          # an operator command older than this (queued while the engine was down) is dropped
 
@@ -412,7 +427,7 @@ class FlyBook:
                    if r["x"] is None or r["outcome"] is None or r["ts"].timestamp() + self.holds[r["strategy"]] + FILL_WAIT_S <= now]
         if applied or expired:
             with conn.cursor() as cur:
-                cur.executemany("UPDATE fly_scored SET state = 'resolved', resolved_at = now(), x = NULL WHERE ts = %s AND mint = %s AND strategy = %s", applied + expired)
+                cur.executemany(RESOLVE_SQL, applied + expired)
         gone = set(expired)
         todo = [r for r in rows if r["ts"].timestamp() + self.holds[r["strategy"]] + LABEL_LAG_S > self.applied_through and r["x"] is not None]
         fills = [r for r in waiting if (r["ts"], r["mint"], r["strategy"]) not in gone]
@@ -557,7 +572,7 @@ class FlyBook:
                "drift": max(drift.values()) if drift else 0.0, "drift_by_strategy": drift, "pending": len(self.pending), "learned": learned,
                "learning_frozen": (self.brain or self).learning_frozen, "frozen_strategies": (self.brain or self).frozen, "channels": self.cfg,
                "holds_min": {k: v / 60.0 for k, v in self.holds.items()},
-               "bootstrap": self.boot_id,
+               "bootstrap": self.boot_id, "gate": self.gate_sid,             # the selector every buy of this book needs (``_follow_deployed``)
                "device": str(self.fly.net.dev), "timing": ph.get("timing")}
         if st is not None:
             out.update({k: v for k, v in st.items() if k != "entries"}); out["stage"] = "trading"
@@ -576,12 +591,10 @@ class FlyBook:
         self._write_state()
         if learned.get("keys"):          # a row still waiting for its live fill keeps its features (tags survive restarts)
             with conn.cursor() as cur:
-                cur.executemany("UPDATE fly_scored SET label = %s, state = %s, outcome = %s, resolved_at = now(), x = CASE WHEN %s = 'awaiting_fill' THEN x END "
-                                "WHERE ts = %s AND mint = %s AND strategy = %s", [(lb, st_, oc, st_, ts_, m, s_) for lb, st_, oc, ts_, m, s_ in learned.pop("keys")])
+                cur.executemany(LABEL_SQL, [(lb, st_, oc, st_, ts_, m, s_) for lb, st_, oc, ts_, m, s_ in learned.pop("keys")])
         if learned.get("fill_keys"):
             with conn.cursor() as cur:
-                cur.executemany("UPDATE fly_scored SET fill = %s, state = 'resolved', resolved_at = now(), x = NULL WHERE ts = %s AND mint = %s AND strategy = %s",
-                                learned.pop("fill_keys"))
+                cur.executemany(FILL_SQL, learned.pop("fill_keys"))
         learned.pop("keys", None); learned.pop("fill_keys", None)
         out["checks"] = self.last_checks; out["updated_at"] = datetime.now(timezone.utc).isoformat()
         out["race_started_at"] = self.race_started_at          # the console's "racing for N days" (the race outlives a paper reset)
@@ -1141,7 +1154,7 @@ class FlyBook:
                 Path(r["path"]).unlink(missing_ok=True)
             except OSError:
                 pass
-        conn.execute("DELETE FROM fly_scored WHERE state <> 'pending' AND ts < %s", (datetime.fromtimestamp(now - SCORED_KEEP_DAYS * 86400.0, timezone.utc),))
+        prune_scored(conn, now)
 
     def _handover_check(self, conn, now: float) -> None:
         """The fly takes the selector's seat once it has raced ``config.HANDOVER_DAYS`` (0: no minimum, the window is the

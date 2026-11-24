@@ -74,13 +74,33 @@ def add_leg(conn, *, intent_id: int, tx_id: int | None, position_id: int | None,
 
 
 # ---- positions
+def aborted_beside(conn, *, intent_id: int, token: str, pool: str | None, quote_asset: str | None, cost: float, gas: float, ts: datetime,
+                   decision_id: int | None, strategy: str | None) -> int:
+    """A re-pick add that bought nothing (``book_buy``, ``charge_gas``): an aborted position of its own, closed at once with
+    its cost as the loss and linked to its intent. Written directly: ledger.open_position would merge it into the open
+    position of the same token, and closing it would close that one. Returns its id."""
+    r = conn.execute("""INSERT INTO positions (book, mint, pool, opened_at, closed_at, entry_decision_id, qty, cost_sol, entry_price, exit_price, realized_sol,
+                          fees_sol, status, forced_exit_kind, strategy, chain, quote_asset, gas_q)
+                        VALUES (%s,%s,%s,%s,%s,%s,0,%s,0,0,%s,%s,'closed','aborted',%s,'rh',%s,%s) RETURNING id""",
+                     (BOOK, token, pool, ts, ts, decision_id, cost, -cost, gas, strategy, quote_asset, gas)).fetchone()
+    conn.execute("UPDATE rh_intents SET position_id = %s WHERE id = %s", (int(r["id"]), intent_id))
+    conn.execute("UPDATE rh_legs SET position_id = %s WHERE intent_id = %s", (int(r["id"]), intent_id))
+    return int(r["id"])
+
+
 def book_buy(conn, *, intent_id: int, token: str, pool: str | None, quote_asset: str, eth_spent_wei: int, tokens_raw: int, decision_id: int | None,
-             ts: datetime, hold_s: float | None, strategy: str | None, lot_basis_eth: float = 0.0, decimals: int = 18) -> tuple[int, float]:
+             ts: datetime, hold_s: float | None, strategy: str | None, lot_basis_eth: float = 0.0, decimals: int = 18,
+             add: bool = False) -> tuple[int, float]:
     """Book a finished buy intent. Returns (position id, realized) — realized is 0 for an opened position and −cost for an
-    aborted one (no tokens)."""
+    aborted one (no tokens). ``add``: a re-pick's add into the open position of ``token`` (rh/live.py): its tokens and cost
+    join that position, ``hold_s`` becomes its hold and its gas adds to the position's; an add that bought nothing is an
+    aborted position of its own, closed at once, the open one untouched."""
     gas = intent_gas_wei(conn, intent_id)
     spent = eth_spent_wei / WEI + lot_basis_eth
     cost = spent + gas / WEI
+    if tokens_raw <= 0 and add:                                  # an add that bought nothing: its own aborted row, never merged into the open position
+        return aborted_beside(conn, intent_id=intent_id, token=token, pool=pool, quote_asset=quote_asset, cost=cost, gas=gas / WEI, ts=ts,
+                              decision_id=decision_id, strategy=strategy), -cost
     if tokens_raw <= 0:                                          # nothing bought: the gas and any base loss are the loss
         pid = ledger.open_position(conn, book=BOOK, mint=token, pool=pool, qty_raw=0, cost_sol=cost, entry_price=0.0, decision_id=decision_id,
                                    fees_sol=gas / WEI, ts=ts, hold_s=hold_s, strategy=strategy)
@@ -89,8 +109,11 @@ def book_buy(conn, *, intent_id: int, token: str, pool: str | None, quote_asset:
         return pid, float(realized or -cost)
     price = spent / (tokens_raw / 10 ** decimals)
     pid = ledger.open_position(conn, book=BOOK, mint=token, pool=pool, qty_raw=tokens_raw, cost_sol=cost, entry_price=price, decision_id=decision_id,
-                               fees_sol=gas / WEI, ts=ts, hold_s=hold_s, strategy=strategy)
-    conn.execute("UPDATE positions SET quote_asset = %s, gas_q = %s WHERE id = %s", (quote_asset, gas / WEI, pid))
+                               fees_sol=gas / WEI, ts=ts, hold_s=None if add else hold_s, strategy=strategy, add_hold_s=hold_s if add else None)
+    if add:
+        conn.execute("UPDATE positions SET gas_q = COALESCE(gas_q, 0) + %s WHERE id = %s", (gas / WEI, pid))
+    else:
+        conn.execute("UPDATE positions SET quote_asset = %s, gas_q = %s WHERE id = %s", (quote_asset, gas / WEI, pid))
     conn.execute("UPDATE rh_intents SET position_id = %s WHERE id = %s", (pid, intent_id))
     conn.execute("UPDATE rh_legs SET position_id = %s WHERE intent_id = %s", (pid, intent_id))
     return pid, 0.0
@@ -149,6 +172,10 @@ def charge_gas(conn, intent_id: int, position_id: int | None) -> float:
         conn.execute("UPDATE rh_intents SET position_id = %s WHERE id = %s", (dead, intent_id))
         return gas
     now = datetime.now(timezone.utc)
+    if it["token"] and conn.execute("SELECT 1 FROM positions WHERE book = %s AND mint = %s AND status = 'open'", (BOOK, it["token"])).fetchone():
+        # a failed buy of a held token can only be a re-pick add (rh/exec.py refuses every other buy of one before its intent opens)
+        aborted_beside(conn, intent_id=intent_id, token=it["token"], pool=None, quote_asset=None, cost=gas, gas=gas, ts=now, decision_id=it["decision_id"], strategy=None)
+        return gas
     pid = ledger.open_position(conn, book=BOOK, mint=it["token"] or "gas", pool=None, qty_raw=0, cost_sol=gas, entry_price=0.0, decision_id=None,
                                fees_sol=gas, ts=now)
     conn.execute("UPDATE positions SET gas_q = %s WHERE id = %s", (gas, pid))

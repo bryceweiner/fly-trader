@@ -4,10 +4,14 @@ exits: positions held their own hold (the strategy's, stored on the position) or
 price (or the last traded price: the training label's exit), and earlier a position whose minute closed at its
 take-profit line (``take_profit_x``: a buy of a coin trading far below its high since graduation is sold once it doubles,
 config.TAKE_PROFIT_X / TAKE_PROFIT_DIP; its token is not bought again before its hold would have ended), and a Solana
-position whose coin fell 25 % under its 5-minute high after its entry at that crash's price (agent/crash_exit.py);
+position whose coin fell 25 % under its 5-minute high after its entry at that crash's price (agent/crash_exit.py; its
+token is not bought again for ``CRASH_REBUY_COOLDOWN_MIN``, rail 'crashed');
 entries: scores at or above the book's line open a position sized from the book's certainty bands
 (``agent/sizing.py``), one position per token, unless blocked (global kill switch, paused entries, the book's own
-drawdown halt, a minute traded more than ``ENTRY_MAX_LAG_S`` after its end, or the caller's ``block``); marks and wealth
+drawdown halt, a minute traded more than ``ENTRY_MAX_LAG_S`` after its end, or the caller's ``block``); a pick of a token
+the book holds is an add (``REPICK_ADD_*``, kind '<kind>_add') once per position when it comes ``REPICK_ADD_MIN_S`` or
+more after the entry at or below ``1 - REPICK_ADD_DIP`` of the entry price: bought into the same position, sized as the
+pick with the position's cost counted against the caps, and the position then held its hold from the add; marks and wealth
 per minute (positions net of exit cost, exposure at cost, drawdown ≥ 0); the book's drawdown halt is checked on its own
 peak (``rails.check_book_drawdown``). Every score, entry, exit and blocked pick is a ``decisions`` row.
 
@@ -73,6 +77,41 @@ def took_profit(conn, book: str, m1, horizon_s: float) -> set:
     return {r["mint"] for r in rows}
 
 
+def cooling(conn, book: str, market, m1, horizon_s: float) -> tuple[set, set]:
+    """(tokens ``book`` took profit on whose hold has not ended -- ``took_profit`` --, tokens it sold in a crash exit within
+    ``CRASH_REBUY_COOLDOWN_MIN`` of ``m1``): neither is bought again yet. The wallet's rebuys within an hour of a crash sale
+    lost 25 of 29 times (2026-11-07..18). The fly's book, which the wallet mirrors, also counts the wallet's own crash sales;
+    the race books only their own. One query, the one ``took_profit`` was: the minute's live entries wait on it."""
+    cool = float(config.CRASH_REBUY_COOLDOWN_MIN) * 60.0
+    books = [book] + ([market.live_book] if cool > 0 and book == market.fly_book else [])
+    rows = conn.execute("""SELECT p.mint, p.forced_exit_kind AS k FROM positions p LEFT JOIN decisions d ON d.id = p.entry_decision_id
+                           WHERE p.book = ANY(%(books)s) AND p.status = 'closed' AND p.forced_exit_kind IN ('take_profit', 'crash') AND p.closed_at > %(m1)s - interval '1 day'
+                             AND ((p.forced_exit_kind = 'take_profit' AND p.book = %(book)s
+                                   AND p.opened_at + make_interval(secs => COALESCE(p.hold_s, (d.detail->>'hold_s')::float, %(h)s)) > %(m1)s)
+                               OR (p.forced_exit_kind = 'crash' AND %(cool)s > 0 AND p.closed_at > %(m1)s - make_interval(secs => %(cool)s)))""",
+                        {"books": books, "book": book, "m1": m1, "h": horizon_s, "cool": cool}).fetchall()
+    return {r["mint"] for r in rows if r["k"] == "take_profit"}, {r["mint"] for r in rows if r["k"] == "crash"}
+
+
+def added_to(conn, kind: str, position_ids: list) -> set:
+    """Open positions (of ``position_ids``) that already had their one re-pick add: an add decision of ``kind``
+    ('<kind>_add') whose paper fill went through (no rail)."""
+    if not position_ids:
+        return set()
+    rows = conn.execute("""SELECT DISTINCT (detail->>'add_to')::bigint AS pid FROM decisions WHERE kind = %s AND rail IS NULL
+                           AND (detail->>'add_to')::bigint = ANY(%s)""", (kind, list(position_ids))).fetchall()
+    return {int(r["pid"]) for r in rows}
+
+
+def add_due(market, p: dict | None, m1, price: float | None) -> bool:
+    """Whether a pick of open position ``p``'s token at ``price`` is a re-pick add (before the one-per-position check): adds
+    on on the chain, ``REPICK_ADD_MIN_S`` past its entry, at or below ``1 - REPICK_ADD_DIP`` of its entry price."""
+    if p is None or config.REPICK_ADD_DIP <= 0 or market.chain not in config.REPICK_ADD_CHAINS or not price:
+        return False
+    entry = float(p.get("entry_price") or 0.0)
+    return entry > 0 and (m1 - p["opened_at"]).total_seconds() >= config.REPICK_ADD_MIN_S and price <= entry * (1.0 - config.REPICK_ADD_DIP)
+
+
 def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str, mints: list, infos: list, scores, threshold,
                 table: list | None, horizon_s: float, block: str | None = None, holds=None, strategies=None, allow=None, reasons=None,
                 tables: list | None = None, flat: bool = False, live_allow=None, size_margins=None, correctness=None, marks: list | None = None) -> dict:
@@ -96,7 +135,11 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
     strategy's correctness sizes a row, its band is read at that margin instead of score − line; every decision, entry and
     rebuy carries both (``size_margin``, ``correctness``: the console's correctness %), so a live mirror sizes it the same.
 
-    ``marks`` (per row, a dict): carried the same way; its ``stake_x`` multiplies the row's stake (agent/rising_clean.py)."""
+    ``marks`` (per row, a dict): carried the same way; its ``stake_x`` multiplies the row's stake (agent/rising_clean.py).
+
+    A re-pick add (``add_due``, once per position) is an entry too, of kind '<kind>_add', carrying ``add_to`` (the paper
+    position), ``of_entry`` (its entry decision: a live mirror adds only to the position of that decision) and ``hold_s``
+    (the position's new hold, from that entry decision's minute)."""
     conn, m1 = ctx.conn, ctx.m1
     beat = conn.execute("INSERT INTO beats (run_id, ts, beat_no, n_slots_active, notes) VALUES (%s,%s,%s,%s,%s) RETURNING id",
                         (run_id, m1, beat_no, len(mints), json.dumps({"minute": m1.isoformat(), "mints_traded": len(ctx.agg), "book": book}))).fetchone()["id"]
@@ -116,9 +159,11 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
         exits.append((p, held, kw, broker.quote_sell(position=p, **kw), "crash" if crash else "take_profit" if tp else None))
     leaving = {int(p["id"]) for p, *_ in exits}
     opens_now = [p for p in opens_before if int(p["id"]) not in leaving]; open_mints = {p["mint"] for p in opens_now}
+    open_by_mint = {p["mint"]: p for p in opens_now}
     paid = {p["mint"]: float(p["cost_sol"]) for p in opens_now}; rebuy = {}        # a token it keeps: what it paid, this minute's verdict on buying it again
-    cash = ledger.paper_cash(conn, book) + sum(q for _, _, _, q, _ in exits); n_enter = 0; picks = []; entries = []; buys = []
-    tp_held = None                                               # tokens it took profit on, not bought again yet (read at the minute's first pick)
+    cash = ledger.paper_cash(conn, book) + sum(q for _, _, _, q, _ in exits); n_enter = n_add = 0; picks = []; entries = []; buys = []
+    tp_held = crash_held = None                                  # tokens it took profit on / sold in a crash, not bought again yet (read at the minute's first pick)
+    added = None                                                 # positions that had their re-pick add (read at the minute's first add)
     bankroll = cash + sum(float(p["cost_sol"]) for p in opens_now)         # wealth at cost: the sizing base (agent/sizing.py)
     from ..markets import for_book
     market = for_book(book)                                     # the book's market: its circuit, money settings and sizes
@@ -144,11 +189,50 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
         size, why = sizing.size_position(float(sc), thr_k, tab_k or [], bankroll, cash, i["resq"], flat=flat, market=market, margin=mg,
                                          creator_heavy=bool(i.get("creator_heavy")), stake_x=cx.get("stake_x", 1.0))
         denied = allow is not None and not bool(allow[k])
-        if tp_held is None:                                      # this minute's own take-profits are not booked yet
-            tp_held = took_profit(conn, book, m1, horizon_s) | {p["mint"] for p, _, _, _, why in exits if why == "take_profit"}
+        if tp_held is None:                                      # this minute's own take-profits and crash sales are not booked yet
+            tp_held, crash_held = cooling(conn, book, market, m1, horizon_s)
+            tp_held |= {p["mint"] for p, _, _, _, why in exits if why == "take_profit"}
+            if config.CRASH_REBUY_COOLDOWN_MIN > 0:
+                crash_held |= {p["mint"] for p, _, _, _, why in exits if why == "crash"}
         cooled = m in tp_held and m not in open_mints
-        if m in open_mints or cooled or blocked or denied or size <= 0:
-            rail = blocked or ("held" if m in open_mints else "took profit" if cooled else (str(reasons[k]) if denied and reasons is not None else "filtered") if denied else "sizing")
+        crashed = not cooled and m in crash_held and m not in open_mints
+        pk = open_by_mint.get(m)
+        if not (blocked or denied) and add_due(market, pk, m1, i["price"]):     # a re-pick of a held token under its entry: an add, once
+            if added is None:
+                added = added_to(conn, f"{kind}_add", [int(p["id"]) for p in opens_now])
+            if int(pk["id"]) not in added:
+                size_a, why = sizing.size_position(float(sc), thr_k, tab_k or [], bankroll, cash, i["resq"], flat=flat, market=market, margin=mg,
+                                                   creator_heavy=bool(i.get("creator_heavy")), stake_x=cx.get("stake_x", 1.0), held_cost=float(pk["cost_sol"]))
+                if size_a > 0:
+                    hk = float(holds[k]) if holds is not None and holds[k] is not None else float("nan")
+                    add_hold = hk if np.isfinite(hk) and hk > 0 else float(horizon_s)
+                    start = pk.get("decision_ts") or pk["opened_at"]          # the position's hold counts from its entry decision (paper and live)
+                    new_hold = max(float(pk.get("hold_s") or horizon_s), (m1 - start).total_seconds() + add_hold)
+                    dip = float(i["price"]) / float(pk["entry_price"]) - 1.0
+                    did = conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, m_hat, size_sol, forced, reason, book_targets, detail) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,false,%s,%s,%s) RETURNING id",
+                                       (beat, run_id, m1, m, i["pool"], f"{kind}_add", float(sc), size_a,
+                                        f"add on a re-pick {dip:+.0%} from its entry: {strat_k + ': ' if strat_k else ''}score {sc:.3f} ≥ {thr_k:.3f}; {why}", [book],
+                                        json.dumps({"book": book, "add_to": int(pk["id"]), "of_entry": pk.get("entry_decision_id"), "dip": dip, "score": float(sc),
+                                                    "threshold": thr_k, "size_sol": size_a, "sizing": why, "resq": i["resq"], "age_h": i["age_h"], "price": i["price"],
+                                                    "strategy": strat_k, "hold_s": new_hold, "add_hold_s": add_hold, **cx}))).fetchone()["id"]
+                    args = dict(size_sol=size_a, price=i["price"], res_quote_sol=i["resq"], mcap_sol=i["mcap"], decimals=i["decimals"],
+                                program_label=ctx.cost_label(m, i["program_label"]), pool_fee=ctx.fee(m))
+                    q = broker.quote_buy(**args)
+                    if q.ok:
+                        n_add += 1; cash -= size_a; added.add(int(pk["id"])); buys.append((did, m, i, args, new_hold, strat_k, True))
+                        entries.append({"mint": m, "decision_id": did, "score": float(sc), "size_sol": size_a, "info": i, "threshold": thr_k, "table": tab_k,
+                                        "hold_s": new_hold, "strategy": strat_k, "add_to": int(pk["id"]), "of_entry": pk.get("entry_decision_id"), **cx,
+                                        "ref_price": size_a / (q.token_delta / 10 ** int(i["decimals"]))})
+                    else:
+                        conn.execute("UPDATE decisions SET rail = %s, reason = %s WHERE id = %s", ("paper_fill", q.reason, did))
+                    qr = broker.quote_buy(size_sol=paid[m], price=i["price"], res_quote_sol=i["resq"], mcap_sol=i["mcap"], decimals=i["decimals"],
+                                          program_label=ctx.cost_label(m, i["program_label"]), pool_fee=ctx.fee(m))
+                    rebuy[m] = {"score": float(sc), "threshold": thr_k, **cx,   # a live retry of its first buy still reads this minute's verdict
+                                **({"table": tab_k, "ref_price": paid[m] / (qr.token_delta / 10 ** int(i["decimals"]))} if qr.ok else {"why": qr.reason})}
+                    continue
+        if m in open_mints or cooled or crashed or blocked or denied or size <= 0:
+            rail = blocked or ("held" if m in open_mints else "took profit" if cooled else "crashed" if crashed
+                               else (str(reasons[k]) if denied and reasons is not None else "filtered") if denied else "sizing")
             conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, m_hat, size_sol, forced, rail, reason, detail) VALUES (%s,%s,%s,%s,%s,'blocked',%s,%s,false,%s,%s,%s)",
                          (beat, run_id, m1, m, i["pool"], float(sc), size, rail, why if rail == "sizing" else f"{kind} pick not taken",
                           json.dumps({"book": book, "score": float(sc), "threshold": thr_k, "sizing": why, **cx,
@@ -159,7 +243,7 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
                 rebuy[m] = {"score": float(sc), "threshold": thr_k, **cx,
                             **({"table": tab_k, "ref_price": paid[m] / (q.token_delta / 10 ** int(i["decimals"]))} if q is not None and q.ok
                                else {"why": blocked or (q.reason if q is not None else str(reasons[k]) if reasons is not None else "filtered")})}
-            if denied and live_allow is not None and bool(live_allow[k]) and not blocked and m not in open_mints and not cooled and size > 0:
+            if denied and live_allow is not None and bool(live_allow[k]) and not blocked and m not in open_mints and not cooled and not crashed and size > 0:
                 hold_k = float(holds[k]) if holds is not None else None      # the wallet's buy alone: this book stays as it is
                 tp_k = take_profit_x(ctx, market, m, i["price"])
                 did = conn.execute("INSERT INTO decisions (beat_id, run_id, ts, mint, pool, kind, m_hat, size_sol, forced, reason, book_targets, detail) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,false,%s,%s,%s) RETURNING id",
@@ -186,13 +270,13 @@ def plan_minute(ctx, *, book: str, run_id: str, beat_no: int, broker, kind: str,
                     program_label=ctx.cost_label(m, i["program_label"]), pool_fee=ctx.fee(m))
         q = broker.quote_buy(**args)
         if q.ok:
-            n_enter += 1; open_mints.add(m); cash -= size; buys.append((did, m, i, args, hold_k, strat_k))
+            n_enter += 1; open_mints.add(m); cash -= size; buys.append((did, m, i, args, hold_k, strat_k, False))
             entries.append({"mint": m, "decision_id": did, "score": float(sc), "size_sol": size, "info": i, "threshold": thr_k, "table": tab_k, "hold_s": hold_k, "strategy": strat_k,
                             "take_profit_x": tp_k, **cx, "ref_price": size / (q.token_delta / 10 ** int(i["decimals"]))})
         else:
             conn.execute("UPDATE decisions SET rail = %s, reason = %s WHERE id = %s", ("paper_fill", q.reason, did))
     return {"book": book, "run_id": run_id, "kind": kind, "broker": broker, "beat_id": beat, "exits": exits, "buys": buys, "entries": entries,
-            "entered": n_enter, "picks": picks, "blocked": blocked, "market": market, "rebuy": rebuy}
+            "entered": n_enter, "added": n_add, "picks": picks, "blocked": blocked, "market": market, "rebuy": rebuy}
 
 
 def book_minute(ctx, plan: dict) -> dict:
@@ -209,8 +293,9 @@ def book_minute(ctx, plan: dict) -> dict:
                            (beat, plan["run_id"], m1, p["mint"], p["pool"], f"{plan['kind']}_exit", float(p["cost_sol"]), reason, json.dumps({"book": book}))).fetchone()["id"]
         broker.sell(conn, position=p, decision_id=did, forced_kind=why, ts=m1, **kw)
         n_exit += 1
-    for did, m, i, args, hold_k, strat_k in plan["buys"]:
-        fill = broker.buy(conn, decision_id=did, mint=m, pool=i["pool"], ts=m1, hold_s=hold_k, strategy=strat_k, **args)
+    for did, m, i, args, hold_k, strat_k, add in plan["buys"]:          # an add: into the open position, held ``hold_k`` from its entry decision
+        fill = broker.buy(conn, decision_id=did, mint=m, pool=i["pool"], ts=m1, hold_s=None if add else hold_k, strategy=strat_k,
+                          add_hold_s=hold_k if add else None, **args)
         if not fill.ok:                                          # its own quote planned it: only a changed broker could refuse it now
             conn.execute("UPDATE decisions SET rail = %s, reason = %s WHERE id = %s", ("paper_fill", fill.reason, did))
     ledger.mark_positions(conn, book, ctx.prices, {}, m1)
@@ -227,7 +312,7 @@ def book_minute(ctx, plan: dict) -> dict:
                  (beat, book, m1, cash, positions_net, exit_cost, wealth, peak, (1.0 - wealth / peak) if peak > 0 else 0.0, exposure, len(opens)))
     rails.check_book_drawdown(conn, book, wealth, peak, drawdown=market.kill_drawdown(), unit=market.unit)   # the book's own kill switch
     picks = plan["picks"]
-    return {"beat_id": beat, "entries": plan["entries"], "entered": plan["entered"], "exited": n_exit, "open": len(opens), "cash": cash, "wealth": wealth,
+    return {"beat_id": beat, "entries": plan["entries"], "entered": plan["entered"], "added": plan.get("added", 0), "exited": n_exit, "open": len(opens), "cash": cash, "wealth": wealth,
             "picks": len(picks), "blocked": plan["blocked"], "top_scores": sorted(picks, key=lambda x: -x[1])[:5], "open_mints": sorted({p["mint"] for p in opens})}
 
 

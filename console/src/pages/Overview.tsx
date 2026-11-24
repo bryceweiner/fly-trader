@@ -1,4 +1,4 @@
-// Overview, laid out like Dashtreme's index: the selector book's KPI widgets, what the system is doing in plain words
+// Overview, laid out like Dashtreme's index: the money book's KPI widgets (live, else the paper book in the seat), what the system is doing in plain words
 // beside the win rate, the money's book (its wealth and open positions), the fly's brain, this minute's scoring with the top
 // scores, the race between the selector and the plastic fly, the rising + clean test and its go-live, the selector's setups
 // per day, and the live ticker (ui/api/overview.py; the brain ui/api/brain.py).
@@ -32,6 +32,7 @@ type Summary = {
   dd_spark: number[]
   wealth_help: string
   live: boolean
+  book?: string
   label: string
 }
 type Top = { mint: string; token: string; score: number }
@@ -83,7 +84,7 @@ function TokenButton({ chain, mint, token }: { chain: string; mint: string; toke
   return <button type="button" className="link-btn" title={mint} onClick={() => openInspector({ kind: 'token', chain, mint })}>{token}</button>
 }
 
-/** The selector book's KPI row, then the narrative beside the win rate. */
+/** The money book's KPI row (live, else the paper book in the seat), then the narrative beside the win rate. */
 function SummaryPanel() {
   const { chain } = useApp()
   const s = useTopic<Summary>('overview.summary', { chain })
@@ -110,7 +111,7 @@ function SummaryPanel() {
                 <Card title="In plain words" icon="bx-message-square-detail" className="flex-fill"><Md text={d.narrative} /></Card>
               </div>
               <div className="col-12 col-xl-4 d-flex">
-                <Card title="Win rate" icon="target" sub={d.live ? 'closed live trades that made money' : 'closed trades of the selector book that made money'} className="flex-fill" bodyClass="pb-0">
+                <Card title="Win rate" icon="target" sub={d.live ? 'closed live trades that made money' : `closed trades of ${d.book?.endsWith('fly') ? "the fly's paper book" : 'the selector book'} that made money`} className="flex-fill" bodyClass="pb-0">
                   <RadialGauge value={winRate} label="winners" display={winRate === null ? '—' : `${Math.round(winRate * 100)}%`} height={210} />
                   <RowGroup items={[{ label: 'closed', value: int(d.closed) }, { label: 'winners', value: int(d.wins) }, { label: `realized ${u}`, value: num(d.pnl ?? 0, 3, true) }]} />
                 </Card>
@@ -307,18 +308,19 @@ function BookPanel() {
 }
 
 type SetupDay = { day: string; setups: number | null; trades: number | null; live: number; ran: number }
-type SetupChain = { chain: string; name: string; setups: number; trades: number; live: number; days: SetupDay[] }
+type SetupChain = { chain: string; name: string; setups: number; trades: number; live: number; days: SetupDay[]; seat?: { book: 'selector' | 'fly'; since: string | null } }
 type Setups = { tz: string; n_days: number; gap_min: number; chains: SetupChain[] }
 const dayLabel = (iso: string) => new Date(`${iso}T00:00:00Z`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
-const PARTIAL = 0.9         // a day the selector book ran less of than this is flagged
+const PARTIAL = 0.9         // a day the trading book ran less of than this is flagged
 
-/** The selector's setups per UTC day over 30 days, beside the trades it took: one chart per chain, Solana on the left,
- *  Robinhood Chain on the right. Fewer setups is a quieter market; setups without trades are vetoes. */
+/** The trading book's setups per UTC day over 30 days, beside the trades it took: the selector's until the chain's handover,
+ *  the fly's from then on. One chart per chain, Solana on the left, Robinhood Chain on the right. Fewer setups is a quieter
+ *  market; setups without trades are vetoes. */
 function SetupsPanel() {
   const s = useTopic<Setups>('overview.setups')
   return (
     <Card title={`Setups · ${s.data?.n_days ?? 30} days`} icon="target"
-      sub="the buying chances the selector found each UTC day, and the trades it took · fewer setups is a quieter market, not a blocked bot">
+      sub="the buying chances the trading book found each UTC day, and the trades it took · fewer setups is a quieter market, not a blocked bot">
       <Loaded state={s} height={300}>
         {(d) => (
           <div className="row g-4">
@@ -326,18 +328,20 @@ function SetupsPanel() {
               const last = c.days.length - 1
               const partial = c.days.filter((x, i) => i < last && x.setups !== null && x.ran < PARTIAL)
               const off = c.days.filter((x) => x.setups === null).length
+              const who = c.seat?.book === 'fly' ? 'fly' : 'selector'
               return (
                 <div key={c.chain} className={`col-12 ${d.chains.length > 1 ? 'col-xl-6' : ''}`}>
                   <div className="d-flex align-items-baseline gap-2 mb-1">
                     <h6 className="m-0" style={{ color: '#fff' }}>{c.name}</h6>
-                    <span className="caption m-0">{int(c.setups)} setups · {int(c.trades)} selector trades · {int(c.live)} live</span>
+                    <span className="caption m-0">{int(c.setups)} setups · {int(c.trades)} {who} trades · {int(c.live)} live</span>
                   </div>
                   <BarChart categories={c.days.map((x, i) => (i === last ? 'today' : dayLabel(x.day)))} height={260}
-                    series={[{ name: 'setups', data: c.days.map((x) => x.setups) }, { name: 'selector trades', data: c.days.map((x) => x.trades) }]}
+                    series={[{ name: 'setups', data: c.days.map((x) => x.setups) }, { name: `${who} trades`, data: c.days.map((x) => x.trades) }]}
                     yFormat={(v) => (Number.isInteger(v) ? int(v) : '')} />
+                  {c.seat?.since && <Caption>The fly took the selector's seat on {dayLabel(c.seat.since.slice(0, 10))}: from then on the bars are the fly's picks and trades.</Caption>}
                   {(partial.length > 0 || off > 0) && (
                     <Caption>
-                      {off > 0 && `${off} day${off > 1 ? 's' : ''} without a bar: the selector book was not running. `}
+                      {off > 0 && `${off} day${off > 1 ? 's' : ''} without a bar: the trading book was not running. `}
                       {partial.length > 0 && `Ran only part of ${partial.slice(-6).map((x) => `${dayLabel(x.day)} (${Math.round(x.ran * 100)}%)`).join(', ')}`}
                       {partial.length > 6 && ` and ${partial.length - 6} earlier day${partial.length > 7 ? 's' : ''}`}
                       {partial.length > 0 && ': fewer setups there say nothing of the market.'}
@@ -350,7 +354,7 @@ function SetupsPanel() {
         )}
       </Loaded>
       <Caption>
-        A setup is a token the selector picked while not holding it; its picks less than {s.data?.gap_min ?? 30} minutes apart count once. A setup it
+        A setup is a token the trading book picked while not holding it; its picks less than {s.data?.gap_min ?? 30} minutes apart count once. A setup it
         did not trade was vetoed (dump veto, win filter). Days are UTC.
       </Caption>
     </Card>

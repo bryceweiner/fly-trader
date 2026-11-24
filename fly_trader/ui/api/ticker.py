@@ -11,20 +11,22 @@ from ..hub import topic
 from ..state import KALSHI_BOOKS, kalshi_enabled, labels
 
 N = 60
-FLY_KINDS = ["fly_enter", "fly_exit", "fly_rh_enter", "fly_rh_exit", "blocked"]
+FLY_KINDS = ["fly_enter", "fly_add", "fly_exit", "fly_rh_enter", "fly_rh_add", "fly_rh_exit", "blocked"]
 KALSHI_KINDS = ["kalshi_taker_enter", "kalshi_maker_post", "kalshi_maker_fill", "kalshi_settle", "kalshi_exit"]
 KALSHI_ACTION = {"kalshi_taker_enter": "bought", "kalshi_maker_post": "posted", "kalshi_maker_fill": "filled", "kalshi_maker_cancel": "cancelled",
                  "kalshi_settle": "settled", "kalshi_exit": "sold"}
 
 
-RAIL_TEXT = {"held": "already holding it", "filtered": "a filter said no", "paper_fill": "the simulated fill failed"}
+RAIL_TEXT = {"held": "already holding it", "filtered": "a filter said no", "paper_fill": "the simulated fill failed",
+             "crashed": "sold in a crash within the hour"}
 
 
 def action_of(kind: str) -> str:
     """A decision kind as a verb: bought / sold / not taken, or the Kalshi arm's own (posted, filled, settled…)."""
     if kind in KALSHI_ACTION:
         return KALSHI_ACTION[kind]
-    return "bought" if kind.endswith("_enter") or kind == "enter" else "sold" if kind.endswith("_exit") or kind == "exit" else "not taken" if kind == "blocked" else kind
+    return ("bought" if kind.endswith("_enter") or kind == "enter" else "added" if kind.endswith("_add") else "sold" if kind.endswith("_exit") or kind == "exit"
+            else "not taken" if kind == "blocked" else kind)
 
 
 def actor_of(kind: str, book: str | None) -> str:
@@ -58,7 +60,7 @@ def memecoin_items(fly_books: list[str], live_books: list[str]) -> list[dict]:
     for r in dec:
         m = markets.for_book(r["book"] or ""); live = (r["book"] or "").startswith("live"); act = action_of(r["kind"])
         size = float(r["size_sol"]) if r["size_sol"] is not None else None
-        if act == "bought":
+        if act in ("bought", "added"):
             detail = f"{_num(size, 4)} {m.unit}" + (f" — {r['reason']}" if r["reason"] else "")
         elif act == "sold":
             detail = f"cost {_num(size, 4)} {m.unit}" + (f" — {r['reason']}" if r["reason"] else "")
@@ -69,7 +71,7 @@ def memecoin_items(fly_books: list[str], live_books: list[str]) -> list[dict]:
                 detail += f" (score {float(r['m_hat']):.3f})"
         who = "Live" if live else "Fly"
         out.append({"id": f"d:{r['id']}", "ts": r["ts"], "chain": m.chain, "book": r["book"], "kind": r["kind"], "action": act,
-                    "side": "buy" if act == "bought" else "sell" if act == "sold" else None, "mint": r["mint"], "ticker": None,
+                    "side": "buy" if act in ("bought", "added") else "sell" if act == "sold" else None, "mint": r["mint"], "ticker": None,
                     "token": names.get(r["mint"], (r["mint"] or "")[:6]), "size": size, "unit": m.unit, "price": None, "live": live,
                     "strategy": r["strategy"], "detail": detail.strip(),
                     "text": f"{who} {act} {names.get(r['mint'], r['mint'])} on {m.name}: {detail.strip()}"})

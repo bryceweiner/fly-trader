@@ -88,6 +88,7 @@ class RhRequest:
     decimals: int = 18
     ref_price: float | None = None             # a buy: its decision's paper fill price (ETH per token), the most it may chase by MAX_ENTRY_CHASE
     retry: int = 0                             # a buy sent again after a failure (rh/live.py): its n-th retry
+    add: bool = False                          # a buy: a re-pick's add into the open position of its token, ``hold_s`` that position's new hold
 
 
 @dataclass
@@ -232,8 +233,10 @@ class RhExecutor:
             if req.kind == "buy":
                 with transaction() as conn:
                     held = conn.execute("SELECT 1 FROM positions WHERE book = %s AND mint = %s AND status = 'open'", (A.BOOK, req.token.lower())).fetchone()
-                if held:                                                    # the sale queued before it did not close the position
+                if held and not req.add:                                    # the sale queued before it did not close the position
                     return RhResult(req, False, "held: the live book still holds this token (the sale before this buy did not close it)", retryable=True)
+                if req.add and not held:                                    # sold since the add was decided: nothing to add to
+                    return RhResult(req, False, "held: the position this add was for is closed", retryable=False)
             iid = self._open_intent(req)
             if iid is None:
                 return RhResult(req, False, DUPLICATE)
@@ -431,7 +434,7 @@ class RhExecutor:
                     A.open_lot(conn, asset=base, qty_raw=base_left, basis_eth=left_eth, source="stray", intent_id=iid)
                 pid, realized = A.book_buy(conn, intent_id=iid, token=tok, pool=(req.pool or {}).get("pool_id"), quote_asset=(req.quote_asset or ZERO).lower(),
                                            eth_spent_wei=int(spent - left_eth * A.WEI), tokens_raw=max(tok_delta, 0), decision_id=req.decision_id, ts=now,
-                                           hold_s=req.hold_s, strategy=req.strategy, decimals=req.decimals)
+                                           hold_s=req.hold_s, strategy=req.strategy, decimals=req.decimals, add=req.add)
             else:
                 sold = -tok_delta
                 A.add_leg(conn, intent_id=iid, tx_id=tx_id, position_id=req.position_id, leg_no=1, asset_in=tok, asset_out=A.NATIVE, amount_in=max(sold, 0),

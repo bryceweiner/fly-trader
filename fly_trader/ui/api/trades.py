@@ -15,11 +15,12 @@ LIMIT = 300
 
 
 def _book(params: dict, mk: markets.MarketSpec) -> str:
-    """The book asked for when it belongs to this chain, else the chain's selector book — the Streamlit page reset its
-    remembered book the same way when the chain changed under it."""
+    """The book asked for when it belongs to this chain, else the chain's money book (ui/state.system_state: the wallet's
+    while live money trades, else the paper book in the seat) — the Streamlit page reset its remembered book the same way
+    when the chain changed under it."""
     b = params.get("book")
     if not isinstance(b, str) or not b or len(b) > 64 or markets.for_book(b) is not mk:
-        return mk.selector_book
+        return system_state(mk)["money_book"]
     return b
 
 
@@ -30,8 +31,8 @@ def books(params: dict) -> dict:
     mk = market_param(params)
     seen = [r["book"] for r in q("SELECT DISTINCT book FROM positions UNION SELECT DISTINCT book FROM fills ORDER BY 1")]
     out = list(mk.books) + [b for b in seen if b not in mk.books and markets.for_book(b) is mk]
-    live = bool(system_state(mk)["live_money"])                  # while live money trades, the page opens on the live book
-    return {"chain": mk.chain, "unit": mk.unit, "books": out, "default": mk.live_book if live else mk.selector_book, "live": live,
+    s = system_state(mk); live = bool(s["live_money"])           # the page opens on the money's book: live, else the seat's paper book
+    return {"chain": mk.chain, "unit": mk.unit, "books": out, "default": s["money_book"], "live": live,
             "help": f"{mk.selector_book} is the selector's paper book, {mk.fly_book} the fly's, {mk.live_book} the bot wallet; amounts in {mk.unit}."}
 
 

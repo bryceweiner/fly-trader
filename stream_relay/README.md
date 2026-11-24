@@ -53,6 +53,10 @@ The optional settings:
 | `RELAY_BUFFER` | 300000 | events kept for a client that reconnects; 17–27 minutes in a busy hour, ~350 MB for the whole relay when it fills, ~400 MB a day later |
 | `RELAY_BATCH_S` | 0.05 | how often batches go out, in seconds |
 | `RELAY_UPSTREAM` | `wss://stream.pumpapi.io` | the stream the relay holds |
+| `RELAY_TRANSFERS_DIR` | unset | keep graduated coins' `transfer` events there, one gzipped JSON-lines file per UTC day, never forwarded; use `/var/lib/fly-stream-relay/transfers` (the service's `StateDirectory`, its one writable directory) |
+| `RELAY_TRANSFERS_MAX_MB` | 1024 | written a day, at most; the rest is dropped and counted (`tap_dropped` in `/health`) |
+| `RELAY_TRANSFERS_MIN_FREE_GB` | 3 | no transfer is written below this much free disk |
+| `RELAY_TRANSFERS_KEEP_DAYS` | 14 | day files older than this are deleted; the Mac pulls them first with `stream_relay/pull_transfers.sh` |
 
 **Name and certificate.** Point a DNS name (e.g. `relay.example.com`) at the server. Then, with port 80 open while the certificate is issued:
 

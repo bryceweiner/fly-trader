@@ -12,6 +12,7 @@ for _name in ("LIVE_ENABLED", "RH_LIVE_ENABLED", "KALSHI_LIVE_ENABLED", "LIVE_WI
     os.environ[_name] = "0"                                                                   # live switches from .env
 os.environ["RH_CAPITAL_ETH"] = ""      # empty = the code's pinned default, not the operator's wallet balance (load_dotenv never overrides)
 os.environ["KELLY_FRACTION"] = ""      # and the code's default stake, not the operator's
+os.environ["RH_KELLY_FRACTION"] = ""   # (Robinhood Chain's too)
 
 import pytest  # noqa: E402
 

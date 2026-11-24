@@ -86,11 +86,12 @@ def _series(rows: list[dict], books: list[str]) -> list[dict]:
 
 @topic("overview.summary", every=5)
 def summary(params: dict) -> dict:
-    """The narrative and the money's metrics — the live book while live money trades, else the selector's paper book:
+    """The narrative and the money's metrics — the live book while live money trades, else the paper book in the seat
+    (the selector's, the fly's after its handover):
     wealth, realized P&L, closed (wins), open, drawdown, with sparklines (wealth and drawdown over the book's whole
     history, realized P&L cumulative over the last 180 trades). A live book's capital and realized P&L are its wallet's
     (ops/wallets.money), so they hold what the trade ledger never sees."""
-    mk = market_param(params); s = system_state(mk); live = bool(s["live_money"]); BOOK = mk.live_book if live else mk.selector_book; u = mk.unit
+    mk = market_param(params); s = system_state(mk); live = bool(s["live_money"]); BOOK = s["money_book"]; u = mk.unit
     money = wallets.money(mk) if live else None
     cap = money["start"] if money else mk.capital()
     w = q1("SELECT wealth, exposure, n_open, drawdown FROM wealth_marks WHERE book = %s ORDER BY ts DESC LIMIT 1", (BOOK,)) or {}
@@ -161,10 +162,10 @@ def race(params: dict) -> dict:
 
 @topic("overview.book", every=15)
 def book(params: dict) -> dict:
-    """The money's book — live while live money trades, else the selector's paper book: its whole wealth history and
+    """The money's book — live while live money trades, else the paper book in the seat: its whole wealth history and
     its open positions (held, exits in, cost, gross return). A live position can be sold now (``sell_now``) at the exit's
     slippage stepping up to the forced one (``sell``, in percent)."""
-    mk = market_param(params); live = bool(system_state(mk)["live_money"]); BOOK = mk.live_book if live else mk.selector_book; u = mk.unit
+    mk = market_param(params); s = system_state(mk); live = bool(s["live_money"]); BOOK = s["money_book"]; u = mk.unit
     hist = _series(marks([BOOK]), [BOOK])
     rows = q("""SELECT p.id, p.mint, p.opened_at, p.cost_sol, p.entry_price, p.last_mark_price, p.hold_s, p.strategy,
                        (d.detail->>'correctness')::float AS correctness
@@ -181,7 +182,7 @@ def book(params: dict) -> dict:
                         "correctness": float(r["correctness"]) if r["correctness"] is not None else None,
                         "ret": (float(r["last_mark_price"]) / float(r["entry_price"]) - 1) * 100 if r["entry_price"] and r["last_mark_price"] else None})
     return {"unit": u, "history": hist[0]["data"] if hist else [], "positions": out, "live": live, "book": BOOK,
-            "title": "Live wealth" if live else "Paper wealth", "sub": "the bot wallet since it started trading" if live else "the selector book since it started",
+            "title": "Live wealth" if live else "Paper wealth", "sub": "the bot wallet since it started trading" if live else ("the fly's paper book since it started" if BOOK == mk.fly_book else "the selector book since it started"),
             "observer": isinstance(runtime.sup(), runtime.Observer), "sell": {"from_pct": config.SLIPPAGE_EXIT_BPS / 100, "to_pct": config.SLIPPAGE_FORCED_BPS / 100}}
 
 
@@ -443,20 +444,41 @@ def setups_by_day(picks) -> dict[tuple[str, object], dict]:
     return out
 
 
+def _seat(m) -> datetime | None:
+    """When the chain's fly took the selector's seat (agent/handover.py), else None: the selector holds it."""
+    from ...agent import handover
+    with transaction() as conn:
+        h = handover.state(conn, m.chain)
+    at = _utc_of((h or {}).get("at"))
+    return at
+
+
 @topic("overview.setups", every=60)
 def setups(params: dict) -> dict:
-    """The selector's setups per UTC day over the last ``SETUP_DAYS`` days, per chain (Solana, then Robinhood Chain): the
+    """The trading book's setups per UTC day over the last ``SETUP_DAYS`` days, per chain (Solana, then Robinhood Chain): the
     buying chances its strategy stack found (``setups_by_day``), the trades its paper book took from them, and the live
-    book's. ``ran``: the share of the day's minutes the selector book ran (to the current minute today) -- a day it ran
-    only part of says nothing of the market."""
+    book's. The trading book is the selector's until the chain's handover and the fly's from then on (``seat``), which
+    the selector book stops for (a paper-only install, 2026-11-04: its chart showed no setups after it while the fly traded every
+    day). ``ran``: the share of the day's minutes that book ran (to the current minute today) -- a day it ran only part
+    of says nothing of the market."""
     now = datetime.now(timezone.utc); today = now.date()
     days = [today - timedelta(days=SETUP_DAYS - 1 - i) for i in range(SETUP_DAYS)]
     since = datetime(days[0].year, days[0].month, days[0].day, tzinfo=timezone.utc)
-    enabled = markets.enabled(); sel = [m.selector_book for m in enabled]
-    per = setups_by_day(selector_picks(sel, since - SETUP_GAP))
-    ran = {(r["book"], r["d"]): int(r["minutes"]) for r in q(
-        """SELECT r.config->>'book' AS book, (b.ts AT TIME ZONE 'UTC')::date AS d, count(DISTINCT b.ts) AS minutes FROM beats b JOIN runs r USING (run_id)
-           WHERE b.ts >= %s AND r.config->>'book' = ANY(%s) GROUP BY 1, 2""", (since, sel))}
+    enabled = markets.enabled()
+    seats = {m.chain: _seat(m) for m in enabled}
+    ninf, pinf = datetime(1970, 1, 1, tzinfo=timezone.utc), datetime(9999, 1, 1, tzinfo=timezone.utc)
+    spans = [(m.chain, m.selector_book, ninf, seats[m.chain] or pinf) for m in enabled] + \
+            [(m.chain, m.fly_book, seats[m.chain], pinf) for m in enabled if seats[m.chain]]      # (chain, book, from, to): the seat's book
+    picks = selector_picks(sorted({b for _, b, _, _ in spans}), since - SETUP_GAP)
+    per = setups_by_day([(c, mint, t, e) for book, mint, t, e in picks for c, b, lo, hi in spans if b == book and lo <= t < hi])
+    ran: dict[tuple[str, object], int] = {}
+    if spans:
+        vals = ", ".join(["(%s, %s, %s::timestamptz, %s::timestamptz)"] * len(spans))
+        for r in q(f"""WITH w(chain, book, lo, hi) AS (VALUES {vals})
+                       SELECT w.chain, (b.ts AT TIME ZONE 'UTC')::date AS d, count(DISTINCT b.ts) AS minutes FROM beats b JOIN runs r USING (run_id)
+                       JOIN w ON w.book = r.config->>'book' WHERE b.ts >= %s AND b.ts >= w.lo AND b.ts < w.hi GROUP BY 1, 2""",
+                   tuple(x for sp in spans for x in sp) + (since,)):
+            ran[(r["chain"], r["d"])] = ran.get((r["chain"], r["d"]), 0) + int(r["minutes"])
     live: dict[tuple[str, object], int] = {}
     for book, t, _ in _every_position([m.live_book for m in enabled], since)[0]:
         live[(book, t.date())] = live.get((book, t.date()), 0) + 1
@@ -465,9 +487,11 @@ def setups(params: dict) -> dict:
         rows = []
         for d in days:
             span = 1440 if d < today else max(1, now.hour * 60 + now.minute)
-            share = min(1.0, ran.get((m.selector_book, d), 0) / span); c = per.get((m.selector_book, d)) or {"setups": 0, "trades": 0}
+            share = min(1.0, ran.get((m.chain, d), 0) / span); c = per.get((m.chain, d)) or {"setups": 0, "trades": 0}
             rows.append({"day": d.isoformat(), "setups": c["setups"] if share > 0 else None, "trades": c["trades"] if share > 0 else None,
                          "live": live.get((m.live_book, d), 0), "ran": round(share, 3)})
+        at = seats[m.chain]
         out.append({"chain": m.chain, "name": m.name, "setups": sum(r["setups"] or 0 for r in rows), "trades": sum(r["trades"] or 0 for r in rows),
-                    "live": sum(r["live"] for r in rows), "days": rows})
+                    "live": sum(r["live"] for r in rows), "days": rows,
+                    "seat": {"book": "fly" if at else "selector", "since": at.isoformat() if at else None}})
     return {"tz": "UTC", "n_days": SETUP_DAYS, "gap_min": int(SETUP_GAP.total_seconds() // 60), "chains": out}

@@ -2,7 +2,7 @@
 // groups, an off-canvas panel on phones), the status strip under it on every page, and the footer.
 import { useEffect, useState, type ReactNode } from 'react'
 import { NavLink, useLocation } from 'react-router'
-import { useApp } from '../context'
+import { useApp, type ModelVersion } from '../context'
 import { InspectorDrawer } from '../fly/Inspector'
 import { LiveToasts } from '../fly/Ticker'
 import { useConn } from '../lib/hooks'
@@ -114,6 +114,34 @@ function OperatorBox() {
   )
 }
 
+const CHAIN = { sol: 'SOL', rh: 'RH' } as const
+
+function modelTip(kind: string, m: ModelVersion | null): string {
+  return m ? `${kind} #${m.id}${m.file ? ` · ${m.file}` : ''}${m.sha ? ` · sha256 ${m.sha}…` : ''}` : `${kind}: not reported yet`
+}
+
+/** Code, selector and fly along the top: the models by their file's sha256 (the same on every machine running the same model). */
+function VersionStrip() {
+  const { meta } = useApp()
+  const v = meta?.versions
+  if (!v) return null
+  const key = (m: ModelVersion | null) => m?.sha ?? (m ? `#${m.id}` : '—')
+  const same = v.models.every((x) => key(x.selector) === key(v.models[0]?.selector) && key(x.fly) === key(v.models[0]?.fly))
+  const groups = same && v.models.length ? [{ label: '', m: v.models[0] }] : v.models.map((m) => ({ label: CHAIN[m.chain], m }))
+  return (
+    <div className="d-none d-lg-flex align-items-center gap-3 version-strip" style={{ fontSize: 12, color: 'var(--fly-muted)', whiteSpace: 'nowrap' }}>
+      <span title={v.code.detail}>code <b className="font-monospace" style={{ color: v.code.changed ? 'var(--bs-warning)' : 'inherit' }}>{v.code.label}</b></span>
+      {groups.map(({ label, m }) => (
+        <span key={label || 'all'} className="d-flex gap-2">
+          {label && <span>{label}</span>}
+          <span title={modelTip('selector', m.selector)}>selector <b className="font-monospace">{key(m.selector)}</b></span>
+          <span title={modelTip('fly', m.fly)}>fly <b className="font-monospace">{key(m.fly)}</b></span>
+        </span>
+      ))}
+    </div>
+  )
+}
+
 function TopBar({ onMenu }: { onMenu: () => void }) {
   const conn = useConn()
   return (
@@ -123,6 +151,7 @@ function TopBar({ onMenu }: { onMenu: () => void }) {
           <div className="topbar-logo-header d-none d-lg-flex"><Logo /></div>
           <div className="mobile-toggle-menu d-block d-lg-none" role="button" aria-label="Menu" onClick={onMenu}><i className="bx bx-menu" style={{ fontSize: 26 }} /></div>
           <div className="search-bar flex-grow-1"><SearchBox /></div>
+          <VersionStrip />
           <div className="top-menu ms-auto">
             <ul className="navbar-nav align-items-center gap-1">
               <li className="nav-item d-flex align-items-center" title={conn === 'open' ? 'Live: the console pushes changes as they happen' : 'Reconnecting to the console…'}>

@@ -84,7 +84,10 @@ def _state(**kw) -> dict:
                    "meta": {"trained_through": "2026-10-02", "horizon_min": 120, "model": {"min_age_h": 6.0, "min_resq_sol": 10.0, "min_vol_15m_sol": 5.0}}},
          "market": markets.SOL, "live_money": False, "trading_why": "Trading every minute.", "fly": {"stage": "trading", "line": 0.161}, "handover": None,
          "training": False, "train_status": {}}
-    return {**s, **kw}
+    s = {**s, **kw}
+    m = s["market"]                                                      # as ui/state.system_state: the wallet's, else the seat's paper book
+    s.setdefault("money_book", m.live_book if s["live_money"] else (m.fly_book if s["handover"] else m.selector_book))
+    return s
 
 
 def test_narrative_says_what_the_streamlit_page_said(monkeypatch):
@@ -305,6 +308,64 @@ def test_setups_topic_counts_todays_picks_and_marks_the_days_the_selector_did_no
     quiet_day = (now - timedelta(days=29)).date().isoformat()
     assert before[quiet_day]["ran"] > 0 or before[quiet_day]["setups"] is None                 # no bar on a day the selector book did not run
 
+
+
+def test_after_the_handover_the_setups_are_the_flys(console, monkeypatch, tmp_path):
+    """A paper-only install handed over on 2026-11-04 and its chart showed no setups after it while the fly traded every day: the
+    selector book stops at the handover, so from then on the chart counts the fly book's picks and minutes."""
+    monkeypatch.setattr(config, "PG_ARCHIVE_DIR", tmp_path)
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0); at = now - timedelta(minutes=30)
+    runs = {"paper_selector": str(uuid.uuid4()), "paper_fly": str(uuid.uuid4())}; tag = uuid.uuid4().hex[:8]
+    with transaction() as c:
+        saved = c.execute("SELECT value FROM ui_settings WHERE key = 'handover'").fetchone()
+        c.execute("INSERT INTO ui_settings (key, value) VALUES ('handover', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                  (Jsonb({"at": at.isoformat(), "chain": "sol"}),))
+        for book, run in runs.items():
+            c.execute("INSERT INTO runs (run_id, kind, config) VALUES (%s, %s, %s)", (run, "selector" if book == "paper_selector" else "fly", Jsonb({"book": book})))
+        c.execute("INSERT INTO beats (run_id, ts, beat_no) VALUES (%s, %s, 1)", (runs["paper_selector"], at - timedelta(minutes=5)))
+        c.execute("INSERT INTO beats (run_id, ts, beat_no) VALUES (%s, %s, 1)", (runs["paper_fly"], now))
+        c.execute("INSERT INTO decisions (ts, kind, mint, detail) VALUES (%s, 'selector_enter', %s, %s)", (at - timedelta(minutes=5), f"SELbefore{tag}", Jsonb({"book": "paper_selector"})))
+        c.execute("INSERT INTO decisions (ts, kind, mint, detail) VALUES (%s, 'fly_enter', %s, %s)", (at - timedelta(minutes=4), f"FLYbefore{tag}", Jsonb({"book": "paper_fly"})))
+        c.execute("INSERT INTO decisions (ts, kind, mint, detail) VALUES (%s, 'fly_enter', %s, %s)", (now, f"FLYafter{tag}", Jsonb({"book": "paper_fly"})))
+    try:
+        d = _ok(console.topic("overview.setups"))["chains"][0]
+        with transaction() as c:
+            c.execute("DELETE FROM decisions WHERE mint LIKE %s", (f"%{tag}",))
+        base = _ok(console.topic("overview.setups"))["chains"][0]
+    finally:
+        with transaction() as c:
+            c.execute("DELETE FROM decisions WHERE mint LIKE %s", (f"%{tag}",))
+            for run in runs.values():
+                c.execute("DELETE FROM beats WHERE run_id = %s", (run,)); c.execute("DELETE FROM runs WHERE run_id = %s", (run,))
+            if saved:
+                c.execute("UPDATE ui_settings SET value = %s WHERE key = 'handover'", (Jsonb(saved["value"]),))
+            else:
+                c.execute("DELETE FROM ui_settings WHERE key = 'handover'")
+    today = now.date().isoformat()
+    assert d["seat"] == {"book": "fly", "since": at.isoformat()}
+    assert (d["setups"] - base["setups"], d["trades"] - base["trades"]) == (2, 2)     # the selector's before, the fly's after; not the fly's before
+    assert {r["day"]: r for r in d["days"]}[today]["ran"] > 0
+
+
+def test_after_the_handover_the_money_pages_show_the_flys_book(console):
+    """A paper-only install handed over on 2026-11-04 and trades on paper: its Overview and Trades page kept showing the stopped
+    selector book (5.42 SOL, no trade since) while its fly traded every day. Without live money the pages show the paper
+    book in the seat: the selector's, the fly's after the handover."""
+    with transaction() as c:
+        saved = c.execute("SELECT value FROM ui_settings WHERE key = 'handover'").fetchone()
+        c.execute("DELETE FROM ui_settings WHERE key = 'handover'")
+    try:
+        before = (_ok(console.topic("overview.summary"))["book"], _ok(console.topic("overview.book"))["book"], _ok(console.topic("trades.books"))["default"])
+        with transaction() as c:
+            c.execute("INSERT INTO ui_settings (key, value) VALUES ('handover', %s)", (Jsonb({"at": "2026-11-04T08:00:00+00:00", "chain": "sol"}),))
+        after = (_ok(console.topic("overview.summary"))["book"], _ok(console.topic("overview.book"))["book"], _ok(console.topic("trades.books"))["default"])
+        summary_book = _ok(console.topic("trades.summary"))["book"]                      # no book asked: the money's
+    finally:
+        with transaction() as c:
+            c.execute("DELETE FROM ui_settings WHERE key = 'handover'")
+            if saved:
+                c.execute("INSERT INTO ui_settings (key, value) VALUES ('handover', %s)", (Jsonb(saved["value"]),))
+    assert before == ("paper_selector",) * 3 and after == ("paper_fly",) * 3 and summary_book == "paper_fly"
 
 # ---------------------------------------------------------------- the brain
 T0 = datetime(2026, 10, 16, 14, 0, tzinfo=timezone.utc).timestamp()

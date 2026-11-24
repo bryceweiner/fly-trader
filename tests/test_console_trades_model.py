@@ -290,10 +290,16 @@ def selector_at_work():
         sid = conn.execute("INSERT INTO brain_snapshots (path, kind, note) VALUES ('/tmp/sel.pkl', 'selector', %s) RETURNING id", (json.dumps(meta),)).fetchone()["id"]
         conn.execute("INSERT INTO runs (run_id, kind, status, started_at, brain_snapshot_id, config) VALUES (%s, 'selector', 'running', now() + interval '1 day', %s, %s)",
                      (run_id, sid, json.dumps({"threshold": 0.06})))
+        saved = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM ui_settings WHERE key IN ('selector_status', 'fly_status')").fetchall()}
+        for k, v in (("selector_status", {"snapshot": sid}), ("fly_status", {})):      # the session's report (ui/state.loaded_model)
+            conn.execute("INSERT INTO ui_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (k, json.dumps(v)))
     yield sid
     with transaction() as conn:
         conn.execute("DELETE FROM runs WHERE run_id = %s", (run_id,))
         conn.execute("DELETE FROM brain_snapshots WHERE id = %s", (sid,))
+        conn.execute("DELETE FROM ui_settings WHERE key IN ('selector_status', 'fly_status')")
+        for k, v in saved.items():
+            conn.execute("INSERT INTO ui_settings (key, value) VALUES (%s, %s)", (k, json.dumps(v) if not isinstance(v, str) else v))
 
 
 def test_model_at_work(console, selector_at_work):

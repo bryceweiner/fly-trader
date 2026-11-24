@@ -149,7 +149,8 @@ def _trade(conn, broker, run, beat, m1, prices, buy=()):
                                               "fee_rate": None} for m in buy], scores=np.full(len(buy), 0.05), threshold=0.01, table=TABLE, horizon_s=14400.0)
 
 
-def test_paper_sells_a_crashed_coin_at_the_crashs_price_and_may_buy_it_again(db_conn, monkeypatch):
+def test_paper_sells_a_crashed_coin_at_the_crashs_price_and_buys_it_again_only_after_the_cooldown(db_conn, monkeypatch):
+    """Since 2026-11-18 a coin sold in a crash is not bought again for config.CRASH_REBUY_COOLDOWN_MIN (rail 'crashed')."""
     monkeypatch.setattr(config, "CAPITAL_SOL", 5.0)
     w = crash_exit.Watch(); monkeypatch.setattr(crash_exit, "WATCH", w)
 
@@ -169,9 +170,12 @@ def test_paper_sells_a_crashed_coin_at_the_crashs_price_and_may_buy_it_again(db_
             sold = conn.execute("SELECT forced_exit_kind, exit_price FROM positions WHERE book = %s AND mint = 'CRASHpump'", (BOOK,)).fetchone()
             why = [r["reason"] for r in conn.execute("SELECT reason FROM decisions WHERE run_id = %s AND kind = 'selector_exit'", (run,)).fetchall()]
             again = _trade(conn, broker, run, 3, M0 + timedelta(minutes=5), {"CRASHpump": 0.5, "CALMpump": 1.0}, buy=["CRASHpump"])
+            rail = conn.execute("SELECT rail FROM decisions WHERE run_id = %s AND kind = 'blocked' AND mint = 'CRASHpump'", (run,)).fetchone()["rail"]
+            later = _trade(conn, broker, run, 4, M0 + timedelta(minutes=5 + config.CRASH_REBUY_COOLDOWN_MIN), {"CRASHpump": 0.5, "CALMpump": 1.0}, buy=["CRASHpump"])
             left = {p["mint"] for p in ledger.open_positions(conn, BOOK)}
     finally:
         wipe()
     assert st["exited"] == 1 and sold["forced_exit_kind"] == "crash" and sold["exit_price"] == pytest.approx(0.7 * entry, rel=0.05)
     assert why == ["crash: sold at -30% from its entry, 25% under its 5-minute high"]
-    assert again["entered"] == 1 and left == {"CRASHpump", "CALMpump"}
+    assert again["entered"] == 0 and rail == "crashed"
+    assert later["entered"] == 1 and left == {"CRASHpump", "CALMpump"}
